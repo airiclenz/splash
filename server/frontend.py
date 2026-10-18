@@ -72,6 +72,8 @@ else:
 PREPARATION_WAIT_SECONDS = 30.0
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 REASONING_EFFORT_ALIASES = {"high": "xhigh", "max": "xhigh", "minimal": "low"}
+# Effort order for the --max-reasoning-effort cap, computed once per process.
+REASONING_EFFORT_RANKS = {effort: rank for rank, effort in enumerate(REASONING_EFFORTS)}
 
 
 MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
@@ -225,6 +227,7 @@ class Frontend:
         thinking_codec=None,
         served_model_names=(),
         default_reasoning_effort=None,
+        max_reasoning_effort=None,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
@@ -246,7 +249,17 @@ class Frontend:
             and default_reasoning_effort not in REASONING_EFFORTS
         ):
             raise ValueError("invalid default_reasoning_effort")
+        if (
+            max_reasoning_effort is not None
+            and max_reasoning_effort not in REASONING_EFFORTS
+        ):
+            raise ValueError("invalid max_reasoning_effort")
         self.default_reasoning_effort = default_reasoning_effort
+        self.max_reasoning_effort = max_reasoning_effort
+        if self._clamp_reasoning_effort(default_reasoning_effort) != (
+            default_reasoning_effort
+        ):
+            raise ValueError("default_reasoning_effort exceeds max_reasoning_effort")
         self.max_context = max_context
         self.default_max_new = default_max_new
         self.request_timeout = request_timeout
@@ -694,6 +707,7 @@ class Frontend:
             or reasoning_effort not in REASONING_EFFORTS
         ):
             raise APIError(400, "invalid reasoning_effort")
+        reasoning_effort = self._clamp_reasoning_effort(reasoning_effort)
         preserve_thinking = body.get("preserve_thinking")
         if preserve_thinking is not None and not isinstance(preserve_thinking, bool):
             raise APIError(400, "preserve_thinking must be a boolean")
@@ -749,16 +763,47 @@ class Frontend:
         with self.latencies.measure("template"):
             return self._render_template(messages, template)
 
+    def _clamp_reasoning_effort(self, effort):
+        """Return `effort` lowered to the server's cap; None stays None.
+
+        None means the template's own default, which the server cannot rank.
+        """
+        cap = self.max_reasoning_effort
+        if (
+            effort is None
+            or cap is None
+            or REASONING_EFFORT_RANKS[effort] <= REASONING_EFFORT_RANKS[cap]
+        ):
+            return effort
+        return cap
+
     def _render_template(self, messages, template):
         try:
             return self.tokenizer.apply_chat_template(messages, **template)
         except TemplateError:
-            alias = REASONING_EFFORT_ALIASES.get(template.get("reasoning_effort"))
-            if alias is None:
+            retry = self._template_retry_effort(template.get("reasoning_effort"))
+            if retry is None:
                 raise
             return self.tokenizer.apply_chat_template(
-                messages, **{**template, "reasoning_effort": alias}
+                messages, **{**template, "reasoning_effort": retry}
             )
+
+    def _template_retry_effort(self, effort):
+        """Pick the one effort to retry after the template rejected `effort`.
+
+        The template's alias is used unless it exceeds the cap; an alias the
+        cap lowers back to `effort` would fail again, so the retry steps one
+        effort below it instead. None means re-raise: no alias exists, or the
+        only lower effort is "none", which would contradict enable_thinking.
+        """
+        alias = REASONING_EFFORT_ALIASES.get(effort)
+        if alias is None:
+            return None
+        retry = self._clamp_reasoning_effort(alias)
+        if retry != effort:
+            return retry
+        lower = REASONING_EFFORTS[REASONING_EFFORT_RANKS[effort] - 1]
+        return None if lower == "none" else lower
 
     def _render_prompt(
         self, prompt, deadline, *, check_context=True, add_generation_prompt=True

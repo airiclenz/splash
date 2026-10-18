@@ -69,7 +69,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 [model alias](DEVELOPMENT.md#api-model-aliases).
 Reasoning follows the model default unless a [server default](DEVELOPMENT.md#default-reasoning-effort)
 is configured. `"reasoning_effort": "none"` turns it off, and
-Qwen3.8-27B also takes `low`, `medium`, and `xhigh`.
+Qwen3.8-27B also takes `low`, `medium`, and `xhigh`. `--max-reasoning-effort`
+lowers any request above it to that effort.
 
 `GET /health` always answers 200 and names the served model, for example
 `{"status":"ok","model":"incoai/Qwen3.8-27B-Splash","ready":true,"memory_pressure":"normal"}`.

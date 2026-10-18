@@ -46,7 +46,12 @@ if __package__:
     from .constraints import ConstraintFactory, validate_tokenizer
     from .diagnostics import log_unexpected, print_request, print_status
     from .errors import APIError, ContextLengthError
-    from .frontend import REASONING_EFFORTS, Frontend, validate_served_model_name
+    from .frontend import (
+        REASONING_EFFORT_RANKS,
+        REASONING_EFFORTS,
+        Frontend,
+        validate_served_model_name,
+    )
     from .http_security import authenticate, validate_api_key, validate_headers
     from .latency import RequestLatency
     from .metrics import (
@@ -90,7 +95,12 @@ else:
     from constraints import ConstraintFactory, validate_tokenizer
     from diagnostics import log_unexpected, print_request, print_status
     from errors import APIError, ContextLengthError
-    from frontend import REASONING_EFFORTS, Frontend, validate_served_model_name
+    from frontend import (
+        REASONING_EFFORT_RANKS,
+        REASONING_EFFORTS,
+        Frontend,
+        validate_served_model_name,
+    )
     from http_security import authenticate, validate_api_key, validate_headers
     from latency import RequestLatency
     from metrics import (
@@ -1882,6 +1892,12 @@ def parse_args(argv=None):
         help="Chat/Responses effort when unspecified (default: SPLASH_DEFAULT_REASONING_EFFORT or model template)",
     )
     parser.add_argument(
+        "--max-reasoning-effort",
+        choices=REASONING_EFFORTS,
+        default=os.environ.get("SPLASH_MAX_REASONING_EFFORT"),
+        help="lower any request effort above this to it (default: SPLASH_MAX_REASONING_EFFORT or no cap)",
+    )
+    parser.add_argument(
         "--reasoning-loop-limit",
         type=_parse_reasoning_loop_limit,
         default=os.environ.get(
@@ -1923,6 +1939,21 @@ def parse_args(argv=None):
     ):
         parser.error(
             "invalid --default-reasoning-effort / SPLASH_DEFAULT_REASONING_EFFORT"
+        )
+    if (
+        args.max_reasoning_effort is not None
+        and args.max_reasoning_effort not in REASONING_EFFORTS
+    ):
+        parser.error("invalid --max-reasoning-effort / SPLASH_MAX_REASONING_EFFORT")
+    if (
+        args.default_reasoning_effort is not None
+        and args.max_reasoning_effort is not None
+        and REASONING_EFFORT_RANKS[args.default_reasoning_effort]
+        > REASONING_EFFORT_RANKS[args.max_reasoning_effort]
+    ):
+        parser.error(
+            f"--default-reasoning-effort {args.default_reasoning_effort} exceeds "
+            f"--max-reasoning-effort {args.max_reasoning_effort}"
         )
     if args.api_key is not None:
         try:
@@ -2034,6 +2065,7 @@ def main():
             thinking_codec=thinking_codec,
             served_model_names=args.served_model_name,
             default_reasoning_effort=args.default_reasoning_effort,
+            max_reasoning_effort=args.max_reasoning_effort,
         )
         server.app = app
         server.server_activate()

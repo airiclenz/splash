@@ -214,3 +214,188 @@ class DefaultReasoningTests(unittest.TestCase):
                     self.assertEqual(
                         "--default-reasoning-effort" in argv, expected is not None
                     )
+
+
+QWEN_EFFORTS = ("low", "medium", "xhigh")
+
+
+class MaxReasoningEffortTests(unittest.TestCase):
+    def harness(self, cap, default=None):
+        harness = fixtures.Harness(
+            fixtures.FakeRuntime(),
+            default_reasoning_effort=default,
+            max_reasoning_effort=cap,
+        )
+        self.addCleanup(harness.close)
+        return harness
+
+    def template_app(self, cap):
+        tokenizer = fixtures.TemplateTokenizer(
+            fixtures.ServerTest.reasoning_template(efforts=QWEN_EFFORTS)
+        )
+        app = frontend.Frontend(
+            tokenizer, None, "test-model", 128, 16, 1, 2, max_reasoning_effort=cap
+        )
+        return tokenizer, app
+
+    def rendered_efforts(self, tokenizer):
+        return [kwargs.get("reasoning_effort") for _, kwargs in tokenizer.templates]
+
+    def test_request_above_cap_is_clamped_on_every_endpoint(self):
+        harness = self.harness("medium")
+        anthropic = fixtures.ServerTest.anthropic_body(
+            max_tokens=1100, output_config={"effort": "xhigh"}
+        )
+        anthropic["thinking"] = {"type": "adaptive"}
+        for path, body in (
+            (
+                "/v1/chat/completions",
+                fixtures.ServerTest.body(reasoning_effort="xhigh"),
+            ),
+            (
+                "/v1/responses",
+                {
+                    **fixtures.ServerTest.responses_body(),
+                    "reasoning": {"effort": "xhigh"},
+                },
+            ),
+            ("/v1/messages", anthropic),
+        ):
+            with self.subTest(path=path):
+                status, _, payload = harness.request("POST", path, body)
+
+                self.assertEqual(status, 200, payload)
+                DefaultReasoningTests.assert_effort(self, harness, "medium")
+
+    def test_request_at_or_below_cap_is_untouched(self):
+        harness = self.harness("medium")
+        for effort in ("none", "low", "medium"):
+            with self.subTest(effort=effort):
+                body = fixtures.ServerTest.body(reasoning_effort=effort)
+
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", body
+                )
+
+                self.assertEqual(status, 200, payload)
+                DefaultReasoningTests.assert_effort(self, harness, effort)
+
+    def test_unset_effort_keeps_template_default_under_cap(self):
+        harness = self.harness("low")
+
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", fixtures.ServerTest.body()
+        )
+
+        self.assertEqual(status, 200, payload)
+        DefaultReasoningTests.assert_effort(self, harness, None)
+
+    def test_template_alias_above_cap_retries_once_below_it(self):
+        for effort in ("high", "xhigh", "max"):
+            with self.subTest(effort=effort):
+                tokenizer, app = self.template_app("high")
+
+                job, _, _ = app.prepare(
+                    fixtures.ServerTest.body(reasoning_effort=effort)
+                )
+
+                self.assertTrue(job.thinking)
+                self.assertEqual(self.rendered_efforts(tokenizer), ["high", "medium"])
+
+    def test_alias_retry_never_drops_to_none(self):
+        tokenizer, app = self.template_app("minimal")
+
+        with self.assertRaises(frontend.APIError):
+            app.prepare(fixtures.ServerTest.body(reasoning_effort="low"))
+
+        self.assertEqual(self.rendered_efforts(tokenizer), ["minimal"])
+
+    def test_alias_within_cap_is_used_unchanged(self):
+        tokenizer, app = self.template_app("xhigh")
+
+        app.prepare(fixtures.ServerTest.body(reasoning_effort="high"))
+
+        self.assertEqual(self.rendered_efforts(tokenizer), ["high", "xhigh"])
+
+    def test_frontend_rejects_invalid_cap_and_default_above_cap(self):
+        for options in (
+            {"max_reasoning_effort": "HIGH"},
+            {"max_reasoning_effort": "low", "default_reasoning_effort": "medium"},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                frontend.Frontend(None, None, "test-model", 128, 16, 1, 2, **options)
+
+    def test_default_above_cap_fails_before_startup(self):
+        for parse, args in (
+            (api.parse_args, SERVER_ARGS),
+            (launcher.parse_args, ["serve", "--model", "owner/repo"]),
+        ):
+            for environment, options in (
+                ({}, ["--default-reasoning-effort", "xhigh"]),
+                ({"SPLASH_DEFAULT_REASONING_EFFORT": "xhigh"}, []),
+                (
+                    {"SPLASH_MAX_REASONING_EFFORT": "low"},
+                    ["--default-reasoning-effort", "medium"],
+                ),
+            ):
+                with (
+                    self.subTest(parse=parse.__module__, environment=environment),
+                    mock.patch.dict(os.environ, environment),
+                    mock.patch("sys.stderr", io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    if "SPLASH_MAX_REASONING_EFFORT" not in environment:
+                        options = [*options, "--max-reasoning-effort", "medium"]
+                    parse([*args, *options])
+            for value in ("", "off", "HIGH"):
+                with (
+                    self.subTest(parse=parse.__module__, value=value),
+                    mock.patch.dict(os.environ, {"SPLASH_MAX_REASONING_EFFORT": value}),
+                    mock.patch("sys.stderr", io.StringIO()),
+                ):
+                    with self.assertRaises(SystemExit):
+                        parse(args)
+                    with self.assertRaises(SystemExit):
+                        parse([*args, "--max-reasoning-effort", value])
+            parsed = parse(
+                [
+                    *args,
+                    "--default-reasoning-effort",
+                    "medium",
+                    "--max-reasoning-effort",
+                    "medium",
+                ]
+            )
+            self.assertEqual(parsed.max_reasoning_effort, "medium")
+
+    def test_cli_over_environment_and_launcher_forwarding(self):
+        for env, explicit, expected in (
+            (None, None, None),
+            ("low", None, "low"),
+            ("low", "high", "high"),
+        ):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("SPLASH_MAX_REASONING_EFFORT", None)
+                os.environ.pop("SPLASH_DEFAULT_REASONING_EFFORT", None)
+                if env is not None:
+                    os.environ["SPLASH_MAX_REASONING_EFFORT"] = env
+                options = ["--max-reasoning-effort", explicit] if explicit else []
+                self.assertEqual(
+                    api.parse_args([*SERVER_ARGS, *options]).max_reasoning_effort,
+                    expected,
+                )
+                with (
+                    tempfile.TemporaryDirectory() as tmp,
+                    mock.patch.object(launcher, "RUNTIME_DIR", Path(tmp)),
+                    mock.patch.object(launcher.socket, "socket"),
+                    mock.patch.object(launcher, "_ensure_installed"),
+                    mock.patch.object(launcher.catalog, "spawn_refresh"),
+                    mock.patch.object(launcher.os, "execve") as execute,
+                ):
+                    launcher.main(["serve", "--model", "owner/repo", *options])
+
+                    argv = execute.call_args.args[1]
+                    os.environ.pop("SPLASH_MAX_REASONING_EFFORT", None)
+                    self.assertEqual(
+                        api.parse_args(argv[3:]).max_reasoning_effort, expected
+                    )

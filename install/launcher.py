@@ -188,6 +188,8 @@ def serve(args):
             command.extend(
                 ["--default-reasoning-effort", args.default_reasoning_effort]
             )
+        if args.max_reasoning_effort is not None:
+            command.extend(["--max-reasoning-effort", args.max_reasoning_effort])
         command.extend(["--reasoning-loop-limit", str(args.reasoning_loop_limit)])
         if args.max_request_size is not None:
             command.extend(["--max-request-size", str(args.max_request_size)])
@@ -435,6 +437,12 @@ def parse_args(argv=None):
         help="Chat/Responses effort when unspecified (default: SPLASH_DEFAULT_REASONING_EFFORT or model template)",
     )
     server.add_argument(
+        "--max-reasoning-effort",
+        choices=REASONING_EFFORTS,
+        default=os.environ.get("SPLASH_MAX_REASONING_EFFORT"),
+        help="lower any request effort above this to it (default: SPLASH_MAX_REASONING_EFFORT or no cap)",
+    )
+    server.add_argument(
         "--reasoning-loop-limit",
         type=_parse_reasoning_loop_limit,
         default=os.environ.get(
@@ -495,6 +503,23 @@ def parse_args(argv=None):
     ):
         parser.error(
             "invalid --default-reasoning-effort / SPLASH_DEFAULT_REASONING_EFFORT"
+        )
+    if (
+        args.command == "serve"
+        and args.max_reasoning_effort is not None
+        and args.max_reasoning_effort not in REASONING_EFFORTS
+    ):
+        parser.error("invalid --max-reasoning-effort / SPLASH_MAX_REASONING_EFFORT")
+    if (
+        args.command == "serve"
+        and args.default_reasoning_effort is not None
+        and args.max_reasoning_effort is not None
+        and REASONING_EFFORTS.index(args.default_reasoning_effort)
+        > REASONING_EFFORTS.index(args.max_reasoning_effort)
+    ):
+        parser.error(
+            f"--default-reasoning-effort {args.default_reasoning_effort} exceeds "
+            f"--max-reasoning-effort {args.max_reasoning_effort}"
         )
     if args.command in clients.INSTALL_URLS:
         try:

@@ -88,13 +88,26 @@ or empty, `.` or `..` path segments. This keeps model discovery URLs unambiguous
 `--default-reasoning-effort` (or `SPLASH_DEFAULT_REASONING_EFFORT`) sets the
 fallback for Chat `reasoning_effort` and Responses `reasoning.effort` when absent
 or null. Accepted values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
-`max`. An explicit request value wins; the CLI flag takes precedence over the
-environment. Unset, the model's template default is unchanged. Effort names are
-passed to the template using the same mapping as per-request values, not token
-budgets.
+`max`. An explicit request value wins up to the cap below; the CLI flag takes
+precedence over the environment. Unset, the model's template default is
+unchanged. Effort names are passed to the template using the same mapping as
+per-request values, not token budgets.
 
 ```sh
 splash serve --model incoai/Qwen3.8-27B-Splash --default-reasoning-effort none
+```
+
+`--max-reasoning-effort` (or `SPLASH_MAX_REASONING_EFFORT`) caps the effort:
+a Chat, Responses or Anthropic request above it is silently lowered to it, in
+the order listed above. A default above the cap fails at startup. When the
+template rejects an effort and its fallback alias (for example `high` to
+`xhigh`) would exceed the cap, the template is rendered one effort lower
+instead. A request that names no effort and has no server default keeps the
+template's own default, which the cap cannot rank; pair the cap with
+`--default-reasoning-effort` to bound those too.
+
+```sh
+splash serve --model incoai/Qwen3.8-27B-Splash --max-reasoning-effort medium
 ```
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
