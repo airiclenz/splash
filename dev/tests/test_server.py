@@ -2643,6 +2643,24 @@ class ServerTest(unittest.TestCase):
             },
         )
 
+    def test_health_is_not_ready_when_metal_is_unhealthy(self):
+        for metal in ({"healthy": False}, None):
+            with self.subTest(metal=metal):
+                runtime = FakeRuntime()
+                snapshot = json.loads(runtime.status_event.json)
+                snapshot["metal"] = metal
+                runtime.status_event = native_wire.StatusJsonEvent(
+                    1,
+                    native_wire.STATUS_SCHEMA_VERSION,
+                    json.dumps(snapshot).encode(),
+                )
+                harness = self.harness(runtime)
+                self.assertEqual(harness.request("GET", "/ready")[0], 503)
+
+                _, _, payload = harness.request("GET", "/health")
+
+                self.assertIs(json.loads(payload)["ready"], False)
+
     def test_status_identifies_the_http_instance_independently_of_readiness(self):
         first = self.harness(FakeRuntime())
         second = self.harness(FakeRuntime())

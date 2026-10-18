@@ -361,11 +361,14 @@ class NativeBackend:
             self._ensure_background_status_refresh()
             return {"ready": False, "memory_pressure": None}
         pressure = snapshot.get("memory_pressure")
+        metal = snapshot.get("metal")
         ready = (
             not closing
             and self.runtime.ready
             and snapshot.get("ready") is True
             and pressure in READY_MEMORY_PRESSURES
+            and isinstance(metal, dict)
+            and metal.get("healthy") is True
         )
         return {"ready": ready, "memory_pressure": pressure}
 
