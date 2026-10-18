@@ -1,6 +1,5 @@
 """Native request submission, cancellation, recovery and completion ownership."""
 
-import copy
 import queue
 import threading
 import time
@@ -382,10 +381,13 @@ class NativeBackend:
         return snapshot
 
     def _cache_status(self, snapshot):
+        # Stored as is: the decoder builds a fresh dict per event, and every
+        # reader copies the top level before adding keys, so the cached dict
+        # is replaced wholesale and never mutated.
         with self.lock:
             if self.closing:
                 return
-            self.status_snapshot = copy.deepcopy(snapshot)
+            self.status_snapshot = snapshot
             self.status_snapshot_at = time.monotonic()
             self.status_refresh_failures = 0
             self.status_refresh_after = 0.0
@@ -444,8 +446,9 @@ class NativeBackend:
         except Exception as error:
             stale_error = error
             with self.lock:
-                snapshot = copy.deepcopy(self.status_snapshot)
+                cached = self.status_snapshot
                 captured_at = self.status_snapshot_at
+            snapshot = None if cached is None else dict(cached)
             if snapshot is None or captured_at is None:
                 snapshot = {
                     "schema_version": wire.STATUS_SCHEMA_VERSION,
@@ -460,6 +463,8 @@ class NativeBackend:
                 self._ensure_background_status_refresh()
         else:
             self._cache_status(snapshot)
+            # Callers add top-level keys; keep the cached dict untouched.
+            snapshot = dict(snapshot)
         with self.lock:
             transport_ready = not self.closing and self.runtime.ready
         snapshot["transport"] = {

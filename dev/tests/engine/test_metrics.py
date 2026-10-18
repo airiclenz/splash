@@ -56,5 +56,92 @@ class HostMemoryMetricsTests(unittest.TestCase):
         self.assertIn('splash_memory_pressure{state="normal"} 0', text)
 
 
+FIXTURE_STATUS = {
+    "schema_version": 5,
+    "ready": True,
+    "memory_pressure": "warning",
+    "metal": {"healthy": True},
+    "transport": {"pending": 2},
+    "frontend": {"active": 1, "waiting": 0},
+    "requests": {"submitted": 40, "completed": 37, "cancelled": 2, "failed": 1},
+    "scheduler": {
+        "queued": 3,
+        "decoding": 2,
+        "decode_batches_by_width": {"b1": 10, "b2": 5, "b4": 1},
+    },
+    "cache": {"hits": 12, "resource_replay_tokens": 4096, "reused_tokens": "n/a"},
+    "kv": {"pages_total": 1024, "pages_free": 512, "unmap_last_ms": 1.5},
+    "state": {"entries": 4, "pinned": False},
+    "memory_governor": {
+        "limit_bytes": 34359738368,
+        "headroom_bytes": 2147483648,
+        "host_measurement_valid": True,
+        "host_headroom_bytes": 1073741824,
+        "host_available_bytes": 8589934592,
+        "system_pressure": "normal",
+    },
+    "metrics": {
+        "ttft_ms": {"p50": 120.25, "p95": 480.0},
+        "decode_tokens_per_second": 55.5,
+        "draft_acceptance_rate": float("nan"),
+    },
+    "response_store": {"entries": 6, "bytes": 2048},
+}
+
+# The rendering of FIXTURE_STATUS before the metric table became a module
+# constant: the output must stay byte-identical.
+FIXTURE_RENDERING = """\
+# HELP splash_info Splash runtime metrics.
+# TYPE splash_info gauge
+splash_info{runtime="native"} 1
+splash_memory_pressure{state="normal"} 0
+splash_memory_pressure{state="warning"} 1
+splash_memory_pressure{state="critical"} 0
+splash_system_memory_pressure{state="normal"} 1
+splash_system_memory_pressure{state="warning"} 0
+splash_system_memory_pressure{state="critical"} 0
+splash_ready 1
+splash_metal_healthy 1
+splash_transport_pending 2
+splash_frontend_active 1
+splash_frontend_waiting 0
+splash_requests_submitted_total 40
+splash_requests_completed_total 37
+splash_requests_cancelled_total 2
+splash_requests_failed_total 1
+splash_scheduler_queued 3
+splash_cache_resource_replay_tokens_total 4096
+splash_scheduler_decoding 2
+splash_scheduler_decode_b1_total 10
+splash_scheduler_decode_b2_total 5
+splash_scheduler_decode_b4_total 1
+splash_kv_pages_total 1024
+splash_kv_pages_free 512
+splash_kv_unmap_last_ms 1.5
+splash_state_entries 4
+splash_state_pinned 0
+splash_cache_hits_total 12
+splash_memory_limit_bytes 34359738368
+splash_memory_headroom_bytes 2147483648
+splash_ttft_p50_milliseconds 120.25
+splash_ttft_p95_milliseconds 480.0
+splash_decode_tokens_per_second 55.5
+splash_response_store_entries 6
+splash_response_store_bytes 2048
+splash_host_headroom_bytes 1073741824
+splash_host_available_bytes 8589934592
+"""
+
+
+class StatusMetricsRenderingTests(unittest.TestCase):
+    def test_fixture_renders_exactly_as_before(self):
+        self.assertEqual(prometheus_metrics(FIXTURE_STATUS), FIXTURE_RENDERING)
+
+    def test_repeated_renders_are_identical(self):
+        self.assertEqual(
+            prometheus_metrics(FIXTURE_STATUS), prometheus_metrics(FIXTURE_STATUS)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

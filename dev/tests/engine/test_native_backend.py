@@ -747,6 +747,49 @@ class NativeBackendContractTests(unittest.TestCase):
         )
         self.assertFalse(transport.is_ready())
 
+    def test_status_caller_mutations_leave_the_cached_snapshot_untouched(self):
+        transport, _runtime = self.make_transport()
+        status = transport.status()
+        cached = transport.status_snapshot
+        expected = {
+            "schema_version": 5,
+            "ready": True,
+            "memory_pressure": "normal",
+            "metal": {"healthy": True},
+        }
+
+        status["frontend"] = {"active": 1}
+        status["ready"] = False
+
+        self.assertIsNot(status, cached)
+        self.assertEqual(transport.status_snapshot, expected)
+        self.assertIs(transport.status_snapshot, cached)
+
+    def test_stale_status_fails_closed_without_touching_the_cache(self):
+        runtime = FakeRuntime()
+        transport, _runtime = self.make_transport(runtime)
+        self.assertTrue(transport.status()["ready"])
+        cached = transport.status_snapshot
+        runtime.mode = "status_timeout"
+
+        stale = transport.status(timeout=0.01)
+
+        self.assertFalse(stale["ready"])
+        self.assertTrue(stale["transport"]["status_stale"])
+        self.assertIs(transport.status_snapshot, cached)
+        self.assertTrue(cached["ready"])
+        self.assertNotIn("transport", cached)
+
+    def test_status_never_deep_copies_the_snapshot(self):
+        runtime = FakeRuntime()
+        transport, _runtime = self.make_transport(runtime)
+        with mock.patch(
+            "copy.deepcopy", side_effect=AssertionError("status snapshot deep copy")
+        ):
+            self.assertTrue(transport.status()["ready"])
+            runtime.mode = "status_timeout"
+            self.assertFalse(transport.status(timeout=0.01)["ready"])
+
     def test_status_timeout_without_cache_keeps_type_stable(self):
         transport, _runtime = self.make_transport(FakeRuntime("status_timeout"))
 
