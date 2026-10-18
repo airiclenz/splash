@@ -99,9 +99,11 @@ public:
   // Live command buffers are never eviction candidates. Physical KV release
   // is paced one extent at a time; reclaimDeferred() reports that the pass
   // stopped behind an in-flight release and should run again shortly.
+  // A warning pass keeps one empty KV extent mapped while a running lane's
+  // next chunk needs it; a critical pass releases every empty extent.
   [[nodiscard]] uint64_t reclaimMemory(const MemoryReclaimDirective &directive);
   [[nodiscard]] bool reclaimDeferred() const noexcept {
-    return cache_.releaseDeferred();
+    return cache_.releaseDeferred(reclaimKeptKvRunway_);
   }
 
 private:
@@ -186,6 +188,7 @@ private:
   [[nodiscard]] bool reuseIdleBackingWhilePaused(const TokenAdmission &admission);
   [[nodiscard]] bool growthPaused() const;
   [[nodiscard]] uint32_t completedTokens(const Request &request) const;
+  [[nodiscard]] bool residentLaneNeedsKvRunway() const;
   struct KvAdmission {
     TokenAdmission allocation;
     bool retryableBudget = false;
@@ -221,6 +224,9 @@ private:
   std::optional<Pending> pending_;
   uint64_t resourceEpoch_ = 1;
   bool recoveringResources_ = false;
+  // The last pressure pass kept a KV runway extent mapped; that extent is not
+  // deferred reclaim work.
+  bool reclaimKeptKvRunway_ = false;
   EngineSnapshot counters_;
 };
 

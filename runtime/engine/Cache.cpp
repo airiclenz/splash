@@ -283,17 +283,24 @@ bool Cache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
 }
 
 uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
-                             bool keepResumePoint) {
+                             bool keepResumePoint, bool keepRunway) {
   // Empty backing that is waiting behind an in-flight release will satisfy
   // part of the target by itself; evicting more cache now would only
   // discard reusable prefixes without returning memory any sooner.
-  if (releaseDeferred())
+  if (releaseDeferred(keepRunway))
     return 0;
-  uint64_t released = reclaimEmptyExtents();
-  auto needsMore = [&] { return evictAll || released < targetBytes; };
-  while (needsMore() && !releaseDeferred()) {
-    const CacheReclaimResult result =
-        reclaimOne(CacheReclaimMode::ReleaseBacking, keepResumePoint);
+  uint64_t released = reclaimEmptyExtents(keepRunway);
+  // Evicting cache to cover the runway this pass chose to keep mapped would
+  // discard prefixes without returning any more memory.
+  const uint64_t keptBytes =
+      keepRunway && pool_.reclaimableExtentCount() == 1
+          ? pool_.snapshot().reclaimableBackingBytes
+          : 0;
+  const uint64_t target = targetBytes > keptBytes ? targetBytes - keptBytes : 0;
+  auto needsMore = [&] { return evictAll || released < target; };
+  while (needsMore() && !releaseDeferred(keepRunway)) {
+    const CacheReclaimResult result = reclaimOne(
+        CacheReclaimMode::ReleaseBacking, keepResumePoint, keepRunway);
     if (!result.madeProgress)
       break;
     released += result.reclaimedBytes;
@@ -302,11 +309,11 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
 }
 
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
-                                     bool keepResumePoint) {
+                                     bool keepResumePoint, bool keepRunway) {
   if (mode == CacheReclaimMode::ReleaseBacking) {
-    if (releaseDeferred())
+    if (releaseDeferred(keepRunway))
       return {};
-    if (const uint64_t bytes = reclaimEmptyExtents())
+    if (const uint64_t bytes = reclaimEmptyExtents(keepRunway))
       return {true, bytes};
   }
 
@@ -325,7 +332,7 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
   }
   kv_.erase(kv->id);
   return {true, mode == CacheReclaimMode::ReleaseBacking
-                    ? reclaimEmptyExtents()
+                    ? reclaimEmptyExtents(keepRunway)
                     : 0};
 }
 
@@ -336,8 +343,18 @@ bool Cache::reclaimOneState(bool checkpointsOnly) {
          states_.evict(state->id).evicted;
 }
 
-bool Cache::releaseDeferred() const noexcept {
-  return pool_.reclaimableExtentCount() > 0 && releasePending();
+bool Cache::releaseDeferred(bool keepRunway) const noexcept {
+  const uint32_t keptExtents = keepRunway ? 1 : 0;
+  return pool_.reclaimableExtentCount() > keptExtents && releasePending();
+}
+
+uint32_t Cache::partlyUsedFreePages() const noexcept {
+  const KvPoolSnapshot pool = pool_.snapshot();
+  const uint64_t emptyExtentPages =
+      pool.reclaimableBackingBytes / pool_.bytesPerPage();
+  return emptyExtentPages >= pool.pagesFreeResident
+             ? 0
+             : pool.pagesFreeResident - static_cast<uint32_t>(emptyExtentPages);
 }
 
 bool Cache::releasePending() const noexcept {
@@ -407,9 +424,9 @@ std::optional<CacheEvictionCandidate> Cache::oldestStateFreeKvBlock() const {
   return std::nullopt;
 }
 
-uint64_t Cache::reclaimEmptyExtents() {
+uint64_t Cache::reclaimEmptyExtents(bool keepRunway) {
   const uint64_t before = pool_.residentBackingBytes();
-  static_cast<void>(pool_.reclaimEmptyExtents(false));
+  static_cast<void>(pool_.reclaimEmptyExtents(keepRunway));
   const uint64_t after = pool_.residentBackingBytes();
   return before >= after ? before - after : 0;
 }

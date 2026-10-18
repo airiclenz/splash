@@ -103,13 +103,14 @@ CacheNamespace cacheNamespace() {
 }
 
 struct CacheFixture {
-  test::TestKvBacking backing{4, 100};
+  // Every page is its own extent; pages past the first four stay empty.
+  test::TestKvBacking backing;
   KvPool pool{backing};
   engine::Cache cache{pool, cacheNamespace()};
   std::vector<uint32_t> prompt;
   std::vector<uint64_t> blocks;
 
-  CacheFixture() {
+  explicit CacheFixture(uint32_t pages = 4) : backing(pages, 100) {
     for (uint32_t block = 0; block < 4; ++block) {
       for (uint32_t row = 0; row < KvCache::pageTokens; ++row)
         prompt.push_back(1000 + block * 100 + row);
@@ -403,6 +404,43 @@ void testSpeculativeReclaimKeepsTheResumePoint() {
   static_cast<void>(fixture.cache.reclaimCache(everything, false, false));
   require(fixture.cache.snapshot().stateCache.entries == 0,
           "a demanded shrink could not reach the resume point");
+}
+
+// Warning reclaim keeps one empty extent mapped for a running request's next
+// chunk. Its bytes count toward the target: a target no larger than the empty
+// backing evicts no cache to make up for the kept extent.
+void testWarningReclaimKeepsResidentRunway() {
+  CacheFixture fixture(6);
+  fixture.publish(0, 100);
+  const uint64_t emptyExtentBytes = 2 * 100;
+
+  const uint64_t released =
+      fixture.cache.reclaimCache(emptyExtentBytes, false, false, true);
+
+  const CacheSnapshot after = fixture.cache.snapshot();
+  require(released == 100 && after.pool.pagesFreeResident == 1 &&
+              after.pool.reclaimableExtents == 1,
+          "warning reclaim did not keep exactly one runway extent mapped");
+  require(after.stateCache.entries == 1 && after.kvCache.blocks == 4,
+          "warning reclaim evicted cache to cover the kept runway");
+  require(!fixture.cache.releaseDeferred(true),
+          "the kept runway was reported as deferred reclaim work");
+}
+
+// Critical reclaim, and every caller that does not ask for a runway, unmaps
+// every empty extent.
+void testCriticalReclaimUnmapsEmptyExtents() {
+  CacheFixture fixture(6);
+  fixture.publish(0, 100);
+
+  static_cast<void>(fixture.cache.reclaimCache(
+      std::numeric_limits<uint64_t>::max(), true));
+
+  const CacheSnapshot after = fixture.cache.snapshot();
+  require(after.pool.pagesFreeResident == 0 &&
+              after.pool.reclaimableExtents == 0 &&
+              after.pool.residentBackingBytes == 0,
+          "critical reclaim left an empty extent mapped");
 }
 
 // A newer disposable checkpoint must not displace a warmed ordinary state
@@ -791,6 +829,8 @@ int main() {
     testLazyJunctionMaterialization();
     testByteLruAndPins();
     testSpeculativeReclaimKeepsTheResumePoint();
+    testWarningReclaimKeepsResidentRunway();
+    testCriticalReclaimUnmapsEmptyExtents();
     testCheckpointDoesNotOutrankTheResumePoint();
     testKvEvictionInvalidatesStateFirst();
     testStatePublicationValidation();

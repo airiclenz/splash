@@ -990,6 +990,40 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
   ++counters_.resourceSuspensions;
 }
 
+// A running lane whose next chunk overflows the free pages of partly used
+// extents takes an empty extent. Unmapping the last one would make that chunk
+// wait on a mapping a host-constrained governor denies, suspending the lane.
+// The prefill chunk is bounded by the full token budget, so this errs toward
+// keeping the runway. Costs one scheduler and one page-table lookup per
+// resident request, without allocation.
+bool Engine::residentLaneNeedsKvRunway() const {
+  const uint64_t packedFreePages = cache_.partlyUsedFreePages();
+  uint64_t neededPages = 0;
+  for (const auto &[id, active] : requests_) {
+    if (!active.stateCell || active.suspended)
+      continue;
+    const Phase phase = scheduler_.phase(id);
+    uint64_t chunkEnd = 0;
+    if (phase == Phase::Prefill) {
+      chunkEnd = std::min<uint64_t>(
+          active.exactTokens.size(),
+          uint64_t{scheduler_.promptProcessed(id)} +
+              model::ExecutionLimits::prefillTokenBudget);
+    } else if (phase == Phase::Decode || phase == Phase::WaitingMask) {
+      chunkEnd = active.exactTokens.size() +
+                 model::ExecutionLimits::targetVerifyRows;
+    } else {
+      continue;
+    }
+    const uint64_t chunkPages =
+        (chunkEnd + KvCache::pageTokens - 1) / KvCache::pageTokens;
+    const uint64_t heldPages = cache_.pageTable(id).pages.size();
+    if (chunkPages > heldPages)
+      neededPages += chunkPages - heldPages;
+  }
+  return neededPages > packedFreePages;
+}
+
 uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
   if (!directive.reclaimEmptyKvExtents)
     return 0;
@@ -999,9 +1033,14 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
     released += idle;
   const uint64_t remaining =
       released >= directive.targetBytes ? 0 : directive.targetBytes - released;
-  // Even a zero-byte directive may release completely empty KV extents.
+  // Critical pressure releases every empty KV extent. A warning pass, even a
+  // zero-byte one, releases them too, except one kept mapped while a running
+  // lane's next chunk needs it.
+  const bool warning = !directive.evictAllUnpinnedPrefixes;
+  reclaimKeptKvRunway_ = warning && residentLaneNeedsKvRunway();
   released += cache_.reclaimCache(remaining, directive.evictAllUnpinnedPrefixes,
-                                 directive.keepResumePoint);
+                                 directive.keepResumePoint,
+                                 reclaimKeptKvRunway_);
   // Evicted states park their buffers in the model's pool; a pressure pass
   // returns that memory to the host now rather than keeping it warm.
   while (model_.reclaimIdleState()) {

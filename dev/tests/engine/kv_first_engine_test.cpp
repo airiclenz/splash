@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -1310,6 +1311,87 @@ void testPressureReclaimRespectsStateLifetimes() {
   require(critical.stateCache.entries == 0 && critical.kvCache.blocks == 0 &&
               critical.pool.residentBackingBytes == 0,
           "critical pressure left evictable cached state or KV backing");
+}
+
+// Maps the first extents before the pool sees the backing, so they start out
+// resident and empty.
+Backing &mapLeadingPages(Backing &backing, uint32_t pages) {
+  for (uint32_t page = 0; page < pages; page += 4)
+    static_cast<void>(backing.ensureResident(page));
+  return backing;
+}
+
+// Runs a long prompt's first prefill chunk, which fills sixteen extents and
+// leaves the two further mapped extents empty, then applies one directive at
+// the command-free point before the next chunk.
+KvPoolSnapshot reclaimBesideRunningLane(
+    std::initializer_list<MemoryReclaimDirective> directives,
+    bool &deferredAfterFirst) {
+  Backing backing(256);
+  KvPool pool(mapLeadingPages(backing, 72));
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  engine.submit(request(40, std::vector<uint32_t>(4097, 40)));
+  for (uint32_t step = 1;
+       step <= 8 && (resources.snapshot().pool.pagesActive == 0 ||
+                     engine.commandInFlight());
+       ++step) {
+    static_cast<void>(engine.tick(step));
+  }
+  const KvPoolSnapshot running = resources.snapshot().pool;
+  require(running.pagesActive == 64 && running.pagesFreeResident == 8 &&
+              running.reclaimableExtents == 2 && !engine.commandInFlight(),
+          "runway setup did not leave a running lane beside two empty extents");
+
+  // Pace the release so a kept runway is distinguishable from deferred work.
+  backing.deferRelease = true;
+  bool first = true;
+  for (const MemoryReclaimDirective &directive : directives) {
+    static_cast<void>(engine.reclaimMemory(directive));
+    if (first)
+      deferredAfterFirst = engine.reclaimDeferred();
+    first = false;
+    backing.releasePending = false;
+  }
+  const KvPoolSnapshot after = resources.snapshot().pool;
+  engine.cancel(40);
+  runUntilIdle(engine);
+  return after;
+}
+
+void testPressureReclaimKeepsRunwayOnlyForWarning() {
+  const MemoryReclaimDirective warning{.reclaimEmptyKvExtents = true};
+  const MemoryReclaimDirective critical{
+      .reclaimEmptyKvExtents = true,
+      .evictAllUnpinnedPrefixes = true,
+      .targetBytes = std::numeric_limits<uint64_t>::max()};
+
+  // The second pass runs once the first release completed: nothing paces it.
+  bool deferred = true;
+  const KvPoolSnapshot warned =
+      reclaimBesideRunningLane({warning, warning}, deferred);
+  require(warned.pagesFreeResident == 4 && warned.reclaimableExtents == 1,
+          "warning reclaim unmapped the runway a running lane's chunk needs");
+  require(!deferred, "the kept runway re-ran the pressure pass as deferred");
+
+  const KvPoolSnapshot criticalAfterWarning =
+      reclaimBesideRunningLane({warning, critical}, deferred);
+  require(criticalAfterWarning.pagesFreeResident == 0 &&
+              criticalAfterWarning.reclaimableExtents == 0,
+          "critical reclaim left an empty extent mapped");
+
+  // With no running lane the runway serves nothing; warning unmaps it too.
+  Backing backing(16);
+  KvPool pool(mapLeadingPages(backing, 8));
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  static_cast<void>(engine.reclaimMemory(warning));
+  require(resources.snapshot().pool.pagesFreeResident == 0,
+          "warning reclaim kept a runway no running lane needs");
 }
 
 void testConcurrencyLimitDoesNotEvictCache() {
@@ -3451,6 +3533,7 @@ int main() {
     testKvGrowthReclaimsIdleStateBeforeCache();
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testPressureReclaimRespectsStateLifetimes();
+    testPressureReclaimKeepsRunwayOnlyForWarning();
     testConcurrencyLimitDoesNotEvictCache();
     testHostPressureDoesNotDrainCacheOnStateAdmission();
     testHostPressureStillRecyclesLruStateForDeniedSnapshot();

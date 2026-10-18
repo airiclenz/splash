@@ -141,21 +141,30 @@ public:
   // that no request is waiting for gains the one cell that publication holds
   // and costs the next request a replay of its whole prompt, because a
   // hybrid model cannot resume from cached KV without the recurrent state.
-  // Empty backing, older publications and state-free KV are still reclaimed.
+  // Older publications and state-free KV are still reclaimed.
+  // keepRunway leaves one empty extent mapped: the free resident runway a
+  // running request's next chunk takes without asking for a new mapping. Its
+  // bytes count toward targetBytes, so no cache is evicted to make up for
+  // them. Without it every empty extent is released.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
-                                      bool keepResumePoint = false);
+                                      bool keepResumePoint = false,
+                                      bool keepRunway = false);
   // One bounded reclaim step for an allocation retry. Progress is distinct
   // from physical bytes because evicting a KV reference can make a resident
   // page reusable without immediately emptying its extent.
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
-      bool keepResumePoint = false);
+      bool keepResumePoint = false, bool keepRunway = false);
   // Recycles an unpinned state, preferring checkpoints, for a required state
   // publication. KV bytes only return once an extent unmaps.
   [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
   // Empty resident backing exists but the previous release is still in
   // flight; more reclaim work becomes possible without evicting anything.
-  [[nodiscard]] bool releaseDeferred() const noexcept;
+  // keepRunway does not count the one extent a runway-keeping pass leaves.
+  [[nodiscard]] bool releaseDeferred(bool keepRunway = false) const noexcept;
+  // Free resident pages outside empty extents: what a request can take while
+  // every empty extent stays reclaimable.
+  [[nodiscard]] uint32_t partlyUsedFreePages() const noexcept;
   // Includes the last unmap, even when no empty extent remains to reclaim.
   [[nodiscard]] bool releasePending() const noexcept;
   [[nodiscard]] uint64_t releaseGeneration() const noexcept;
@@ -181,7 +190,7 @@ private:
   [[nodiscard]] bool evictOneKvBlock();
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   oldestStateFreeKvBlock() const;
-  [[nodiscard]] uint64_t reclaimEmptyExtents();
+  [[nodiscard]] uint64_t reclaimEmptyExtents(bool keepRunway);
 
   KvPool &pool_;
   CacheRecency recency_;
