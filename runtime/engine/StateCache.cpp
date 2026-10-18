@@ -156,6 +156,26 @@ bool StateCache::contains(uint64_t kvBlock) const noexcept {
   return entries_.contains(kvBlock);
 }
 
+StateProtection StateCache::protect(uint64_t kvBlock) {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end())
+    return {};
+  Entry &entry = found->second;
+  if (entry.protections == std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("composite state protection count overflowed");
+  ++entry.protections;
+  return {kvBlock, entry.publication};
+}
+
+void StateCache::unprotect(StateProtection protection) noexcept {
+  const auto found = entries_.find(protection.kvBlock);
+  if (found == entries_.end() ||
+      found->second.publication != protection.publication ||
+      !found->second.protections)
+    return;
+  --found->second.protections;
+}
+
 uint64_t StateCache::resumePoint() const noexcept {
   // Checkpoints can survive cancellation but remain disposable. Prefer an
   // ordinary state for speculative protection, regardless of recency.
@@ -164,13 +184,19 @@ uint64_t StateCache::resumePoint() const noexcept {
 }
 
 std::optional<CacheEvictionCandidate>
-StateCache::evictionCandidate(bool keepResumePoint) const noexcept {
+StateCache::evictionCandidate(bool keepResumePoint,
+                              bool spareProtected) const noexcept {
   // Withholding the resume point must not also spare the publications behind
   // it: a speculative pass still sheds everything else it would have taken.
+  // Sparing protected states likewise walks on to the next publication.
   const uint64_t kept = keepResumePoint ? resumePoint() : 0;
   for (uint64_t oldest : {checkpointEviction_.oldest, ordinaryEviction_.oldest}) {
-    if (oldest && oldest != kept)
-      return CacheEvictionCandidate{oldest, entries_.at(oldest).lastUsed};
+    uint64_t candidate = oldest;
+    while (spareProtected && candidate &&
+           (candidate == kept || entries_.at(candidate).protections))
+      candidate = entries_.at(candidate).nextEvictable;
+    if (candidate && candidate != kept)
+      return CacheEvictionCandidate{candidate, entries_.at(candidate).lastUsed};
   }
   return std::nullopt;
 }

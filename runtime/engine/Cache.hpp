@@ -146,18 +146,32 @@ public:
   // running request's next chunk takes without asking for a new mapping. Its
   // bytes count toward targetBytes, so no cache is evicted to make up for
   // them. Without it every empty extent is released.
+  // A pass without evictAll (Warning pressure) spares every state protected
+  // for a suspended request and evicts the next publication instead; evictAll
+  // (Critical pressure) takes protected states too.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
                                       bool keepResumePoint = false,
                                       bool keepRunway = false);
   // One bounded reclaim step for an allocation retry. Progress is distinct
   // from physical bytes because evicting a KV reference can make a resident
   // page reusable without immediately emptying its extent.
+  // spareProtectedStates walks past states protected for suspended requests.
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
-      bool keepResumePoint = false, bool keepRunway = false);
+      bool keepResumePoint = false, bool keepRunway = false,
+      bool spareProtectedStates = false);
   // Recycles an unpinned state, preferring checkpoints, for a required state
-  // publication. KV bytes only return once an extent unmaps.
+  // publication. KV bytes only return once an extent unmaps. A state
+  // protected for a suspended request is taken only when no other state
+  // qualifies.
   [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
+  // Protects the deepest composite state on the request's published prefix,
+  // the one its resume would restore, from Warning reclaim. Call before
+  // endRequest; returns an empty handle when the prefix holds no state. Reads
+  // the request's own block list: no lookup, hashing or pin.
+  [[nodiscard]] StateProtection protectDeepestState(uint64_t requestId);
+  // Ends one protection. No-op once its publication is gone.
+  void unprotectState(StateProtection protection) noexcept;
   // Empty resident backing exists but the previous release is still in
   // flight; more reclaim work becomes possible without evicting anything.
   // keepRunway does not count the one extent a runway-keeping pass leaves.

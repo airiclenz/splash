@@ -2671,6 +2671,185 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
   }
 }
 
+// A Warning pass as production runs it with host headroom left: no request
+// is treated as idle (keepResumePoint false) and nothing is evicted wholesale.
+MemoryReclaimDirective warningReclaim(uint64_t targetBytes) {
+  return {.reclaimEmptyKvExtents = true,
+          .evictAllUnpinnedPrefixes = false,
+          .targetBytes = targetBytes,
+          .keepResumePoint = false};
+}
+
+// Request 280 suspended by a request-sized host denial while global pressure
+// stays Normal (growthPaused false), after its first dispatch left an ordinary
+// replay state at 128 of its 129 prompt tokens. With peerState, request 279
+// first leaves an unrelated state at 64 on the same prefix.
+struct SuspendedResumeFixture final {
+  explicit SuspendedResumeFixture(bool peerState = false)
+      : pool(backing), resources(pool, CacheNamespace{}), executor(2),
+        engine(normalPressureConfig(), resources, executor, events) {
+    executor.unblockGrowthOnSuspend = false;
+    executor.physicalGrowthBlocked = &backing.growthBlocked;
+    if (peerState) {
+      engine.submit(request(279, peerPrompt));
+      runUntilIdle(engine);
+    }
+    backing.allocationFailure = metal::AllocationFailure::HostPressure;
+    backing.growthAllowed = [this] { return !backing.growthBlocked; };
+    engine.submit(request(280, prompt));
+    require(engine.tick(1) && engine.tick(2) &&
+                resources.cachedTokens(prompt) == 128,
+            "suspension fixture did not publish the 128-token replay state");
+    backing.growthBlocked = true;
+    require(engine.tick(3) && engine.snapshot().resourceSuspensions == 1,
+            "suspension fixture did not suspend the request");
+    restoredBeforeResume = executor.restored;
+  }
+
+  static EngineConfig normalPressureConfig() {
+    EngineConfig config;
+    config.growthPaused = [] { return false; };
+    return config;
+  }
+
+  // Lets the suspended request resume and run to completion.
+  void resume() {
+    backing.growthBlocked = false;
+    for (double now = 403; now < 425 && !engine.idle(); ++now)
+      static_cast<void>(engine.tick(now));
+    require(engine.idle() && engine.snapshot().resourceResumptions == 1 &&
+                events.completedCount >= 1 && events.failedCount == 0,
+            "suspended request did not resume and complete");
+  }
+
+  const std::vector<uint32_t> prompt = std::vector<uint32_t>(129, 280);
+  const std::vector<uint32_t> peerPrompt = std::vector<uint32_t>(65, 280);
+  Backing backing{64};
+  KvPool pool;
+  engine::Cache resources;
+  Executor executor;
+  Events events;
+  engine::Engine engine;
+  uint32_t restoredBeforeResume = 0;
+};
+
+void testWarningReclaimKeepsSuspendedRequestsResumeState() {
+  SuspendedResumeFixture fixture;
+
+  static_cast<void>(fixture.engine.reclaimMemory(
+      warningReclaim(std::numeric_limits<uint64_t>::max())));
+  require(fixture.resources.cachedTokens(fixture.prompt) == 128,
+          "warning reclaim evicted a suspended request's resume state");
+  fixture.resume();
+
+  // The resume restores the 128-token state and replays nothing: every row
+  // below the suspension point comes back from the cache.
+  require(fixture.executor.restored - fixture.restoredBeforeResume == 128 &&
+              fixture.engine.snapshot().resourceReplayTokens == 0,
+          "the resume replayed rows its spared state covers");
+}
+
+void testWarningReclaimWalksPastProtectedResumeState() {
+  SuspendedResumeFixture fixture(true);
+  // Return the empty backing first, so the next target is met by one state.
+  static_cast<void>(fixture.engine.reclaimMemory(warningReclaim(0)));
+  {
+    // Releasing this restore pin makes the peer state the newest one,
+    // leaving the protected state oldest in eviction order.
+    const CacheLookup peer = fixture.resources.lookup(fixture.peerPrompt);
+    require(peer.resumeBoundary() == 64, "peer state was not cached");
+  }
+  const uint32_t entries = fixture.resources.snapshot().stateCache.entries;
+
+  static_cast<void>(
+      fixture.engine.reclaimMemory(warningReclaim(State{}.bytes())));
+
+  require(fixture.resources.snapshot().stateCache.entries == entries - 1 &&
+              fixture.resources.cachedTokens(fixture.prompt) == 128 &&
+              fixture.resources.cachedTokens(fixture.peerPrompt) == 0,
+          "warning reclaim stalled on the protected oldest state");
+}
+
+void testCriticalReclaimEvictsSuspendedRequestsResumeState() {
+  SuspendedResumeFixture fixture;
+
+  static_cast<void>(fixture.engine.reclaimMemory(
+      {.reclaimEmptyKvExtents = true,
+       .evictAllUnpinnedPrefixes = true,
+       .targetBytes = std::numeric_limits<uint64_t>::max()}));
+  require(fixture.resources.snapshot().stateCache.entries == 0,
+          "critical reclaim spared a suspended request's resume state");
+  fixture.resume();
+
+  require(fixture.executor.restored == fixture.restoredBeforeResume &&
+              fixture.engine.snapshot().resourceReplayTokens == 128,
+          "a resume without its state did not replay the processed prefix");
+}
+
+void testCancelledSuspendedRequestReleasesItsResumeExemption() {
+  SuspendedResumeFixture fixture;
+
+  fixture.engine.cancel(280);
+  runUntilIdle(fixture.engine);
+  static_cast<void>(fixture.engine.reclaimMemory(
+      warningReclaim(std::numeric_limits<uint64_t>::max())));
+
+  require(fixture.resources.cachedTokens(fixture.prompt) == 0,
+          "a cancelled request's resume state stayed exempt from reclaim");
+}
+
+void testSuspendedLanesSharingAResumeStateKeepItUntilBothRelease() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.unblockGrowthOnSuspend = false;
+  executor.physicalGrowthBlocked = &backing.growthBlocked;
+  Events events;
+  engine::Engine engine(SuspendedResumeFixture::normalPressureConfig(),
+                        resources, executor, events);
+  const std::vector<uint32_t> shared(129, 290);
+  engine.submit(request(289, shared));
+  runUntilIdle(engine);
+  require(resources.cachedTokens(shared) == 128,
+          "shared-state fixture did not cache the 128-token state");
+  // Unmap the empty extent the finished request left, so neither lane can
+  // prefill past the shared state before it is suspended.
+  static_cast<void>(engine.reclaimMemory(warningReclaim(0)));
+  require(resources.snapshot().pool.pagesFreeResident == 0,
+          "shared-state fixture left free resident pages");
+  backing.allocationFailure = metal::AllocationFailure::HostPressure;
+  backing.growthAllowed = [&] { return !backing.growthBlocked; };
+  backing.growthBlocked = true;
+  // Both lanes restore the shared state, then need a page that cannot map.
+  for (uint64_t id : {290, 291}) {
+    std::vector<uint32_t> prompt = shared;
+    prompt.insert(prompt.end(), 128, static_cast<uint32_t>(id));
+    engine.submit(request(id, prompt));
+  }
+  for (double now = 1;
+       now < 16 && engine.snapshot().resourceSuspensions < 2; ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.snapshot().resourceSuspensions == 2 &&
+              executor.restored == 256,
+          "shared-state fixture did not suspend two lanes on one state");
+  const MemoryReclaimDirective warning =
+      warningReclaim(std::numeric_limits<uint64_t>::max());
+
+  static_cast<void>(engine.reclaimMemory(warning));
+  require(resources.cachedTokens(shared) == 128 &&
+              resources.snapshot().stateCache.entries == 1,
+          "warning reclaim evicted a state two suspended lanes resume from");
+  engine.cancel(290);
+  static_cast<void>(engine.reclaimMemory(warning));
+  require(resources.cachedTokens(shared) == 128,
+          "one lane's release dropped the state its peer still resumes from");
+  engine.cancel(291);
+  static_cast<void>(engine.reclaimMemory(warning));
+  require(resources.cachedTokens(shared) == 0,
+          "the shared state stayed exempt after both lanes released it");
+}
+
 void testAdmissionReopensAfterLastSuspendedRequestResumes() {
   Backing backing(32);
   KvPool pool(backing);
@@ -3564,6 +3743,11 @@ int main() {
     testRepeatedPreemptionRespectsBackoffAndCancellation();
     testAdmissionReopensAfterLastSuspendedRequestResumes();
     testRecoveryAdmitsFailedKvTargetBeforeReplaying();
+    testWarningReclaimKeepsSuspendedRequestsResumeState();
+    testWarningReclaimWalksPastProtectedResumeState();
+    testCriticalReclaimEvictsSuspendedRequestsResumeState();
+    testCancelledSuspendedRequestReleasesItsResumeExemption();
+    testSuspendedLanesSharingAResumeStateKeepItUntilBothRelease();
     testStateAdmissionWaitsForKvRelease();
     testAdmissionsWaitForBackgroundRelease();
     testAllocationCausesRemainRetryableAndDistinct();

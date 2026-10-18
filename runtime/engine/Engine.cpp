@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace splash::engine {
 namespace {
@@ -519,6 +520,8 @@ bool Engine::admit(Request &active, double now) {
     }
     model_.setDraftContextPlan(active.request.id, std::move(draft));
     if (resuming) {
+      // A failed resume attempt returns above and keeps the exemption.
+      cache_.unprotectState(std::exchange(active.resumeProtection, {}));
       active.suspended = false;
       active.replaying = true;
       ++counters_.resourceResumptions;
@@ -975,6 +978,9 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
     scheduler_.setPrefillBoundary(active.request.id, std::nullopt);
   }
   model_.suspend(active.request.id);
+  // Warning reclaim must not turn the resume into a full replay; Critical
+  // reclaim and growth eviction still take this state.
+  active.resumeProtection = cache_.protectDeepestState(active.request.id);
   cache_.endRequest(active.request.id);
   active.stateCell.reset();
   active.suspended = true;
@@ -1035,7 +1041,8 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
       released >= directive.targetBytes ? 0 : directive.targetBytes - released;
   // Critical pressure releases every empty KV extent. A warning pass, even a
   // zero-byte one, releases them too, except one kept mapped while a running
-  // lane's next chunk needs it.
+  // lane's next chunk needs it. A warning pass also spares each suspended
+  // request's resume state; Critical evicts it.
   const bool warning = !directive.evictAllUnpinnedPrefixes;
   reclaimKeptKvRunway_ = warning && residentLaneNeedsKvRunway();
   released += cache_.reclaimCache(remaining, directive.evictAllUnpinnedPrefixes,
@@ -1246,6 +1253,7 @@ void Engine::finishCapacity(Request &active, const TokenAdmission &admission) {
 
 void Engine::release(Request &active) {
   active.resourceWait = {};
+  cache_.unprotectState(std::exchange(active.resumeProtection, {}));
   if (active.stateCell || active.suspended) {
     discardPendingStateBoundaries(active);
     model_.end(active.request.id);

@@ -299,8 +299,9 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
   const uint64_t target = targetBytes > keptBytes ? targetBytes - keptBytes : 0;
   auto needsMore = [&] { return evictAll || released < target; };
   while (needsMore() && !releaseDeferred(keepRunway)) {
-    const CacheReclaimResult result = reclaimOne(
-        CacheReclaimMode::ReleaseBacking, keepResumePoint, keepRunway);
+    const CacheReclaimResult result =
+        reclaimOne(CacheReclaimMode::ReleaseBacking, keepResumePoint,
+                   keepRunway, !evictAll);
     if (!result.madeProgress)
       break;
     released += result.reclaimedBytes;
@@ -309,7 +310,8 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
 }
 
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
-                                     bool keepResumePoint, bool keepRunway) {
+                                     bool keepResumePoint, bool keepRunway,
+                                     bool spareProtectedStates) {
   if (mode == CacheReclaimMode::ReleaseBacking) {
     if (releaseDeferred(keepRunway))
       return {};
@@ -318,7 +320,7 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
   }
 
   const std::optional<CacheEvictionCandidate> state =
-      states_.evictionCandidate(keepResumePoint);
+      states_.evictionCandidate(keepResumePoint, spareProtectedStates);
   const bool checkpoint = state && states_.checkpoint(state->id);
   const std::optional<CacheEvictionCandidate> kv =
       checkpoint ? std::nullopt : oldestStateFreeKvBlock();
@@ -337,10 +339,26 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
 }
 
 bool Cache::reclaimOneState(bool checkpointsOnly) {
-  const std::optional<CacheEvictionCandidate> state =
-      states_.evictionCandidate();
+  std::optional<CacheEvictionCandidate> state =
+      states_.evictionCandidate(false, true);
+  if (!state)
+    state = states_.evictionCandidate();
   return state && (!checkpointsOnly || states_.checkpoint(state->id)) &&
          states_.evict(state->id).evicted;
+}
+
+StateProtection Cache::protectDeepestState(uint64_t requestId) {
+  const Request &active = request(requestId);
+  for (auto block = active.cachedBlocks.rbegin();
+       block != active.cachedBlocks.rend(); ++block) {
+    if (states_.contains(*block))
+      return states_.protect(*block);
+  }
+  return {};
+}
+
+void Cache::unprotectState(StateProtection protection) noexcept {
+  states_.unprotect(protection);
 }
 
 bool Cache::releaseDeferred(bool keepRunway) const noexcept {

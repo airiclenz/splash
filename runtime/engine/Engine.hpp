@@ -145,6 +145,9 @@ private:
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;
+    // The state a suspended request resumes from, spared by Warning reclaim
+    // until the resume succeeds or the request ends.
+    StateProtection resumeProtection;
     // The scheduler owns the terminal phase; this flag records that the
     // corresponding event was emitted and model/resource ownership ended.
     bool finalized = false;
