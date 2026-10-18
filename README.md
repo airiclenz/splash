@@ -117,6 +117,9 @@ that a long uncached prompt will reach its first token quickly.
 - `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
 - `--kv-format`: target KV cache storage, `int8` (default) or `bf16`.
 - `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
+- `--reasoning-loop-limit`: end a reply, with finish reason `length`, once its
+  reasoning repeats one sentence this many times; `0` turns the check off.
+  Defaults to `SPLASH_REASONING_LOOP_LIMIT` or `24`.
 - `--allowed-host`: extra HTTP `Host` name to accept, not a bind address. Repeatable.
 - `--api-key`: require this key on API requests, as a bearer token or
   `x-api-key`. Defaults to `SPLASH_API_KEY`.

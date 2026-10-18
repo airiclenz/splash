@@ -3124,6 +3124,7 @@ class ServerTest(unittest.TestCase):
             port=0,
             binary="splash",
             kv_format="int8",
+            reasoning_loop_limit=7,
         )
         runtime = mock.Mock()
         runtime.readiness = native_wire.ReadyEvent(
@@ -3194,7 +3195,10 @@ class ServerTest(unittest.TestCase):
             eager_start=False,
         )
         backend_type.assert_called_once_with(
-            runtime, tokenizer, request_logger=diagnostics.print_request
+            runtime,
+            tokenizer,
+            request_logger=diagnostics.print_request,
+            reasoning_loop_limit=7,
         )
         self.assertEqual(app_type.call_args.args[3], 262144)
         self.assertEqual(app_type.call_args.args[6], 4)
@@ -3227,6 +3231,7 @@ class ServerTest(unittest.TestCase):
             port=0,
             binary="splash",
             kv_format="int8",
+            reasoning_loop_limit=7,
         )
         runtime = mock.Mock()
         runtime.wait_ready.side_effect = api.engine_runtime.EngineUnhealthy("late")
@@ -3277,6 +3282,7 @@ class ServerTest(unittest.TestCase):
             port=8000,
             binary="splash",
             kv_format="int8",
+            reasoning_loop_limit=7,
         )
         server = mock.Mock()
         server.server_bind.side_effect = OSError(48, "Address already in use")

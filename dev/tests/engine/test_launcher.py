@@ -104,6 +104,45 @@ class LauncherTests(unittest.TestCase):
             )
             self.assertEqual(args.max_image_pixels, value)
 
+    def test_reasoning_loop_limit_fails_before_installation(self):
+        with (
+            mock.patch.object(launcher, "_ensure_installed") as install,
+            mock.patch("sys.stderr", io.StringIO()),
+            self.assertRaises(SystemExit) as failed,
+        ):
+            launcher.main(
+                ["serve", "--model", MODEL_ID, "--reasoning-loop-limit", "-1"]
+            )
+
+        self.assertEqual(failed.exception.code, 2)
+        install.assert_not_called()
+
+    def test_reasoning_loop_limit_is_forwarded_to_the_server(self):
+        for env, options, expected in (
+            (None, [], launcher.REASONING_LOOP_LIMIT),
+            ("0", [], 0),
+            ("0", ["--reasoning-loop-limit", "12"], 12),
+        ):
+            with (
+                self.subTest(env=env, options=options),
+                mock.patch.dict(os.environ, {}, clear=False),
+                tempfile.TemporaryDirectory() as tmp,
+                mock.patch.object(launcher, "RUNTIME_DIR", Path(tmp)),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher, "_ensure_installed"),
+                mock.patch.object(launcher.catalog, "spawn_refresh"),
+                mock.patch.object(launcher.os, "execve") as execute,
+            ):
+                os.environ.pop("SPLASH_REASONING_LOOP_LIMIT", None)
+                if env is not None:
+                    os.environ["SPLASH_REASONING_LOOP_LIMIT"] = env
+
+                launcher.main(["serve", "--model", MODEL_ID, *options])
+
+                argv = execute.call_args.args[1]
+                flag = argv.index("--reasoning-loop-limit")
+                self.assertEqual(argv[flag + 1], str(expected))
+
     def test_size_validation(self):
         for value in ("1G", "1GB", "1GiB", "1073741824"):
             self.assertEqual(launcher._parse_max_memory(value), 1024**3)

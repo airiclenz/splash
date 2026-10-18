@@ -25,6 +25,7 @@ ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
 PORT = 8000
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+REASONING_LOOP_LIMIT = 24
 BASE_URL = f"http://127.0.0.1:{PORT}"
 
 
@@ -187,6 +188,7 @@ def serve(args):
             command.extend(
                 ["--default-reasoning-effort", args.default_reasoning_effort]
             )
+        command.extend(["--reasoning-loop-limit", str(args.reasoning_loop_limit)])
         if args.max_request_size is not None:
             command.extend(["--max-request-size", str(args.max_request_size)])
         if args.max_image_pixels is not None:
@@ -351,6 +353,18 @@ def _parse_max_image_pixels(value):
     return pixels
 
 
+def _parse_reasoning_loop_limit(value):
+    try:
+        limit = int(value)
+    except ValueError:
+        limit = -1
+    # Mirror the server's check so a bad limit fails before installation,
+    # without importing the server's runtime dependencies.
+    if limit < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return limit
+
+
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     client_args = []
@@ -419,6 +433,16 @@ def parse_args(argv=None):
         choices=REASONING_EFFORTS,
         default=os.environ.get("SPLASH_DEFAULT_REASONING_EFFORT"),
         help="Chat/Responses effort when unspecified (default: SPLASH_DEFAULT_REASONING_EFFORT or model template)",
+    )
+    server.add_argument(
+        "--reasoning-loop-limit",
+        type=_parse_reasoning_loop_limit,
+        default=os.environ.get(
+            "SPLASH_REASONING_LOOP_LIMIT", str(REASONING_LOOP_LIMIT)
+        ),
+        metavar="N",
+        help="end a reply whose reasoning repeats one sentence N times; 0 disables "
+        f"(default: SPLASH_REASONING_LOOP_LIMIT or {REASONING_LOOP_LIMIT})",
     )
     server.add_argument(
         "--kv-format",

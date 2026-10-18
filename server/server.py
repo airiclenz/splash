@@ -38,7 +38,11 @@ if __package__:
         responses_response,
         stream_chunk,
     )
-    from .backend import NativeBackend, remaining_request_time
+    from .backend import (
+        DEFAULT_REASONING_LOOP_LIMIT,
+        NativeBackend,
+        remaining_request_time,
+    )
     from .constraints import ConstraintFactory, validate_tokenizer
     from .diagnostics import log_unexpected, print_request, print_status
     from .errors import APIError, ContextLengthError
@@ -78,7 +82,11 @@ else:
         responses_response,
         stream_chunk,
     )
-    from backend import NativeBackend, remaining_request_time
+    from backend import (
+        DEFAULT_REASONING_LOOP_LIMIT,
+        NativeBackend,
+        remaining_request_time,
+    )
     from constraints import ConstraintFactory, validate_tokenizer
     from diagnostics import log_unexpected, print_request, print_status
     from errors import APIError, ContextLengthError
@@ -1839,6 +1847,16 @@ def _parse_model_id(value):
     return value
 
 
+def _parse_reasoning_loop_limit(value):
+    try:
+        limit = int(value)
+    except ValueError:
+        limit = -1
+    if limit < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return limit
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("target")
@@ -1859,6 +1877,16 @@ def parse_args(argv=None):
         choices=REASONING_EFFORTS,
         default=os.environ.get("SPLASH_DEFAULT_REASONING_EFFORT"),
         help="Chat/Responses effort when unspecified (default: SPLASH_DEFAULT_REASONING_EFFORT or model template)",
+    )
+    parser.add_argument(
+        "--reasoning-loop-limit",
+        type=_parse_reasoning_loop_limit,
+        default=os.environ.get(
+            "SPLASH_REASONING_LOOP_LIMIT", str(DEFAULT_REASONING_LOOP_LIMIT)
+        ),
+        metavar="N",
+        help="end a reply whose reasoning repeats one sentence N times; 0 disables "
+        f"(default: SPLASH_REASONING_LOOP_LIMIT or {DEFAULT_REASONING_LOOP_LIMIT})",
     )
     parser.add_argument("--max-context", type=_parse_max_context, default=None)
     parser.add_argument("--max-memory", type=_parse_max_memory, default=None)
@@ -1972,6 +2000,7 @@ def main():
             runtime,
             tokenizer,
             request_logger=print_request,
+            reasoning_loop_limit=args.reasoning_loop_limit,
         )
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")

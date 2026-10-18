@@ -1,16 +1,22 @@
+import io
+import os
 import unittest
 from unittest import mock
 
 from dev.tests.engine.test_native_backend import FakeRuntime, make_job, success_result
 from dev.tests.test_server import _byte_backend
+from install import launcher
 from server import backend as backend_api
 from server import output as model_output
 from server import protocol as wire
+from server import server as api
 
 REPEATED = "I should check the file again."
 THINK_END_ID = 3
 REPEATED_ID = 1
 CONTENT_ID = 4
+SERVER_ARGS = ["target", "draft", "--tokenizer", "tokenizer", "--model", "owner/repo"]
+LAUNCHER_ARGS = ["serve", "--model", "owner/repo"]
 
 
 class LoopTokenizer:
@@ -254,6 +260,75 @@ class NativeBackendLoopGuardTests(unittest.TestCase):
     def test_negative_limit_is_rejected(self):
         with self.assertRaises(ValueError):
             backend_api.NativeBackend(FakeRuntime(), LoopTokenizer(), None, -1)
+
+
+class ReasoningLoopLimitFlagTests(unittest.TestCase):
+    def test_cli_wins_over_environment_and_default_is_backend_default(self):
+        for env, explicit, expected in (
+            (None, None, backend_api.DEFAULT_REASONING_LOOP_LIMIT),
+            ("7", None, 7),
+            ("7", "0", 0),
+            (None, "40", 40),
+        ):
+            options = ["--reasoning-loop-limit", explicit] if explicit else []
+            for parse, args in (
+                (api.parse_args, SERVER_ARGS),
+                (launcher.parse_args, LAUNCHER_ARGS),
+            ):
+                with (
+                    self.subTest(env=env, explicit=explicit, parse=parse.__module__),
+                    mock.patch.dict(os.environ, {}, clear=False),
+                ):
+                    os.environ.pop("SPLASH_REASONING_LOOP_LIMIT", None)
+                    if env is not None:
+                        os.environ["SPLASH_REASONING_LOOP_LIMIT"] = env
+
+                    parsed = parse([*args, *options])
+
+                    self.assertEqual(parsed.reasoning_loop_limit, expected)
+
+    def test_negative_or_malformed_limit_is_rejected(self):
+        for value in ("-1", "", "abc", "1.5"):
+            for parse, args in (
+                (api.parse_args, SERVER_ARGS),
+                (launcher.parse_args, LAUNCHER_ARGS),
+            ):
+                with (
+                    self.subTest(value=value, parse=parse.__module__),
+                    mock.patch("sys.stderr", io.StringIO()),
+                ):
+                    with self.assertRaises(SystemExit) as flag_failed:
+                        parse([*args, "--reasoning-loop-limit", value])
+                    with (
+                        mock.patch.dict(
+                            os.environ, {"SPLASH_REASONING_LOOP_LIMIT": value}
+                        ),
+                        self.assertRaises(SystemExit) as env_failed,
+                    ):
+                        parse(args)
+
+                    self.assertEqual(flag_failed.exception.code, 2)
+                    self.assertEqual(env_failed.exception.code, 2)
+
+    def test_launcher_default_matches_backend_default(self):
+        self.assertEqual(
+            launcher.REASONING_LOOP_LIMIT, backend_api.DEFAULT_REASONING_LOOP_LIMIT
+        )
+
+    def test_help_names_the_flag_and_its_environment_variable(self):
+        for parse, args in (
+            (api.parse_args, SERVER_ARGS[:2]),
+            (launcher.parse_args, ["serve"]),
+        ):
+            with (
+                self.subTest(parse=parse.__module__),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                self.assertRaises(SystemExit),
+            ):
+                parse([*args, "--help"])
+
+            self.assertIn("--reasoning-loop-limit", stdout.getvalue())
+            self.assertIn("SPLASH_REASONING_LOOP_LIMIT", stdout.getvalue())
 
 
 if __name__ == "__main__":
