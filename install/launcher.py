@@ -13,6 +13,8 @@ import urllib.error
 import urllib.request
 
 try:
+    from server.http_security import API_KEY_RULE, validate_api_key
+
     from . import catalog, clients, paths
     from . import models as model_artifacts
 except ImportError:  # Executed directly by the source or packaged entry point.
@@ -20,6 +22,9 @@ except ImportError:  # Executed directly by the source or packaged entry point.
     import clients
     import models as model_artifacts
     import paths
+
+    sys.path.insert(0, str(paths.ROOT))
+    from server.http_security import API_KEY_RULE, validate_api_key
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
@@ -490,7 +495,7 @@ def parse_args(argv=None):
     server.add_argument(
         "--api-key",
         default=os.environ.get("SPLASH_API_KEY"),
-        help="API key (default: SPLASH_API_KEY environment variable)",
+        help=f"API key: {API_KEY_RULE} (default: SPLASH_API_KEY environment variable)",
     )
     server.add_argument("--no-webui", action="store_true", help="disable the chat page")
     for name in clients.INSTALL_URLS:
@@ -527,8 +532,10 @@ def parse_args(argv=None):
         except argparse.ArgumentTypeError as error:
             parser.error(f"SPLASH_PORT: {error}")
     if args.command == "serve" and args.api_key is not None:
-        if not args.api_key or any(ord(c) <= 32 or ord(c) >= 127 for c in args.api_key):
-            parser.error("API key must contain only visible ASCII characters")
+        try:
+            validate_api_key(args.api_key)
+        except ValueError as error:
+            parser.error(str(error))
     if client_args and args.command == "serve":
         parser.error("arguments after -- are only supported for coding clients")
     args.client_args = client_args

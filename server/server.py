@@ -52,7 +52,12 @@ if __package__:
         Frontend,
         validate_served_model_name,
     )
-    from .http_security import authenticate, validate_api_key, validate_headers
+    from .http_security import (
+        API_KEY_RULE,
+        authenticate,
+        validate_api_key,
+        validate_headers,
+    )
     from .latency import RequestLatency
     from .metrics import (
         is_finite_number,
@@ -101,7 +106,12 @@ else:
         Frontend,
         validate_served_model_name,
     )
-    from http_security import authenticate, validate_api_key, validate_headers
+    from http_security import (
+        API_KEY_RULE,
+        authenticate,
+        validate_api_key,
+        validate_headers,
+    )
     from latency import RequestLatency
     from metrics import (
         is_finite_number,
@@ -1928,7 +1938,11 @@ def parse_args(argv=None):
     parser.add_argument("--queue-size", type=int, default=32)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--allowed-host", action="append", default=[])
-    parser.add_argument("--api-key", default=os.environ.get("SPLASH_API_KEY"))
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("SPLASH_API_KEY"),
+        help=f"API key: {API_KEY_RULE} (default: SPLASH_API_KEY environment variable)",
+    )
     parser.add_argument("--no-webui", action="store_true")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))

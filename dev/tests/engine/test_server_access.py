@@ -238,6 +238,57 @@ class ServerAccessTests(unittest.TestCase):
                     with self.assertRaises(SystemExit):
                         parse([*arguments, "--api-key", key])
 
+    def test_api_key_help_states_the_rule_without_the_key(self):
+        for parse, arguments in (
+            (launcher.parse_args, ["serve", "--help"]),
+            (server.parse_args, ["--help"]),
+        ):
+            with self.subTest(parse=parse.__module__):
+                output = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        os.environ, {"SPLASH_API_KEY": "secret-environment-key"}
+                    ),
+                    mock.patch("sys.stdout", output),
+                    self.assertRaises(SystemExit),
+                ):
+                    parse(arguments)
+                text = " ".join(output.getvalue().split())
+                self.assertIn("non-empty, visible ASCII 33-126, no spaces", text)
+                self.assertIn("SPLASH_API_KEY", text)
+                self.assertNotIn("secret-environment-key", text)
+
+    def test_launcher_validates_key_with_the_server_rule(self):
+        with mock.patch.object(
+            launcher, "validate_api_key", wraps=launcher.validate_api_key
+        ) as validate:
+            launcher.parse_args(["serve", "--model", "owner/repo", "--api-key", "key"])
+        validate.assert_called_once_with("key")
+
+    def test_bad_key_error_names_the_full_rule(self):
+        for parse, arguments in (
+            (launcher.parse_args, ["serve", "--model", "owner/repo"]),
+            (
+                server.parse_args,
+                [
+                    "target",
+                    "draft",
+                    "--tokenizer",
+                    "tokenizer",
+                    "--model",
+                    "owner/repo",
+                ],
+            ),
+        ):
+            with self.subTest(parse=parse.__module__):
+                errors = io.StringIO()
+                with mock.patch("sys.stderr", errors), self.assertRaises(SystemExit):
+                    parse([*arguments, "--api-key", "two words"])
+                self.assertIn(
+                    "API key must be non-empty, visible ASCII 33-126, no spaces",
+                    errors.getvalue(),
+                )
+
     def test_launcher_uses_key_and_reports_auth_failure(self):
         harness = self.harness(api_key="test-server-key")
         port = harness.server.server_port

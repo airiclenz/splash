@@ -9,9 +9,12 @@ else:
     from errors import APIError
 
 
+API_KEY_RULE = "non-empty, visible ASCII 33-126, no spaces"
+
+
 def validate_api_key(value):
     if not value or any(ord(char) <= 32 or ord(char) >= 127 for char in value):
-        raise ValueError("API key must contain only visible ASCII characters")
+        raise ValueError(f"API key must be {API_KEY_RULE}")
     return value
 
 

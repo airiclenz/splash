@@ -128,7 +128,8 @@ that a long uncached prompt will reach its first token quickly.
   Defaults to `SPLASH_REASONING_LOOP_LIMIT` or `24`.
 - `--allowed-host`: extra HTTP `Host` name to accept, not a bind address. Repeatable.
 - `--api-key`: require this key on API requests, as a bearer token or
-  `x-api-key`. Defaults to `SPLASH_API_KEY`.
+  `x-api-key`. The key must be non-empty visible ASCII (codes 33-126), with no
+  spaces. Defaults to `SPLASH_API_KEY`.
 - `--no-webui`: turn off the chat page.
 
 To use BF16 target KV, select it when starting the server:
