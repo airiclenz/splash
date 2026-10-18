@@ -43,6 +43,10 @@ STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
 STATUS_BACKGROUND_TIMEOUT_SECONDS = 30.0
 
 
+# Native memory pressure states under which the service still takes requests.
+READY_MEMORY_PRESSURES = frozenset({"normal", "warning"})
+
+
 REQUEST_PRIORITIES = {"foreground": 0, "normal": 1, "background": 2}
 REQUEST_PRIORITY_NAMES = {value: name for name, value in REQUEST_PRIORITIES.items()}
 
@@ -341,7 +345,30 @@ class NativeBackend:
             return False
         snapshot = self.status()
         pressure = snapshot.get("memory_pressure")
-        return snapshot.get("ready") is True and pressure in {"normal", "warning"}
+        return snapshot.get("ready") is True and pressure in READY_MEMORY_PRESSURES
+
+    def health(self):
+        """Return `ready` and `memory_pressure` from the last cached snapshot.
+
+        Never waits on native: the snapshot is read by reference (it is
+        replaced wholesale, never mutated). `ready` mirrors `is_ready` against
+        that snapshot; with no snapshot yet, `ready` is false, `memory_pressure`
+        is None, and a background refresh is started for the next probe.
+        """
+        with self.lock:
+            snapshot = self.status_snapshot
+            closing = self.closing
+        if snapshot is None:
+            self._ensure_background_status_refresh()
+            return {"ready": False, "memory_pressure": None}
+        pressure = snapshot.get("memory_pressure")
+        ready = (
+            not closing
+            and self.runtime.ready
+            and snapshot.get("ready") is True
+            and pressure in READY_MEMORY_PRESSURES
+        )
+        return {"ready": ready, "memory_pressure": pressure}
 
     @staticmethod
     def _decode_status_event(event):

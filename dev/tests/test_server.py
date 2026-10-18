@@ -931,9 +931,33 @@ class ServerTest(unittest.TestCase):
         self.assertIn(b"@keyframes spin", payload)
 
         status, _, payload = harness.request("GET", "/health")
-        self.assertEqual((status, json.loads(payload)), (200, {"status": "ok"}))
+        self.assertEqual(
+            (status, json.loads(payload)),
+            (
+                200,
+                {
+                    "status": "ok",
+                    "model": "test-model",
+                    "ready": False,
+                    "memory_pressure": None,
+                },
+            ),
+        )
         status, _, payload = harness.request("GET", "/ready")
         self.assertEqual((status, json.loads(payload)), (200, {"status": "ready"}))
+        status, _, payload = harness.request("GET", "/health")
+        self.assertEqual(
+            (status, json.loads(payload)),
+            (
+                200,
+                {
+                    "status": "ok",
+                    "model": "test-model",
+                    "ready": True,
+                    "memory_pressure": "normal",
+                },
+            ),
+        )
         status, _, payload = harness.request("GET", "/status")
         snapshot = json.loads(payload)
         self.assertEqual(status, 200)
@@ -2563,13 +2587,57 @@ class ServerTest(unittest.TestCase):
         runtime.ready = False
         harness = self.harness(runtime)
         status, _, payload = harness.request("GET", "/health")
-        self.assertEqual((status, json.loads(payload)), (200, {"status": "ok"}))
+        self.assertEqual(
+            (status, json.loads(payload)),
+            (
+                200,
+                {
+                    "status": "ok",
+                    "model": "test-model",
+                    "ready": False,
+                    "memory_pressure": None,
+                },
+            ),
+        )
         status, _, payload = harness.request("GET", "/ready")
         self.assertEqual(
             (status, json.loads(payload)), (503, {"status": "unavailable"})
         )
         status, _, payload = harness.request("GET", "/status")
         self.assertFalse(json.loads(payload)["ready"])
+
+    def test_health_reads_the_cached_snapshot_without_a_native_call(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        self.assertEqual(harness.request("GET", "/ready")[0], 200)
+        runtime.status = mock.Mock(side_effect=AssertionError("native status call"))
+
+        status, _, payload = harness.request("GET", "/health")
+        runtime.ready = False
+        _, _, recovering = harness.request("GET", "/health")
+
+        runtime.status.assert_not_called()
+        self.assertEqual(
+            (status, json.loads(payload)),
+            (
+                200,
+                {
+                    "status": "ok",
+                    "model": "test-model",
+                    "ready": True,
+                    "memory_pressure": "normal",
+                },
+            ),
+        )
+        self.assertEqual(
+            json.loads(recovering),
+            {
+                "status": "ok",
+                "model": "test-model",
+                "ready": False,
+                "memory_pressure": "normal",
+            },
+        )
 
     def test_status_identifies_the_http_instance_independently_of_readiness(self):
         first = self.harness(FakeRuntime())

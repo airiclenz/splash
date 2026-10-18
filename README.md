@@ -71,6 +71,11 @@ Reasoning follows the model default unless a [server default](DEVELOPMENT.md#def
 is configured. `"reasoning_effort": "none"` turns it off, and
 Qwen3.8-27B also takes `low`, `medium`, and `xhigh`.
 
+`GET /health` always answers 200 and names the served model, for example
+`{"status":"ok","model":"incoai/Qwen3.8-27B-Splash","ready":true,"memory_pressure":"normal"}`.
+`ready` and `memory_pressure` come from the last status snapshot: `false` and
+`null` until the first one arrives. `/ready` answers 503 while requests would be refused.
+
 `/v1/judgments` and `/v1/systemone` provide scoring without generation.
 See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
 

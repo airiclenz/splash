@@ -367,7 +367,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._safe_error(APIError(404, "not found", "not_found"))
             return
         if path == "/health":
-            self._json(200, {"status": "ok"})
+            self._json(
+                200,
+                {"status": "ok", "model": self.app.model, **self.app.backend.health()},
+            )
             return
         if path == "/ready":
             ready = self.app.backend.is_ready()

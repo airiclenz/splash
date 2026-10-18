@@ -202,6 +202,9 @@ class ServerAccessTests(unittest.TestCase):
                 self.assertEqual(harness.request(method, path)[0], 200)
             for path in ("/", "/index.html?test=1"):
                 self.assertEqual(harness.request(method, path)[0], 404)
+        self.assertEqual(
+            json.loads(harness.request("GET", "/health")[2])["model"], "test-model"
+        )
         default = self.harness()
         self.assertEqual(default.request("GET", "/")[0], 200)
         self.assertEqual(default.request("GET", "/v1/models")[0], 200)
