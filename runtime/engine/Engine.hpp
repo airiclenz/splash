@@ -61,7 +61,9 @@ struct EngineSnapshot final {
   uint64_t checkpointPublicationFailures = 0;
   uint64_t resourceSuspensions = 0;
   uint64_t resourceResumptions = 0;
-  // All prefill rows after preemption, including an unfinished prompt suffix.
+  // Prefill rows after preemption that recompute tokens the request had
+  // already processed before a suspension; an unfinished prompt suffix is
+  // ordinary prefill and never counts.
   uint64_t resourceReplayTokens = 0;
 };
 
@@ -130,6 +132,9 @@ private:
     uint32_t promptTokens = 0;
     uint32_t reportedPromptTokens = 0;
     uint32_t replayTokens = 0;
+    // Deepest position processed before any suspension: replay rows below it
+    // count as reprocessing, rows past it as ordinary prefill. Never lowered.
+    uint32_t replayCountEnd = 0;
     // A failed dispatch must fit before replay can consume any model work.
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;
@@ -180,6 +185,7 @@ private:
   [[nodiscard]] bool reclaimIdleState() noexcept;
   [[nodiscard]] bool reuseIdleBackingWhilePaused(const TokenAdmission &admission);
   [[nodiscard]] bool growthPaused() const;
+  [[nodiscard]] uint32_t completedTokens(const Request &request) const;
   struct KvAdmission {
     TokenAdmission allocation;
     bool retryableBudget = false;

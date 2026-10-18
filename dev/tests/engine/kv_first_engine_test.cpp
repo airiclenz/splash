@@ -1870,6 +1870,104 @@ void testGrowthYieldsLowerPriorityResidentOutsideBatch() {
           "priority preemption failed to finish both requests");
 }
 
+constexpr double kPeerSuspensionTicks = 4;
+constexpr double kSuspensionPointTickLimit = 64;
+
+// Suspends request 48 once it has prefilled `suspendAt` tokens, by admitting a
+// foreground peer `peerId` that leaves no room for both lanes.
+void suspendPrefillForForegroundPeer(engine::Engine &engine,
+                                     engine::Cache &resources,
+                                     Executor &executor, uint64_t peerId,
+                                     uint32_t suspendAt, double &now) {
+  for (; now < kSuspensionPointTickLimit && !(executor.requests.contains(48) &&
+                       executor.requests.at(48).resident &&
+                       executor.requests.at(48).position == suspendAt);
+       ++now)
+    static_cast<void>(engine.tick(now));
+  require(executor.requests.at(48).position == suspendAt,
+          "replay fixture did not reach the suspension point");
+  // An earlier peer's idle cached pages would let this one run without
+  // growth; evict them so its admission must displace request 48.
+  static_cast<void>(resources.reclaimCache(
+      std::numeric_limits<uint64_t>::max(), true));
+  const uint32_t suspensions = executor.suspensions;
+  auto foreground = request(peerId, std::vector<uint32_t>(8192, peerId));
+  foreground.priority = RequestPriority::Foreground;
+  engine.submit(std::move(foreground));
+  // The peer is admitted first; its growth then displaces request 48.
+  const double deadline = now + kPeerSuspensionTicks;
+  for (; now < deadline && executor.suspensions == suspensions; ++now) {
+    require(executor.requests.at(48).position == suspendAt,
+            "prefilling lane advanced past the suspension point");
+    static_cast<void>(engine.tick(now));
+  }
+  require(executor.suspensions == suspensions + 1 &&
+              !executor.requests.at(48).resident,
+          "foreground peer did not suspend the prefilling lane");
+}
+
+void testMidPrefillSuspensionCountsOnlyProcessedTokensAsReplay() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  // Nothing is restored, so the resume replays from the first token.
+  executor.deniedSnapshots = std::numeric_limits<uint32_t>::max();
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  backing.growthAllowed = [&] {
+    return std::count_if(executor.requests.begin(), executor.requests.end(),
+                         [](const auto &entry) { return entry.second.resident; }) < 2;
+  };
+  engine.submit(request(48, std::vector<uint32_t>(4096, 48)));
+  double now = 1;
+
+  suspendPrefillForForegroundPeer(engine, resources, executor, 49, 2048, now);
+  for (; now < 128 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+
+  require(engine.idle() && events.completedCount == 2 &&
+              events.failedCount == 0 && executor.restored == 0 &&
+              engine.snapshot().resourceResumptions == 1,
+          "mid-prefill replay fixture did not finish both requests");
+  // The 2048 prompt tokens never processed before the suspension are
+  // ordinary prefill, not replay.
+  require(engine.snapshot().resourceReplayTokens == 2048,
+          "unprocessed prompt suffix was counted as cache replay");
+}
+
+void testRepeatedSuspensionKeepsTheFirstReplayEnd() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  // Nothing is restored, so every resume replays from the first token.
+  executor.deniedSnapshots = std::numeric_limits<uint32_t>::max();
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  backing.growthAllowed = [&] {
+    return std::count_if(executor.requests.begin(), executor.requests.end(),
+                         [](const auto &entry) { return entry.second.resident; }) < 2;
+  };
+  engine.submit(request(48, std::vector<uint32_t>(8192, 48)));
+  double now = 1;
+
+  suspendPrefillForForegroundPeer(engine, resources, executor, 49, 4096, now);
+  // The second suspension lands inside the replay, below the first end.
+  suspendPrefillForForegroundPeer(engine, resources, executor, 50, 2048, now);
+  for (; now < 192 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+
+  require(engine.idle() && events.completedCount == 3 &&
+              events.failedCount == 0 && executor.restored == 0 &&
+              engine.snapshot().resourceResumptions == 2,
+          "repeated suspension fixture did not finish every request");
+  // First partial replay: 2048 rows. Second replay: the 4096 rows processed
+  // before the first suspension; the rest of the prompt is ordinary prefill.
+  require(engine.snapshot().resourceReplayTokens == 2048 + 4096,
+          "a second suspension lowered the replay end of the first");
+}
+
 void testPrefillGrowthPreservesAnActiveDecodePeer() {
   Backing backing(512);
   KvPool pool(backing);
@@ -2061,7 +2159,7 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
   // continuation has reserved both pages. Neither replays generated output.
   require(executor.resumedPrompts ==
               std::vector<std::vector<uint32_t>>{committedHistory, {252}} &&
-              engine.snapshot().resourceReplayTokens == committedHistory.size() + 1,
+              engine.snapshot().resourceReplayTokens == committedHistory.size(),
           "replay omitted or duplicated committed generated history");
   require(events.outputs.at(250) == std::vector<uint32_t>(4, 42) &&
               events.outputs.at(251) == std::vector<uint32_t>(4, 42) &&
@@ -2482,7 +2580,7 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
             "prefill recovery duplicated or regressed progress");
     require(engine.idle() && engine.snapshot().resourceResumptions == 1 &&
                 executor.restored == restored + 128 &&
-                engine.snapshot().resourceReplayTokens == 1 &&
+                engine.snapshot().resourceReplayTokens == 0 &&
                 events.outputs.at(280) == std::vector<uint32_t>{42} &&
                 resources.snapshot().activeRequests == 0 &&
                 resources.snapshot().pool.pagesActive == 0 &&
@@ -3371,6 +3469,8 @@ int main() {
     testUnadmittedRequestsHonorCancellationAndDeadline();
     testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield();
     testGrowthYieldsLowerPriorityResidentOutsideBatch();
+    testMidPrefillSuspensionCountsOnlyProcessedTokensAsReplay();
+    testRepeatedSuspensionKeepsTheFirstReplayEnd();
     testPrefillGrowthPreservesAnActiveDecodePeer();
     testPhysicalKvPressureSuspendsInsteadOfKillingActiveWork();
     testRecoveryDrainDoesNotConsumeResourceWaitBudget();

@@ -830,11 +830,6 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
   // cell before completed prefill is discarded.
   if (denied.empty())
     throw std::logic_error("empty resource admission result");
-  const auto completedTokens = [&](const Request &active) -> uint64_t {
-    return scheduler_.phase(active.request.id) == Phase::Prefill
-               ? scheduler_.promptProcessed(active.request.id)
-               : active.exactTokens.size();
-  };
   const auto yieldsBefore = [&](const Request &a, const Request &b) {
     if (a.request.priority != b.request.priority)
       return a.request.priority > b.request.priority;
@@ -963,6 +958,14 @@ bool Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
   return reused.madeProgress;
 }
 
+// Tokens a resident lane has processed: the prompt position during prefill,
+// the whole exact history (prompt plus committed output) during decode.
+uint32_t Engine::completedTokens(const Request &active) const {
+  return scheduler_.phase(active.request.id) == Phase::Prefill
+             ? scheduler_.promptProcessed(active.request.id)
+             : static_cast<uint32_t>(active.exactTokens.size());
+}
+
 void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
   if (!active.stateCell || active.suspended) {
     throw std::logic_error("request cannot be suspended for growth");
@@ -978,6 +981,10 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
   active.resumeKvTargetTokens = workEnd;
   recoveringResources_ = true;
   active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
+  // A suspension during resumed replay must keep counting the rows processed
+  // before the first suspension.
+  active.replayCountEnd =
+      std::max(active.replayCountEnd, completedTokens(active));
   scheduler_.suspendForResources(active.request.id);
   deferResourceRetry(active, now);
   ++counters_.resourceSuspensions;
@@ -1045,8 +1052,10 @@ void Engine::apply(const BatchPlan &plan,
       const uint32_t promptProcessed =
           item.promptOffset + result.consumedPromptTokens;
       inputTokens += result.consumedPromptTokens;
-      if (active.replaying)
-        counters_.resourceReplayTokens += result.consumedPromptTokens;
+      // Rows past the suspension point were never processed: ordinary prefill.
+      if (active.replaying && item.promptOffset < active.replayCountEnd)
+        counters_.resourceReplayTokens +=
+            std::min(promptProcessed, active.replayCountEnd) - item.promptOffset;
       if (promptProcessed == active.replayTokens)
         active.replaying = false;
       static_cast<void>(cache_.publishCommittedBlocks(
