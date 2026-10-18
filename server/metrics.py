@@ -19,6 +19,15 @@ def is_finite_number(value):
         return False
 
 
+MEMORY_PRESSURE_STATES = ("normal", "warning", "critical")
+# Status.cpp writes these as 0 when the host sample failed, so they are only
+# exported while memory_governor.host_measurement_valid is true.
+HOST_MEMORY_METRICS = {
+    "splash_host_headroom_bytes": ("memory_governor", "host_headroom_bytes"),
+    "splash_host_available_bytes": ("memory_governor", "host_available_bytes"),
+}
+
+
 def prometheus_metrics(status):
     """Render low-cardinality metrics directly from the native status."""
 
@@ -195,14 +204,29 @@ def prometheus_metrics(status):
         'splash_info{runtime="native"} 1',
     ]
     pressure = status.get("memory_pressure")
-    for state in ("normal", "warning", "critical"):
+    for state in MEMORY_PRESSURE_STATES:
         lines.append(
             f'splash_memory_pressure{{state="{state}"}} {1 if pressure == state else 0}'
         )
+    governor = status.get("memory_governor")
+    if not isinstance(governor, dict):
+        governor = {}
+    system_pressure = governor.get("system_pressure")
+    if isinstance(system_pressure, str):
+        for state in MEMORY_PRESSURE_STATES:
+            gauge_value = 1 if system_pressure == state else 0
+            lines.append(
+                f'splash_system_memory_pressure{{state="{state}"}} {gauge_value}'
+            )
     for name, path in metrics.items():
         metric_value = value(path)
         if metric_value is not None:
             lines.append(f"{name} {metric_value}")
+    if governor.get("host_measurement_valid") is True:
+        for name, path in HOST_MEMORY_METRICS.items():
+            metric_value = value(path)
+            if metric_value is not None:
+                lines.append(f"{name} {metric_value}")
     lines.extend(prometheus_latency(status.get("latency", {})))
     return "\n".join(lines) + "\n"
 
