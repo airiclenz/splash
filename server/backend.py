@@ -13,19 +13,21 @@ if __package__:
     from . import protocol as wire
     from . import runtime as engine_runtime
     from .constraints import TokenConstraint
+    from .diagnostics import print_status
     from .errors import APIError, NativeError
     from .latency import RequestLatency
     from .metrics import metrics_dict
-    from .output import hold_partial
+    from .output import ReasoningLoopGuard, hold_partial
     from .tool_schema import THINK_END, ToolPolicy
 else:
     import json_codec
     import protocol as wire
     from constraints import TokenConstraint
+    from diagnostics import print_status
     from errors import APIError, NativeError
     from latency import RequestLatency
     from metrics import metrics_dict
-    from output import hold_partial
+    from output import ReasoningLoopGuard, hold_partial
     from tool_schema import THINK_END, ToolPolicy
 
     import runtime as engine_runtime
@@ -46,6 +48,11 @@ REQUEST_PRIORITY_NAMES = {value: name for name, value in REQUEST_PRIORITIES.item
 
 
 MAX_PROTOCOL_U64 = (1 << 64) - 1
+
+
+# A thinking reply whose reasoning repeats one sentence this many times is
+# ended with finish reason `length`; 0 disables the guard.
+DEFAULT_REASONING_LOOP_LIMIT = 24
 
 
 def remaining_request_time(deadline):
@@ -124,7 +131,21 @@ class Job:
 
 
 class CallbackStreamer:
-    def __init__(self, tokenizer, callback, stop_sequences=(), on_stop=None):
+    """Decode native tokens incrementally into callback text.
+
+    Stops early, through `on_stop`, on a stop sequence or, with a positive
+    `reasoning_loop_limit`, when the reasoning before the think-end token
+    repeats one sentence that many times (`reasoning_loop_tripped`).
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        callback,
+        stop_sequences=(),
+        on_stop=None,
+        reasoning_loop_limit=0,
+    ):
         self.tokenizer = tokenizer
         self.callback = callback
         self.stop_sequences = tuple(stop_sequences)
@@ -139,6 +160,14 @@ class CallbackStreamer:
         self.stop_sequence = None
         convert = getattr(tokenizer, "convert_tokens_to_ids", None)
         self.think_end_token = convert(THINK_END) if callable(convert) else None
+        self.reasoning_loop_tripped = False
+        # Without a think-end token id the reasoning cannot be told apart
+        # from content, so the guard is never built.
+        self.reasoning_loop_guard = (
+            ReasoningLoopGuard(reasoning_loop_limit)
+            if reasoning_loop_limit > 0 and isinstance(self.think_end_token, int)
+            else None
+        )
 
     def _send(self, text):
         if text:
@@ -173,12 +202,21 @@ class CallbackStreamer:
         self.pending_text = self.pending_text[-retained:] if retained else ""
         self._send(ready)
 
+    def _trip_reasoning_loop(self):
+        self.reasoning_loop_tripped = True
+        self.reasoning_loop_guard = None
+        if self.on_stop is not None:
+            self.on_stop()
+
     def put_tokens(self, token_ids):
-        if self.stop_sequence is not None:
+        if self.stop_sequence is not None or self.reasoning_loop_tripped:
             return
         for token_id in token_ids:
             token_id = int(token_id)
             self.token_ids.append(token_id)
+            guard = self.reasoning_loop_guard
+            if guard is not None and token_id == self.think_end_token:
+                self.reasoning_loop_guard = guard = None
             if self.decode_stream is None:
                 continue
             try:
@@ -194,6 +232,9 @@ class CallbackStreamer:
             if text:
                 self._emit(text)
                 if self.stop_sequence is not None:
+                    break
+                if guard is not None and guard.feed(text):
+                    self._trip_reasoning_loop()
                     break
 
     def end(self):
@@ -256,10 +297,19 @@ class NativeBackend:
         wire.FinishReason.CANCELLED: "cancelled",
     }
 
-    def __init__(self, runtime, tokenizer, request_logger=None):
+    def __init__(
+        self,
+        runtime,
+        tokenizer,
+        request_logger=None,
+        reasoning_loop_limit=DEFAULT_REASONING_LOOP_LIMIT,
+    ):
+        if reasoning_loop_limit < 0:
+            raise ValueError("reasoning loop limit must be non-negative")
         self.runtime = runtime
         self.tokenizer = tokenizer
         self.request_logger = request_logger
+        self.reasoning_loop_limit = reasoning_loop_limit
         self.active = {}
         self.closing = False
         self.lock = threading.RLock()
@@ -489,7 +539,11 @@ class NativeBackend:
             job.events.put(("text", text))
 
         streamer = CallbackStreamer(
-            self.tokenizer, emit, job.stop_sequences, stop_matched
+            self.tokenizer,
+            emit,
+            job.stop_sequences,
+            stop_matched,
+            self.reasoning_loop_limit if job.thinking else 0,
         )
         state = _JobState(job, streamer)
         try:
@@ -666,16 +720,23 @@ class NativeBackend:
             job.reasoning_tokens = state.streamer.count_reasoning_tokens(job.thinking)
             done = native.done
             stop_sequence = state.streamer.stop_sequence
+            if stop_sequence is not None:
+                reason = "stop"
+            elif state.streamer.reasoning_loop_tripped:
+                # `length` lets clients and output validators reuse their
+                # incomplete-reply handling.
+                reason = "length"
+            else:
+                reason = self._FINISH_NAMES[done.reason]
+            stopped_early = (
+                stop_sequence is not None or state.streamer.reasoning_loop_tripped
+            )
             result = NativeResult(
-                reason=(
-                    "stop"
-                    if stop_sequence is not None
-                    else self._FINISH_NAMES[done.reason]
-                ),
+                reason=reason,
                 prompt_tokens=done.prompt_tokens,
                 completion_tokens=(
                     len(state.streamer.token_ids)
-                    if stop_sequence is not None
+                    if stopped_early
                     else done.completion_tokens
                 ),
                 option_logits=done.option_logits,
@@ -705,6 +766,8 @@ class NativeBackend:
             # before close() acquires the state lock remains a normal result.
             result = None
             error = APIError(503, "server is shutting down", "server_shutdown")
+        if state.streamer.reasoning_loop_tripped:
+            self._warn_reasoning_loop(job)
         self._record(job, result=result, error=error)
         job.events.put(("error", error) if error else ("done", result))
 
@@ -749,6 +812,17 @@ class NativeBackend:
         if isinstance(error, TimeoutError):
             return APIError(504, "request timed out", "request_timeout")
         return APIError(500, str(error), "runtime_error")
+
+    def _warn_reasoning_loop(self, job):
+        try:
+            print_status(
+                f"Warning · reasoning loop · request {job.request_id} · "
+                f"one sentence repeated {self.reasoning_loop_limit} times"
+            )
+        except Exception:
+            # A closed console must not stop the finalizer thread, the same
+            # rule `_record` follows for the request logger.
+            pass
 
     def _record(self, job, result=None, error=None):
         if self.request_logger is None:

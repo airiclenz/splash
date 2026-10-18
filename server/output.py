@@ -100,6 +100,93 @@ class ReasoningSplitter:
         return [(kind, text)]
 
 
+# A sentence ends at whitespace after `.`, `!` or `?`, or at a newline, so
+# `backend.py` and `0.5` stay whole; the 3-character lookbehind keeps "e.g. "
+# and "i.e. " inside their sentence.
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])(?<!\.\w[.!?])\s|\n")
+_SENTENCE_BOUNDARY_CONTEXT_CHARS = 3
+_SENTENCE_PUNCTUATION = str.maketrans("", "", "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+REASONING_LOOP_MIN_WORDS = 4
+REASONING_LOOP_MAX_SENTENCE_CHARS = 1024
+
+
+class ReasoningLoopGuard:
+    """Count repeated reasoning sentences and report when one reaches `limit`.
+
+    Feeding is incremental: each call scans only the new text plus a few
+    characters of boundary context, and only the unfinished trailing sentence
+    is buffered (at most `REASONING_LOOP_MAX_SENTENCE_CHARS`; a longer one is
+    dropped). Counts are keyed by the hash of the normalized sentence, so
+    memory is O(distinct sentences) with no copy of the reasoning text.
+    Normalized sentences under `REASONING_LOOP_MIN_WORDS` words are ignored.
+    A `limit` of 0 disables the guard; a negative limit is rejected.
+    """
+
+    def __init__(self, limit):
+        if limit < 0:
+            raise ValueError("reasoning loop limit must be non-negative")
+        self.limit = limit
+        self.tripped = False
+        self._counts = {}
+        self._carry = []
+        self._carry_chars = 0
+        self._overlong = False
+        self._context = ""
+
+    @property
+    def pending_chars(self):
+        """Characters of the unfinished trailing sentence currently buffered."""
+        return self._carry_chars
+
+    def feed(self, text):
+        """Consume reasoning text; return True once a sentence reached `limit`."""
+        if self.tripped or not self.limit or not text:
+            return self.tripped
+        window = self._context + text
+        offset = len(self._context)
+        self._context = window[-_SENTENCE_BOUNDARY_CONTEXT_CHARS:]
+        start = 0
+        for boundary in _SENTENCE_BOUNDARY.finditer(window, offset):
+            end = boundary.start() - offset
+            self._hold(text[start:end])
+            if self._finish_sentence():
+                return True
+            start = end + 1
+        self._hold(text[start:])
+        return False
+
+    def _hold(self, piece):
+        if not piece or self._overlong:
+            return
+        self._carry_chars += len(piece)
+        if self._carry_chars > REASONING_LOOP_MAX_SENTENCE_CHARS:
+            self._carry.clear()
+            self._carry_chars = 0
+            self._overlong = True
+            return
+        self._carry.append(piece)
+
+    def _finish_sentence(self):
+        sentence = "".join(self._carry)
+        overlong = self._overlong
+        self._carry.clear()
+        self._carry_chars = 0
+        self._overlong = False
+        if overlong:
+            return False
+        normalized = " ".join(
+            sentence.casefold().translate(_SENTENCE_PUNCTUATION).split()
+        )
+        if normalized.count(" ") < REASONING_LOOP_MIN_WORDS - 1:
+            return False
+        key = hash(normalized)
+        count = self._counts.get(key, 0) + 1
+        self._counts[key] = count
+        if count >= self.limit:
+            self.tripped = True
+        return self.tripped
+
+
 class StreamingToolCallProjector:
     """Stream Qwen tool XML as OpenAI JSON argument deltas.
 

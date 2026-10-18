@@ -200,6 +200,7 @@ class PassthroughStreamer:
         self.tokenizer = tokenizer
         self.callback = callback
         self.stop_sequence = None
+        self.reasoning_loop_tripped = False
 
     def put_tokens(self, token_ids):
         text = self.tokenizer.decode(token_ids)
