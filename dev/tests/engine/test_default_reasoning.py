@@ -236,6 +236,7 @@ class MaxReasoningEffortTests(unittest.TestCase):
         app = frontend.Frontend(
             tokenizer, None, "test-model", 128, 16, 1, 2, max_reasoning_effort=cap
         )
+        tokenizer.templates.clear()
         return tokenizer, app
 
     def rendered_efforts(self, tokenizer):
@@ -290,7 +291,7 @@ class MaxReasoningEffortTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         DefaultReasoningTests.assert_effort(self, harness, None)
 
-    def test_template_alias_above_cap_retries_once_below_it(self):
+    def test_template_alias_above_cap_renders_once_below_it(self):
         for effort in ("high", "xhigh", "max"):
             with self.subTest(effort=effort):
                 tokenizer, app = self.template_app("high")
@@ -300,7 +301,7 @@ class MaxReasoningEffortTests(unittest.TestCase):
                 )
 
                 self.assertTrue(job.thinking)
-                self.assertEqual(self.rendered_efforts(tokenizer), ["high", "medium"])
+                self.assertEqual(self.rendered_efforts(tokenizer), ["medium"])
 
     def test_alias_retry_never_drops_to_none(self):
         tokenizer, app = self.template_app("minimal")
@@ -315,7 +316,7 @@ class MaxReasoningEffortTests(unittest.TestCase):
 
         app.prepare(fixtures.ServerTest.body(reasoning_effort="high"))
 
-        self.assertEqual(self.rendered_efforts(tokenizer), ["high", "xhigh"])
+        self.assertEqual(self.rendered_efforts(tokenizer), ["xhigh"])
 
     def test_frontend_rejects_invalid_cap_and_default_above_cap(self):
         for options in (
@@ -399,3 +400,122 @@ class MaxReasoningEffortTests(unittest.TestCase):
                     self.assertEqual(
                         api.parse_args(argv[3:]).max_reasoning_effort, expected
                     )
+
+
+class EffortAliasProbeTests(unittest.TestCase):
+    REJECTS_HIGH = ("minimal", "low", "medium", "xhigh", "max")
+
+    @staticmethod
+    def template(efforts=None, *, failing_message=None):
+        source = fixtures.ServerTest.reasoning_template(efforts=efforts)
+        if failing_message is None:
+            return source
+        return (
+            "{% if messages[0].content == "
+            + repr(failing_message)
+            + " %}{{ raise_exception('bad message') }}{% endif %}"
+            + source
+        )
+
+    @staticmethod
+    def app(tokenizer):
+        app = frontend.Frontend(tokenizer, None, "test-model", 128, 16, 1, 2)
+        tokenizer.templates.clear()
+        return app
+
+    @staticmethod
+    def rendered_efforts(tokenizer):
+        return [kwargs.get("reasoning_effort") for _, kwargs in tokenizer.templates]
+
+    def test_rejected_effort_renders_its_alias_once(self):
+        tokenizer = fixtures.TemplateTokenizer(self.template(self.REJECTS_HIGH))
+        app = self.app(tokenizer)
+
+        job, thinking, _ = app.prepare(
+            fixtures.ServerTest.body(reasoning_effort="high")
+        )
+
+        self.assertTrue(thinking)
+        self.assertTrue(job.thinking)
+        self.assertEqual(self.rendered_efforts(tokenizer), ["xhigh"])
+
+    def test_probed_render_matches_the_per_request_retry(self):
+        for effort in EFFORTS[1:]:
+            with self.subTest(effort=effort):
+                renders = []
+                for probe in (True, False):
+                    tokenizer = fixtures.TemplateTokenizer(
+                        self.template(self.REJECTS_HIGH)
+                    )
+                    app = self.app(tokenizer)
+                    if not probe:
+                        app.effort_aliases = ({}, {})
+                    job, _, _ = app.prepare(
+                        fixtures.ServerTest.body(reasoning_effort=effort)
+                    )
+                    renders.append((tokenizer.templates[-1], job.prompt_tokens))
+
+                self.assertEqual(renders[0], renders[1])
+
+    def test_template_accepting_every_effort_records_no_alias(self):
+        tokenizer = fixtures.TemplateTokenizer(self.template(EFFORTS[1:]))
+
+        app = self.app(tokenizer)
+
+        self.assertEqual(app.effort_aliases, ({}, {}))
+
+    def test_message_errors_still_raise_after_an_alias(self):
+        tokenizer = fixtures.TemplateTokenizer(
+            self.template(self.REJECTS_HIGH, failing_message="boom")
+        )
+        app = self.app(tokenizer)
+        for effort, expected in (("high", ["xhigh"]), ("medium", ["medium"])):
+            with self.subTest(effort=effort):
+                tokenizer.templates.clear()
+                body = fixtures.ServerTest.body(
+                    reasoning_effort=effort,
+                    messages=[{"role": "user", "content": "boom"}],
+                )
+
+                with self.assertRaises(frontend.APIError):
+                    app.prepare(body)
+
+                self.assertEqual(self.rendered_efforts(tokenizer), expected)
+
+    def test_probe_failures_never_fail_startup(self):
+        class RaisingTemplate(fixtures.FakeTokenizer):
+            def get_chat_template(self, **kwargs):
+                return "template"
+
+            def apply_chat_template(self, messages, **kwargs):
+                raise ValueError("template raised")
+
+        class MissingTemplate(fixtures.FakeTokenizer):
+            def get_chat_template(self, **kwargs):
+                raise ValueError("no chat template")
+
+        for tokenizer in (RaisingTemplate(), MissingTemplate()):
+            with self.subTest(tokenizer=type(tokenizer).__name__):
+                app = frontend.Frontend(tokenizer, None, "test-model", 128, 16, 1, 2)
+
+                self.assertEqual(app.effort_aliases, ({}, {}))
+
+    def test_aliases_follow_the_template_source_the_request_selects(self):
+        tokenizer = fixtures.TemplateTokenizer(
+            {
+                "default": self.template(self.REJECTS_HIGH),
+                "tool_use": self.template(EFFORTS[1:]),
+            }
+        )
+        app = self.app(tokenizer)
+        tool = fixtures.ServerTest.rich_weather_tool()
+        for tools, expected in (([tool], ["high"]), (None, ["xhigh"])):
+            with self.subTest(tools=tools is not None):
+                tokenizer.templates.clear()
+                body = fixtures.ServerTest.body(reasoning_effort="high")
+                if tools is not None:
+                    body["tools"] = tools
+
+                app.prepare(body)
+
+                self.assertEqual(self.rendered_efforts(tokenizer), expected)

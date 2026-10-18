@@ -165,6 +165,9 @@ class TemplateTokenizer(FakeTokenizer):
         self.renderer = PreTrainedTokenizerFast(tokenizer_object=self.backend_tokenizer)
         self.renderer.chat_template = template
 
+    def get_chat_template(self, **kwargs):
+        return self.renderer.get_chat_template(**kwargs)
+
     def apply_chat_template(self, messages, **kwargs):
         self.templates.append((messages, kwargs))
         return self.renderer.apply_chat_template(messages, **kwargs)
@@ -1729,6 +1732,7 @@ class ServerTest(unittest.TestCase):
 
         app.latencies = LatencyMetrics()
         app.max_context = 1024
+        app.effort_aliases = ({}, {})
         quoted = "中文 📷 <|vision_start|><|image_pad|><|vision_end|>"
         messages = [
             {"role": "system", "content": "Document: " + api_shapes.IMAGE_PAD_TOKEN},
@@ -5181,6 +5185,7 @@ class ServerTest(unittest.TestCase):
                         tokenizer=tokenizer,
                         constraint_factory=factory,
                     )
+                    tokenizer.templates.clear()
                     body = self.body(
                         response_format={
                             "type": "json_schema",
@@ -5277,12 +5282,13 @@ class ServerTest(unittest.TestCase):
                             kwargs["reasoning_effort"]
                             for _, kwargs in tokenizer.templates
                         ],
-                        [effort, aliases[effort]] if effort in aliases else [effort],
+                        [aliases[effort]] if effort in aliases else [effort],
                     )
 
     def test_reasoning_template_errors_do_not_silently_drop_effort(self):
         tokenizer = TemplateTokenizer(self.reasoning_template(efforts=("medium",)))
         app = request_frontend.Frontend(tokenizer, None, "test-model", 128, 16, 1, 2)
+        tokenizer.templates.clear()
         with self.assertRaises(api.APIError):
             app.prepare(self.body(reasoning_effort="high"))
         self.assertEqual(

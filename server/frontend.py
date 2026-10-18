@@ -74,6 +74,15 @@ REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 REASONING_EFFORT_ALIASES = {"high": "xhigh", "max": "xhigh", "minimal": "low"}
 # Effort order for the --max-reasoning-effort cap, computed once per process.
 REASONING_EFFORT_RANKS = {effort: rank for rank, effort in enumerate(REASONING_EFFORTS)}
+# Makes a dictionary chat template select its tool source in the alias probe.
+REASONING_PROBE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "probe",
+        "description": "",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
 
 
 MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
@@ -276,6 +285,8 @@ class Frontend:
         self.thinking_codec = (
             ThinkingCodec() if thinking_codec is None else thinking_codec
         )
+        # Indexed by whether a request passes tools; read-only after startup.
+        self.effort_aliases = self._probe_effort_aliases()
 
     def accepts_model(self, model):
         return isinstance(model, str) and model in self.model_names
@@ -777,7 +788,66 @@ class Frontend:
             return effort
         return cap
 
+    def _probe_effort_aliases(self):
+        """Resolve once which effort each chat template source accepts.
+
+        Returns (tool-less aliases, tool aliases): a dictionary template picks
+        its source by whether tools are passed, and a source shared by both is
+        probed once. Any failure records nothing, so startup never fails here
+        and requests keep the per-request TemplateError retry.
+        """
+        try:
+            tool_less = self.tokenizer.get_chat_template(tools=None)
+            tool = self.tokenizer.get_chat_template(tools=[REASONING_PROBE_TOOL])
+        except Exception:
+            return {}, {}
+        aliases = self._probe_source_aliases(tool_less)
+        if tool == tool_less:
+            return aliases, aliases
+        return aliases, self._probe_source_aliases(tool)
+
+    def _probe_source_aliases(self, source):
+        """Map each effort `source` rejects to the retry effort it renders.
+
+        The retry is the one `_render_template` would pick after a rejection,
+        cap included, so a request renders the same prompt it rendered before.
+        Efforts above the cap are skipped: requests are clamped before here.
+        """
+        aliases = {}
+        for effort in REASONING_EFFORT_ALIASES:
+            retry = self._template_retry_effort(effort)
+            if retry is None or self._clamp_reasoning_effort(effort) != effort:
+                continue
+            if self._probe_render(source, effort) is False and self._probe_render(
+                source, retry
+            ):
+                aliases[effort] = retry
+        return aliases
+
+    def _probe_render(self, source, effort):
+        """True when `source` renders `effort`, False on TemplateError and
+        None on any other error, which proves nothing about the effort."""
+        try:
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": "Hi"}],
+                chat_template=source,
+                tokenize=False,
+                return_dict=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+                reasoning_effort=effort,
+            )
+        except TemplateError:
+            return False
+        except Exception:
+            return None
+        return True
+
     def _render_template(self, messages, template):
+        aliases = self.effort_aliases[template.get("tools") is not None]
+        alias = aliases.get(template.get("reasoning_effort"))
+        if alias is not None:
+            template = {**template, "reasoning_effort": alias}
         try:
             return self.tokenizer.apply_chat_template(messages, **template)
         except TemplateError:
