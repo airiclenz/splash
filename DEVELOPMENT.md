@@ -431,7 +431,9 @@ suspensions, replay tokens and denied memory reservations, each diffed from
 starts a server. `--api-key` defaults to `SPLASH_API_KEY`, `--model` to the
 first model `/v1/models` lists, and `--json` prints the records as JSON. The
 counters are server-wide, so probe an otherwise idle server; a rate whose
-native wall time did not move prints as `unavailable`.
+native wall time did not move prints as `unavailable`. Requests ask for
+`reasoning_effort: none`; a chat template that cannot turn thinking off is
+probed with its default effort instead, with a note on stderr.
 
 For slow tool-bearing requests, the `latency` section of `/status` separates
 preparation, tokenization, grammar preparation, native queueing and TTFT. Grammar preparation

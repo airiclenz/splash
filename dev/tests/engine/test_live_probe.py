@@ -75,8 +75,9 @@ REPEAT_AFTER = snapshot(
 class StubServer:
     """Serve canned `/status` snapshots in order and a fixed chat reply."""
 
-    def __init__(self, statuses):
+    def __init__(self, statuses, refuses_effort=False):
         self.statuses = list(statuses)
+        self.refuses_effort = refuses_effort
         self.status_requests = 0
         self.chat_bodies = []
         self.authorizations = []
@@ -86,9 +87,9 @@ class StubServer:
             def log_message(self, *_arguments):
                 pass
 
-            def reply(self, document):
+            def reply(self, document, status=200):
                 raw = json.dumps(document).encode()
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
@@ -105,7 +106,14 @@ class StubServer:
 
             def do_POST(self):
                 length = int(self.headers["Content-Length"])
-                stub.chat_bodies.append(json.loads(self.rfile.read(length)))
+                body = json.loads(self.rfile.read(length))
+                stub.chat_bodies.append(body)
+                if stub.refuses_effort and "reasoning_effort" in body:
+                    message = (
+                        "chat template does not support the requested thinking mode"
+                    )
+                    self.reply({"error": {"message": message}}, status=400)
+                    return
                 self.reply(
                     {
                         "choices": [{"message": {"content": "1\n2"}}],
@@ -138,8 +146,8 @@ def run_main(arguments):
 
 
 class LiveProbeTests(unittest.TestCase):
-    def probe_json(self, statuses):
-        with StubServer(statuses) as stub:
+    def probe_json(self, statuses, refuses_effort=False):
+        with StubServer(statuses, refuses_effort) as stub:
             code, output = run_main(
                 [
                     "--base-url",
@@ -186,6 +194,30 @@ class LiveProbeTests(unittest.TestCase):
         self.assertEqual(stub.chat_bodies[0], stub.chat_bodies[1])
         self.assertEqual(stub.chat_bodies[0]["model"], MODEL)
         self.assertEqual(set(stub.authorizations), {f"Bearer {API_KEY}"})
+
+    def test_main_templateCannotDisableThinking_probesWithTemplateDefault(self):
+        statuses = [snapshot(), snapshot(), COLD_AFTER, COLD_AFTER, REPEAT_AFTER]
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            stub, document = self.probe_json(statuses, refuses_effort=True)
+
+        self.assertEqual(stub.chat_bodies[0]["reasoning_effort"], "none")
+        self.assertNotIn("reasoning_effort", stub.chat_bodies[1])
+        self.assertEqual(stub.chat_bodies[1], stub.chat_bodies[2])
+        cold, repeat = document["requests"]
+        self.assertEqual(cold["prefill_tokens_per_second"], 2048.0)
+        self.assertEqual(repeat["cache_matched_tokens"], 2040)
+
+    def test_main_otherRefusal_failsWithoutRetry(self):
+        with StubServer([snapshot()], refuses_effort=True) as stub:
+            with (
+                mock.patch.object(probe, "THINKING_MODE_REFUSAL", "no such message"),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                code, _output = run_main(["--base-url", stub.base_url])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(len(stub.chat_bodies), 1)
 
     def test_main_staleSnapshot_isRetriedForAFreshOne(self):
         stale = copy.deepcopy(COLD_AFTER)

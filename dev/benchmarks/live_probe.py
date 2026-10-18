@@ -28,6 +28,8 @@ STATUS_TIMEOUT_SECONDS = 30.0
 MINIMUM_PROMPT_TOKENS = 16
 # Tokens left for the nonce, the closing instruction and the chat template.
 PROMPT_FRAME_TOKENS = 16
+# Substring of the server's 400 for a thinking mode the chat template lacks.
+THINKING_MODE_REFUSAL = "does not support the requested thinking mode"
 STALE_SNAPSHOT_RETRIES = 3
 STALE_RETRY_DELAY_SECONDS = 0.15
 API_KEY_ENVIRONMENT = "SPLASH_API_KEY"
@@ -90,7 +92,14 @@ REPORT_ROWS = (
 
 
 class ProbeError(RuntimeError):
-    """The server refused a request or never produced a fresh `/status`."""
+    """The server refused a request or never produced a fresh `/status`.
+
+    `status` is the HTTP status of a refused request, None otherwise.
+    """
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 class ProbeClient:
@@ -127,7 +136,9 @@ class ProbeClient:
                 raw = response.read()
         except urllib.error.HTTPError as error:
             detail = error.read().decode(errors="replace")[:500]
-            raise ProbeError(f"{method} {path}: HTTP {error.code}: {detail}") from error
+            raise ProbeError(
+                f"{method} {path}: HTTP {error.code}: {detail}", error.code
+            ) from error
         except (urllib.error.URLError, OSError) as error:
             raise ProbeError(f"{method} {path}: {error}") from error
         try:
@@ -242,13 +253,38 @@ def run_probe(client: ProbeClient, model: str, prompt: str, max_tokens, timeout)
     }
     records = []
     for label in ("cold", "repeat"):
-        before = fresh_status(client)
-        started = time.monotonic()
-        reply = client.request("POST", "/v1/chat/completions", body, timeout=timeout)
-        wall_ms = (time.monotonic() - started) * 1000.0
-        after = fresh_status(client)
-        records.append(probe_record(label, before, after, reply, wall_ms))
+        try:
+            records.append(timed_request(client, label, body, timeout))
+        except ProbeError as error:
+            # A template that cannot turn thinking off refuses before any
+            # native work; measure with its default thinking mode instead.
+            if label != "cold" or not refuses_thinking_mode(error):
+                raise
+            del body["reasoning_effort"]
+            print(
+                "live_probe: template cannot disable thinking; "
+                "probing with its default reasoning effort",
+                file=sys.stderr,
+            )
+            records.append(timed_request(client, label, body, timeout))
     return records
+
+
+# ------------------------------------------------------------------------------
+def timed_request(client: ProbeClient, label: str, body: dict, timeout) -> dict:
+    """Send `body` once and return its report row, diffed from `/status`."""
+    before = fresh_status(client)
+    started = time.monotonic()
+    reply = client.request("POST", "/v1/chat/completions", body, timeout=timeout)
+    wall_ms = (time.monotonic() - started) * 1000.0
+    after = fresh_status(client)
+    return probe_record(label, before, after, reply, wall_ms)
+
+
+# ------------------------------------------------------------------------------
+def refuses_thinking_mode(error: ProbeError) -> bool:
+    """True when the server refused the requested thinking mode."""
+    return error.status == 400 and THINKING_MODE_REFUSAL in str(error)
 
 
 # ------------------------------------------------------------------------------
