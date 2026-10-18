@@ -400,6 +400,24 @@ model revision, actual input/output token counts, and cache hits with results.
 Keep cold prefill, cached TTFT and sustained decode separate; a UI token rate
 alone does not measure end-to-end agent performance.
 
+To measure the server you are actually running (for example on the target
+machine), probe it over HTTP instead:
+
+```sh
+.venv/bin/python -m dev.benchmarks.live_probe --base-url http://127.0.0.1:8000 \
+  --prompt-tokens 8192 --max-tokens 256
+```
+
+It sends one cold prompt (a random nonce leads, so nothing is cached) and then
+its exact repeat, and prints per request prefill and decode tok/s, draft
+acceptance, average prefill chunk rows, cache matched tokens, resource
+suspensions, replay tokens and denied memory reservations, each diffed from
+`GET /status` snapshots taken just before and after the request. It never
+starts a server. `--api-key` defaults to `SPLASH_API_KEY`, `--model` to the
+first model `/v1/models` lists, and `--json` prints the records as JSON. The
+counters are server-wide, so probe an otherwise idle server; a rate whose
+native wall time did not move prints as `unavailable`.
+
 For slow tool-bearing requests, the `latency` section of `/status` separates
 preparation, tokenization, grammar preparation, native queueing and TTFT. Grammar preparation
 includes construction, compilation/cache lookup and per-request cloning;

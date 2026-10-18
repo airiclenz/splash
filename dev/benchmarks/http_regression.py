@@ -58,6 +58,52 @@ def prompts(tokenizer, contexts: list[int], samples: int, nonce: str) -> dict:
     return result
 
 
+# ------------------------------------------------------------------------------
+# The cumulative native counters `measure` diffs around one request; `summarize`
+# reads the decode pair from the resulting `native_delta`.
+NATIVE_DELTA_PATHS = tuple(
+    ("metrics", key)
+    for key in (
+        "prefill_wall_ms",
+        "decode_wall_ms",
+        "prefill_input_tokens",
+        "decode_output_tokens",
+        "drafted_tokens",
+        "accepted_draft_tokens",
+    )
+)
+
+
+# ------------------------------------------------------------------------------
+def status_value(snapshot, path) -> float:
+    """Return the number at a nested key path of a `/status` document, or 0.
+
+    A missing key, a non-object on the way, or a non-numeric leaf reads as 0 so
+    a counter an older server does not export diffs to 0 instead of raising.
+    """
+    value = snapshot
+    for key in path:
+        if not isinstance(value, dict):
+            return 0
+        value = value.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return value
+
+
+# ------------------------------------------------------------------------------
+def status_delta(before, after, paths) -> dict:
+    """Diff cumulative `/status` counters between two snapshots.
+
+    `paths` are tuples of nested keys, e.g. ``("metrics", "prefill_wall_ms")``;
+    the result maps each path tuple to ``after - before``, reading an absent
+    counter as 0 on either side. Pure: neither snapshot is modified.
+    """
+    return {
+        path: status_value(after, path) - status_value(before, path) for path in paths
+    }
+
+
 def measure(server, model, content, output_tokens, scenario, context, timeout):
     _, before = smoke.request(server.port, "GET", "/status")
     started = time.monotonic()
@@ -98,15 +144,8 @@ def measure(server, model, content, output_tokens, scenario, context, timeout):
         "active resources leaked",
     )
     delta = {
-        key: after["metrics"][key] - before["metrics"][key]
-        for key in (
-            "prefill_wall_ms",
-            "decode_wall_ms",
-            "prefill_input_tokens",
-            "decode_output_tokens",
-            "drafted_tokens",
-            "accepted_draft_tokens",
-        )
+        path[-1]: value
+        for path, value in status_delta(before, after, NATIVE_DELTA_PATHS).items()
     }
     return {
         "scenario": scenario,

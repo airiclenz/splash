@@ -1,0 +1,259 @@
+import contextlib
+import copy
+import io
+import json
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
+
+from dev.benchmarks import http_regression
+from dev.benchmarks import live_probe as probe
+
+API_KEY = "probe-key"
+MODEL = "incoai/Qwen3.8-27B-Splash"
+
+
+def snapshot(**counters):
+    """Return a `/status` document whose diffed counters are all 0 unless given."""
+    document = {
+        "transport": {"status_stale": False},
+        "metrics": {
+            "prefill_input_tokens": 0,
+            "prefill_wall_ms": 0,
+            "decode_output_tokens": 0,
+            "decode_wall_ms": 0,
+            "drafted_tokens": 0,
+            "accepted_draft_tokens": 0,
+        },
+        "scheduler": {"prefill_rows": 0, "prefill_batches": 0},
+        "cache": {
+            "reused_tokens": 0,
+            "resource_suspensions": 0,
+            "resource_replay_tokens": 0,
+        },
+        "memory_governor": {"denied_reservations": 0},
+    }
+    for path, value in counters.items():
+        section, key = path.split("__")
+        document[section][key] = value
+    return document
+
+
+# Cold: 2048 prompt tokens prefilled in 1000 ms over 4 chunks, 128 decoded in
+# 2000 ms with 100 of 160 drafts accepted, one suspension and its replay.
+COLD_AFTER = snapshot(
+    metrics__prefill_input_tokens=2048,
+    metrics__prefill_wall_ms=1000,
+    metrics__decode_output_tokens=128,
+    metrics__decode_wall_ms=2000,
+    metrics__drafted_tokens=160,
+    metrics__accepted_draft_tokens=100,
+    scheduler__prefill_rows=2048,
+    scheduler__prefill_batches=4,
+    cache__resource_suspensions=1,
+    cache__resource_replay_tokens=512,
+    memory_governor__denied_reservations=2,
+)
+# Repeat: 2040 tokens matched, 8 prefilled in 4 ms in one chunk, 128 decoded.
+REPEAT_AFTER = snapshot(
+    metrics__prefill_input_tokens=2056,
+    metrics__prefill_wall_ms=1004,
+    metrics__decode_output_tokens=256,
+    metrics__decode_wall_ms=3000,
+    metrics__drafted_tokens=320,
+    metrics__accepted_draft_tokens=220,
+    scheduler__prefill_rows=2056,
+    scheduler__prefill_batches=5,
+    cache__reused_tokens=2040,
+    cache__resource_suspensions=1,
+    cache__resource_replay_tokens=512,
+    memory_governor__denied_reservations=2,
+)
+
+
+class StubServer:
+    """Serve canned `/status` snapshots in order and a fixed chat reply."""
+
+    def __init__(self, statuses):
+        self.statuses = list(statuses)
+        self.status_requests = 0
+        self.chat_bodies = []
+        self.authorizations = []
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_arguments):
+                pass
+
+            def reply(self, document):
+                raw = json.dumps(document).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):
+                stub.authorizations.append(self.headers.get("Authorization"))
+                if self.path == "/v1/models":
+                    self.reply({"object": "list", "data": [{"id": MODEL}]})
+                    return
+                index = min(stub.status_requests, len(stub.statuses) - 1)
+                stub.status_requests += 1
+                self.reply(stub.statuses[index])
+
+            def do_POST(self):
+                length = int(self.headers["Content-Length"])
+                stub.chat_bodies.append(json.loads(self.rfile.read(length)))
+                self.reply(
+                    {
+                        "choices": [{"message": {"content": "1\n2"}}],
+                        "usage": {"prompt_tokens": 2048, "completion_tokens": 128},
+                    }
+                )
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exception):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+    @property
+    def base_url(self):
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+
+def run_main(arguments):
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), mock.patch.object(probe.time, "sleep"):
+        code = probe.main(arguments)
+    return code, output.getvalue()
+
+
+class LiveProbeTests(unittest.TestCase):
+    def probe_json(self, statuses):
+        with StubServer(statuses) as stub:
+            code, output = run_main(
+                [
+                    "--base-url",
+                    stub.base_url,
+                    "--api-key",
+                    API_KEY,
+                    "--prompt-tokens",
+                    "64",
+                    "--max-tokens",
+                    "128",
+                    "--json",
+                ]
+            )
+        self.assertEqual(code, 0)
+        return stub, json.loads(output)
+
+    def test_main_coldThenRepeat_reportsRatesFromStatusDiff(self):
+        statuses = [snapshot(), COLD_AFTER, COLD_AFTER, REPEAT_AFTER]
+
+        _stub, document = self.probe_json(statuses)
+
+        cold, repeat = document["requests"]
+        self.assertEqual(document["model"], MODEL)
+        self.assertEqual(cold["prefill_tokens_per_second"], 2048.0)
+        self.assertEqual(cold["decode_tokens_per_second"], 64.0)
+        self.assertEqual(cold["draft_acceptance"], 0.625)
+        self.assertEqual(cold["average_prefill_chunk_rows"], 512.0)
+        self.assertEqual(cold["cache_matched_tokens"], 0)
+        self.assertEqual(cold["resource_suspensions"], 1)
+        self.assertEqual(cold["replay_tokens"], 512)
+        self.assertEqual(cold["denied_reservations"], 2)
+        self.assertEqual(repeat["prefill_tokens_per_second"], 2000.0)
+        self.assertEqual(repeat["decode_tokens_per_second"], 128.0)
+        self.assertEqual(repeat["draft_acceptance"], 0.75)
+        self.assertEqual(repeat["average_prefill_chunk_rows"], 8.0)
+        self.assertEqual(repeat["resource_suspensions"], 0)
+
+    def test_main_repeatRequest_reportsCacheMatch(self):
+        statuses = [snapshot(), COLD_AFTER, COLD_AFTER, REPEAT_AFTER]
+
+        stub, document = self.probe_json(statuses)
+
+        self.assertEqual(document["requests"][1]["cache_matched_tokens"], 2040)
+        self.assertEqual(stub.chat_bodies[0], stub.chat_bodies[1])
+        self.assertEqual(stub.chat_bodies[0]["model"], MODEL)
+        self.assertEqual(set(stub.authorizations), {f"Bearer {API_KEY}"})
+
+    def test_main_staleSnapshot_isRetriedForAFreshOne(self):
+        stale = copy.deepcopy(COLD_AFTER)
+        stale["transport"]["status_stale"] = True
+        stale["metrics"]["prefill_wall_ms"] = 999999
+        statuses = [snapshot(), stale, COLD_AFTER, COLD_AFTER, REPEAT_AFTER]
+
+        _stub, document = self.probe_json(statuses)
+
+        self.assertEqual(document["requests"][0]["prefill_tokens_per_second"], 2048.0)
+
+    def test_main_statusStaysStale_retriesAtMostThreeTimesThenFails(self):
+        stale = snapshot()
+        stale["transport"]["status_stale"] = True
+
+        with StubServer([stale]) as stub:
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                code, _output = run_main(
+                    ["--base-url", stub.base_url, "--model", MODEL]
+                )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stub.status_requests, probe.STALE_SNAPSHOT_RETRIES + 1)
+        self.assertIn("stale", errors.getvalue())
+        self.assertEqual(stub.chat_bodies, [])
+
+    def test_main_zeroWallDelta_reportsRateUnavailable(self):
+        statuses = [snapshot(), snapshot(), snapshot(), REPEAT_AFTER]
+
+        with StubServer(statuses) as stub:
+            code, output = run_main(["--base-url", stub.base_url, "--model", MODEL])
+
+        self.assertEqual(code, 0)
+        prefill_row = next(
+            line for line in output.splitlines() if line.startswith("prefill tok/s")
+        )
+        self.assertEqual(prefill_row.split()[-2], probe.UNAVAILABLE)
+
+    def test_coldPrompt_nonceLeadsAndChangesThePrompt(self):
+        first = probe.cold_prompt(64, 16, "aaaa")
+        second = probe.cold_prompt(64, 16, "bbbb")
+
+        self.assertTrue(first.startswith("aaaa\n"))
+        self.assertNotEqual(first[:4], second[:4])
+        self.assertEqual(first, probe.cold_prompt(64, 16, "aaaa"))
+
+
+class StatusDeltaTests(unittest.TestCase):
+    def test_statusDelta_missingCounters_readAsZero(self):
+        before = {"metrics": {"decode_wall_ms": 5}}
+        after = {"metrics": {"decode_wall_ms": 12, "drafted_tokens": 3}}
+        paths = (
+            ("metrics", "decode_wall_ms"),
+            ("metrics", "drafted_tokens"),
+            ("cache", "resource_suspensions"),
+        )
+
+        delta = http_regression.status_delta(before, after, paths)
+
+        self.assertEqual(
+            delta,
+            {
+                ("metrics", "decode_wall_ms"): 7,
+                ("metrics", "drafted_tokens"): 3,
+                ("cache", "resource_suspensions"): 0,
+            },
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
