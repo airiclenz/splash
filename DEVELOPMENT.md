@@ -102,7 +102,9 @@ a Chat, Responses or Anthropic request above it is silently lowered to it, in
 the order listed above. A default above the cap fails at startup. When the
 template rejects an effort and its fallback alias (for example `high` to
 `xhigh`) would exceed the cap, the template is rendered one effort lower
-instead. A request that names no effort and has no server default keeps the
+instead, unless that lower effort is `none` (cap `minimal` on a template
+that rejects `minimal`): then the template's error is raised again without a
+retry. A request that names no effort and has no server default keeps the
 template's own default, which the cap cannot rank; pair the cap with
 `--default-reasoning-effort` to bound those too.
 
