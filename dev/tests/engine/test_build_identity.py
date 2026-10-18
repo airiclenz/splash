@@ -330,7 +330,11 @@ class CompileConfigurationTests(unittest.TestCase):
             q8_sources = [
                 kernel_root / phase / name
                 for phase in ("prefill", "decode")
-                for name in ("attention_q8.metal", "attention_q8_store.metal")
+                for name in (
+                    "attention_q8.metal",
+                    "attention_q8_sgf.metal",
+                    "attention_q8_store.metal",
+                )
             ]
             removed_source = kernel_root / "shared/removed.metal"
             removed_header = kernel_root / "common/removed.h"
