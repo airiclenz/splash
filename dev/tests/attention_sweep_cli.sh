@@ -34,7 +34,7 @@ for option in --histories --lanes --repeat --shapes --phases --compare-metallib 
         --tile; do
     reject "$option requires a value" "$option"
 done
-reject '--phases takes both, verify or prefill' --phases typo
+reject '--phases takes all, both, verify, prefill or draft' --phases typo
 reject '--tile takes mpp or register' --tile typo
 reject 'unknown option --unknown' --unknown 1
 # Valid values must reach the final sentinel, still without opening Metal.

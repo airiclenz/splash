@@ -6,12 +6,22 @@
 // over deterministic synthetic history. These are kernel
 // timings, not a correctness oracle (the tuning tests are).
 //
+// The draft phase times one DFlash draft pass of the attention core: the
+// split and its reduce for every draft layer of the shape's draft model, over
+// the 2048-token bf16 ring with the history as each lane's cache length. Its
+// pipeline times are per pass (summed over the layers); --kv-format and --tile
+// do not apply to it.
+//
 // usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b]
-//                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
+//                        [--lanes 1,4] [--repeat N]
+//                        [--phases all|both|verify|prefill|draft]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
 //                        [--tile mpp|register]
+// `both` is prefill and verify; `all`, the default, adds draft.
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "model/DFlashDraft.hpp"
+#include "ops/DraftAttention.hpp"
 #include "ops/ExecutionPlans.hpp"
 
 #include <algorithm>
@@ -280,6 +290,136 @@ private:
   std::array<kv::Q8VerifyAttentionParams, kMaximumLanes> attention_{};
 };
 
+// The draft model a target shape speculates with: the 27B draft is the
+// layout's default, the 35B-A3B draft mirrors ModelDescriptor's Qwen3.6 one.
+model::DFlashDraftLayout draftLayout(bool isDense) {
+  model::DFlashDraftLayout layout;
+  if (!isDense) {
+    layout.layers = 6;
+    layout.hiddenSize = 2048;
+    layout.dynamicSize = 512;
+  }
+  return layout;
+}
+
+struct DraftPlan final {
+  DraftAttentionPlan attention;
+  uint32_t layers = 0;
+  uint32_t cacheLength = 0;
+  uint64_t ringBytes = 0;
+  uint64_t bytes = 0;
+
+  [[nodiscard]] DraftAttentionWorkspace workspace() const { return attention.workspace(); }
+};
+
+DraftPlan makeDraftPlan(const model::DFlashDraftLayout &layout, uint32_t lanes,
+                        uint32_t history) {
+  if (!lanes || lanes > kMaximumLanes)
+    throw std::invalid_argument("--lanes must contain values from 1 to 4");
+  if (history > SPLASH_MAXIMUM_CONTEXT_TOKENS)
+    throw std::invalid_argument("history exceeds the draft cache length limit");
+  const DraftAttentionShape shape = layout.attentionShape();
+  DraftPlan plan{DraftAttention::plan(shape, lanes), layout.layers, history,
+                 uint64_t{shape.kvHeads} * SPLASH_DRAFT_SLIDING_WINDOW *
+                     shape.headDimension * 2};
+  const auto workspace = plan.workspace();
+  plan.bytes = aligned(workspace.groupedQueriesBytes) + aligned(workspace.queryKeysBytes) +
+               aligned(workspace.queryValuesBytes) +
+               uint64_t{plan.layers} * lanes * 2 * aligned(plan.ringBytes);
+  return plan;
+}
+
+// One draft pass: per layer, the split and reduce over that layer's rings.
+// The layers share the grouped queries as production does, so each layer
+// attends with the previous layer's output in place of its prepared queries;
+// the kernels' cost does not depend on those values.
+class DraftFixture final {
+public:
+  DraftFixture(metal::MetalBackend &backend, DraftPlan plan)
+      : plan_(std::move(plan)),
+        base_(backend.allocateBuffer(plan_.bytes, metal::BufferStorage::Shared,
+                                     "attention-sweep-draft-fixture")) {
+    const auto workspace = plan_.workspace();
+    uint64_t offset = 0;
+    auto take = [&](uint64_t bytes) {
+      auto buffer = backend.view(base_, offset, bytes);
+      offset += aligned(bytes);
+      return buffer;
+    };
+    groupedQueries_ = take(workspace.groupedQueriesBytes);
+    queryKeys_ = take(workspace.queryKeysBytes);
+    queryValues_ = take(workspace.queryValuesBytes);
+    const uint32_t lanes = plan_.attention.lanes();
+    keys_.resize(plan_.layers);
+    values_.resize(plan_.layers);
+    for (uint32_t layer = 0; layer < plan_.layers; ++layer) {
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        keys_[layer][lane] = take(plan_.ringBytes);
+        values_[layer][lane] = take(plan_.ringBytes);
+      }
+      // Every lane slot is bound; unused lanes alias lane 0.
+      for (uint32_t lane = lanes; lane < kMaximumLanes; ++lane) {
+        keys_[layer][lane] = keys_[layer][0];
+        values_[layer][lane] = values_[layer][0];
+      }
+    }
+    cacheLengths_.fill(plan_.cacheLength);
+    initialize();
+  }
+
+  metal::CommandGraph graph() const {
+    metal::CommandGraph result;
+    for (uint32_t layer = 0; layer < plan_.layers; ++layer)
+      DraftAttention::addDecode(result,
+                                {groupedQueries_, keys_[layer], values_[layer], queryKeys_,
+                                 queryValues_},
+                                cacheLengths_, SPLASH_DRAFT_SLIDING_WINDOW, plan_.attention);
+    return result;
+  }
+
+  bool sameOutput(const DraftFixture &other) const {
+    // The reduce writes the attention output over the grouped query rows.
+    const uint64_t bytes = uint64_t{plan_.attention.lanes()} * SPLASH_DRAFT_QUERY_ROWS *
+                           plan_.attention.shape().attentionSize * 2;
+    return std::memcmp(groupedQueries_.contents(), other.groupedQueries_.contents(), bytes) == 0;
+  }
+
+  uint64_t historyBytes() const {
+    // The live window of both rings, per lane and layer.
+    const uint64_t window = std::min<uint64_t>(plan_.cacheLength, SPLASH_DRAFT_SLIDING_WINDOW - 1);
+    return window * plan_.ringBytes / SPLASH_DRAFT_SLIDING_WINDOW * 2 * plan_.layers *
+           plan_.attention.lanes();
+  }
+
+private:
+  void initialize() {
+    std::memset(base_.contents(), 0, plan_.bytes);
+    const auto fill = [](metal::MetalBuffer buffer, uint32_t seed, float scale) {
+      auto *data = static_cast<uint16_t *>(buffer.contents());
+      const uint64_t count = buffer.sizeBytes() / sizeof(uint16_t);
+      for (uint64_t i = 0; i < count; ++i)
+        data[i] = bf16(float(int((i * 37 + seed * 101 + (i >> 7) * 13) % 255) - 127) * scale);
+    };
+    fill(groupedQueries_, 1, 1.0f / 254.0f);
+    fill(queryKeys_, 2, 0.006f);
+    fill(queryValues_, 3, 0.007f);
+    for (uint32_t layer = 0; layer < plan_.layers; ++layer)
+      for (uint32_t lane = 0; lane < plan_.attention.lanes(); ++lane) {
+        fill(keys_[layer][lane], 4 + layer * 8 + lane, 0.006f);
+        fill(values_[layer][lane], 5 + layer * 8 + lane, 0.007f);
+      }
+  }
+
+  DraftPlan plan_;
+  metal::MetalBuffer base_;
+  metal::MetalBuffer groupedQueries_;
+  metal::MetalBuffer queryKeys_;
+  metal::MetalBuffer queryValues_;
+  std::vector<std::array<metal::MetalBuffer, kMaximumLanes>> keys_;
+  std::vector<std::array<metal::MetalBuffer, kMaximumLanes>> values_;
+  std::array<uint32_t, kMaximumLanes> cacheLengths_{};
+};
+
 struct Case final {
   double fusedMilliseconds = 0.0;
   std::map<std::string, double> pipelineMilliseconds;
@@ -291,13 +431,14 @@ double median(std::vector<double> values) {
   return values[values.size() / 2];
 }
 
+template <typename FixtureType, typename PlanType>
 std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
-                          const Plan &plan, uint32_t repeat) {
-  std::vector<std::unique_ptr<Fixture>> fixtures;
+                          const PlanType &plan, uint32_t repeat) {
+  std::vector<std::unique_ptr<FixtureType>> fixtures;
   std::vector<metal::CommandGraph> graphs;
   std::vector<Case> results(backends.size());
   for (size_t i = 0; i < backends.size(); ++i) {
-    fixtures.push_back(std::make_unique<Fixture>(*backends[i], plan));
+    fixtures.push_back(std::make_unique<FixtureType>(*backends[i], plan));
     graphs.push_back(fixtures.back()->graph());
     results[i].kvBytes = fixtures.back()->historyBytes();
   }
@@ -383,7 +524,7 @@ int main(int argc, const char *argv[]) {
   try {
     if (argc < 2) {
       std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b] "
-                   "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
+                   "[--lanes LIST] [--repeat N] [--phases all|both|verify|prefill|draft] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16] "
                    "[--tile mpp|register]\n";
       return 64;
@@ -394,7 +535,7 @@ int main(int argc, const char *argv[]) {
     uint32_t repeat = 5;
     kv::Format format = kv::Format::Int8;
     VerifyAttentionConfig verifyConfig;
-    std::string comparisonLibrary, phases = "both";
+    std::string comparisonLibrary, phases = "all";
     for (int index = 2; index < argc; index += 2) {
       const std::string option(argv[index]);
       if (index + 1 >= argc)
@@ -422,8 +563,9 @@ int main(int argc, const char *argv[]) {
       }
       else if (option == "--phases") {
         phases = argv[index + 1];
-        if (phases != "both" && phases != "verify" && phases != "prefill")
-          throw std::invalid_argument("--phases takes both, verify or prefill");
+        if (phases != "all" && phases != "both" && phases != "verify" &&
+            phases != "prefill" && phases != "draft")
+          throw std::invalid_argument("--phases takes all, both, verify, prefill or draft");
       }
       else if (option == "--shapes") {
         shapes.clear();
@@ -456,22 +598,40 @@ int main(int argc, const char *argv[]) {
       const AttentionShape geometry = shape == "27b" ? AttentionShape{24, 4, 256, format}
                                                      : AttentionShape{16, 2, 256, format};
       const std::string name = shape == "27b" ? "qwen3.8-27b" : "qwen3.6-35b-a3b";
+      const model::DFlashDraftLayout draft = draftLayout(shape == "27b");
       std::cerr << "\n" << name << "  (" << geometry.queryHeads << " query heads, "
-                << geometry.kvHeads << " KV heads, d=" << geometry.headDimension << ")\n";
+                << geometry.kvHeads << " KV heads, d=" << geometry.headDimension
+                << "; draft " << draft.layers << " layers)\n";
       for (uint32_t history : histories) {
-        auto report = [&](bool prefill, uint32_t lane) {
-          const auto cases = measure(backends, makePlan(geometry, prefill, lane, history, verifyConfig), repeat);
+        auto print = [&](const std::vector<Case> &cases, const std::string &kind,
+                         uint32_t lane) {
           for (size_t i = 0; i < cases.size(); ++i) {
-            std::cout << (firstCase ? "" : ",")
-                      << json(cases[i], name, history, prefill ? "prefill" : "verify", lane, i);
+            std::cout << (firstCase ? "" : ",") << json(cases[i], name, history, kind, lane, i);
             firstCase = false;
-            std::cerr << history << " " << (prefill ? "prefill" : "verify")
-                      << " lanes=" << lane << " variant=" << i << " fused="
-                      << cases[i].fusedMilliseconds << " ms\n";
+            std::cerr << history << " " << kind << " lanes=" << lane << " variant=" << i
+                      << " fused=" << cases[i].fusedMilliseconds << " ms";
+            if (kind == "draft") {
+              // The draft attention cost of one pass: split plus reduce, all layers.
+              double attention = 0.0;
+              for (const auto &[pipeline, milliseconds] : cases[i].pipelineMilliseconds)
+                attention += milliseconds;
+              std::cerr << " split+reduce=" << attention << " ms per pass";
+            }
+            std::cerr << "\n";
           }
         };
-        if (phases != "verify") report(true, 1);
-        if (phases != "prefill") for (uint32_t lane : lanes) report(false, lane);
+        auto report = [&](bool prefill, uint32_t lane) {
+          print(measure<Fixture>(backends, makePlan(geometry, prefill, lane, history, verifyConfig),
+                                 repeat),
+                prefill ? "prefill" : "verify", lane);
+        };
+        const bool isAll = phases == "all", isTarget = isAll || phases == "both";
+        if (isTarget || phases == "prefill") report(true, 1);
+        if (isTarget || phases == "verify") for (uint32_t lane : lanes) report(false, lane);
+        if (isAll || phases == "draft")
+          for (uint32_t lane : lanes)
+            print(measure<DraftFixture>(backends, makeDraftPlan(draft, lane, history), repeat),
+                  "draft", lane);
       }
     }
     std::cout << "]}\n";
