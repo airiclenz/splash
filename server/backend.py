@@ -40,6 +40,9 @@ NATIVE_RECOVERY_GRACE_SECONDS = 2.0
 # Control requests use a short live probe and explicitly label stale snapshots.
 STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
 STATUS_BACKGROUND_TIMEOUT_SECONDS = 30.0
+# /health never probes native; it starts a background refresh once the cached
+# snapshot is this old, so a lone /health poller still sees live state.
+STATUS_HEALTH_MAX_AGE_SECONDS = 1.0
 
 
 # Native memory pressure states under which the service still takes requests.
@@ -419,6 +422,10 @@ class NativeBackend:
         self.status_snapshot_at = None
         self.status_refresh_inflight = False
         self.status_refresh_thread = None
+        # True while the in-flight refresh was started (or joined) by a timed
+        # out probe or a recovering runtime: status() then reads the cache
+        # instead of probing. A /health-started refresh leaves it False.
+        self.should_skip_status_probe = False
         self.status_refresh_failures = 0
         self.status_refresh_after = 0.0
         self.tokenizer_decode_fallbacks = 0
@@ -452,14 +459,20 @@ class NativeBackend:
         Never waits on native: the snapshot is read by reference (it is
         replaced wholesale, never mutated). `ready` mirrors `is_ready` against
         that snapshot; with no snapshot yet, `ready` is false, `memory_pressure`
-        is None, and a background refresh is started for the next probe.
+        is None. With no snapshot, or one at least
+        `STATUS_HEALTH_MAX_AGE_SECONDS` old, a single-flight background refresh
+        is started for the next probe; it never makes `status()` skip its live
+        probe.
         """
         with self.lock:
             snapshot = self.status_snapshot
+            captured_at = self.status_snapshot_at
             closing = self.closing
         if snapshot is None:
-            self._ensure_background_status_refresh()
+            self._ensure_background_status_refresh(should_skip_status_probe=False)
             return {"ready": False, "memory_pressure": None}
+        if time.monotonic() - captured_at >= STATUS_HEALTH_MAX_AGE_SECONDS:
+            self._ensure_background_status_refresh(should_skip_status_probe=False)
         pressure = snapshot.get("memory_pressure")
         metal = snapshot.get("metal")
         ready = (
@@ -511,14 +524,19 @@ class NativeBackend:
             with self.lock:
                 self.status_refresh_inflight = False
                 self.status_refresh_thread = None
+                self.should_skip_status_probe = False
 
-    def _ensure_background_status_refresh(self):
+    def _ensure_background_status_refresh(self, *, should_skip_status_probe=True):
         with self.lock:
-            if (
-                self.closing
-                or self.status_refresh_inflight
-                or time.monotonic() < self.status_refresh_after
-            ):
+            if self.closing:
+                return
+            if self.status_refresh_inflight:
+                # A timed out probe joins a /health-started refresh, so the
+                # next status() reads the cache instead of waiting again.
+                if should_skip_status_probe:
+                    self.should_skip_status_probe = True
+                return
+            if time.monotonic() < self.status_refresh_after:
                 return
             thread = threading.Thread(
                 target=self._background_status_refresh,
@@ -527,11 +545,13 @@ class NativeBackend:
             )
             self.status_refresh_inflight = True
             self.status_refresh_thread = thread
+            self.should_skip_status_probe = should_skip_status_probe
             try:
                 thread.start()
             except BaseException:
                 self.status_refresh_inflight = False
                 self.status_refresh_thread = None
+                self.should_skip_status_probe = False
                 raise
 
     def status(self, timeout=STATUS_REFRESH_TIMEOUT_SECONDS):
@@ -539,7 +559,9 @@ class NativeBackend:
         stale_age_ms = None
         with self.lock:
             refresh_pending = (
-                self.status_refresh_inflight and self.status_snapshot is not None
+                self.status_refresh_inflight
+                and self.should_skip_status_probe
+                and self.status_snapshot is not None
             )
         try:
             if refresh_pending:

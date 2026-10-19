@@ -174,6 +174,26 @@ class FakeRuntime:
                 call.complete(error=runtime.RuntimeClosed("runtime is closed"))
 
 
+def hold_background_status(native, release):
+    """Hold `native`'s background status refresh until `release` is set.
+
+    Live probes (any other timeout) pass straight through. Returns an event set
+    once the background refresh has reached the runtime.
+    """
+    status = native.status
+    entered = threading.Event()
+
+    def held_status(timeout=5.0):
+        if timeout == backend_api.STATUS_BACKGROUND_TIMEOUT_SECONDS:
+            entered.set()
+            if not release.wait(2.0):
+                raise TimeoutError("test did not release the background status")
+        return status(timeout=timeout)
+
+    native.status = held_status
+    return entered
+
+
 def make_job(request_id=101, *, constraint=None, temperature=0.0):
     return backend_api.Job(
         request_id=request_id,
@@ -909,6 +929,100 @@ class NativeBackendContractTests(unittest.TestCase):
             self.assertTrue(refreshed.wait(1.0))
             transport.close()
         self.assertFalse(transport.finalizer.is_alive())
+
+    def finish_status_refresh(self, transport):
+        with transport.lock:
+            thread = transport.status_refresh_thread
+        if thread is not None:
+            thread.join(1.0)
+        self.assertFalse(transport.status_refresh_inflight)
+
+    def hold_health_refresh(self, transport, native):
+        """Start a /health refresh on an aged snapshot and hold it in flight."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        entered = hold_background_status(native, release)
+        transport.status_snapshot_at -= backend_api.STATUS_HEALTH_MAX_AGE_SECONDS
+        health = transport.health()
+        self.assertTrue(entered.wait(1.0))
+        return health
+
+    def test_health_refreshes_a_snapshot_once_it_reaches_the_max_age(self):
+        transport, native = self.make_transport()
+        clock = [1024.0]
+        with mock.patch.object(backend_api.time, "monotonic", new=lambda: clock[0]):
+            transport.status()
+            native.status_event = wire.StatusJsonEvent(
+                1,
+                wire.STATUS_SCHEMA_VERSION,
+                b'{"schema_version":5,"ready":true,"memory_pressure":"warning",'
+                b'"metal":{"healthy":false}}',
+            )
+            clock[0] += backend_api.STATUS_HEALTH_MAX_AGE_SECONDS
+
+            aged = transport.health()
+            self.finish_status_refresh(transport)
+            refreshed = transport.health()
+
+        self.assertEqual(aged, {"ready": True, "memory_pressure": "normal"})
+        self.assertEqual(native.status_calls, 2)
+        self.assertEqual(refreshed, {"ready": False, "memory_pressure": "warning"})
+
+    def test_health_starts_one_refresh_per_interval_however_often_it_polls(self):
+        transport, native = self.make_transport()
+        start = 1024.0
+        clock = [start]
+        polls_per_interval = 64
+        with mock.patch.object(backend_api.time, "monotonic", new=lambda: clock[0]):
+            transport.status()
+
+            for poll in range(2 * polls_per_interval):
+                clock[0] = start + backend_api.STATUS_HEALTH_MAX_AGE_SECONDS * (
+                    1 + poll / polls_per_interval
+                )
+                transport.health()
+                self.finish_status_refresh(transport)
+
+        # One startup probe, then one refresh for each of the two intervals.
+        self.assertEqual(native.status_calls, 3)
+
+    def test_health_returns_without_waiting_on_the_runtime(self):
+        transport, native = self.make_transport()
+        transport.status()
+
+        health = self.hold_health_refresh(transport, native)
+
+        self.assertEqual(health, {"ready": True, "memory_pressure": "normal"})
+        self.assertTrue(transport.status_refresh_inflight)
+
+    def test_health_refresh_leaves_the_status_probe_live(self):
+        transport, native = self.make_transport()
+        transport.status()
+        self.hold_health_refresh(transport, native)
+        calls = native.status_calls
+
+        status = transport.status()
+
+        self.assertEqual(native.status_calls, calls + 1)
+        self.assertTrue(status["ready"])
+        self.assertFalse(status["transport"]["status_stale"])
+        self.assertTrue(transport.is_ready())
+
+    def test_status_timeout_during_a_health_refresh_skips_the_next_probe(self):
+        transport, native = self.make_transport()
+        transport.status()
+        self.hold_health_refresh(transport, native)
+        native.mode = "status_timeout"
+        self.assertTrue(transport.status(timeout=0.01)["transport"]["status_stale"])
+        calls = native.status_calls
+
+        stale = transport.status()
+
+        self.assertEqual(native.status_calls, calls)
+        self.assertFalse(stale["ready"])
+        self.assertEqual(
+            stale["transport"]["error"], "native status refresh is pending"
+        )
 
     def test_runtime_errors_map_to_stable_http_statuses(self):
         cases = (

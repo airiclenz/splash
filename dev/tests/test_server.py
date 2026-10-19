@@ -2836,10 +2836,14 @@ class ServerTest(unittest.TestCase):
         harness = self.harness(runtime)
         self.assertEqual(harness.request("GET", "/ready")[0], 200)
         runtime.status = mock.Mock(side_effect=AssertionError("native status call"))
+        # Freeze the clock at the snapshot's capture so it never ages past
+        # the /health refresh threshold, however slow the run.
+        captured_at = harness.backend.status_snapshot_at
 
-        status, _, payload = harness.request("GET", "/health")
-        runtime.ready = False
-        _, _, recovering = harness.request("GET", "/health")
+        with mock.patch.object(backend_api.time, "monotonic", new=lambda: captured_at):
+            status, _, payload = harness.request("GET", "/health")
+            runtime.ready = False
+            _, _, recovering = harness.request("GET", "/health")
 
         runtime.status.assert_not_called()
         self.assertEqual(
@@ -2863,6 +2867,33 @@ class ServerTest(unittest.TestCase):
                 "memory_pressure": "normal",
             },
         )
+
+    def test_health_poller_leaves_ready_status_and_metrics_live(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        self.assertEqual(harness.request("GET", "/ready")[0], 200)
+        release = threading.Event()
+        entered = native_fakes.hold_background_status(runtime, release)
+        try:
+            for _ in range(3):
+                # Each poll finds a snapshot a full interval old, as a 1 Hz
+                # poller does between the other probes' live refreshes.
+                harness.backend.status_snapshot_at -= (
+                    backend_api.STATUS_HEALTH_MAX_AGE_SECONDS
+                )
+                self.assertEqual(harness.request("GET", "/health")[0], 200)
+                self.assertTrue(entered.wait(1.0))
+
+                ready = harness.request("GET", "/ready")[0]
+                status = json.loads(harness.request("GET", "/status")[2])
+                metrics = harness.request("GET", "/metrics")[2].decode()
+
+                self.assertEqual(ready, 200)
+                self.assertTrue(status["ready"])
+                self.assertFalse(status["transport"]["status_stale"])
+                self.assertIn("splash_ready 1", metrics.splitlines())
+        finally:
+            release.set()
 
     def test_health_is_not_ready_when_metal_is_unhealthy(self):
         for metal in ({"healthy": False}, None):

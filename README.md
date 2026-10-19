@@ -75,7 +75,9 @@ lowers any request above it to that effort.
 `GET /health` always answers 200 and names the served model, for example
 `{"status":"ok","model":"incoai/Qwen3.8-27B-Splash","ready":true,"memory_pressure":"normal"}`.
 `ready` and `memory_pressure` come from the last status snapshot: `false` and
-`null` until the first one arrives. `/ready` answers 503 while requests would be refused.
+`null` until the first one arrives. `/health` never waits on the engine; a snapshot a
+second old is refreshed in the background for the next poll. `/ready` answers 503 while
+requests would be refused.
 
 `/v1/judgments` and `/v1/systemone` provide scoring without generation.
 See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
