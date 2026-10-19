@@ -58,6 +58,17 @@ MAX_PROTOCOL_U64 = (1 << 64) - 1
 DEFAULT_REASONING_LOOP_LIMIT = 24
 
 
+# A rebuilt incremental decoder is primed with at most this many ids, and at
+# most this many held ids are re-stepped, so one recovery costs O(16) steps.
+DECODE_RECOVERY_WINDOW = 16
+
+
+def _is_invalid_prefix(error):
+    # tokenizers raises a plain Exception with this message when an
+    # incremental decode cannot continue.
+    return str(error).startswith("Invalid prefix encountered")
+
+
 def remaining_request_time(deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -143,6 +154,11 @@ class CallbackStreamer:
     With `thinking` set, stop sequences match only the content after the
     think-end text: the reasoning before it, and the think-end text itself,
     are sent unmatched.
+
+    When the incremental decoder rejects a token, a fresh one is rebuilt from
+    a bounded window of recent ids so streaming, stops and the guard continue
+    (`decode_fallbacks` counts these); if that fails too, `end()` reconciles
+    the rest of the reply from a whole-sequence decode.
     """
 
     def __init__(
@@ -163,6 +179,10 @@ class CallbackStreamer:
             DecodeStream(skip_special_tokens=True) if self.backend is not None else None
         )
         self.token_ids = []
+        # Length of the `token_ids` prefix up to the last token whose decoder
+        # step returned text; the ids after it are held by the decoder.
+        self.decoded_through = 0
+        self.decode_fallbacks = 0
         self.emitted = []
         self.pending_text = ""
         self.stop_sequence = None
@@ -263,13 +283,15 @@ class CallbackStreamer:
             try:
                 text = self.decode_stream.step(self.backend, token_id)
             except Exception as error:
-                # tokenizers raises a plain Exception with this message when an
-                # incremental decode cannot continue; fall back to decoding the
-                # whole sequence at the end.
-                if not str(error).startswith("Invalid prefix encountered"):
+                if not _is_invalid_prefix(error):
                     raise
-                self.decode_stream = None
-                continue
+                self.decode_fallbacks += 1
+                text = self._recover_decode_stream()
+                if self.decode_stream is None:
+                    continue
+            else:
+                if text:
+                    self.decoded_through = len(self.token_ids)
             if not text and not is_think_end:
                 continue
             # The think-end token's step closes the reasoning even when its
@@ -280,6 +302,42 @@ class CallbackStreamer:
             if guard is not None and guard.feed(text):
                 self._trip_reasoning_loop()
                 break
+
+    def _recover_decode_stream(self):
+        """Rebuild the incremental decoder after it rejected the last token.
+
+        Primes a fresh `DecodeStream` with at most `DECODE_RECOVERY_WINDOW` ids
+        ending at the last token whose step returned text, then re-steps every
+        later id: the tokens the old decoder held (a partial UTF-8 character)
+        and the rejected one. None of them returned text before, so the
+        re-stepped text is new and is returned for one `_emit`. When more ids
+        are held than the window, or the rebuilt decoder rejects them too, the
+        decoder is dropped and `end()` reconciles the rest of the reply.
+        """
+        start = self.decoded_through
+        held = self.token_ids[start:]
+        self.decode_stream = None
+        if len(held) > DECODE_RECOVERY_WINDOW:
+            return ""
+        stream = DecodeStream(
+            ids=self.token_ids[max(0, start - DECODE_RECOVERY_WINDOW) : start],
+            skip_special_tokens=True,
+        )
+        parts = []
+        through = start
+        try:
+            for position, token_id in enumerate(held, start + 1):
+                text = stream.step(self.backend, token_id)
+                if text:
+                    parts.append(text)
+                    through = position
+        except Exception as error:
+            if not _is_invalid_prefix(error):
+                raise
+            return ""
+        self.decode_stream = stream
+        self.decoded_through = through
+        return "".join(parts)
 
     def end(self):
         if self.stop_sequence is not None:
@@ -363,6 +421,7 @@ class NativeBackend:
         self.status_refresh_thread = None
         self.status_refresh_failures = 0
         self.status_refresh_after = 0.0
+        self.tokenizer_decode_fallbacks = 0
         self.terminals = queue.Queue()
         self.finalizer = threading.Thread(
             target=self._finalize_loop,
@@ -511,6 +570,8 @@ class NativeBackend:
             snapshot = dict(snapshot)
         with self.lock:
             transport_ready = not self.closing and self.runtime.ready
+            decode_fallbacks = self.tokenizer_decode_fallbacks
+        snapshot["tokenizer"] = {"decode_fallbacks": decode_fallbacks}
         snapshot["transport"] = {
             "ready": transport_ready,
             "recovering": not self.closing and not transport_ready,
@@ -833,8 +894,10 @@ class NativeBackend:
         except Exception as unexpected:
             error = self._api_error(unexpected)
         finally:
+            decode_fallbacks = state.streamer.decode_fallbacks
             with self.lock:
                 shutdown_requested = state.shutdown_requested
+                self.tokenizer_decode_fallbacks += decode_fallbacks
                 self._detach_locked(state)
         if shutdown_requested:
             # Once close() has claimed an active HTTP request, its public
@@ -845,6 +908,8 @@ class NativeBackend:
             error = APIError(503, "server is shutting down", "server_shutdown")
         if state.streamer.reasoning_loop_tripped:
             self._warn_reasoning_loop(job)
+        if decode_fallbacks:
+            self._warn_decode_fallback(job, decode_fallbacks)
         self._record(job, result=result, error=error)
         job.events.put(("error", error) if error else ("done", result))
 
@@ -899,6 +964,16 @@ class NativeBackend:
         except Exception:
             # A closed console must not stop the finalizer thread, the same
             # rule `_record` follows for the request logger.
+            pass
+
+    def _warn_decode_fallback(self, job, fallbacks):
+        try:
+            print_status(
+                f"Warning · tokenizer decode fallback · request {job.request_id} · "
+                f"{fallbacks} incremental decode failures"
+            )
+        except Exception:
+            # A closed console must not stop the finalizer thread.
             pass
 
     def _record(self, job, result=None, error=None):

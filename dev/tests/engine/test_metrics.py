@@ -133,6 +133,18 @@ splash_host_available_bytes 8589934592
 """
 
 
+class TokenizerMetricsTests(unittest.TestCase):
+    def test_decode_fallbacks_render_as_a_counter(self):
+        lines = prometheus_metrics({"tokenizer": {"decode_fallbacks": 3}}).splitlines()
+
+        self.assertIn("splash_tokenizer_decode_fallbacks_total 3", lines)
+
+    def test_missing_tokenizer_status_renders_no_counter(self):
+        self.assertNotIn(
+            "splash_tokenizer_decode_fallbacks_total", prometheus_metrics({})
+        )
+
+
 class StatusMetricsRenderingTests(unittest.TestCase):
     def test_fixture_renders_exactly_as_before(self):
         self.assertEqual(prometheus_metrics(FIXTURE_STATUS), FIXTURE_RENDERING)

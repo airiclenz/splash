@@ -33,6 +33,7 @@ _STATUS_METRICS = {
     "splash_ready": ("ready",),
     "splash_metal_healthy": ("metal", "healthy"),
     "splash_transport_pending": ("transport", "pending"),
+    "splash_tokenizer_decode_fallbacks_total": ("tokenizer", "decode_fallbacks"),
     "splash_frontend_active": ("frontend", "active"),
     "splash_frontend_waiting": ("frontend", "waiting"),
     "splash_requests_submitted_total": ("requests", "submitted"),

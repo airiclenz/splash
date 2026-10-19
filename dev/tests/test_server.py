@@ -19,7 +19,9 @@ from unittest import mock
 
 from openai import OpenAI
 from tokenizers import Tokenizer, decoders, models
+from tokenizers.decoders import DecodeStream
 
+from dev.tests.engine import test_native_backend as native_fakes
 from server import api_shapes, diagnostics, judgments, tool_schema
 from server import backend as backend_api
 from server import constraints as generation_constraints
@@ -204,6 +206,7 @@ class PassthroughStreamer:
         self.callback = callback
         self.stop_sequence = None
         self.reasoning_loop_tripped = False
+        self.decode_fallbacks = 0
 
     def put_tokens(self, token_ids):
         text = self.tokenizer.decode(token_ids)
@@ -229,6 +232,27 @@ class SeededRandomChunkStreamer(PassthroughStreamer):
             length = self.random.randint(1, 4)
             self.callback(text[:length])
             text = text[length:]
+
+
+class FailingDecodeStream:
+    """A real incremental decoder whose step number `fail_at` raises."""
+
+    def __init__(self, fail_at, ids=None, skip_special_tokens=True):
+        self.stream = DecodeStream(ids=ids, skip_special_tokens=skip_special_tokens)
+        self.steps = 0
+        self.fail_at = fail_at
+
+    def step(self, backend, token_id):
+        self.steps += 1
+        if self.steps == self.fail_at:
+            raise Exception("Invalid prefix encountered")
+        return self.stream.step(backend, token_id)
+
+
+def rejecting_decode_stream(**_kwargs):
+    return SimpleNamespace(
+        step=mock.Mock(side_effect=Exception("Invalid prefix encountered"))
+    )
 
 
 class ByteLevelTestTokenizer:
@@ -879,9 +903,152 @@ class ServerTest(unittest.TestCase):
             step=mock.Mock(side_effect=ValueError("Invalid prefix encountered"))
         )
         streamer.put_tokens(tokenizer.token_ids)
-        self.assertEqual(chunks, [])
+        streamed = "".join(chunks)
         streamer.end()
-        self.assertEqual("".join(chunks), tokenizer.decode(tokenizer.token_ids))
+
+        decoded = tokenizer.decode(tokenizer.token_ids)
+        self.assertEqual(streamed, decoded)
+        self.assertEqual("".join(chunks), decoded)
+        self.assertEqual(streamer.decode_fallbacks, 1)
+
+    def test_callback_streamer_keeps_stopping_after_a_decode_fallback(self):
+        tokenizer = FakeTokenizer()
+        chunks = []
+        stopped = []
+        streamer = backend_api.CallbackStreamer(
+            tokenizer, chunks.append, ("plain",), lambda: stopped.append(True)
+        )
+        streamer.decode_stream = FailingDecodeStream(2)
+
+        streamer.put_tokens([1, 14, 15, 4, 27])
+
+        self.assertEqual(
+            ("".join(chunks), stopped, streamer.stop_sequence),
+            ("because first second\n", [True], "plain"),
+        )
+        self.assertEqual(len(streamer.token_ids), 4)
+        self.assertEqual(streamer.decode_fallbacks, 1)
+
+    def test_callback_streamer_feeds_the_loop_guard_after_a_decode_fallback(self):
+        tokenizer = ByteLevelTestTokenizer(
+            [b"Let me think.\n", b"I should check the file again.\n", b"</think>"]
+        )
+        think, repeated, think_end = tokenizer.token_ids
+        tokenizer.convert_tokens_to_ids = lambda token: (
+            think_end if token == "</think>" else None
+        )
+        token_ids = [think, *([repeated] * 10)]
+        tripped_at = []
+        for decode_stream in (None, FailingDecodeStream(3)):
+            stopped = []
+            streamer = backend_api.CallbackStreamer(
+                tokenizer, [].append, (), lambda: stopped.append(True), 4, True
+            )
+            if decode_stream is not None:
+                streamer.decode_stream = decode_stream
+
+            streamer.put_tokens(token_ids)
+
+            self.assertTrue(streamer.reasoning_loop_tripped)
+            self.assertEqual(stopped, [True])
+            tripped_at.append(len(streamer.token_ids))
+        self.assertEqual(tripped_at[0], tripped_at[1])
+        self.assertLess(tripped_at[1], len(token_ids))
+
+    def test_callback_streamer_reconciles_when_the_rebuilt_decoder_fails(self):
+        tokenizer = ByteLevelTestTokenizer([b"alpha ", b"beta ", b"<STOP>", b"tail"])
+        chunks = []
+        streamer = backend_api.CallbackStreamer(tokenizer, chunks.append, ("<STOP>",))
+        streamer.decode_stream = FailingDecodeStream(2)
+
+        with mock.patch.object(backend_api, "DecodeStream", rejecting_decode_stream):
+            streamer.put_tokens(tokenizer.token_ids)
+        streamed = "".join(chunks)
+        streamer.end()
+
+        self.assertEqual(streamed, "alpha ")
+        self.assertIsNone(streamer.decode_stream)
+        self.assertEqual(
+            ("".join(chunks), streamer.stop_sequence), ("alpha beta ", "<STOP>")
+        )
+
+    def test_callback_streamer_fallback_after_a_held_byte_emits_no_duplicate(self):
+        tokenizer = ByteLevelTestTokenizer([b"ab", b"\xe4", b"\xb8\xad", b"cd"])
+        chunks = []
+        streamer = backend_api.CallbackStreamer(tokenizer, chunks.append)
+        streamer.decode_stream = FailingDecodeStream(3)
+
+        streamer.put_tokens(tokenizer.token_ids)
+        streamed = list(chunks)
+        streamer.end()
+
+        self.assertEqual(streamed, ["ab", "中", "cd"])
+        self.assertEqual("".join(chunks), "ab中cd")
+
+    def test_callback_streamer_fallback_text_spanning_think_end_feeds_the_gate_once(
+        self,
+    ):
+        tokenizer = ByteLevelTestTokenizer(
+            [b"because second ", b"</thi", b"nk>\xe4", b"\xb8\xad second", b" tail"]
+        )
+        chunks = []
+        stopped = []
+        streamer = backend_api.CallbackStreamer(
+            tokenizer, chunks.append, ("second",), lambda: stopped.append(True), 0, True
+        )
+        streamer.decode_stream = FailingDecodeStream(4)
+
+        streamer.put_tokens(tokenizer.token_ids)
+        streamed = ("".join(chunks), list(stopped))
+        streamer.end()
+
+        self.assertEqual(streamed, ("because second </think>中 ", [True]))
+        self.assertEqual(
+            ("".join(chunks), stopped, streamer.stop_sequence),
+            ("because second </think>中 ", [True], "second"),
+        )
+
+    def test_native_backend_counts_and_logs_decode_fallbacks_once_per_request(self):
+        # Every decoder rejects its second step, so each token after the first
+        # forces a fallback whose rebuilt decoder accepts it.
+        tokenizer = ByteLevelTestTokenizer([b"alpha ", b"beta ", b"gamma"])
+        fake_runtime = native_fakes.FakeRuntime()
+        backend = backend_api.NativeBackend(fake_runtime, tokenizer)
+        self.addCleanup(backend.close)
+        job = native_fakes.make_job()
+        chunks = []
+
+        with (
+            mock.patch.object(
+                backend_api,
+                "DecodeStream",
+                lambda **kwargs: FailingDecodeStream(2, **kwargs),
+            ),
+            mock.patch.object(backend_api, "print_status") as print_status,
+        ):
+            self.assertTrue(backend.submit(job))
+            call = fake_runtime.calls[0]
+            call.emit(
+                native_wire.TokensEvent(call.request_id, 0, tuple(tokenizer.token_ids))
+            )
+            call.complete(
+                result=native_fakes.success_result(call, tokens=tokenizer.token_ids)
+            )
+            while True:
+                kind, payload = job.events.get(timeout=1.0)
+                if kind in ("done", "error"):
+                    break
+                chunks.append(payload)
+
+        warnings = [
+            entry.args[0]
+            for entry in print_status.call_args_list
+            if "decode fallback" in entry.args[0]
+        ]
+        self.assertEqual(kind, "done")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(f"request {job.request_id}", warnings[0])
+        self.assertEqual(backend.status()["tokenizer"], {"decode_fallbacks": 2})
 
     def test_callback_streamer_stops_across_token_boundaries(self):
         tokenizer = ByteLevelTestTokenizer([b"alpha <ST", b"OP>hidden", b" trailing"])
