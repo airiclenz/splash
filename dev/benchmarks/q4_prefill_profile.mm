@@ -1,5 +1,6 @@
 #include "../../runtime/metal/MetalBackend.hpp"
 #include "metal/abi/Linear.h"
+#include "metal/abi/MoE.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -246,6 +247,61 @@ void profileRmsSums(MetalBackend &backend, uint32_t rows, uint32_t width,
             << " speedup=" << separate / fusedMilliseconds << '\n';
 }
 
+// The MoE router scores at the 35B-A3B shape (hidden 2048, 256 experts,
+// top 8): both score tiles over the same synthetic q8 router, whose weights,
+// scales and biases sit per quant group as (group * 256 + expert) [* 64].
+// The samples alternate the tiles so drift lands on both alike.
+void profileRouter(MetalBackend &backend, uint32_t rows) {
+  constexpr uint32_t kHidden = 2048;
+  constexpr uint32_t kExperts = 256;
+  constexpr uint32_t kTopK = 8;
+  const uint64_t parameterElements =
+      uint64_t{kHidden / kQuantGroup} * kExperts;
+  MetalBuffer input = shared(backend, uint64_t{rows} * kHidden * sizeof(__bf16),
+                             "router input");
+  MetalBuffer weights =
+      shared(backend, parameterElements * kQuantGroup, "router weights");
+  MetalBuffer scales = shared(backend, parameterElements * sizeof(__bf16),
+                              "router scales");
+  MetalBuffer biases = shared(backend, parameterElements * sizeof(__bf16),
+                              "router biases");
+  MetalBuffer scores = shared(
+      backend, uint64_t{rows} * kExperts * sizeof(__bf16), "router scores");
+  std::memset(input.contents(), 0x3c, input.sizeBytes());
+  std::memset(weights.contents(), 0x5a, weights.sizeBytes());
+  std::memset(scales.contents(), 0x3c, scales.sizeBytes());
+  std::memset(biases.contents(), 0x3c, biases.sizeBytes());
+  const MoeRouteParams params{rows, kHidden, kExperts, kTopK};
+
+  // Rows x experts per threadgroup, as MoE::add dispatches each tile.
+  const auto route = [&](const std::string &pipeline, uint32_t tileRows,
+                         uint32_t tileExperts) {
+    return ComputeDispatch{pipeline,
+                           {{0, input}, {1, weights}, {2, scales},
+                            {3, biases}, {4, scores}},
+                           {{5, &params, sizeof(params)}},
+                           {(rows + tileRows - 1) / tileRows,
+                            kExperts / tileExperts, 1},
+                           {256, 1, 1}};
+  };
+  const ComputeDispatch narrow = route("moe_route_scores_q8_m8", 8, 32);
+  const ComputeDispatch wide = route("moe_route_scores_q8_m32", 32, 128);
+  for (uint32_t warmup = 0; warmup < 2; ++warmup) {
+    static_cast<void>(backend.submit(narrow));
+    static_cast<void>(backend.submit(wide));
+  }
+  std::vector<double> narrowSamples;
+  std::vector<double> wideSamples;
+  for (uint32_t repeat = 0; repeat < 7; ++repeat) {
+    narrowSamples.push_back(backend.submit(narrow).gpuSeconds * 1000.0);
+    wideSamples.push_back(backend.submit(wide).gpuSeconds * 1000.0);
+  }
+  std::cout << "moe_route_scores_q8_m8 rows=" << rows
+            << " router_ms=" << median(narrowSamples) << '\n'
+            << "moe_route_scores_q8_m32 rows=" << rows
+            << " router_ms=" << median(wideSamples) << '\n';
+}
+
 void run(const std::string &metallibPath) {
   MetalBackend backend(metallibPath);
   constexpr std::array<uint32_t, 13> kProfileRows{
@@ -340,6 +396,9 @@ void run(const std::string &metallibPath) {
     profileRmsSums(backend, rows, 5120, 32, "prefill_linear_q4_sums32",
                    "prefill_norm_rms_sums32", "rms_sums_m32");
   }
+  // Batch 1 verifies eight rows; the prefill chunks use the profile rows.
+  profileRouter(backend, 8);
+  for (uint32_t rows : kProfileRows) profileRouter(backend, rows);
 }
 
 } // namespace
