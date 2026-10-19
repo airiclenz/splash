@@ -973,9 +973,10 @@ bool Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
   const CacheReclaimResult reused =
       cache_.reclaimOneForGrowth(CacheReclaimMode::ReuseBacking);
   if (reused.madeProgress) {
-    // An evicted state parks its buffers in the model's pool; under pressure
-    // that memory goes back to the host now rather than waiting for the
-    // next background pass.
+    // An evicted state parks its buffers in the model's pool (only a lane's
+    // own retired checkpoint refills that lane's reserve instead); under
+    // pressure that memory goes back to the host now rather than waiting for
+    // the next background pass.
     while (model_.reclaimIdleState()) {
     }
     signalResourceProgress();
@@ -1072,7 +1073,8 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
   released += cache_.reclaimCache(remaining, directive.evictAllUnpinnedPrefixes,
                                  directive.keepResumePoint,
                                  reclaimKeptKvRunway_);
-  // Evicted states park their buffers in the model's pool; a pressure pass
+  // Evicted states park their buffers in the model's pool (only a lane's own
+  // retired checkpoint refills that lane's reserve instead); a pressure pass
   // returns that memory to the host now rather than keeping it warm.
   while (model_.reclaimIdleState()) {
   }

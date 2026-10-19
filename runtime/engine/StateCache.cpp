@@ -210,6 +210,8 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
   if (found == entries_.end() || found->second.pins)
     return {};
   const uint64_t reclaimed = found->second.state->bytes();
+  if (retirement)
+    found->second.state->markRetired();
   removeEvictable(kvBlock);
   if (found->second.checkpoint) {
     --checkpointEntries_;

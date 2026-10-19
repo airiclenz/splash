@@ -539,9 +539,11 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   executor.end(request.id);
 
   // Free only pooled state, keeping the image cache. A cache-only request
-  // must fit a fresh state cell without recreating the reclaimed encoder.
+  // must fit a fresh state cell and its checkpoint reserve without recreating
+  // the reclaimed encoder.
   static_cast<void>(states.releaseIdle(0, 0));
-  const uint64_t stateBytes = model.stateLayout().activeCellBytes();
+  const uint64_t stateBytes = model.stateLayout().activeCellBytes() +
+                              model.stateLayout().cachedBytes();
   require(stateBytes < encoderBytes, "image budget fixture cannot deny the encoder");
   const uint64_t beforeReuse = backend.memoryStats().allocatedBytes;
   request.id = 96;
@@ -816,7 +818,7 @@ int main(int argc, char **argv) {
         model.targetActualAllocatedBytes(),
         model.draft.actualAllocatedBytes,
         model.vision.actualAllocatedBytes,
-        model.stateLayout().activeCellBytes(),
+        executorPlan.activeStateCellPlannedAllocatedBytes,
         executorPlan.sharedPrefillPlannedAllocatedBytes,
         executorPlan.sharedDecodePlannedAllocatedBytes,
         executorPlan.pipelineReserveBytes,

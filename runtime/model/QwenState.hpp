@@ -99,9 +99,31 @@ struct QwenBufferPool final {
   bool open = true;
 };
 
+// The checkpoint quantum a live lane holds outside the pool: one cache slot
+// that the lane's next snapshot takes before the pool or the governor, so a
+// lane admitted under pressure can still publish its recovery point. Idle
+// reclaim never sees it. Only the lane's own retired checkpoint refills it;
+// slot release returns what is left to the pool.
+struct QwenSlotReserve final {
+  // Owner of the live slot; zero while the slot is unassigned.
+  uint64_t requestId = 0;
+  QwenCacheSlot buffers;
+};
+
+using QwenSlotReserves =
+    std::array<QwenSlotReserve, ExecutionLimits::maximumBatchWidth>;
+
+// The live slot that produced a cached state.
+struct QwenStateOrigin final {
+  uint32_t slot = 0;
+  uint64_t requestId = 0;
+};
+
 // An immutable composite snapshot owns a private copy of the state that
 // cannot be recovered from sealed Q8 pages. No mutating buffers are exposed
-// after construction; its buffers return to the pool when it is dropped.
+// after construction. When it is dropped, each non-null buffer returns to its
+// origin: the producing slot's reserve when the state was retired while that
+// slot is still live and its reserve is short, otherwise the shared pool.
 class QwenCompositeState final : public CompositeState {
 public:
   ~QwenCompositeState() override;
@@ -111,15 +133,22 @@ public:
   [[nodiscard]] uint64_t bytes() const noexcept override {
     return layout_.cachedBytes();
   }
+  void markRetired() const noexcept override { retired_ = true; }
 
 private:
-  QwenCompositeState(std::shared_ptr<QwenBufferPool> pool, QwenCacheSlot slot,
+  QwenCompositeState(std::shared_ptr<QwenBufferPool> pool,
+                     std::shared_ptr<QwenSlotReserves> reserves,
+                     QwenStateOrigin origin, QwenCacheSlot slot,
                      CompositeStateLayout layout, QwenLogicalLengths lengths);
 
   std::shared_ptr<QwenBufferPool> pool_;
+  std::shared_ptr<QwenSlotReserves> reserves_;
+  QwenStateOrigin origin_;
   QwenCacheSlot slot_;
   CompositeStateLayout layout_;
   QwenLogicalLengths lengths_;
+  // A disposal hint, not state: it only chooses where the buffers go.
+  mutable bool retired_ = false;
 
   friend class QwenStateStorage;
 };
@@ -138,15 +167,17 @@ public:
   [[nodiscard]] const QwenSlotBuffers &buffers(uint32_t slot) const;
   [[nodiscard]] const QwenSlotMetadata &metadata(uint32_t slot) const;
 
-  // Activation reuses pooled buffers and admits any missing allocations.
-  // It clears parity-zero GDN state and resets draft logical lengths; later
-  // transitions overwrite the remaining data. Refusals retain their cause.
-  // Release returns the lane's buffers to the pool.
+  // Activation reuses pooled buffers and admits any missing allocations: the
+  // lane's two cells and ring plus its checkpoint reserve, granted or refused
+  // as a whole. It clears parity-zero GDN state and resets draft logical
+  // lengths; later transitions overwrite the remaining data. Refusals retain
+  // their cause. Release returns the lane's buffers and what is left of its
+  // reserve to the pool.
   [[nodiscard]] metal::AllocationResult tryActivateSlot(uint32_t slot, uint64_t requestId);
   void releaseSlot(uint32_t slot, uint64_t requestId);
 
-  // Returns pooled buffers beyond the kept counts to macOS. Active lanes and
-  // cached states are never moved or reclaimed.
+  // Returns pooled buffers beyond the kept counts to macOS. Active lanes,
+  // their reserves and cached states are never moved or reclaimed.
   [[nodiscard]] uint64_t releaseIdle(uint32_t keepCells,
                                      uint32_t keepRings) noexcept override;
   [[nodiscard]] uint32_t idleCells() const noexcept;
@@ -156,9 +187,10 @@ public:
   void updateLengths(uint32_t slot, QwenLogicalLengths lengths);
   void swapParity(uint32_t slot);
 
-  // Copies committed state into a pooled or newly admitted cache slot while
-  // the lane retains its own cells. Returns nullptr on capacity pressure;
-  // dropping a cached state makes its slot available for retry.
+  // Copies committed state into the lane's reserve, else a pooled or newly
+  // admitted cache slot, while the lane retains its own cells. Returns nullptr
+  // on capacity pressure; dropping a cached state makes its slot available
+  // for retry.
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
   snapshot(uint32_t slot);
   void restore(uint32_t slot, const CompositeState &state,
@@ -167,6 +199,7 @@ public:
   [[nodiscard]] uint64_t actualAllocatedBytes() const noexcept override {
     return allocations_->bytes.load(std::memory_order_relaxed);
   }
+  // The lane's cells plus whatever its reserve still holds.
   [[nodiscard]] uint64_t actualSlotBytes(uint32_t slot) const;
   [[nodiscard]] CompositeStateLayout layout() const noexcept { return layout_; }
 
@@ -200,6 +233,8 @@ private:
   CompositeStateLayout layout_;
   std::shared_ptr<StateAllocationTracker> allocations_;
   std::shared_ptr<QwenBufferPool> pool_;
+  // Shared with cached states so a retired one can refill its lane's reserve.
+  std::shared_ptr<QwenSlotReserves> reserves_;
   std::array<Slot, ExecutionLimits::maximumBatchWidth> slots_;
 };
 

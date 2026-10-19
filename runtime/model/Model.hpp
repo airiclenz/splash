@@ -77,6 +77,11 @@ public:
   // the lane's state; dropping the reference returns that slot to the model's
   // pool, and idle-state reclaim frees it.
   [[nodiscard]] virtual uint64_t bytes() const noexcept = 0;
+  // Marks the state as its lane's replaced checkpoint, called only when the
+  // cache retires it. Its buffers may then refill the producing lane's
+  // reserve instead of the pool; an evicted state is never marked, so the
+  // bytes eviction credits really reach the pool.
+  virtual void markRetired() const noexcept {}
 };
 
 enum class DraftBoundaryPurpose : uint8_t { Active, Materialization };

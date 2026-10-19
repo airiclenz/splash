@@ -2728,7 +2728,9 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
     throw std::invalid_argument("model runtime requires Apple tensor BF16");
   }
   const RuntimeGeometry geometry = RuntimeGeometry::from(package, format);
-  return {package.stateLayout().activeCellBytes(),
+  // An admitted lane also holds its checkpoint reserve: one cached state.
+  const CompositeStateLayout state = package.stateLayout();
+  return {state.activeCellBytes() + state.cachedBytes(),
           plannedPrefillBytes(geometry, operators),
           plannedDecodeBytes(geometry, operators), kPipelineReserveBytes,
           kRuntimeOverheadReserveBytes};

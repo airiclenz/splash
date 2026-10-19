@@ -75,7 +75,8 @@ void run(const std::string &metallib) {
   metal::MetalBackend backend(metallib);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
-  // Switched off to prove that a pooled cache slot needs no new admission.
+  // Switched off to prove that a reserved or pooled cache slot needs no new
+  // admission.
   bool admitNewAllocations = true;
   auto admitState = [&governor, &admitNewAllocations](
                         uint64_t bytes,
@@ -120,8 +121,12 @@ void run(const std::string &metallib) {
             "state cell activation failed");
     observedStorageActual = storage.actualAllocatedBytes();
     observedSlotActual = storage.actualSlotBytes(0);
-    require(observedSlotActual >= kStateLayout.activeCellBytes(),
-            "activated slot allocation is below declared bytes");
+    require(observedSlotActual >=
+                kStateLayout.activeCellBytes() + kStateLayout.cachedBytes(),
+            "activated slot allocation is below declared lane and reserve bytes");
+    require(storage.releaseIdle(0, 0) == 0 &&
+                storage.actualSlotBytes(0) == observedSlotActual,
+            "idle reclaim took a live lane's reserve");
     require(storage.actualSlotBytes(1) == observedSlotActual &&
                 storage.actualAllocatedBytes() == 2 * observedSlotActual,
             "activated slot accounting is not incremental");
@@ -177,20 +182,24 @@ void run(const std::string &metallib) {
             "parity swap copied hot state");
 
     // Publication copies the lane's active-parity GDN cell and its draft
-    // ring into a cache slot the governor admits. The lane keeps its own
+    // ring into the cache slot the lane reserved at admission, so a denying
+    // governor cannot refuse the first checkpoint. The lane keeps its own
     // cells: no address changes, no aliasing, no parity handoff.
     const uint64_t beforePrefix = backend.memoryStats().allocatedBytes;
     const uint64_t storageBeforePrefix = storage.actualAllocatedBytes();
     void *laneActiveGdnBase = slot0.gdn[1].stateBase.contents();
+    admitNewAllocations = false;
     std::shared_ptr<const QwenCompositeState> prefix = storage.snapshot(0);
-    require(prefix != nullptr, "snapshot could not obtain a cache slot");
-    observedPrefixActual = backend.memoryStats().allocatedBytes - beforePrefix;
+    admitNewAllocations = true;
+    require(prefix != nullptr,
+            "first snapshot under a denying governor did not use the reserve");
+    observedPrefixActual = observedSlotActual - storage.actualSlotBytes(0);
     require(prefix->bytes() == kStateLayout.cachedBytes(),
             "cached state footprint is not the declared cached bytes");
     require(observedPrefixActual >= kStateLayout.cachedBytes() &&
-                storage.actualAllocatedBytes() ==
-                    storageBeforePrefix + observedPrefixActual,
-            "cache slot allocation is below declared bytes or unaccounted");
+                backend.memoryStats().allocatedBytes == beforePrefix &&
+                storage.actualAllocatedBytes() == storageBeforePrefix,
+            "reserved cache slot is below declared bytes or was reallocated");
     require(slot0.gdn[1].stateBase.contents() == laneActiveGdnBase &&
                 slot0.gdn[0].stateBase.contents() == stableGdnBase &&
                 slot0.draft[0].keys.contents() == stableDraftBase,
@@ -255,6 +264,8 @@ void run(const std::string &metallib) {
     void *reusableDraftBase = slot0.draft[0].keys.contents();
     word(slot0.gdn[0].convolutionBase) = 0xc1c1c1c1;
     word(slot0.gdn[0].recurrentBase) = 0xc2c2c2c2;
+    // The published prefix holds the spent reserve, so only the lane's own
+    // cells and ring return.
     storage.releaseSlot(0, 101);
     require(!storage.metadata(0).assigned && storage.metadata(0).requestId == 0,
             "cancellation did not release metadata");
@@ -264,8 +275,9 @@ void run(const std::string &metallib) {
     requireThrows<std::logic_error>([&] { storage.swapParity(0); },
                                     "unassigned slot accepted a parity update");
     require(static_cast<bool>(storage.tryActivateSlot(0, 303)), "state cell reuse failed");
-    require(storage.idleCells() == 0 && storage.idleRings() == 0,
-            "reactivation left pooled buffers behind");
+    require(storage.idleCells() == 0 && storage.idleRings() == 0 &&
+                storage.actualSlotBytes(0) == observedSlotActual,
+            "reactivation left pooled buffers behind or no fresh reserve");
     require(slot0.gdn[0].stateBase.contents() == reusableGdnBase &&
                 slot0.draft[0].keys.contents() == reusableDraftBase,
             "slot reuse changed stable buffer addresses");
@@ -294,9 +306,13 @@ void run(const std::string &metallib) {
     requireThrows<std::logic_error>([&] { storage.releaseSlot(0, 404); },
                                     "slot release accepted the wrong owner");
 
+    // Slot release returns the unspent reserve with the lane's buffers.
     const uint64_t beforeSuspend = storage.actualAllocatedBytes();
     const uint64_t releasedSlotBytes = storage.actualSlotBytes(0);
     storage.releaseSlot(0, 303);
+    require(releasedSlotBytes == observedSlotActual &&
+                storage.idleCells() == 3 && storage.idleRings() == 2,
+            "slot release kept its reserve out of the pool");
     require(storage.releaseIdle(0, 0) == releasedSlotBytes,
             "recomputation preemption retained active backing");
     require(!storage.metadata(0).assigned && storage.actualSlotBytes(0) == 0 &&
@@ -310,70 +326,106 @@ void run(const std::string &metallib) {
             "recomputation did not start from a fresh empty state");
 
     // Dropping a cached state returns its buffers to the storage's pool rather
-    // than freeing them: accounting stays flat, and the next publication takes
-    // the pooled buffers without a governor admission. Only releaseIdle
-    // returns pooled bytes to macOS.
+    // than freeing them: accounting stays flat. A publication takes the lane's
+    // reserve first, then the pooled buffers, both without a governor
+    // admission; only then does the governor decide. Only releaseIdle returns
+    // pooled bytes to macOS.
     const uint64_t beforeDrop = storage.actualAllocatedBytes();
     const uint64_t backendBeforeDrop = backend.memoryStats().allocatedBytes;
     prefix.reset();
     require(storage.actualAllocatedBytes() == beforeDrop &&
-                backend.memoryStats().allocatedBytes == backendBeforeDrop,
+                backend.memoryStats().allocatedBytes == backendBeforeDrop &&
+                storage.idleCells() == 1 && storage.idleRings() == 1,
             "dropped cached state freed its slot instead of pooling it");
     storage.updateLengths(0, lengths);
     word(slot0.gdn[0].convolutionBase) = 0xe1e1e1e1;
     word(slot0.gdn[0].recurrentBase) = 0xe2e2e2e2;
     word(slot0.draft[0].keys) = 0xe3e3e3e3;
     admitNewAllocations = false;
+    std::shared_ptr<const QwenCompositeState> reserved = storage.snapshot(0);
+    require(reserved != nullptr && storage.idleCells() == 1 &&
+                storage.idleRings() == 1 &&
+                storage.actualSlotBytes(0) ==
+                    observedSlotActual - observedPrefixActual,
+            "snapshot did not take the lane's reserve before the pool");
     std::shared_ptr<const QwenCompositeState> pooled = storage.snapshot(0);
     require(pooled != nullptr, "snapshot did not reuse the pooled cache slot");
     require(pooled->bytes() == kStateLayout.cachedBytes() &&
+                storage.idleCells() == 0 && storage.idleRings() == 0 &&
                 storage.actualAllocatedBytes() == beforeDrop &&
                 backend.memoryStats().allocatedBytes == backendBeforeDrop,
             "pooled cache slot reuse allocated new buffers");
     require(storage.snapshot(0) == nullptr,
-            "snapshot with an empty pool bypassed the governor");
+            "snapshot with a spent reserve and an empty pool bypassed the governor");
     require(storage.actualAllocatedBytes() == beforeDrop,
             "denied snapshot leaked cache slot bytes");
     admitNewAllocations = true;
-    storage.restore(1, *pooled, true);
+    std::shared_ptr<const QwenCompositeState> fresh = storage.snapshot(0);
+    require(fresh != nullptr &&
+                backend.memoryStats().allocatedBytes ==
+                    backendBeforeDrop + observedPrefixActual &&
+                storage.actualAllocatedBytes() ==
+                    beforeDrop + observedPrefixActual,
+            "admitted cache slot allocation is unaccounted");
+    fresh.reset();
+    storage.restore(1, *reserved, true);
     require(storage.metadata(1).activeParity == 1 &&
                 storage.metadata(1).lengths == lengths &&
                 word(slot1.gdn[1].convolutionBase) == 0xe1e1e1e1 &&
                 word(slot1.gdn[1].recurrentBase) == 0xe2e2e2e2 &&
                 word(slot1.draft[0].keys) == 0xe3e3e3e3,
-            "reused cache slot served stale contents");
+            "reserved cache slot served stale contents");
     require(word(slot1.gdn[0].convolutionBase) == 0x21212121,
-            "restore from the reused slot overwrote inactive parity");
+            "restore from the reserved slot overwrote inactive parity");
+
+    // An evicted state's buffers reach the pool even while its lane's reserve
+    // is short: reclaim credits those bytes, so idle reclaim must free them.
     pooled.reset();
-    require(storage.actualAllocatedBytes() == beforeDrop,
-            "second dropped cached state was freed instead of pooled");
-    require(storage.releaseIdle(0, 0) == observedPrefixActual &&
+    require(storage.actualSlotBytes(0) ==
+                    observedSlotActual - observedPrefixActual &&
+                storage.idleCells() == 2 && storage.idleRings() == 2,
+            "an evicted state refilled its lane's reserve");
+    require(storage.releaseIdle(0, 0) == 2 * observedPrefixActual &&
                 storage.actualAllocatedBytes() ==
                     beforeDrop - observedPrefixActual,
-            "releaseIdle did not free the pooled cache slot");
+            "releaseIdle did not free the evicted cache slots");
+
+    // The lane's own retired checkpoint refills its reserve instead, out of
+    // idle reclaim's reach, so the next publication needs no admission.
+    reserved->markRetired();
+    reserved.reset();
+    require(storage.actualSlotBytes(0) == observedSlotActual &&
+                storage.idleCells() == 0 && storage.idleRings() == 0 &&
+                storage.releaseIdle(0, 0) == 0 &&
+                storage.actualAllocatedBytes() ==
+                    beforeDrop - observedPrefixActual,
+            "a retired checkpoint did not refill its lane's reserve");
     require(storage.metadata(0).assigned && storage.metadata(1).assigned &&
-                storage.actualSlotBytes(0) == observedSlotActual &&
                 storage.actualSlotBytes(1) == observedSlotActual,
             "pool reclaim touched active lane cells");
+    admitNewAllocations = false;
+    std::shared_ptr<const QwenCompositeState> retained = storage.snapshot(0);
+    admitNewAllocations = true;
+    require(retained != nullptr,
+            "a later snapshot under a denying governor did not use the reserve");
 
-    // A live cached state survives its lane's release and reclaim; only its
-    // drop plus a later reclaim frees the slot together with idle cells.
-    std::shared_ptr<const QwenCompositeState> retained = storage.snapshot(1);
-    require(retained != nullptr, "retained snapshot could not admit a slot");
-    require(storage.actualAllocatedBytes() ==
-                2 * observedSlotActual + observedPrefixActual,
+    // A live cached state survives its lane's release and reclaim. Once its
+    // lane is gone even a retired state returns to the pool, and only a later
+    // reclaim frees it together with idle cells.
+    require(storage.actualAllocatedBytes() == 2 * observedSlotActual,
             "retained snapshot accounting is wrong");
     storage.releaseSlot(0, 303);
     storage.releaseSlot(1, 202);
-    require(storage.idleCells() == 4 && storage.idleRings() == 2,
-            "released lane buffers are missing from the pool");
-    retained.reset();
     require(storage.idleCells() == 5 && storage.idleRings() == 3,
+            "released lane buffers are missing from the pool");
+    retained->markRetired();
+    retained.reset();
+    require(storage.idleCells() == 6 && storage.idleRings() == 4,
             "dropped cached state did not return its buffers to the pool");
-    // Releasing down to one lane's worth keeps two cells and one ring warm.
-    require(storage.releaseIdle(2, 1) ==
-                observedSlotActual + observedPrefixActual &&
-                storage.idleCells() == 2 && storage.idleRings() == 1,
+    // Releasing down to one admitted lane's worth keeps three cells and two
+    // rings warm.
+    require(storage.releaseIdle(3, 2) == observedSlotActual &&
+                storage.idleCells() == 3 && storage.idleRings() == 2,
             "partial idle release did not keep the requested buffers");
     require(storage.releaseIdle(0, 0) == observedSlotActual,
             "idle lane buffers were not reclaimed");
@@ -386,10 +438,10 @@ void run(const std::string &metallib) {
           "destroyed state slots remained in actual allocation count");
 
   std::cout << "qwen state storage tests passed: slot_declared="
-            << kStateLayout.activeCellBytes()
+            << kStateLayout.activeCellBytes() + kStateLayout.cachedBytes()
             << " slot_actual=" << observedSlotActual << " four_slots_declared="
             << uint64_t{model::ExecutionLimits::maximumBatchWidth} *
-                   kStateLayout.activeCellBytes()
+                   (kStateLayout.activeCellBytes() + kStateLayout.cachedBytes())
             << " four_slots_actual=" << observedStorageActual
             << " composite_declared=" << kStateLayout.cachedBytes()
             << " prefix_actual=" << observedPrefixActual << '\n';

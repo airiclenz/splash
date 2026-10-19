@@ -1,8 +1,10 @@
 #include "model/QwenState.hpp"
 
+#include <cstddef>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace splash::model {
@@ -29,6 +31,49 @@ void copyExact(const MetalBuffer &destination, const MetalBuffer &source,
 
 void clear(const MetalBuffer &buffer, const char *name) {
   std::memset(writableContents(buffer, name), 0, buffer.sizeBytes());
+}
+
+// An admitted slot holds the lane's two GDN parities plus the reserve's cell,
+// and the lane's draft ring plus the reserve's ring.
+constexpr uint32_t kSlotCells = 3;
+constexpr uint32_t kSlotRings = 2;
+constexpr uint32_t kReserveCell = 2;
+constexpr uint32_t kReserveRing = 1;
+
+// Takes up to taken.size() buffers from the back of the pool, in pop order.
+template <class Buffer, std::size_t Count>
+uint32_t takePooled(std::vector<std::shared_ptr<Buffer>> &pool,
+                    std::array<std::shared_ptr<Buffer>, Count> &taken) {
+  uint32_t count = 0;
+  while (count < Count && !pool.empty()) {
+    taken[count++] = std::move(pool.back());
+    pool.pop_back();
+  }
+  return count;
+}
+
+// Undoes takePooled, so the pool regains its previous order.
+template <class Buffer, std::size_t Count>
+void returnPooled(std::vector<std::shared_ptr<Buffer>> &pool,
+                  std::array<std::shared_ptr<Buffer>, Count> &taken,
+                  uint32_t count) {
+  while (count > 0)
+    pool.push_back(std::move(taken[--count]));
+}
+
+// Returns a dropped buffer to the reserve when one is offered and short of
+// it, else to the pool. A null buffer goes nowhere.
+template <class Buffer>
+void returnBuffer(std::shared_ptr<Buffer> &buffer,
+                  std::type_identity_t<std::shared_ptr<Buffer>> *reserve,
+                  std::vector<std::shared_ptr<Buffer>> &pool) {
+  if (!buffer)
+    return;
+  if (reserve && !*reserve) {
+    *reserve = std::move(buffer);
+    return;
+  }
+  pool.push_back(std::move(buffer));
 }
 
 } // namespace
@@ -75,22 +120,32 @@ QwenGdnCell::~QwenGdnCell() {
   tracker_->bytes.fetch_sub(actualAllocatedBytes_, std::memory_order_relaxed);
 }
 
-QwenCompositeState::QwenCompositeState(std::shared_ptr<QwenBufferPool> pool,
-                                       QwenCacheSlot slot,
-                                       CompositeStateLayout layout,
-                                       QwenLogicalLengths lengths)
-    : pool_(std::move(pool)), slot_(std::move(slot)), layout_(layout),
-      lengths_(lengths) {
-  if (!pool_ || !slot_.gdn || !slot_.draft) {
+QwenCompositeState::QwenCompositeState(
+    std::shared_ptr<QwenBufferPool> pool,
+    std::shared_ptr<QwenSlotReserves> reserves, QwenStateOrigin origin,
+    QwenCacheSlot slot, CompositeStateLayout layout, QwenLogicalLengths lengths)
+    : pool_(std::move(pool)), reserves_(std::move(reserves)), origin_(origin),
+      slot_(std::move(slot)), layout_(layout), lengths_(lengths) {
+  if (!pool_ || !reserves_ || !slot_.gdn || !slot_.draft) {
     throw std::invalid_argument("composite state buffers are empty");
   }
+  if (origin_.slot >= reserves_->size() || !origin_.requestId)
+    throw std::invalid_argument("composite state origin is not a live slot");
 }
 
 QwenCompositeState::~QwenCompositeState() {
   if (!pool_->open)
     return;
-  pool_->cells.push_back(std::move(slot_.gdn));
-  pool_->rings.push_back(std::move(slot_.draft));
+  // Only a retired checkpoint refills its lane's reserve. An evicted state's
+  // bytes are credited to reclaim, so they must reach the pool.
+  QwenCacheSlot *reserve = nullptr;
+  if (retired_) {
+    QwenSlotReserve &origin = (*reserves_)[origin_.slot];
+    if (origin.requestId == origin_.requestId)
+      reserve = &origin.buffers;
+  }
+  returnBuffer(slot_.gdn, reserve ? &reserve->gdn : nullptr, pool_->cells);
+  returnBuffer(slot_.draft, reserve ? &reserve->draft : nullptr, pool_->rings);
 }
 
 QwenStateStorage::QwenStateStorage(metal::MetalBackend &backend,
@@ -99,7 +154,8 @@ QwenStateStorage::QwenStateStorage(metal::MetalBackend &backend,
     : backend_(backend), admitAllocation_(std::move(admitAllocation)),
       layout_(layout),
       allocations_(std::make_shared<StateAllocationTracker>()),
-      pool_(std::make_shared<QwenBufferPool>()) {
+      pool_(std::make_shared<QwenBufferPool>()),
+      reserves_(std::make_shared<QwenSlotReserves>()) {
   if (!admitAllocation_)
     throw std::invalid_argument("Qwen state allocation admission is required");
   if (!layout_.valid() ||
@@ -112,6 +168,7 @@ QwenStateStorage::~QwenStateStorage() {
   pool_->open = false;
   pool_->cells.clear();
   pool_->rings.clear();
+  reserves_->fill({});
 }
 
 const QwenSlotBuffers &QwenStateStorage::buffers(uint32_t index) const {
@@ -138,6 +195,7 @@ metal::AllocationResult QwenStateStorage::tryActivateSlot(uint32_t index, uint64
   clear(current.buffers.gdn[0].convolutionBase, "slot convolution state");
   clear(current.buffers.gdn[0].recurrentBase, "slot recurrent state");
   current.metadata = {true, requestId, 0, {}};
+  (*reserves_)[index].requestId = requestId;
   return true;
 }
 
@@ -147,15 +205,18 @@ void QwenStateStorage::releaseSlot(uint32_t index, uint64_t requestId) {
   if (!requestId || current.metadata.requestId != requestId) {
     throw std::logic_error("Qwen state slot owner mismatch");
   }
-  // Parity one first, so the next activation pops parity zero first and a
-  // reactivated lane gets its previous buffers back in the same order.
+  // Reserve first, then parity one, so the next activation pops parity zero
+  // first and a reactivated lane gets its previous buffers back in the same
+  // order. A reserve a snapshot spent returns nothing here.
+  QwenSlotReserve &reserve = (*reserves_)[index];
+  returnBuffer(reserve.buffers.gdn, nullptr, pool_->cells);
+  returnBuffer(reserve.buffers.draft, nullptr, pool_->rings);
+  reserve.requestId = 0;
   for (uint32_t parity = current.gdn.size(); parity > 0;) {
     --parity;
-    if (current.gdn[parity])
-      pool_->cells.push_back(std::move(current.gdn[parity]));
+    returnBuffer(current.gdn[parity], nullptr, pool_->cells);
   }
-  if (current.draft)
-    pool_->rings.push_back(std::move(current.draft));
+  returnBuffer(current.draft, nullptr, pool_->rings);
   refreshViews(current);
   current.metadata = {};
 }
@@ -198,16 +259,23 @@ QwenStateStorage::snapshot(uint32_t index) {
   Slot &source = slot(index);
   requireAssigned(source);
   validateLengths(source.metadata.lengths, true);
-  // Pooled buffers first; a denied admission puts a pooled cell back and
-  // drops a fresh one, leaving no trace.
+  // The lane's reserve first, then pooled buffers, then the governor. A
+  // denied admission puts a taken cell back where it came from and drops a
+  // fresh one, leaving no trace.
+  QwenCacheSlot &reserve = (*reserves_)[index].buffers;
   QwenCacheSlot cacheSlot;
-  const bool pooledCell = !pool_->cells.empty();
-  cacheSlot.gdn = acquireCell("qwen-state-cache-gdn");
+  const bool reservedCell = static_cast<bool>(reserve.gdn);
+  const bool pooledCell = !reservedCell && !pool_->cells.empty();
+  cacheSlot.gdn = reservedCell ? std::move(reserve.gdn)
+                               : acquireCell("qwen-state-cache-gdn");
   if (!cacheSlot.gdn)
     return nullptr;
-  cacheSlot.draft = acquireRing("qwen-state-cache-draft");
+  cacheSlot.draft = reserve.draft ? std::move(reserve.draft)
+                                  : acquireRing("qwen-state-cache-draft");
   if (!cacheSlot.draft) {
-    if (pooledCell)
+    if (reservedCell)
+      reserve.gdn = std::move(cacheSlot.gdn);
+    else if (pooledCell)
       pool_->cells.push_back(std::move(cacheSlot.gdn));
     return nullptr;
   }
@@ -221,7 +289,8 @@ QwenStateStorage::snapshot(uint32_t index) {
               source.buffers.draft[layer].values, "cached draft values");
   }
   return std::shared_ptr<const QwenCompositeState>(new QwenCompositeState(
-      pool_, std::move(cacheSlot), layout_, source.metadata.lengths));
+      pool_, reserves_, {index, source.metadata.requestId},
+      std::move(cacheSlot), layout_, source.metadata.lengths));
 }
 
 std::shared_ptr<QwenGdnCell>
@@ -292,53 +361,56 @@ uint64_t QwenStateStorage::actualSlotBytes(uint32_t index) const {
     result += current.gdn[1]->actualAllocatedBytes();
   if (current.draft)
     result += current.draft->actualAllocatedBytes();
+  const QwenCacheSlot &reserve = (*reserves_)[index].buffers;
+  if (reserve.gdn)
+    result += reserve.gdn->actualAllocatedBytes();
+  if (reserve.draft)
+    result += reserve.draft->actualAllocatedBytes();
   return result;
 }
 
 metal::AllocationResult QwenStateStorage::allocateSlot(uint32_t index) {
   Slot &destination = slot(index);
-  if (destination.gdn[0] || destination.gdn[1] || destination.draft) {
+  QwenCacheSlot &reserve = (*reserves_)[index].buffers;
+  if (destination.gdn[0] || destination.gdn[1] || destination.draft ||
+      reserve.gdn || reserve.draft) {
     throw std::logic_error("idle Qwen state slot still owns buffers");
   }
-  // Pooled buffers first, then the governor for what the pool lacks. A denied
-  // admission leaves no trace: pooled buffers go back, fresh ones are dropped.
-  std::array<std::shared_ptr<QwenGdnCell>, 2> gdn;
-  std::shared_ptr<DFlashDraftRing> draft;
+  // Pooled buffers first, then the governor for what the pool lacks. The
+  // lane and its reserve are admitted as a whole: a denied admission leaves
+  // no trace, pooled buffers go back and fresh ones are dropped.
+  std::array<std::shared_ptr<QwenGdnCell>, kSlotCells> cells;
+  std::array<std::shared_ptr<DFlashDraftRing>, kSlotRings> rings;
   metal::AllocationFailure failure = metal::AllocationFailure::None;
-  uint32_t pooledCells = 0;
-  while (pooledCells < gdn.size() && !pool_->cells.empty()) {
-    gdn[pooledCells++] = std::move(pool_->cells.back());
-    pool_->cells.pop_back();
-  }
-  const bool pooledRing = !pool_->rings.empty();
-  if (pooledRing) {
-    draft = std::move(pool_->rings.back());
-    pool_->rings.pop_back();
-  }
+  const uint32_t pooledCells = takePooled(pool_->cells, cells);
+  const uint32_t pooledRings = takePooled(pool_->rings, rings);
   const auto giveBack = [&] {
-    for (uint32_t parity = pooledCells; parity > 0;)
-      pool_->cells.push_back(std::move(gdn[--parity]));
-    if (pooledRing)
-      pool_->rings.push_back(std::move(draft));
+    returnPooled(pool_->cells, cells, pooledCells);
+    returnPooled(pool_->rings, rings, pooledRings);
   };
-  for (uint32_t parity = pooledCells; parity < gdn.size(); ++parity) {
-    gdn[parity] = allocateGdnCell("qwen-state-cell-" + std::to_string(index) +
-                                  "-gdn-" + std::to_string(parity), &failure);
-    if (!gdn[parity]) {
+  const std::string prefix = "qwen-state-cell-" + std::to_string(index);
+  for (uint32_t cell = pooledCells; cell < cells.size(); ++cell) {
+    cells[cell] = allocateGdnCell(
+        cell == kReserveCell ? prefix + "-reserve-gdn"
+                             : prefix + "-gdn-" + std::to_string(cell),
+        &failure);
+    if (!cells[cell]) {
       giveBack();
       return failure;
     }
   }
-  if (!pooledRing) {
-    draft = allocateDraftRing("qwen-state-cell-" + std::to_string(index) +
-                              "-draft", &failure);
-    if (!draft) {
+  for (uint32_t ring = pooledRings; ring < rings.size(); ++ring) {
+    rings[ring] = allocateDraftRing(
+        ring == kReserveRing ? prefix + "-reserve-draft" : prefix + "-draft",
+        &failure);
+    if (!rings[ring]) {
       giveBack();
       return failure;
     }
   }
-  destination.gdn = std::move(gdn);
-  destination.draft = std::move(draft);
+  destination.gdn = {std::move(cells[0]), std::move(cells[1])};
+  destination.draft = std::move(rings[0]);
+  reserve = {std::move(cells[kReserveCell]), std::move(rings[kReserveRing])};
   refreshViews(destination);
   return true;
 }
