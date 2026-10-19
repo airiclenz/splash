@@ -400,6 +400,9 @@ struct ModelTelemetry final {
   double lastDecodeWallSeconds = 0.0;
   double totalPrefillWallSeconds = 0.0;
   double totalDecodeWallSeconds = 0.0;
+  // Whether decode steps run the draft proposal; off retains one token per
+  // step and leaves the acceptance rate undefined.
+  bool speculativeDecoding = true;
 };
 
 // Observable outcome used to check repeated runs of the same configuration.

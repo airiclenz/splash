@@ -69,6 +69,9 @@ struct RuntimeContext final {
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  // Off keeps the eight-row target verify graph and the draft context commit
+  // but skips the draft proposal, so each decode step retains one token.
+  bool isSpeculationEnabled = true;
 };
 
 // Validates only the interface between independently defined target and draft

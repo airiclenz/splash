@@ -275,6 +275,7 @@ struct Runtime::Impl {
   uint32_t maximumImagePatches = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  const bool isSpeculationEnabled = true;
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
   ops::Sampling sampling;
@@ -291,6 +292,7 @@ struct Runtime::Impl {
         maximumImagePatches(value.maximumImagePatches),
         pipelineReserveBytes(value.pipelineReserveBytes),
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
+        isSpeculationEnabled(value.isSpeculationEnabled),
         sampling(value.backend, geometry.target.vocabularySize, kDecodeRows),
         targetModel(std::visit(
                         [&](const auto &weights) {
@@ -322,16 +324,26 @@ struct Runtime::Impl {
     return entry.sampling.temperature > 0.0F;
   }
 
+  // Without speculation a step keeps only the anchor and simulates only it.
+  static constexpr uint32_t kUnspeculatedStepTokens = 1;
+
   // The verify rows a decode step may retain: the remaining output budget and
-  // the graph's rows, lowered to the engine's checkpoint cap when it sets one.
-  // The cap only shortens the commit; the terminal path still keys on the
-  // remaining budget alone.
-  static uint32_t maximumRetained(uint32_t remaining,
-                                  const ModelBatchItem &item) noexcept {
-    const uint32_t retained = std::min(remaining, kDecodeRows);
+  // the graph's rows (one without speculation), lowered to the engine's
+  // checkpoint cap when it sets one. The cap only shortens the commit; the
+  // terminal path still keys on the remaining budget alone.
+  uint32_t maximumRetained(uint32_t remaining,
+                           const ModelBatchItem &item) const noexcept {
+    const uint32_t retained = std::min(remaining, simulationTokens());
     return item.retainedTokenLimit
                ? std::min(retained, item.retainedTokenLimit)
                : retained;
+  }
+
+  // The tokens a constrained step's grammar simulation covers: the anchor and
+  // its proposals, or the anchor alone without speculation. Its token mask
+  // carries one row more, for the token after the last simulated one.
+  uint32_t simulationTokens() const noexcept {
+    return isSpeculationEnabled ? kDecodeRows : kUnspeculatedStepTokens;
   }
 
   // Qwen3.5 M-RoPE: text rows advance one counter shared by all three axes;
@@ -1405,7 +1417,8 @@ struct Runtime::Impl {
          decodeArena->packed(DecodeTensor::NextAnchor, width),
          decodeArena->packed(DecodeTensor::AcceptedCount, width)},
         maximumRetained, std::span(policies).first(width),
-        geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
+        geometry.target.stopTokens[0], geometry.target.stopTokens[1],
+        !isSpeculationEnabled);
   }
 
   void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
@@ -1424,6 +1437,20 @@ struct Runtime::Impl {
         graph, decodeArena->packed(DecodeTensor::DraftInputTokens, lanes),
         decodeArena->packed(DecodeTensor::ProposedTokens, lanes),
         decodeArena->packed(DecodeTensor::InputTokens, lanes), lanes);
+  }
+
+  // Embeds the eight target verify rows. Without speculation they are the
+  // anchor and mask-token filler prepareDecodeLane wrote as draft input, so
+  // no proposal is spliced in and only row 0's prediction is retained.
+  void encodeBatchVerifyEmbedding(CommandGraph &graph, uint32_t lanes) {
+    if (!isSpeculationEnabled) {
+      encodeBatchEmbedding(graph, DecodeTensor::DraftInputTokens,
+                           DecodeTensor::Hidden0, lanes);
+      return;
+    }
+    encodeBatchVerifyInput(graph, lanes);
+    encodeBatchEmbedding(graph, DecodeTensor::InputTokens,
+                         DecodeTensor::Hidden0, lanes);
   }
 
   void encodeBatchGdnCommit(CommandGraph &graph,
@@ -1534,7 +1561,7 @@ struct Runtime::Impl {
                 std::move(output),
                 false,
                 DecodeStage::Regular,
-                kDraftProposalTokens,
+                isSpeculationEnabled ? kDraftProposalTokens : 0,
                 std::min(laneResult.accepted, laneResult.retained - 1)};
       if (entry.generatedTokens < entry.maxNewTokens)
         emitTerminalAnchor(entry, result);
@@ -1558,6 +1585,8 @@ struct Runtime::Impl {
   // scheduler batch (and therefore its DecodeArena lanes) owned across that
   // dependency.  All state transitions run on the engine thread; completion
   // handlers only wake it, so they capture the wake hook and never the ticket.
+  // Without speculation the first command only builds the rope tables and the
+  // simulation is the anchor alone.
   class ConstrainedDecodeTicket final : public ModelBatchTicket {
   public:
     ConstrainedDecodeTicket(Impl &impl, std::vector<DecodeLaneResult> lanes,
@@ -1583,36 +1612,36 @@ struct Runtime::Impl {
         for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
           DecodeLaneResult &laneResult = lanes_[lane];
           Request &entry = *laneResult.request;
-          const uint32_t *proposed = contents<uint32_t>(
-              impl_.decodeArena->get(lane, DecodeTensor::ProposedTokens),
-              "constrained draft proposals");
           entry.maskWords.clear();
           entry.verifyMaskInFlight = true;
 
           const uint32_t remaining = entry.maxNewTokens - entry.generatedTokens;
           laneResult.currentAnchor = *entry.pendingToken;
           laneResult.maximumRetained =
-              Impl::maximumRetained(remaining, items_[lane]);
+              impl_.maximumRetained(remaining, items_[lane]);
           laneResult.verify = true;
           entries[lane] = &entry;
 
           if (!abandoned_[lane]) {
             ModelMaskRequest request;
             request.requestId = entry.id;
-            request.simulationTokens.reserve(kDecodeRows);
+            request.simulationTokens.reserve(impl_.simulationTokens());
             request.simulationTokens.push_back(*entry.pendingToken);
-            request.simulationTokens.insert(request.simulationTokens.end(),
-                                            proposed,
-                                            proposed + kDraftProposalTokens);
+            if (impl_.isSpeculationEnabled) {
+              const uint32_t *proposed = contents<uint32_t>(
+                  impl_.decodeArena->get(lane, DecodeTensor::ProposedTokens),
+                  "constrained draft proposals");
+              request.simulationTokens.insert(request.simulationTokens.end(),
+                                              proposed,
+                                              proposed + kDraftProposalTokens);
+            }
             requests.push_back(std::move(request));
           }
         }
 
         CommandGraph target;
         const uint32_t width = static_cast<uint32_t>(lanes_.size());
-        impl_.encodeBatchVerifyInput(target, width);
-        impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
-                                   DecodeTensor::Hidden0, width);
+        impl_.encodeBatchVerifyEmbedding(target, width);
         impl_.encodeTargetVerifyBatchForward(
             target, {entries.data(), lanes_.size()}, items_, stats_);
         submit(target);
@@ -2240,7 +2269,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // output budget only lowers the token-exact commit count; it never
     // changes the Metal graph shape.
     laneResult.currentAnchor = *entry.pendingToken;
-    laneResult.maximumRetained = Impl::maximumRetained(remaining, item);
+    laneResult.maximumRetained = impl_->maximumRetained(remaining, item);
 
     impl_->prepareDecodeLane(entry, item, lane);
     impl_->loadPolicyBuffers(entry, lane, {});
@@ -2273,7 +2302,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
         impl_->decodeArena->packed(DecodeTensor::DraftRopeCos, width),
         impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width));
   }
-  if (draftComputed) {
+  // Without speculation the draft proposes nothing; its context commit still
+  // runs so states stay composite.
+  if (draftComputed && impl_->isSpeculationEnabled) {
     std::array<Impl::Request *, kLaneCount> requests{};
     std::array<uint64_t, kLaneCount> logicalPositions{};
     for (uint32_t lane = 0; lane < lanes.size(); ++lane) {
@@ -2287,9 +2318,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                  batchStats);
   }
   if (verified) {
-    impl_->encodeBatchVerifyInput(commandGraph, width);
-    impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
-                                DecodeTensor::Hidden0, width);
+    impl_->encodeBatchVerifyEmbedding(commandGraph, width);
     std::array<Impl::Request *, kLaneCount> requests{};
     std::array<uint32_t, kLaneCount> maximumRetained{};
     for (uint32_t lane = 0; lane < lanes.size(); ++lane) {
@@ -2386,8 +2415,9 @@ void Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
     throw std::logic_error("request is not waiting for a token mask");
   }
   const uint32_t maskWords = impl_->geometry.maskWords();
+  const uint64_t simulationMaskRows = uint64_t{impl_->simulationTokens()} + 1;
   uint64_t expected = entry.verifyMaskInFlight
-                          ? uint64_t{kDecodeRows + 1} * maskWords
+                          ? simulationMaskRows * maskWords
                           : maskWords;
   if (words.size() != expected) {
     throw std::invalid_argument("token mask has the wrong word count");
@@ -2752,6 +2782,7 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   ModelTelemetry result = impl_->counters;
   result.stateResidentBytes = impl_->states.actualAllocatedBytes();
   result.warmIdleStateCells = impl_->states.idleCells();
+  result.speculativeDecoding = impl_->isSpeculationEnabled;
   return result;
 }
 
