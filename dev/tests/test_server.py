@@ -3496,6 +3496,53 @@ class ServerTest(unittest.TestCase):
 
                 self.assertEqual(api._native_command(args), expected)
 
+    def test_native_command_forwards_contended_prefill_rows_only_when_given(self):
+        required = [
+            "target",
+            "draft",
+            "--tokenizer",
+            "tokenizer",
+            "--model",
+            "community/custom-splash",
+            "--binary",
+            "splash",
+        ]
+        native = ["splash", "serve-native", "target", "draft", "auto", "auto"]
+
+        for options, expected in (
+            ([], native),
+            (
+                ["--contended-prefill-rows", "256"],
+                [*native, "--contended-prefill-rows", "256"],
+            ),
+            (
+                ["--contended-prefill-rows", "2048", "--no-speculation"],
+                [*native, "--no-speculation", "--contended-prefill-rows", "2048"],
+            ),
+        ):
+            with self.subTest(options=options):
+                args = api.parse_args([*required, *options])
+
+                self.assertEqual(api._native_command(args), expected)
+
+    def test_contended_prefill_rows_rejects_values_serve_native_would(self):
+        required = [
+            "target",
+            "draft",
+            "--tokenizer",
+            "tokenizer",
+            "--model",
+            "community/custom-splash",
+        ]
+
+        for value in ("0", "32", "96", "4096", "-64", "not-a-number"):
+            with (
+                self.subTest(value=value),
+                mock.patch("sys.stderr"),
+                self.assertRaises(SystemExit),
+            ):
+                api.parse_args([*required, "--contended-prefill-rows", value])
+
     def test_public_ids_are_stable_and_unique_across_app_instances(self):
         tokenizer = FakeTokenizer()
         first_backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
@@ -3565,6 +3612,7 @@ class ServerTest(unittest.TestCase):
             binary="splash",
             kv_format="int8",
             no_speculation=False,
+            contended_prefill_rows=None,
             reasoning_loop_limit=7,
         )
         runtime = mock.Mock()
@@ -3674,6 +3722,7 @@ class ServerTest(unittest.TestCase):
             binary="splash",
             kv_format="int8",
             no_speculation=False,
+            contended_prefill_rows=None,
             reasoning_loop_limit=7,
         )
         runtime = mock.Mock()
@@ -3727,6 +3776,7 @@ class ServerTest(unittest.TestCase):
             binary="splash",
             kv_format="int8",
             no_speculation=False,
+            contended_prefill_rows=None,
             reasoning_loop_limit=7,
         )
         server = mock.Mock()

@@ -137,6 +137,11 @@ DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
 # Match the former generation ingress envelope (32 slots × 16 MiB).
 DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024
 MAX_CONTEXT_TOKENS = 262144
+# serve-native's contended prefill floor is a power of two in
+# [64, ExecutionLimits::prefillTokenBudget]; mirrored so a bad value fails
+# before the model loads.
+MIN_CONTENDED_PREFILL_ROWS = 64
+MAX_CONTENDED_PREFILL_ROWS = 2048
 HTTP_IO_TIMEOUT = 30.0
 HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
 CLIENT_DISCONNECT_POLL = 0.01
@@ -1880,6 +1885,20 @@ def _parse_reasoning_loop_limit(value):
     return limit
 
 
+def _parse_contended_prefill_rows(value):
+    try:
+        rows = int(value)
+    except ValueError:
+        rows = 0
+    is_in_range = MIN_CONTENDED_PREFILL_ROWS <= rows <= MAX_CONTENDED_PREFILL_ROWS
+    if not is_in_range or rows & (rows - 1):
+        raise argparse.ArgumentTypeError(
+            "must be a power of two in "
+            f"[{MIN_CONTENDED_PREFILL_ROWS}, {MAX_CONTENDED_PREFILL_ROWS}]"
+        )
+    return rows
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("target")
@@ -1930,6 +1949,16 @@ def parse_args(argv=None):
         action="store_true",
         help="decode one token per step without draft proposals; the draft "
         "stays loaded (default: speculative decoding on)",
+    )
+    parser.add_argument(
+        "--contended-prefill-rows",
+        type=_parse_contended_prefill_rows,
+        default=None,
+        metavar="N",
+        help="smallest prefill command, in rows, while other requests decode; "
+        "a power of two in "
+        f"[{MIN_CONTENDED_PREFILL_ROWS}, {MAX_CONTENDED_PREFILL_ROWS}] "
+        f"(default: {MIN_CONTENDED_PREFILL_ROWS})",
     )
     parser.add_argument(
         "--max-request-size",
@@ -2009,6 +2038,8 @@ def _native_command(args):
         command.extend(("--kv-format", args.kv_format))
     if args.no_speculation:
         command.append("--no-speculation")
+    if args.contended_prefill_rows is not None:
+        command.extend(("--contended-prefill-rows", str(args.contended_prefill_rows)))
     return command
 
 

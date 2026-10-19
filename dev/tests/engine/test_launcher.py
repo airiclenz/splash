@@ -159,6 +159,47 @@ class LauncherTests(unittest.TestCase):
                 argv = execute.call_args.args[1]
                 self.assertEqual("--no-speculation" in argv, is_forwarded)
 
+    def test_contended_prefill_rows_is_forwarded_to_the_server_only_when_given(
+        self,
+    ):
+        for options, expected in (
+            ([], None),
+            (["--contended-prefill-rows", "64"], "64"),
+            (["--contended-prefill-rows", "512"], "512"),
+        ):
+            with (
+                self.subTest(options=options),
+                tempfile.TemporaryDirectory() as tmp,
+                mock.patch.object(launcher, "RUNTIME_DIR", Path(tmp)),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher, "_ensure_installed"),
+                mock.patch.object(launcher.catalog, "spawn_refresh"),
+                mock.patch.object(launcher.os, "execve") as execute,
+            ):
+                launcher.main(["serve", "--model", MODEL_ID, *options])
+
+                argv = execute.call_args.args[1]
+                if expected is None:
+                    self.assertNotIn("--contended-prefill-rows", argv)
+                else:
+                    flag = argv.index("--contended-prefill-rows")
+                    self.assertEqual(argv[flag + 1], expected)
+
+    def test_contended_prefill_rows_fails_before_installation(self):
+        for value in ("32", "96", "4096", "not-a-number"):
+            with (
+                self.subTest(value=value),
+                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch("sys.stderr", io.StringIO()),
+                self.assertRaises(SystemExit) as failed,
+            ):
+                launcher.main(
+                    ["serve", "--model", MODEL_ID, "--contended-prefill-rows", value]
+                )
+
+            self.assertEqual(failed.exception.code, 2)
+            install.assert_not_called()
+
     def test_size_validation(self):
         for value in ("1G", "1GB", "1GiB", "1073741824"):
             self.assertEqual(launcher._parse_max_memory(value), 1024**3)

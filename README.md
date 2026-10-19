@@ -127,6 +127,10 @@ that a long uncached prompt will reach its first token quickly.
 - `--no-speculation`: decode one token per step without draft proposals. The
   draft model stays loaded; `/status` reports `speculative_decoding: false` and
   no draft acceptance rate. Default: speculative decoding on.
+- `--contended-prefill-rows`: smallest prefill command, in rows, while other
+  requests are decoding: a power of two from `64` to `2048`. A larger floor
+  finishes a long prompt sooner but stalls their tokens longer per command
+  (about 0.85 s at 64 rows and 3.3 s at 256 on an M2 Pro). Default: `64`.
 - `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
 - `--reasoning-loop-limit`: end a reply, with finish reason `length`, once its
   reasoning repeats one sentence this many times; `0` turns the check off.

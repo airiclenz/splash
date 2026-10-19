@@ -31,6 +31,8 @@ RUNTIME_DIR = paths.RUNTIME
 PORT = 8000
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 REASONING_LOOP_LIMIT = 24
+MIN_CONTENDED_PREFILL_ROWS = 64
+MAX_CONTENDED_PREFILL_ROWS = 2048
 BASE_URL = f"http://127.0.0.1:{PORT}"
 
 
@@ -189,6 +191,10 @@ def serve(args):
             command.extend(("--kv-format", args.kv_format))
         if args.no_speculation:
             command.append("--no-speculation")
+        if args.contended_prefill_rows is not None:
+            command.extend(
+                ["--contended-prefill-rows", str(args.contended_prefill_rows)]
+            )
         for name in args.served_model_name:
             command.append(f"--served-model-name={name}")
         if args.default_reasoning_effort is not None:
@@ -374,6 +380,22 @@ def _parse_reasoning_loop_limit(value):
     return limit
 
 
+def _parse_contended_prefill_rows(value):
+    try:
+        rows = int(value)
+    except ValueError:
+        rows = 0
+    # Mirror the server's check so a bad floor fails before installation,
+    # without importing the server's runtime dependencies.
+    is_in_range = MIN_CONTENDED_PREFILL_ROWS <= rows <= MAX_CONTENDED_PREFILL_ROWS
+    if not is_in_range or rows & (rows - 1):
+        raise argparse.ArgumentTypeError(
+            "must be a power of two in "
+            f"[{MIN_CONTENDED_PREFILL_ROWS}, {MAX_CONTENDED_PREFILL_ROWS}]"
+        )
+    return rows
+
+
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     client_args = []
@@ -470,6 +492,15 @@ def parse_args(argv=None):
         action="store_true",
         help="decode one token per step without draft proposals; the draft "
         "stays loaded (default: speculative decoding on)",
+    )
+    server.add_argument(
+        "--contended-prefill-rows",
+        type=_parse_contended_prefill_rows,
+        metavar="N",
+        help="smallest prefill command, in rows, while other requests decode; "
+        "a power of two in "
+        f"[{MIN_CONTENDED_PREFILL_ROWS}, {MAX_CONTENDED_PREFILL_ROWS}] "
+        f"(default: {MIN_CONTENDED_PREFILL_ROWS})",
     )
     server.add_argument(
         "--max-memory",
