@@ -139,6 +139,10 @@ class CallbackStreamer:
     Stops early, through `on_stop`, on a stop sequence or, with a positive
     `reasoning_loop_limit`, when the reasoning before the think-end token
     repeats one sentence that many times (`reasoning_loop_tripped`).
+
+    With `thinking` set, stop sequences match only the content after the
+    think-end text: the reasoning before it, and the think-end text itself,
+    are sent unmatched.
     """
 
     def __init__(
@@ -148,6 +152,7 @@ class CallbackStreamer:
         stop_sequences=(),
         on_stop=None,
         reasoning_loop_limit=0,
+        thinking=False,
     ):
         self.tokenizer = tokenizer
         self.callback = callback
@@ -164,6 +169,9 @@ class CallbackStreamer:
         convert = getattr(tokenizer, "convert_tokens_to_ids", None)
         self.think_end_token = convert(THINK_END) if callable(convert) else None
         self.reasoning_loop_tripped = False
+        # True while stop matching waits for the think-end text; without stop
+        # sequences there is nothing to gate, so text flows straight through.
+        self.is_reasoning = bool(thinking) and bool(self.stop_sequences)
         # Without a think-end token id the reasoning cannot be told apart
         # from content, so the guard is never built.
         self.reasoning_loop_guard = (
@@ -177,8 +185,37 @@ class CallbackStreamer:
             self.callback(text)
             self.emitted.append(text)
 
-    def _emit(self, text):
-        if not text or self.stop_sequence is not None:
+    def _pass_reasoning(self, text, ends_reasoning):
+        """Send reasoning text unmatched; return the content after its end.
+
+        The end is the first think-end text in the reasoning (the boundary
+        `ReasoningSplitter.put` uses), or, when `ends_reasoning` marks the
+        think-end token's step and its text holds no think-end, all of it. A
+        partial think-end at the tail is held in `pending_text`, so the work is
+        bounded by the chunk, never by the reasoning's length.
+        """
+        self.pending_text += text
+        end = self.pending_text.find(THINK_END)
+        if end >= 0:
+            boundary = end + len(THINK_END)
+        elif ends_reasoning:
+            boundary = len(self.pending_text)
+        else:
+            ready, self.pending_text = hold_partial(self.pending_text, THINK_END)
+            self._send(ready)
+            return ""
+        self._send(self.pending_text[:boundary])
+        content = self.pending_text[boundary:]
+        self.pending_text = ""
+        self.is_reasoning = False
+        return content
+
+    def _emit(self, text, ends_reasoning=False):
+        if self.stop_sequence is not None:
+            return
+        if self.is_reasoning:
+            text = self._pass_reasoning(text, ends_reasoning)
+        if not text:
             return
         if not self.stop_sequences:
             self._send(text)
@@ -217,8 +254,9 @@ class CallbackStreamer:
         for token_id in token_ids:
             token_id = int(token_id)
             self.token_ids.append(token_id)
+            is_think_end = token_id == self.think_end_token
             guard = self.reasoning_loop_guard
-            if guard is not None and token_id == self.think_end_token:
+            if guard is not None and is_think_end:
                 self.reasoning_loop_guard = guard = None
             if self.decode_stream is None:
                 continue
@@ -232,13 +270,16 @@ class CallbackStreamer:
                     raise
                 self.decode_stream = None
                 continue
-            if text:
-                self._emit(text)
-                if self.stop_sequence is not None:
-                    break
-                if guard is not None and guard.feed(text):
-                    self._trip_reasoning_loop()
-                    break
+            if not text and not is_think_end:
+                continue
+            # The think-end token's step closes the reasoning even when its
+            # text never spells the think-end text.
+            self._emit(text or "", is_think_end)
+            if self.stop_sequence is not None:
+                break
+            if guard is not None and guard.feed(text):
+                self._trip_reasoning_loop()
+                break
 
     def end(self):
         if self.stop_sequence is not None:
@@ -579,6 +620,7 @@ class NativeBackend:
             job.stop_sequences,
             stop_matched,
             self.reasoning_loop_limit if job.thinking else 0,
+            job.thinking,
         )
         state = _JobState(job, streamer)
         try:

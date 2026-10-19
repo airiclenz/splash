@@ -899,6 +899,60 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(stopped, [True])
         self.assertEqual(streamer.stop_sequence, "<STOP>")
 
+    def test_callback_streamer_thinking_matches_stops_only_in_content(self):
+        # 1 "because ", 15 "second\n", 26 "</think>", 2+3 "</thi" "nk>answer\n",
+        # 14 "first ", 4 "plain answer\n".
+        cases = (
+            ("think_end_token", [1, 15, 26, 14, 15, 4], False, "first "),
+            ("think_end_spelled", [1, 15, 2, 3, 15, 4], False, "answer\n"),
+            ("decode_fallback", [1, 15, 26, 14, 15, 4], True, "first "),
+        )
+        for name, token_ids, falls_back, content in cases:
+            with self.subTest(name):
+                tokenizer = FakeTokenizer()
+                chunks = []
+                stopped = []
+                streamer = backend_api.CallbackStreamer(
+                    tokenizer,
+                    chunks.append,
+                    ("second",),
+                    lambda: stopped.append(True),
+                    0,
+                    True,
+                )
+                if falls_back:
+                    streamer.decode_stream = SimpleNamespace(
+                        step=mock.Mock(
+                            side_effect=ValueError("Invalid prefix encountered")
+                        )
+                    )
+
+                streamer.put_tokens(token_ids)
+                streamer.end()
+
+                reasoning, _, emitted_content = "".join(chunks).partition("</think>")
+                self.assertEqual(
+                    (reasoning, emitted_content, stopped, streamer.stop_sequence),
+                    ("because second\n", content, [True], "second"),
+                )
+
+    def test_callback_streamer_thinking_without_content_stop_emits_everything(
+        self,
+    ):
+        tokenizer = FakeTokenizer()
+        chunks = []
+        streamer = backend_api.CallbackStreamer(
+            tokenizer, chunks.append, ("because",), None, 0, True
+        )
+
+        streamer.put_tokens([1, 15, 26, 14])
+        streamer.end()
+
+        self.assertEqual(
+            ("".join(chunks), streamer.stop_sequence),
+            ("because second\n</think>first ", None),
+        )
+
     def test_models_and_nonstream_reasoning(self):
         runtime = FakeRuntime(Plan([[1], [2], [3]]))
         harness = self.harness(runtime)
@@ -2741,6 +2795,74 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(response["choices"][0]["finish_reason"], "stop")
         self.assertEqual(response["usage"]["completion_tokens"], 2)
         self.assertEqual(runtime.cancel_count, 1)
+
+    def test_thinking_stop_sequence_matches_only_content(self):
+        runtime = FakeRuntime(
+            Plan([[1], [15], [26], [14], [15], [4]], reason="length", delay=0.01)
+        )
+        harness = self.harness(runtime)
+
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body(stop="second")
+        )
+
+        message = json.loads(payload)["choices"][0]
+        self.assertEqual(
+            (
+                status,
+                message["message"]["reasoning_content"],
+                message["message"]["content"],
+                message["finish_reason"],
+                runtime.cancel_count,
+            ),
+            (200, "because second\n", "first ", "stop", 1),
+        )
+
+    def test_anthropic_thinking_stop_sequence_matches_only_content(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                runtime = FakeRuntime(
+                    Plan([[1], [15], [26], [14], [15], [4]], delay=0.01)
+                )
+                harness = self.harness(runtime)
+
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/messages",
+                    self.anthropic_body(
+                        stream=stream,
+                        max_tokens=2048,
+                        thinking={"type": "enabled", "budget_tokens": 1024},
+                        stop_sequences=["second"],
+                    ),
+                )
+
+                self.assertEqual(status, 200, payload)
+                if stream:
+                    events = self.response_events(payload)
+                    finish = events[-2]["delta"]
+                    deltas = [
+                        event["delta"]
+                        for event in events
+                        if event["type"] == "content_block_delta"
+                    ]
+                    thinking = "".join(delta.get("thinking", "") for delta in deltas)
+                    content = "".join(delta.get("text", "") for delta in deltas)
+                else:
+                    finish = json.loads(payload)
+                    blocks = finish["content"]
+                    thinking = "".join(block.get("thinking", "") for block in blocks)
+                    content = "".join(block.get("text", "") for block in blocks)
+                self.assertEqual(
+                    (
+                        thinking,
+                        content,
+                        finish["stop_reason"],
+                        finish["stop_sequence"],
+                        runtime.cancel_count,
+                    ),
+                    ("because second\n", "first ", "stop_sequence", "second", 1),
+                )
 
     def test_anthropic_cache_usage_and_matched_stop_sequence(self):
         for stream in (False, True):
