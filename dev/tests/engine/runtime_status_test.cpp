@@ -81,7 +81,7 @@ void testCleanRuntimeStatus() {
   engine.scheduler.decodeMixedGreedySamplingBatches = 2;
   engine.resources.pool = {256, 200, 24, 32, 128, 72, 1, 128 * 4096ULL,
                            32 * 4096ULL};
-  engine.resources.kvCache = {32, 32 * 4096ULL};
+  engine.resources.kvCache = {32, 32 * 4096ULL, 5};
   engine.resources.stateCache = {2, 0, 128, 1, 1, 2, 0};
   engine.resources.stateCache.checkpointEntries = 1;
   engine.resources.stateCache.checkpointBytes = 64;
@@ -213,6 +213,9 @@ void testCleanRuntimeStatus() {
                           "\"total_gpu_ms\":0,\"total_wall_ms\":0}}") !=
               std::string::npos,
           "status invented model timings from request metrics");
+  require(json.find("\"blocks\":32,\"cache_bytes\":131072,\"evictions\":5,") !=
+              std::string::npos,
+          "status lost the KV cache eviction count");
   require(json.find("\"pages_free\":200,\"pages_free_resident\":72,") !=
               std::string::npos,
           "status confused free virtual KV pages with resident free pages");

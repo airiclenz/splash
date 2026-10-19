@@ -98,6 +98,7 @@ _STATUS_METRICS = {
         "b4",
     ),
     "splash_kv_blocks": ("kv", "blocks"),
+    "splash_kv_evictions_total": ("kv", "evictions"),
     "splash_kv_pages_total": ("kv", "pages_total"),
     "splash_kv_pages_free": ("kv", "pages_free"),
     "splash_kv_pages_active": ("kv", "pages_active"),

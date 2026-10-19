@@ -157,6 +157,7 @@ std::string runtimeStatusJson(
       << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens
       << ",\"blocks\":" << resources.kvCache.blocks
       << ",\"cache_bytes\":" << resources.kvCache.bytes
+      << ",\"evictions\":" << resources.kvCache.evictions
       << ",\"pages_total\":" << pool.pagesTotal
       << ",\"pages_active\":" << pool.pagesActive
       << ",\"pages_cache\":" << pool.pagesPrefix

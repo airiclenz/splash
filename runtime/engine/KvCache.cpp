@@ -244,6 +244,7 @@ void KvCache::erase(uint64_t blockId) {
   index_.erase(indexed);
   blocks_.erase(blockId);
   ++generation_;
+  ++evictions_;
   if (parentId) {
     Block &parent = block(parentId);
     if (!parent.children)
@@ -263,7 +264,7 @@ KvCache::Snapshot KvCache::snapshot() const noexcept {
           : count * pool_.bytesPerPage();
   return {static_cast<uint32_t>(
               std::min<uint64_t>(count, std::numeric_limits<uint32_t>::max())),
-          bytes};
+          bytes, evictions_};
 }
 
 KvCache::Block &KvCache::block(uint64_t blockId) {

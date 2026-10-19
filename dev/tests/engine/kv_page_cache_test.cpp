@@ -158,6 +158,7 @@ void testExactChainedBlocksAndPhysicalOwnership() {
               pool.snapshot().pagesPrefix == 0 &&
               pool.freePageCount() == pool.pageCount(),
           "page cache erase leaked physical references");
+  require(cache.snapshot().evictions == 4, "KV cache did not count its evicted blocks");
 }
 
 void testErasedLeafParentInheritsRecency() {

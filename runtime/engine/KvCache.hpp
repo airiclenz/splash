@@ -71,6 +71,8 @@ public:
   struct Snapshot {
     uint32_t blocks = 0;
     uint64_t bytes = 0;
+    // Cumulative blocks erased by eviction; each is one page of tokens.
+    uint64_t evictions = 0;
   };
 
   KvCache(KvPool &pool, CacheNamespace cacheNamespace, CacheRecency &recency)
@@ -145,6 +147,7 @@ private:
   uint64_t nextBlockId_ = 1;
   // Any graph change invalidates previews, including a newly matched block.
   uint64_t generation_ = 1;
+  uint64_t evictions_ = 0;
   EvictionOrder evictionOrder_;
 };
 
