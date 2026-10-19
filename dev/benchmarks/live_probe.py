@@ -74,6 +74,14 @@ PROBE_PATHS = (
     REPLAY,
     DENIED,
 )
+# The governor's host page sample, read from the after-snapshot rather than
+# diffed: (record key, `/status` path). An absent key reads as None.
+HOST_READINGS = (
+    ("host_available_bytes", ("memory_governor", "host_available_bytes")),
+    ("host_inactive_bytes", ("memory_governor", "host_inactive_bytes")),
+    ("host_wired_bytes", ("memory_governor", "host_wired_bytes")),
+    ("host_compressor_bytes", ("memory_governor", "host_compressor_bytes")),
+)
 
 # (record key, table label) in display order.
 REPORT_ROWS = (
@@ -87,6 +95,10 @@ REPORT_ROWS = (
     ("resource_suspensions", "resource suspensions"),
     ("replay_tokens", "replay tokens"),
     ("denied_reservations", "denied reservations"),
+    ("host_available_bytes", "host available bytes"),
+    ("host_inactive_bytes", "host inactive bytes"),
+    ("host_wired_bytes", "host wired bytes"),
+    ("host_compressor_bytes", "host compressor bytes"),
     ("http_wall_ms", "HTTP wall ms"),
 )
 
@@ -181,11 +193,29 @@ def rate_per_second(tokens: float, wall_ms: float):
 
 
 # ------------------------------------------------------------------------------
+def status_reading(snapshot: dict, path):
+    """Return the number at a nested `/status` key path, or None when absent.
+
+    Unlike a diffed counter, a point reading an older server does not export
+    must not pass for 0, so a missing key or non-numeric leaf reads as None.
+    """
+    value = snapshot
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+# ------------------------------------------------------------------------------
 def probe_record(label: str, before: dict, after: dict, reply: dict, wall_ms):
     """Build one request's report row from its bracketing `/status` snapshots.
 
     Every rate and counter comes from the snapshot diff; only the token counts
     come from the reply's `usage`. A rate whose denominator delta is 0 is None.
+    The host memory readings come from the after-snapshot alone.
     """
     delta = status_delta(before, after, PROBE_PATHS)
     usage = reply.get("usage") or {}
@@ -207,6 +237,7 @@ def probe_record(label: str, before: dict, after: dict, reply: dict, wall_ms):
         "resource_suspensions": delta[SUSPENSIONS],
         "replay_tokens": delta[REPLAY],
         "denied_reservations": delta[DENIED],
+        **{key: status_reading(after, path) for key, path in HOST_READINGS},
         "http_wall_ms": wall_ms,
     }
 

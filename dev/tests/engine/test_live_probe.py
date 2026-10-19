@@ -71,6 +71,16 @@ REPEAT_AFTER = snapshot(
     memory_governor__denied_reservations=2,
 )
 
+# The governor's host page sample as a server that reports it emits it.
+HOST_SAMPLE = {
+    "host_available_bytes": 6 * 2**30,
+    "host_inactive_bytes": 3 * 2**30,
+    "host_wired_bytes": 5 * 2**30,
+    "host_compressor_bytes": 2**30,
+}
+REPEAT_AFTER_WITH_HOST = copy.deepcopy(REPEAT_AFTER)
+REPEAT_AFTER_WITH_HOST["memory_governor"].update(HOST_SAMPLE)
+
 
 class StubServer:
     """Serve canned `/status` snapshots in order and a fixed chat reply."""
@@ -255,6 +265,49 @@ class LiveProbeTests(unittest.TestCase):
             line for line in output.splitlines() if line.startswith("prefill tok/s")
         )
         self.assertEqual(prefill_row.split()[-2], probe.UNAVAILABLE)
+
+    def test_main_hostSample_reportsAfterSnapshotReadings(self):
+        statuses = [snapshot(), COLD_AFTER, COLD_AFTER, REPEAT_AFTER_WITH_HOST]
+
+        _stub, document = self.probe_json(statuses)
+
+        cold, repeat = document["requests"]
+        for key, value in HOST_SAMPLE.items():
+            self.assertEqual(repeat[key], value)
+            self.assertIsNone(cold[key])
+
+    def test_main_hostSample_tableShowsReadings(self):
+        statuses = [snapshot(), COLD_AFTER, COLD_AFTER, REPEAT_AFTER_WITH_HOST]
+
+        with StubServer(statuses) as stub:
+            code, output = run_main(["--base-url", stub.base_url, "--model", MODEL])
+
+        self.assertEqual(code, 0)
+        rows = {
+            label: next(line for line in output.splitlines() if line.startswith(label))
+            for label in (
+                "host available bytes",
+                "host inactive bytes",
+                "host wired bytes",
+                "host compressor bytes",
+            )
+        }
+        self.assertEqual(rows["host available bytes"].split()[-1], str(6 * 2**30))
+        self.assertEqual(rows["host inactive bytes"].split()[-1], str(3 * 2**30))
+        self.assertEqual(rows["host wired bytes"].split()[-1], str(5 * 2**30))
+        self.assertEqual(rows["host compressor bytes"].split()[-1], str(2**30))
+
+    def test_main_statusWithoutHostSample_tableShowsUnavailable(self):
+        statuses = [snapshot(), COLD_AFTER, COLD_AFTER, REPEAT_AFTER]
+
+        with StubServer(statuses) as stub:
+            code, output = run_main(["--base-url", stub.base_url, "--model", MODEL])
+
+        self.assertEqual(code, 0)
+        wired_row = next(
+            line for line in output.splitlines() if line.startswith("host wired bytes")
+        )
+        self.assertEqual(wired_row.split()[-2:], [probe.UNAVAILABLE] * 2)
 
     def test_coldPrompt_nonceLeadsAndChangesThePrompt(self):
         first = probe.cold_prompt(64, 16, "aaaa")

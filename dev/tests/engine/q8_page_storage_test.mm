@@ -15,6 +15,14 @@ using namespace splash::engine;
 
 namespace {
 
+// Wraps a fake available-bytes reading as a host sample without a breakdown.
+std::optional<HostMemorySample>
+availableOnly(const std::optional<uint64_t> &availableBytes) {
+    if (!availableBytes)
+        return std::nullopt;
+    return HostMemorySample{.availableBytes = *availableBytes};
+}
+
 void require(bool condition, const char *message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -113,7 +121,7 @@ void run(const std::string &metallib) {
     MemoryGovernor bounded(
         backend, observed + 64 * 1024, boundedCushion,
         [&fakeHostAvailable] {
-            return fakeHostAvailable;
+            return availableOnly(fakeHostAvailable);
         });
     auto reservation = bounded.tryReserve(64 * 1024);
     require(reservation.has_value() &&
@@ -315,7 +323,9 @@ void run(const std::string &metallib) {
     MemoryGovernor hostGated(
         backend, backend.capabilities().recommendedMaxWorkingSetBytes,
         EngineMemoryPolicy::hostCushionForReserve(128ULL * 1024 * 1024),
-        [&elasticHostAvailable] { return elasticHostAvailable; });
+        [&elasticHostAvailable] {
+            return availableOnly(elasticHostAvailable);
+        });
     kv::PageStorage hostGatedStorage(
         backend, hostGated.allocationAdmission(), kvLayout, 256);
     if (hostGatedStorage.residentPages() != 128) {

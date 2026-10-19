@@ -36,7 +36,7 @@ uint64_t estimateHostAvailableMemory(const HostMemoryPages &statistics,
   return usedBytes < physicalMemoryBytes ? physicalMemoryBytes - usedBytes : 0;
 }
 
-std::optional<uint64_t> queryHostAvailableMemory() noexcept {
+std::optional<HostMemorySample> queryHostAvailableMemory() noexcept {
   // Physical capacity is immutable; don't add a sysctl to every allocation.
   static const uint64_t physicalMemoryBytes = [] {
     uint64_t bytes = 0;
@@ -58,15 +58,21 @@ std::optional<uint64_t> queryHostAvailableMemory() noexcept {
   mach_port_deallocate(mach_task_self(), host);
   if (statisticsResult != KERN_SUCCESS || !pageSize) return std::nullopt;
 
-  return estimateHostAvailableMemory(
-      {.active = statistics.active_count,
-       .inactive = statistics.inactive_count,
-       .speculative = statistics.speculative_count,
-       .wired = statistics.wire_count,
-       .compressor = statistics.compressor_page_count,
-       .fileBacked = statistics.external_page_count,
-       .purgeable = statistics.purgeable_count},
-      pageSize, physicalMemoryBytes);
+  const HostMemoryPages pages{
+      .active = statistics.active_count,
+      .inactive = statistics.inactive_count,
+      .speculative = statistics.speculative_count,
+      .wired = statistics.wire_count,
+      .compressor = statistics.compressor_page_count,
+      .fileBacked = statistics.external_page_count,
+      .purgeable = statistics.purgeable_count};
+  // Mach page counts are 32-bit, so their byte sizes cannot overflow.
+  return HostMemorySample{
+      .availableBytes =
+          estimateHostAvailableMemory(pages, pageSize, physicalMemoryBytes),
+      .inactiveBytes = pages.inactive * pageSize,
+      .wiredBytes = pages.wired * pageSize,
+      .compressorBytes = pages.compressor * pageSize};
 }
 
 std::optional<MemoryPressure> querySystemMemoryPressure() noexcept {
@@ -152,15 +158,15 @@ MemoryGovernor::MemoryGovernor(
         "existing Metal allocations exceed memory governor limit",
         metal::AllocationFailure::EngineBudget);
   }
-  std::optional<uint64_t> hostAvailable = hostAvailableMemory_();
-  if (!hostAvailable || *hostAvailable <= hostCushion_.reserveBytes) {
+  std::optional<HostMemorySample> hostSample = hostAvailableMemory_();
+  if (!hostSample || hostSample->availableBytes <= hostCushion_.reserveBytes) {
     throw metal::MetalAllocationError(
         "host available memory does not satisfy the system reserve",
         metal::AllocationFailure::HostPressure);
   }
   // Without a stored sample, a snapshot() before the first observe() would
   // report host growth paused.
-  static_cast<void>(updateEffectivePressure(hostAvailable, reservedBytes_));
+  static_cast<void>(updateEffectivePressure(hostSample, reservedBytes_));
 }
 
 uint64_t
@@ -176,7 +182,8 @@ MemoryGovernor::observedResidentBytes(bool refreshDevice) const noexcept {
   return std::max(accounted, memory.deviceCurrentAllocatedBytes);
 }
 
-std::optional<uint64_t> MemoryGovernor::sampleHostAvailable() const noexcept {
+std::optional<HostMemorySample>
+MemoryGovernor::sampleHostAvailable() const noexcept {
   try {
     return hostAvailableMemory_();
   } catch (...) {
@@ -185,12 +192,12 @@ std::optional<uint64_t> MemoryGovernor::sampleHostAvailable() const noexcept {
 }
 
 uint64_t MemoryGovernor::hostHeadroomBytes(
-    const std::optional<uint64_t> &hostAvailable,
+    const std::optional<HostMemorySample> &hostSample,
     uint64_t reservedBytes) const noexcept {
-  if (!hostAvailable || *hostAvailable <= hostCushion_.reserveBytes)
+  if (!hostSample || hostSample->availableBytes <= hostCushion_.reserveBytes)
     return 0;
   const uint64_t availableAfterReserve =
-      *hostAvailable - hostCushion_.reserveBytes;
+      hostSample->availableBytes - hostCushion_.reserveBytes;
   return reservedBytes < availableAfterReserve
       ? availableAfterReserve - reservedBytes
       : 0;
@@ -215,13 +222,13 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
       reservedBytes_ > std::numeric_limits<uint64_t>::max() - bytes;
   uint64_t requested =
       overflows ? std::numeric_limits<uint64_t>::max() : reservedBytes_ + bytes;
-  std::optional<uint64_t> hostAvailable = sampleHostAvailable();
+  std::optional<HostMemorySample> hostSample = sampleHostAvailable();
   MemoryPressure pressure = updateEffectivePressure(
-      hostAvailable, reservedBytes_);
+      hostSample, reservedBytes_);
   bool engineFits = !overflows && observed <= limitBytes_ &&
                     requested <= limitBytes_ - observed;
   if (!engineFits ||
-      !hostAdmits(hostHeadroomBytes(hostAvailable, requested), pressure)) {
+      !hostAdmits(hostHeadroomBytes(hostSample, requested), pressure)) {
     if (failure)
       *failure = !engineFits ? metal::AllocationFailure::EngineBudget
                             : metal::AllocationFailure::HostPressure;
@@ -272,8 +279,8 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   } else {
     used = std::numeric_limits<uint64_t>::max();
   }
-  uint64_t hostHeadroom =
-      hostHeadroomBytes(sampledHostAvailable_, reservedBytes_);
+  uint64_t hostHeadroom = hostHeadroomBytes(sampledHost_, reservedBytes_);
+  const HostMemorySample host = sampledHost_.value_or(HostMemorySample{});
   MemoryPressure pressure = effectivePressure();
   bool hostGrowthAllowed = hostAdmits(hostHeadroom, pressure);
   bool growthAllowed = hostGrowthAllowed && used < limitBytes_;
@@ -284,8 +291,11 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
       used < limitBytes_ ? limitBytes_ - used : 0,
       pressure,
       deniedReservations_,
-      sampledHostAvailable_.has_value(),
-      sampledHostAvailable_.value_or(0),
+      sampledHost_.has_value(),
+      host.availableBytes,
+      host.inactiveBytes,
+      host.wiredBytes,
+      host.compressorBytes,
       hostCushion_.reserveBytes,
       hostCushion_.warningMarginBytes,
       hostCushion_.recoveryMarginBytes,
@@ -297,16 +307,16 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
 }
 
 MemoryPressure MemoryGovernor::updateEffectivePressure(
-    const std::optional<uint64_t> &hostAvailable,
+    const std::optional<HostMemorySample> &hostSample,
     uint64_t reservedBytes) noexcept {
-  sampledHostAvailable_ = hostAvailable;
-  uint64_t hostHeadroom = hostHeadroomBytes(hostAvailable, reservedBytes);
+  sampledHost_ = hostSample;
+  uint64_t hostHeadroom = hostHeadroomBytes(hostSample, reservedBytes);
 
   // The latch enters below the warning margin and holds until the recovery
   // margin, so paced reclaim runs a whole episode. It drives reported
   // pressure and reclaim only; admission reads the headroom itself. Only the
   // system's critical signal warrants dropping every evictable cache entry.
-  hostConstrained_ = !hostAvailable ||
+  hostConstrained_ = !hostSample ||
       hostHeadroom < hostCushion_.warningMarginBytes ||
       (hostConstrained_ && hostHeadroom < hostCushion_.recoveryMarginBytes);
   return effectivePressure();

@@ -140,7 +140,7 @@ void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
   require(root.packageBytes > 3 * kGiB, "the package must exceed the sample");
   config.hostAvailableMemory = [] {
-    return std::optional<uint64_t>(3 * kGiB);
+    return std::optional(HostMemorySample{.availableBytes = 3 * kGiB});
   };
   requireReachesModelLoader(config, root.path,
                             "a package larger than reclaimable host memory "
@@ -148,8 +148,9 @@ void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
 
   // Below the reserve macOS is the one at risk, so startup waits instead.
   // Unmeasurable telemetry waits the same way.
-  for (std::optional<uint64_t> available :
-       {std::optional<uint64_t>(64 * kMiB), std::optional<uint64_t>()}) {
+  for (std::optional<HostMemorySample> available :
+       {std::optional(HostMemorySample{.availableBytes = 64 * kMiB}),
+        std::optional<HostMemorySample>()}) {
     config.hostAvailableMemory = [available] { return available; };
     try {
       auto resources = RuntimeResources::create(config);
@@ -179,7 +180,7 @@ void testStartupRefusalNamesServingFloor(const char *metallibPath) {
       std::to_string(cushion.warningMarginBytes / kMiB) +
       " MiB warning margin)";
   config.hostAvailableMemory = [floorBytes] {
-    return std::optional<uint64_t>(floorBytes);
+    return std::optional(HostMemorySample{.availableBytes = floorBytes});
   };
 
   try {
@@ -192,7 +193,7 @@ void testStartupRefusalNamesServingFloor(const char *metallibPath) {
   }
 
   config.hostAvailableMemory = [floorBytes] {
-    return std::optional<uint64_t>(floorBytes + 1);
+    return std::optional(HostMemorySample{.availableBytes = floorBytes + 1});
   };
   requireReachesModelLoader(config, root.path,
                             "startup refused host memory above the floor");

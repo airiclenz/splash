@@ -34,6 +34,17 @@ void appendBatch(std::ostringstream &out,
       << ",\"tokens_per_second\":" << batch.tokensPerSecond << '}';
 }
 
+// The page breakdown behind host_available_bytes, from the governor's stored
+// sample. Omitted while the measurement is invalid, where it would read 0.
+void appendHostPages(std::ostringstream &out,
+                     const MemoryGovernorSnapshot &memoryGovernor) {
+  if (!memoryGovernor.hostMeasurementValid)
+    return;
+  out << ",\"host_inactive_bytes\":" << memoryGovernor.hostInactiveBytes
+      << ",\"host_wired_bytes\":" << memoryGovernor.hostWiredBytes
+      << ",\"host_compressor_bytes\":" << memoryGovernor.hostCompressorBytes;
+}
+
 } // namespace
 
 std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
@@ -138,8 +149,9 @@ std::string runtimeStatusJson(
       << json::quote(memoryPressureName(memoryGovernor.systemPressure))
       << ",\"host_measurement_valid\":"
       << boolean(memoryGovernor.hostMeasurementValid)
-      << ",\"host_available_bytes\":" << memoryGovernor.hostAvailableBytes
-      << ",\"host_reserve_bytes\":" << memoryGovernor.hostReserveBytes
+      << ",\"host_available_bytes\":" << memoryGovernor.hostAvailableBytes;
+  appendHostPages(out, memoryGovernor);
+  out << ",\"host_reserve_bytes\":" << memoryGovernor.hostReserveBytes
       << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes << "}"
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()
       << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens

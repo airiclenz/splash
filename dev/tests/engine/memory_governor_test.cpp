@@ -22,6 +22,9 @@ constexpr uint64_t kLatchedHostBytes =
     kCushion.reserveBytes +
     (kCushion.warningMarginBytes + kCushion.recoveryMarginBytes) / 2;
 constexpr int kRepeatedSnapshots = 16;
+constexpr uint64_t kInactiveHostBytes = 3 * kGiB;
+constexpr uint64_t kWiredHostBytes = 5 * kGiB;
+constexpr uint64_t kCompressorHostBytes = 1 * kGiB;
 
 void require(bool value, const char *message) {
   if (!value)
@@ -31,6 +34,9 @@ void require(bool value, const char *message) {
 // A host sampler whose answer the test sets and whose calls it counts.
 struct FakeHost {
   std::optional<uint64_t> availableBytes = kAmpleHostBytes;
+  uint64_t inactiveBytes = kInactiveHostBytes;
+  uint64_t wiredBytes = kWiredHostBytes;
+  uint64_t compressorBytes = kCompressorHostBytes;
   int samples = 0;
 };
 
@@ -43,9 +49,12 @@ MemoryGovernor makeGovernor(FakeHost &host,
         return stats;
       },
       kLimitBytes, cushion,
-      [&host] {
+      [&host]() -> std::optional<HostMemorySample> {
         ++host.samples;
-        return host.availableBytes;
+        if (!host.availableBytes)
+          return std::nullopt;
+        return HostMemorySample{*host.availableBytes, host.inactiveBytes,
+                                host.wiredBytes, host.compressorBytes};
       });
 }
 
@@ -229,6 +238,32 @@ void testInvalidCushionRejected() {
   }
 }
 
+void testObserveStoresPageBreakdown() {
+  FakeHost host;
+  MemoryGovernor governor = makeGovernor(host);
+  host.wiredBytes = 2 * kWiredHostBytes;
+
+  const MemoryGovernorSnapshot stored = governor.snapshot();
+  require(stored.hostInactiveBytes == kInactiveHostBytes &&
+              stored.hostWiredBytes == kWiredHostBytes &&
+              stored.hostCompressorBytes == kCompressorHostBytes,
+          "the startup page breakdown was not stored");
+
+  governor.observe();
+  const MemoryGovernorSnapshot observed = governor.snapshot();
+  require(observed.hostWiredBytes == 2 * kWiredHostBytes &&
+              observed.hostInactiveBytes == kInactiveHostBytes,
+          "observe() did not store the new page breakdown");
+  require(host.samples == 2, "the page breakdown cost an extra host sample");
+
+  host.availableBytes.reset();
+  governor.observe();
+  const MemoryGovernorSnapshot invalid = governor.snapshot();
+  require(!invalid.hostMeasurementValid && invalid.hostInactiveBytes == 0 &&
+              invalid.hostWiredBytes == 0 && invalid.hostCompressorBytes == 0,
+          "a failed sample kept a stale page breakdown");
+}
+
 void testSystemPressureReadsWithoutSampling() {
   FakeHost host;
   MemoryGovernor governor = makeGovernor(host);
@@ -254,6 +289,7 @@ int main() {
     testCushionScalesWithPhysicalMemory();
     testInvalidCushionRejected();
     testSystemPressureReadsWithoutSampling();
+    testObserveStoresPageBreakdown();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

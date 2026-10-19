@@ -112,15 +112,15 @@ uint64_t mebibytes(uint64_t bytes) noexcept { return bytes / kMiB; }
 void requireStartupHeadroom(
     const MemoryGovernor::HostAvailableMemoryProvider &hostAvailableMemory,
     const HostCushion &cushion, MemoryPressure pressure) {
-  const std::optional<uint64_t> available = hostAvailableMemory();
-  if (!available || *available <= cushion.admissionFloorBytes() ||
+  const std::optional<HostMemorySample> sample = hostAvailableMemory();
+  if (!sample || sample->availableBytes <= cushion.admissionFloorBytes() ||
       pressure == MemoryPressure::Critical) {
     std::ostringstream message;
     message << "not enough free memory to start: ";
-    if (!available)
+    if (!sample)
       message << "reclaimable host memory cannot be measured";
     else
-      message << mebibytes(*available) << " MiB reclaimable, "
+      message << mebibytes(sample->availableBytes) << " MiB reclaimable, "
               << mebibytes(cushion.admissionFloorBytes())
               << " MiB required (" << mebibytes(cushion.reserveBytes)
               << " MiB protected for macOS + "

@@ -27,7 +27,20 @@ struct HostMemoryPages {
 [[nodiscard]] uint64_t estimateHostAvailableMemory(
     const HostMemoryPages &pages, uint64_t pageSize,
     uint64_t physicalMemoryBytes) noexcept;
-[[nodiscard]] std::optional<uint64_t> queryHostAvailableMemory() noexcept;
+
+// One host page reading: the available estimate plus the page categories that
+// explain a low one, in bytes. The breakdown is telemetry only; admission and
+// the latch read availableBytes alone.
+struct HostMemorySample {
+  uint64_t availableBytes = 0;
+  uint64_t inactiveBytes = 0;
+  uint64_t wiredBytes = 0;
+  uint64_t compressorBytes = 0;
+};
+
+// One host_statistics64 call; empty when the host cannot be measured.
+[[nodiscard]] std::optional<HostMemorySample>
+queryHostAvailableMemory() noexcept;
 
 enum class MemoryPressure : uint8_t {
   Normal,
@@ -61,6 +74,11 @@ struct MemoryGovernorSnapshot {
   uint64_t deniedReservations = 0;
   bool hostMeasurementValid = false;
   uint64_t hostAvailableBytes = 0;
+  // The page breakdown of the same sample, zero while the measurement is
+  // invalid.
+  uint64_t hostInactiveBytes = 0;
+  uint64_t hostWiredBytes = 0;
+  uint64_t hostCompressorBytes = 0;
   uint64_t hostReserveBytes = 0;
   // The cushion's margins over the reserve: growth needs the warning margin
   // left after it; a Warning reclaim episode ends at the recovery margin.
@@ -102,7 +120,7 @@ private:
 class MemoryGovernor final {
 public:
   using HostAvailableMemoryProvider =
-      std::function<std::optional<uint64_t>()>;
+      std::function<std::optional<HostMemorySample>()>;
   // Reads the Metal footprint: the backend's refreshed device sample when
   // its argument is true, its cached accounting otherwise. Must not throw.
   using MetalMemoryStatsProvider =
@@ -181,18 +199,19 @@ public:
 private:
   [[nodiscard]] uint64_t
   observedResidentBytes(bool refreshDevice = false) const noexcept;
-  [[nodiscard]] std::optional<uint64_t> sampleHostAvailable() const noexcept;
+  [[nodiscard]] std::optional<HostMemorySample>
+  sampleHostAvailable() const noexcept;
   [[nodiscard]] uint64_t
-  hostHeadroomBytes(const std::optional<uint64_t> &hostAvailable,
+  hostHeadroomBytes(const std::optional<HostMemorySample> &hostSample,
                     uint64_t reservedBytes) const noexcept;
-  // Stores hostAvailable as the current sample and advances the latch from
+  // Stores hostSample as the current sample and advances the latch from
   // it. Callers hold mutex_ (or own the governor exclusively).
   // The host half of admission, shared by tryReserve() and snapshot() so
   // hostGrowthAllowed reports exactly what a reservation would be told.
   [[nodiscard]] bool hostAdmits(uint64_t hostHeadroom,
                                 MemoryPressure pressure) const noexcept;
   [[nodiscard]] MemoryPressure updateEffectivePressure(
-      const std::optional<uint64_t> &hostAvailable,
+      const std::optional<HostMemorySample> &hostSample,
       uint64_t reservedBytes) noexcept;
   [[nodiscard]] MemoryPressure effectivePressure() const noexcept;
   void release(uint64_t bytes) noexcept;
@@ -205,7 +224,7 @@ private:
   uint64_t reservedBytes_ = 0;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
-  std::optional<uint64_t> sampledHostAvailable_;
+  std::optional<HostMemorySample> sampledHost_;
   bool hostConstrained_ = false;
 };
 

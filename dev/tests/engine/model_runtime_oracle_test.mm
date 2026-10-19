@@ -782,12 +782,13 @@ int main(int argc, char **argv) {
         EngineMemoryPolicy::hostCushion(device.physicalMemoryBytes);
     // Production's startup floor: the reserve plus the warning margin.
     const uint64_t hostProtectedBytes = hostCushion.admissionFloorBytes();
-    const auto hostAvailableBytes = queryHostAvailableMemory();
-    require(hostAvailableBytes.has_value(),
+    const auto hostSample = queryHostAvailableMemory();
+    require(hostSample.has_value(),
             "cannot measure available host memory before loading the oracle model");
-    require(*hostAvailableBytes > hostProtectedBytes,
+    require(hostSample->availableBytes > hostProtectedBytes,
             "available host memory does not cover the protected macOS reserve");
-    uint64_t remainingModelBytes = *hostAvailableBytes - hostProtectedBytes;
+    uint64_t remainingModelBytes =
+        hostSample->availableBytes - hostProtectedBytes;
     const std::filesystem::path modelRoot(argv[2]);
     bool hasModelBytes = false;
     // Match production's packed-file preflight before any model mappings.
