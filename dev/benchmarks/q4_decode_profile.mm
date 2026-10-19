@@ -1,8 +1,12 @@
 // Sweeps the decode Q4 projection pipelines over the production projection
 // shapes and persistent-group counts. Every pipeline streams the same weight
 // bytes, so the effective GB/s is the tuning signal for a device family.
+// Apple7/8 also sweep their register-matrix tile (decode_linear_q4_sgf*) over
+// batch widths and K partitions.
 #include "../../runtime/metal/MetalBackend.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Linear.h"
+#include "ops/Linear.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -11,6 +15,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -19,8 +24,20 @@ using splash::metal::BufferStorage;
 using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
+using splash::ops::LinearBuffers;
+using splash::ops::LinearEpilogue;
+using splash::ops::LinearPhase;
+using splash::ops::LinearPlan;
+using splash::ops::LinearScratch;
+using splash::ops::LinearScratchSize;
+using splash::ops::LinearTile;
+using splash::ops::LinearWorkload;
+using splash::ops::Q4Linear;
+using splash::ops::Q4Projection;
 
 constexpr uint32_t kQuantGroup = 64;
+constexpr uint32_t kWarmups = 2;
+constexpr uint32_t kSamples = 9;
 
 enum class Contract : uint8_t { Affine, Residual, GateUp, UpSilu };
 
@@ -91,6 +108,17 @@ double median(std::vector<double> samples) {
   return samples[samples.size() / 2];
 }
 
+// Median GPU seconds of one dispatch after warmup submissions.
+double timeDispatch(MetalBackend &backend, const ComputeDispatch &dispatch) {
+  for (uint32_t warmup = 0; warmup < kWarmups; ++warmup)
+    static_cast<void>(backend.submit(dispatch));
+  std::vector<double> samples;
+  samples.reserve(kSamples);
+  for (uint32_t repeat = 0; repeat < kSamples; ++repeat)
+    samples.push_back(backend.submit(dispatch).gpuSeconds);
+  return median(std::move(samples));
+}
+
 std::vector<uint32_t> groupCandidates(uint32_t tiles, uint32_t referenceGroups) {
   std::vector<uint32_t> groups{referenceGroups, tiles, tiles / 2, tiles / 4,
                                tiles / 8,  20,        40,        60,
@@ -147,15 +175,111 @@ void sweep(MetalBackend &backend, const Shape &shape, const Pipeline &pipeline,
     Q4Params params{shape.outputSize, shape.inputSize, groups};
     dispatch.bytes = {{parameterIndex, &params, sizeof(params)}};
     dispatch.threadgroups = {groups, 1, 1};
-    for (uint32_t warmup = 0; warmup < 2; ++warmup)
-      static_cast<void>(backend.submit(dispatch));
-    std::vector<double> samples;
-    for (uint32_t repeat = 0; repeat < 9; ++repeat)
-      samples.push_back(backend.submit(dispatch).gpuSeconds);
-    const double seconds = median(samples);
+    const double seconds = timeDispatch(backend, dispatch);
     std::cout << shape.label << ' ' << pipeline.name << " groups=" << groups
               << (groups == shape.referenceGroups ? "*" : "")
               << " ms=" << seconds * 1e3
+              << " GB/s=" << double(bytes) / seconds / 1e9 << '\n';
+  }
+}
+
+Q4Projection projection(const WeightSet &set, const Shape &shape) {
+  return {set.weights, set.scales, set.biases, shape.outputSize,
+          shape.inputSize};
+}
+
+// The policy's own SimdgroupF32 candidates (one per K partition count), so
+// the sweep follows Q4Linear rather than restating its column and split rules.
+std::vector<LinearPlan> simdgroupF32Plans(const Q4Linear &linear,
+                                          LinearWorkload workload) {
+  std::vector<LinearPlan> plans = linear.candidates(workload);
+  std::erase_if(plans, [](const LinearPlan &plan) {
+    return plan.configuration().tile != LinearTile::SimdgroupF32;
+  });
+  return plans;
+}
+
+LinearScratchSize largestScratch(const std::vector<LinearPlan> &plans) {
+  LinearScratchSize largest;
+  for (const LinearPlan &plan : plans) {
+    const LinearScratchSize size = plan.scratchSize();
+    largest.input = std::max(largest.input, size.input);
+    largest.sums = std::max(largest.sums, size.sums);
+    largest.partials = std::max(largest.partials, size.partials);
+    largest.counters = std::max(largest.counters, size.counters);
+  }
+  return largest;
+}
+
+// Times every K partition count of the SimdgroupF32 tile for one batch width.
+// decode_linear_q4_prepare writes the shared input table and row sums once,
+// untimed; each row then times the projection dispatch alone. * marks the
+// device policy's selection.
+void sweepSimdgroupF32(MetalBackend &backend, const Q4Linear &linear,
+                       const Shape &shape, LinearEpilogue epilogue,
+                       uint32_t lanes, const WeightSet &first,
+                       const WeightSet &second) {
+  const LinearWorkload workload{{shape.outputSize, shape.inputSize},
+                                lanes * SPLASH_TARGET_VERIFY_ROWS,
+                                LinearPhase::Decode, epilogue};
+  const std::vector<LinearPlan> plans = simdgroupF32Plans(linear, workload);
+  if (plans.empty())
+    return;
+  const LinearPlan selected = linear.plan(workload);
+  const std::string label = std::string(shape.label) + " sgf";
+  const LinearScratchSize size = largestScratch(plans);
+  MetalBuffer input = backend.allocateBuffer(
+      uint64_t{workload.rows} * shape.inputSize * sizeof(__bf16),
+      BufferStorage::Shared, label + " input");
+  std::memset(input.contents(), 0x3c, input.sizeBytes());
+  const bool residual = epilogue == LinearEpilogue::Residual;
+  const uint64_t outputBytes =
+      uint64_t{workload.rows} * shape.outputSize * sizeof(__bf16);
+  LinearBuffers buffers{
+      input,
+      backend.allocateBuffer(outputBytes, BufferStorage::Shared,
+                             label + " output"),
+      {},
+      residual ? backend.allocateBuffer(outputBytes, BufferStorage::Shared,
+                                        label + " residual")
+               : MetalBuffer{},
+      {},
+      {},
+      LinearScratch{
+          backend.allocateBuffer(size.input, BufferStorage::Shared,
+                                 label + " table"),
+          backend.allocateBuffer(size.sums, BufferStorage::Shared,
+                                 label + " sums"),
+          backend.allocateBuffer(size.partials, BufferStorage::Shared,
+                                 label + " partials"),
+          backend.allocateBuffer(size.counters, BufferStorage::Shared,
+                                 label + " counters")},
+  };
+  // Split kernels reset each counter after their reduction; start from zero.
+  std::memset(buffers.scratch.counters.contents(), 0, size.counters);
+
+  // GateUp binds the gate stream first and passes up as the projection.
+  const bool gateUp = epilogue == LinearEpilogue::GateUp;
+  const Q4Projection primary = projection(gateUp ? second : first, shape);
+  const Q4Projection gate = projection(first, shape);
+  const Q4Projection *gateProjection = gateUp ? &gate : nullptr;
+  const uint64_t bytes = gateUp ? 2 * first.bytes : first.bytes;
+
+  splash::metal::CommandGraph prepare;
+  linear.add(prepare, buffers, primary, plans.front(), gateProjection);
+  static_cast<void>(backend.submitCommand(prepare.dispatches()));
+  buffers.inputPrepared = true;
+
+  for (const LinearPlan &plan : plans) {
+    splash::metal::CommandGraph graph;
+    linear.add(graph, buffers, primary, plan, gateProjection);
+    const double seconds = timeDispatch(backend, graph.dispatches().front());
+    const uint32_t splits = plan.configuration().splits;
+    const bool isSelected =
+        selected.configuration().tile == LinearTile::SimdgroupF32 &&
+        selected.configuration().splits == splits;
+    std::cout << shape.label << ' ' << plan.pipeline() << " splits=" << splits
+              << (isSelected ? "*" : "") << " ms=" << seconds * 1e3
               << " GB/s=" << double(bytes) / seconds / 1e9 << '\n';
   }
 }
@@ -165,6 +289,7 @@ void run(const std::string &metallibPath) {
   const auto &capabilities = backend.capabilities();
   std::cout << "device=\"" << capabilities.deviceName
             << "\" apple_gpu_family=" << capabilities.appleGpuFamily << '\n';
+  const Q4Linear linear(capabilities);
   const Shape shapes[] = {
       {"gdn_input", 16'640, 5'120, 60},
       {"full_input", 14'336, 5'120, 60},
@@ -187,6 +312,16 @@ void run(const std::string &metallibPath) {
         continue;
       sweep(backend, shape, pipeline, first, second);
     }
+    // Only Apple7/8 select the SimdgroupF32 tile.
+    if (capabilities.appleGpuFamily >= 9)
+      continue;
+    const std::vector<LinearEpilogue> epilogues =
+        gateUp ? std::vector{LinearEpilogue::GateUp}
+               : std::vector{LinearEpilogue::None, LinearEpilogue::Residual};
+    for (const LinearEpilogue epilogue : epilogues)
+      for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
+        sweepSimdgroupF32(backend, linear, shape, epilogue, lanes, first,
+                          second);
   }
 }
 

@@ -19,6 +19,10 @@ using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 
 constexpr uint32_t kQuantGroup = 64;
+// The Apple7/8 register-matrix tile: 32 rows x 64 columns on four simdgroups.
+constexpr uint32_t kMma64Columns = 64;
+constexpr uint32_t kMma64Threads = 128;
+const std::string kMma64 = "prefill_linear_q4_mma64";
 
 MetalBuffer shared(MetalBackend &backend, uint64_t bytes,
                    const std::string &label) {
@@ -234,8 +238,18 @@ void run(const std::string &metallibPath) {
             << capabilities.maxThreadgroupMemoryBytes
             << " threadgroup_width=" << capabilities.maxThreadgroupWidth
             << '\n';
+  // Only Apple7/8 select the mma64 tile; its rows carry the pipeline name.
+  const bool registerMatrix = capabilities.appleGpuFamily < 9;
+  const auto profileMma64 = [&](uint32_t rows, uint32_t inputSize,
+                                uint32_t outputSize, const std::string &label) {
+    if (registerMatrix)
+      profileShape(backend, rows, inputSize, outputSize, 32, kMma64Columns,
+                   "prefill_linear_q4_sums32", kMma64, label + "_" + kMma64,
+                   false, kMma64Threads);
+  };
   // Each plain projection with the three tiles the policy may choose: N128
-  // and N256 on eight SIMD groups and N128 on four (the Apple10 default).
+  // and N256 on eight SIMD groups and N128 on four (the Apple10 default),
+  // plus mma64 on Apple7/8.
   const auto profileTiles = [&](uint32_t rows, uint32_t inputSize,
                                 uint32_t outputSize, const std::string &label) {
     profileShape(backend, rows, inputSize, outputSize, 32, 128,
@@ -247,16 +261,22 @@ void run(const std::string &metallibPath) {
     profileShape(backend, rows, inputSize, outputSize, 32, 128,
                  "prefill_linear_q4_sums32", "prefill_linear_q4_n128_sg4",
                  label + "_m32n128_sg4", false, 128);
+    profileMma64(rows, inputSize, outputSize, label);
   };
   for (uint32_t rows : kProfileRows) {
     profileTiles(rows, 5120, 17408, "ffn_up");
     profileShape(backend, rows, 17408, 5120, 32, 256, "prefill_linear_q4_sums32",
                  "prefill_linear_q4_n256", "ffn_down_m32n256");
+    profileMma64(rows, 17408, 5120, "ffn_down");
     profileUpSilu(backend, rows, 5120, 17408,
                   "prefill_linear_q4_n256_up_silu_sums", "ffn_up_silu_m32n256");
     profileUpSilu(backend, rows, 5120, 17408,
                   "prefill_linear_q4_n128_up_silu_sums_sg4",
                   "ffn_up_silu_m32n128_sg4", 128, 128);
+    if (registerMatrix)
+      profileUpSilu(backend, rows, 5120, 17408, kMma64 + "_up_silu_sums",
+                    "ffn_up_silu_" + kMma64 + "_up_silu_sums", kMma64Columns,
+                    kMma64Threads);
     profileTiles(rows, 5120, 16640, "gdn_input");
     profileTiles(rows, 5120, 14336, "attention_input");
     profileTiles(rows, 6144, 5120, "mixer_output");
@@ -268,6 +288,7 @@ void run(const std::string &metallibPath) {
   for (uint32_t rows : kProfileRows) {
     profileShape(backend, rows, 5120, 6144, 32, 128, "prefill_linear_q4_sums32",
                  "prefill_linear_q4_n128", "draft_qkv_m32n128");
+    profileMma64(rows, 5120, 6144, "draft_qkv");
   }
   // The residual FFN down projection with both tile widths: the executor
   // picks 128 columns when the 256-column grid would leave cores idle.
@@ -281,6 +302,11 @@ void run(const std::string &metallibPath) {
     profileShape(backend, rows, 17408, 5120, 32, 128, "prefill_linear_q4_sums32",
                  "prefill_linear_q4_n128_residual_sg4",
                  "ffn_down_residual_m32n128_sg4", true, 128);
+    if (registerMatrix)
+      profileShape(backend, rows, 17408, 5120, 32, kMma64Columns,
+                   "prefill_linear_q4_sums32", kMma64 + "_residual",
+                   "ffn_down_residual_" + kMma64 + "_residual", true,
+                   kMma64Threads);
   }
   for (uint32_t rows : {128u, 512u, 1'808u, 2'048u}) {
     profileRmsSums(backend, rows, 5120, 32, "prefill_linear_q4_sums32",
