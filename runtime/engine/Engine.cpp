@@ -250,6 +250,13 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
   if (pending_ || model_.needsHealthCheck())
     result = nextHealthCheckMilliseconds_;
   const bool draining = drainingForRecovery();
+  // admitQueued() retries only suspended requests while one recovers, so a
+  // non-resident, non-suspended waiter's retry time (0 once its epoch is
+  // stale) must not wake the loop; its deadlines still do.
+  const bool recovering =
+      recoveringResources_ &&
+      std::any_of(requests_.begin(), requests_.end(),
+                  [](const auto &entry) { return entry.second.suspended; });
   for (const auto &[_, active] : requests_) {
     if (active.finalized || active.failure)
       continue;
@@ -259,6 +266,8 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
         (!result || active.resourceWait.deadlineMilliseconds < *result))
       result = active.resourceWait.deadlineMilliseconds;
     if (draining || active.resourceWait.retryMilliseconds <= 0.0)
+      continue;
+    if (recovering && !active.suspended && !active.stateCell)
       continue;
     const double wakeup = active.resourceWait.epoch == resourceEpoch_
                               ? active.resourceWait.retryMilliseconds

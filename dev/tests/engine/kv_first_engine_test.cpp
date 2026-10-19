@@ -2138,6 +2138,66 @@ void testPhysicalPressureRetryIsBackedOffWithoutProgress() {
           "backed-off resource requests did not recover cleanly");
 }
 
+// While a suspended request recovers, admitQueued() retries only suspended
+// requests; a stale non-suspended waiter must not pin the wakeup at 0 ms.
+void testRecoveryWakeupIgnoresWaitersItDoesNotRetry() {
+  for (bool waiterDeadline : {false, true}) {
+    Backing backing(8);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor(1);
+    Events events;
+    EngineConfig config;
+    config.growthPaused = [] { return true; };
+    engine::Engine engine(config, resources, executor, events);
+
+    backing.growthBlocked = true;
+    engine.submit(request(60, {60}));
+    auto waiter = request(61, {61});
+    if (waiterDeadline)
+      waiter.deadlineMilliseconds = 50.0;
+    engine.submit(std::move(waiter));
+    require(engine.tick(1.0), "blocked lane did not suspend");
+    const auto setup = engine.resourceWaitSnapshot(1.0);
+    require(setup.suspended == 1 && setup.memory == 1 &&
+                setup.concurrency == 1 && !setup.draining,
+            "fixture lacks one suspended and one non-suspended waiter");
+
+    executor.reclaimableIdleStateBytes = 128;
+    require(engine.reclaimMemory({.reclaimEmptyKvExtents = true}) > 0,
+            "reclaim did not bump the resource epoch");
+    // The suspended request's own epoch is stale too: one tick retries it,
+    // the retry fails, and its wait is re-armed at the current epoch.
+    static_cast<void>(engine.tick(10.0));
+    require(executor.resumeAttempts == 1 &&
+                engine.resourceWaitSnapshot(10.0).suspended == 1,
+            "recovery did not retry the suspended request once");
+    if (waiterDeadline) {
+      require(engine.nextWakeupMilliseconds() == 50.0,
+              "recovery dropped a non-suspended waiter's deadline");
+      continue;
+    }
+    require(engine.nextWakeupMilliseconds() == 110.0,
+            "stale non-suspended waiter woke the recovering engine at once");
+
+    // Sleep until each reported wakeup, as FdTransport::run does: the ticks
+    // over the interval are bounded by its retry back-off, not a 0 ms spin.
+    constexpr double interval = 1000.0;
+    constexpr double backoff = 100.0;
+    double now = 10.0;
+    uint32_t ticks = 0;
+    while (ticks <= 1000) {
+      now = std::max(now, engine.nextWakeupMilliseconds().value_or(now));
+      if (now >= 10.0 + interval)
+        break;
+      static_cast<void>(engine.tick(now));
+      ++ticks;
+    }
+    require(ticks <= interval / backoff,
+            "recovery busy-spun on a stale non-suspended waiter");
+  }
+}
+
 void testRecoveryDrainDoesNotConsumeResourceWaitBudget() {
   for (bool expireRequest : {false, true}) {
     Backing backing(2);
@@ -3737,6 +3797,7 @@ int main() {
     testPhysicalKvPressureSuspendsInsteadOfKillingActiveWork();
     testRecoveryDrainDoesNotConsumeResourceWaitBudget();
     testPhysicalPressureRetryIsBackedOffWithoutProgress();
+    testRecoveryWakeupIgnoresWaitersItDoesNotRetry();
     testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput();
     testLongDecodePreemptionPlansTheCurrentReplayBoundary();
     testPreemptedDecodeRestoresItsResidentCompositeState();
