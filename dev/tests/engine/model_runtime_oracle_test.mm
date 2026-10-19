@@ -759,6 +759,95 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
             << " decode_stop=" << decodeStop << '\n';
 }
 
+struct GreedyDecode final {
+  std::vector<uint32_t> tokens;
+  uint32_t draftedTokens = 0;
+  uint32_t cycles = 0;
+};
+
+// Greedy decode of one cold request on a runtime that is the only one alive.
+// Without speculation every cycle must draft nothing and retain one token.
+GreedyDecode decodeGreedy(model::RuntimeContext context,
+                          std::span<const uint32_t> prompt,
+                          uint32_t tokenBudget) {
+  constexpr uint64_t kRequestId = 1;
+  constexpr uint32_t kSlot = 0;
+  auto &states = static_cast<model::QwenStateStorage &>(context.stateStorage);
+  const std::vector<uint32_t> pageTable = pageRange(0, 8);
+  for (uint32_t page : pageTable)
+    require(static_cast<bool>(context.kvPages.ensureResident(page)),
+            "speculation parity KV backing is unavailable");
+  model::Runtime runtime(context);
+  require(runtime.telemetry().speculativeDecoding ==
+              context.isSpeculationEnabled,
+          "telemetry does not report the runtime's speculation mode");
+  const EngineRequest request = makeRequest(
+      kRequestId, std::vector<uint32_t>(prompt.begin(), prompt.end()),
+      tokenBudget);
+  beginCold(runtime, request, kSlot);
+  requireOpen(prefillChunk(runtime, kRequestId, kSlot, 0, 0, prompt, pageTable),
+              "speculation parity");
+  GreedyDecode result;
+  uint64_t committed = prompt.size();
+  bool finished = false;
+  // Each cycle emits at least one token, so the budget bounds the cycles.
+  while (!finished && result.tokens.size() < tokenBudget) {
+    const ModelStepResult step = decodeOne(runtime, kRequestId, kSlot,
+                                           committed, pageTable,
+                                           BatchCohort::Greedy);
+    require(!step.outputTokens.empty() &&
+                step.outputTokensWithoutKv <= step.outputTokens.size() &&
+                step.acceptedDraftTokens <= step.draftedTokens,
+            "speculation parity output accounting is invalid");
+    const uint64_t retained =
+        step.outputTokens.size() - step.outputTokensWithoutKv;
+    if (!context.isSpeculationEnabled)
+      require(step.draftedTokens == 0 && step.acceptedDraftTokens == 0 &&
+                  retained == 1,
+              "decode without speculation drafted or retained more than "
+              "one token per step");
+    committed += retained;
+    require(states.metadata(kSlot).lengths.targetTokens == committed,
+            "speculation parity committed length differs from its output");
+    result.tokens.insert(result.tokens.end(), step.outputTokens.begin(),
+                         step.outputTokens.end());
+    result.draftedTokens += step.draftedTokens;
+    ++result.cycles;
+    // Budget exhaustion is the engine's decision; the oracle mirrors it.
+    finished = step.finished;
+  }
+  runtime.end(kRequestId);
+  return result;
+}
+
+// Speculation only proposes tokens the target then verifies, so greedy decode
+// without it must select the same tokens. Each runtime is built in its own
+// scope while no other runtime is alive, on released state slots, as
+// warmupEos's are.
+void requireUnspeculatedGreedyParity(model::RuntimeContext context,
+                                     std::span<const uint32_t> prompt) {
+  constexpr uint32_t kTokenBudget = 16;
+  context.isSpeculationEnabled = true;
+  const GreedyDecode speculated = decodeGreedy(context, prompt, kTokenBudget);
+  context.isSpeculationEnabled = false;
+  const GreedyDecode unspeculated = decodeGreedy(context, prompt, kTokenBudget);
+  require(speculated.tokens == unspeculated.tokens,
+          "decode without speculation changed the greedy tokens");
+  require(unspeculated.draftedTokens == 0 &&
+              unspeculated.cycles >= speculated.cycles,
+          "decode without speculation drafted tokens or took fewer cycles");
+  auto &states = static_cast<model::QwenStateStorage &>(context.stateStorage);
+  for (uint32_t slot = 0; slot < 4; ++slot)
+    require(!states.metadata(slot).assigned,
+            "speculation parity left an active state slot");
+  static_cast<void>(states.releaseIdle(0, 0));
+  std::cout << "speculation_off_greedy=PASS tokens="
+            << unspeculated.tokens.size()
+            << " speculated_cycles=" << speculated.cycles
+            << " unspeculated_cycles=" << unspeculated.cycles
+            << " speculated_drafted=" << speculated.draftedTokens << '\n';
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -893,6 +982,20 @@ int main(int argc, char **argv) {
       warmupEos(context, model);
       return 0;
     }
+    const std::vector<uint32_t> samplingSeedTokens{
+        248045, 8678,   198,   24342,  286,    4879,  369,    716,   310,
+        830,    11553,  13,    5044,   1683,   15060, 1472,   279,   3274,
+        11,     9307,   1328,  30800,  11,     2814,  47675,  25605, 11,
+        321,    60445,  55404, 11,     27224,  11,    321,    30246, 303,
+        279,    1534,   4087,  13,     248046, 198,   248045, 846,   198,
+        9419,   248046, 198,   248045, 74455,  198,   248068, 198};
+    // A natural token pattern: a run of zero tokens can make the target select
+    // a stop token right after prefill, which leaves no decode cycle to test.
+    std::vector<uint32_t> prompt128(128);
+    for (uint32_t index = 0; index < prompt128.size(); ++index)
+      prompt128[index] = samplingSeedTokens[index % samplingSeedTokens.size()];
+    if (!imagesOnly)
+      requireUnspeculatedGreedyParity(context, prompt128);
     model::Runtime executor(context);
     arenaReservation->commit();
     // Fault only physical KV admission, after actual state activation. This
@@ -933,18 +1036,6 @@ int main(int argc, char **argv) {
       return 0;
     }
 
-    const std::vector<uint32_t> samplingSeedTokens{
-        248045, 8678,   198,   24342,  286,    4879,  369,    716,   310,
-        830,    11553,  13,    5044,   1683,   15060, 1472,   279,   3274,
-        11,     9307,   1328,  30800,  11,     2814,  47675,  25605, 11,
-        321,    60445,  55404, 11,     27224,  11,    321,    30246, 303,
-        279,    1534,   4087,  13,     248046, 198,   248045, 846,   198,
-        9419,   248046, 198,   248045, 74455,  198,   248068, 198};
-    // A natural token pattern: a run of zero tokens can make the target select
-    // a stop token right after prefill, which leaves no decode cycle to test.
-    std::vector<uint32_t> prompt128(128);
-    for (uint32_t index = 0; index < prompt128.size(); ++index)
-      prompt128[index] = samplingSeedTokens[index % samplingSeedTokens.size()];
     std::vector<uint32_t> prompt129 = prompt128;
     prompt129.push_back(samplingSeedTokens[128 % samplingSeedTokens.size()]);
     const std::vector<uint32_t> pageTable = pageRange(0, 8);
