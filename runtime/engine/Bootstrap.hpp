@@ -5,8 +5,10 @@
 #include "engine/Status.hpp"
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -61,6 +63,49 @@ struct RuntimeBootstrapConfig {
     NativeLoopConfig nativeLoop;
     protocol::ProtocolLimits protocolLimits;
 };
+
+// A serve-native command line the operator must correct; the message names
+// the offending option.
+class NativeUsageError final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// The serve-native options that follow the four positionals.
+struct NativeOptions {
+    kv::Format kvFormat = kv::Format::Int8;
+    // Off keeps the target verify graph but skips the draft proposal.
+    bool isSpeculationEnabled = true;
+};
+
+// Parses `[--kv-format int8|bf16] [--no-speculation]` in any order. Throws
+// NativeUsageError on an unknown, repeated or incomplete option.
+[[nodiscard]] NativeOptions parseNativeOptions(
+    std::span<const std::string_view> arguments);
+
+// The resolved serve-native command line.
+struct NativeArguments {
+    std::filesystem::path modelRoot;
+    model::ModelDescriptor model;
+    // Zero means auto.
+    uint32_t maxContext = 0;
+    // Zero means auto.
+    uint64_t maxMemoryBytes = 0;
+    NativeOptions options;
+};
+
+// Facts about this process the bootstrap configuration binds.
+struct NativeProcessIdentity {
+    std::filesystem::path metallibPath;
+    std::string buildId;
+    uint64_t engineInstanceId = 1;
+};
+
+// Builds the bootstrap configuration for one serve-native process. The
+// caller adds the live pressure, cancellation and metrics hooks.
+[[nodiscard]] RuntimeBootstrapConfig nativeBootstrapConfig(
+    const NativeArguments &arguments,
+    const NativeProcessIdentity &process);
 
 using ActualMemoryReporter =
     std::function<ActualMemoryReport(uint64_t estimatedWarmupPeakBytes)>;

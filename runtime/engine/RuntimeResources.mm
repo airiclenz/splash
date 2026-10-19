@@ -268,7 +268,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<kv::PageStorage> kvPages,
     std::unique_ptr<model::StateStorage> stateStorage,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    uint32_t maximumImagePatches)
+    uint32_t maximumImagePatches, bool isSpeculationEnabled)
     : backend_(std::move(backend)), model_(std::move(model)),
       operators_(std::move(operators)),
       memoryPlan_(std::move(memoryPlan)),
@@ -276,7 +276,8 @@ RuntimeResources::RuntimeResources(
       cacheIdentity_(std::move(cacheIdentity)),
       memoryGovernor_(std::move(memoryGovernor)), kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvPool_(std::move(kvPool)),
-      cache_(std::move(cache)), maximumImagePatches_(maximumImagePatches) {}
+      cache_(std::move(cache)), maximumImagePatches_(maximumImagePatches),
+      isSpeculationEnabled_(isSpeculationEnabled) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config) {
@@ -509,7 +510,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         std::move(memoryPlan),
         std::move(modelMemoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
-        std::move(kvPool), std::move(cache), config.maximumImagePatches));
+        std::move(kvPool), std::move(cache), config.maximumImagePatches,
+        config.isSpeculationEnabled));
     return result;
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,
@@ -535,6 +537,7 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       maximumImagePatches_,
       budget.pipelineReserveBytes,
       budget.runtimeOverheadReserveBytes,
+      isSpeculationEnabled_,
   };
 }
 

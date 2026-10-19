@@ -1,5 +1,7 @@
 #include "engine/Bootstrap.hpp"
 
+#include "model/Model.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -8,6 +10,21 @@
 
 namespace splash::engine {
 namespace {
+
+constexpr std::string_view kKvFormatOption = "--kv-format";
+constexpr std::string_view kNoSpeculationOption = "--no-speculation";
+// One image may cover at most this many 16x16 patches (4,194,304 pixels).
+// The wire limit, the engine's request validation, and the model's vision
+// scratch are all sized from this one value.
+constexpr uint32_t kMaximumImagePatches = ops::kMaximumImagePatches;
+
+kv::Format parseKvFormat(std::string_view value) {
+  if (value == "int8")
+    return kv::Format::Int8;
+  if (value == "bf16")
+    return kv::Format::BFloat16;
+  throw NativeUsageError("--kv-format requires int8 or bf16");
+}
 
 RuntimeBootstrapReport reportForPlan(const EngineMemoryPlan &plan) {
   RuntimeBootstrapReport report;
@@ -333,6 +350,56 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   return std::unique_ptr<RuntimeBootstrap>(
       new RuntimeBootstrap(std::move(resources), std::move(modelRuntime),
                            std::move(nativeLoop), std::move(report)));
+}
+
+NativeOptions parseNativeOptions(std::span<const std::string_view> arguments) {
+  NativeOptions options;
+  bool hasKvFormat = false;
+  for (size_t index = 0; index < arguments.size(); ++index) {
+    const std::string_view argument = arguments[index];
+    if (argument == kKvFormatOption) {
+      if (hasKvFormat)
+        throw NativeUsageError("--kv-format given more than once");
+      if (index + 1 == arguments.size())
+        throw NativeUsageError("--kv-format requires int8 or bf16");
+      options.kvFormat = parseKvFormat(arguments[++index]);
+      hasKvFormat = true;
+    } else if (argument == kNoSpeculationOption) {
+      if (!options.isSpeculationEnabled)
+        throw NativeUsageError("--no-speculation given more than once");
+      options.isSpeculationEnabled = false;
+    } else {
+      throw NativeUsageError("unknown option " + std::string(argument));
+    }
+  }
+  return options;
+}
+
+RuntimeBootstrapConfig nativeBootstrapConfig(
+    const NativeArguments &arguments, const NativeProcessIdentity &process) {
+  const model::ModelCapabilities &capabilities = arguments.model.capabilities;
+  const uint32_t maskWordsPerToken = (capabilities.vocabularySize + 31) / 32;
+  RuntimeBootstrapConfig config;
+  config.resources.metallibPath = process.metallibPath;
+  config.resources.modelRoot = arguments.modelRoot;
+  config.resources.model = arguments.model;
+  config.resources.buildId = process.buildId;
+  config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
+  config.resources.kvFormat = arguments.options.kvFormat;
+  config.resources.isSpeculationEnabled =
+      arguments.options.isSpeculationEnabled;
+  config.resources.maximumImagePatches = kMaximumImagePatches;
+  config.nativeLoop.engine.maxContext = arguments.maxContext;
+  config.nativeLoop.engine.maxImagePatches = kMaximumImagePatches;
+  config.protocolLimits.maxImagePatches = kMaximumImagePatches;
+  config.nativeLoop.engineInstanceId = process.engineInstanceId;
+  config.nativeLoop.maskWordsPerToken = maskWordsPerToken;
+  config.protocolLimits.maxTokenBatch =
+      model::ExecutionLimits::maximumStepTokens;
+  config.protocolLimits.maxSimulationTokens = capabilities.draftQueryRows;
+  config.protocolLimits.maxMaskWords =
+      maskWordsPerToken * (capabilities.draftQueryRows + 1);
+  return config;
 }
 
 } // namespace splash::engine

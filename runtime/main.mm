@@ -1,4 +1,3 @@
-#include "ops/Vision.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
@@ -36,27 +35,14 @@
 namespace splash {
 namespace {
 
-// One image may cover at most this many 16x16 patches (4,194,304 pixels).
-// The wire limit, the engine's request validation, and the model's vision
-// scratch are all sized from this one value.
-constexpr uint32_t kMaximumImagePatches = ops::kMaximumImagePatches;
 // Temporary host/driver allocation failures can recover during startup.
 // Preserve the desktop reserve and bound retries; configuration and compute
 // failures remain immediate and fail-closed.
 constexpr auto kStartupMemoryRecoveryTimeout = std::chrono::seconds(30);
 constexpr auto kStartupMemoryRecoveryPoll = std::chrono::seconds(1);
-class UsageError final : public std::runtime_error {
-public:
-  using std::runtime_error::runtime_error;
-};
-
-struct NativeArguments final {
-  std::filesystem::path modelRoot;
-  model::ModelDescriptor model;
-  uint32_t maxContext = 0;
-  uint64_t maxMemoryBytes = 0;
-  kv::Format kvFormat = kv::Format::Int8;
-};
+// argv[0] is the executable, argv[1] the command, then four positionals.
+constexpr int kFirstOptionIndex = 6;
+using UsageError = engine::NativeUsageError;
 
 // One observer spans bootstrap and serving. The dispatch queue only records
 // pressure and wakes control; all allocation/reclaim decisions stay on the
@@ -125,7 +111,8 @@ private:
 void printUsage(std::string_view executable) {
   std::cerr << "usage: " << executable
             << " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
-               " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [--kv-format int8|bf16]\n";
+               " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [--kv-format int8|bf16]"
+               " [--no-speculation]\n";
 }
 
 template <typename T>
@@ -183,18 +170,14 @@ std::filesystem::path requireModelRoot(std::string_view targetArgument,
   return target.parent_path();
 }
 
-NativeArguments parseArguments(int argc, char **argv) {
-  if ((argc != 6 && argc != 8) || std::string_view(argv[1]) != "serve-native") {
+engine::NativeArguments parseArguments(int argc, char **argv) {
+  if (argc < kFirstOptionIndex || std::string_view(argv[1]) != "serve-native") {
     throw UsageError("expected the serve-native command");
   }
-  NativeArguments result;
-  if (argc == 8) {
-    const std::string_view format(argv[7]);
-    if (std::string_view(argv[6]) != "--kv-format" ||
-        (format != "int8" && format != "bf16"))
-      throw UsageError("--kv-format requires int8 or bf16");
-    result.kvFormat = format == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
-  }
+  const std::vector<std::string_view> options(argv + kFirstOptionIndex,
+                                              argv + argc);
+  engine::NativeArguments result;
+  result.options = engine::parseNativeOptions(options);
   result.modelRoot = requireModelRoot(argv[2], argv[3]);
   result.model = model::inspectModelPackage(result.modelRoot);
   result.maxContext = parseMaxContext(argv[4], result.model.capabilities);
@@ -229,30 +212,12 @@ uint64_t engineInstanceId() {
 }
 
 engine::RuntimeBootstrapConfig
-bootstrapConfig(const NativeArguments &arguments) {
-  const model::ModelCapabilities &capabilities = arguments.model.capabilities;
-  const uint32_t maskWordsPerToken =
-      (capabilities.vocabularySize + 31) / 32;
-  engine::RuntimeBootstrapConfig config;
-  config.resources.metallibPath =
-      executablePath().parent_path() / "splash.metallib";
-  config.resources.modelRoot = arguments.modelRoot;
-  config.resources.model = arguments.model;
-  config.resources.buildId = SPLASH_BUILD_ID;
-  config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
-  config.resources.kvFormat = arguments.kvFormat;
-  config.resources.maximumImagePatches = kMaximumImagePatches;
-  config.nativeLoop.engine.maxContext = arguments.maxContext;
-  config.nativeLoop.engine.maxImagePatches = kMaximumImagePatches;
-  config.protocolLimits.maxImagePatches = kMaximumImagePatches;
-  config.nativeLoop.engineInstanceId = engineInstanceId();
-  config.nativeLoop.maskWordsPerToken = maskWordsPerToken;
-  config.protocolLimits.maxTokenBatch =
-      model::ExecutionLimits::maximumStepTokens;
-  config.protocolLimits.maxSimulationTokens = capabilities.draftQueryRows;
-  config.protocolLimits.maxMaskWords =
-      maskWordsPerToken * (capabilities.draftQueryRows + 1);
-  return config;
+bootstrapConfig(const engine::NativeArguments &arguments) {
+  return engine::nativeBootstrapConfig(
+      arguments,
+      {.metallibPath = executablePath().parent_path() / "splash.metallib",
+       .buildId = SPLASH_BUILD_ID,
+       .engineInstanceId = engineInstanceId()});
 }
 
 // SIGTERM, SIGINT and SIGHUP end the transport loop instead of killing the
@@ -291,7 +256,7 @@ public:
   }
 };
 
-int runNative(const NativeArguments &arguments) {
+int runNative(const engine::NativeArguments &arguments) {
   engine::FdTransport transport(STDIN_FILENO, STDOUT_FILENO);
   ShutdownSignals signals(transport);
   MemoryPressureMonitor pressureMonitor(transport.controlNotifier());
@@ -422,7 +387,8 @@ void printBootstrapError(const engine::RuntimeBootstrapReport &report) {
 int main(int argc, char **argv) {
   @autoreleasepool {
     try {
-      splash::NativeArguments arguments = splash::parseArguments(argc, argv);
+      splash::engine::NativeArguments arguments =
+          splash::parseArguments(argc, argv);
       return splash::runNative(arguments);
     } catch (const splash::UsageError &error) {
       std::cerr << "error: " << error.what() << '\n';

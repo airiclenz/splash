@@ -509,6 +509,40 @@ void testResourceWaitDiagnostics() {
   require(reporter.update(wait, true).empty(), "concurrency queue logged pressure");
 }
 
+void testSpeculativeDecodingStatus() {
+  const auto memoryPlan = plan();
+  RuntimeMetricsSnapshot metrics;
+  metrics.draftedTokens = 70;
+  metrics.acceptedDraftTokens = 35;
+  metrics.draftAcceptanceRate = 0.5;
+  auto status = [&](const model::ModelTelemetry &telemetry) {
+    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, metrics, telemetry, {},
+                             {}, true);
+  };
+  model::ModelTelemetry speculating;
+  speculating.speculativeDecoding = true;
+  model::ModelTelemetry verifyingOnly;
+  verifyingOnly.speculativeDecoding = false;
+
+  const std::string unreported = status({});
+  const std::string on = status(speculating);
+  const std::string off = status(verifyingOnly);
+
+  require(unreported.find("\"speculative_decoding\":true,\"drafted_tokens\":70,"
+                          "\"accepted_draft_tokens\":35,"
+                          "\"draft_acceptance_rate\":0.5,") !=
+              std::string::npos,
+          "default telemetry did not report speculation on with its acceptance");
+  require(on.find("\"speculative_decoding\":true,") != std::string::npos &&
+              on.find("\"draft_acceptance_rate\":0.5,") != std::string::npos,
+          "speculation on lost its flag or acceptance rate");
+  require(off.find("\"speculative_decoding\":false,\"drafted_tokens\":70,"
+                   "\"accepted_draft_tokens\":35,\"capacity_failures\":") !=
+                  std::string::npos &&
+              off.find("draft_acceptance_rate") == std::string::npos,
+          "speculation off still reported an acceptance rate");
+}
+
 } // namespace
 
 int main() {
@@ -518,6 +552,7 @@ int main() {
     testWarmupStatesPreserveReadinessAndMeasurementTruth();
     testMemoryPressureTelemetry();
     testResourceWaitDiagnostics();
+    testSpeculativeDecodingStatus();
     std::cout << "runtime status tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

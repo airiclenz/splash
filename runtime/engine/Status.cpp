@@ -307,10 +307,14 @@ std::string runtimeStatusJson(
       << ",\"decode_output_tokens\":" << metrics.decodeOutputTokens
       << ",\"decode_wall_ms\":" << metrics.decodeWallMilliseconds
       << ",\"decode_tokens_per_second\":" << metrics.decodeTokensPerSecond
+      << ",\"speculative_decoding\":"
+      << boolean(executorTelemetry.speculativeDecoding)
       << ",\"drafted_tokens\":" << metrics.draftedTokens
-      << ",\"accepted_draft_tokens\":" << metrics.acceptedDraftTokens
-      << ",\"draft_acceptance_rate\":" << metrics.draftAcceptanceRate
-      << ",\"capacity_failures\":" << metrics.capacityFailures
+      << ",\"accepted_draft_tokens\":" << metrics.acceptedDraftTokens;
+  // Without a draft proposal there is no acceptance to report.
+  if (executorTelemetry.speculativeDecoding)
+    out << ",\"draft_acceptance_rate\":" << metrics.draftAcceptanceRate;
+  out << ",\"capacity_failures\":" << metrics.capacityFailures
       << ",\"metal_failures\":" << metrics.metalFailures
       << ",\"current_prefill_batch\":";
   appendBatch(out, metrics.currentPrefillBatch);

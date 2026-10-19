@@ -73,6 +73,8 @@ struct RuntimeResourcesConfig {
   // Patches per image the vision scratch covers; the protocol limit and the
   // engine's request validation use the same value.
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
+  // Copied into the model's RuntimeContext; off skips the draft proposal.
+  bool isSpeculationEnabled = true;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.
@@ -191,7 +193,7 @@ private:
                    std::unique_ptr<model::StateStorage> stateStorage,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   uint32_t maximumImagePatches);
+                   uint32_t maximumImagePatches, bool isSpeculationEnabled);
 
   std::unique_ptr<metal::MetalBackend> backend_;
   model::ModelPackage model_;
@@ -205,6 +207,7 @@ private:
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   uint32_t maximumImagePatches_ = 0;
+  bool isSpeculationEnabled_ = true;
 };
 
 } // namespace splash::engine

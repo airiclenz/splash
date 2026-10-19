@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -765,6 +766,75 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
   }
 }
 
+NativeOptions options(std::initializer_list<std::string_view> arguments) {
+  const std::vector<std::string_view> tail(arguments);
+  return parseNativeOptions(tail);
+}
+
+void requireUsageError(std::initializer_list<std::string_view> arguments,
+                       const char *message) {
+  try {
+    static_cast<void>(options(arguments));
+  } catch (const NativeUsageError &) {
+    return;
+  }
+  throw std::runtime_error(message);
+}
+
+void testNativeOptionsAcceptEitherOrder() {
+  const NativeOptions defaults = options({});
+  const NativeOptions formatFirst =
+      options({"--kv-format", "bf16", "--no-speculation"});
+  const NativeOptions flagFirst =
+      options({"--no-speculation", "--kv-format", "bf16"});
+
+  require(defaults.isSpeculationEnabled &&
+              defaults.kvFormat == kv::Format::Int8,
+          "serve-native defaults changed");
+  require(!formatFirst.isSpeculationEnabled &&
+              formatFirst.kvFormat == kv::Format::BFloat16,
+          "--no-speculation after --kv-format was not parsed");
+  require(!flagFirst.isSpeculationEnabled &&
+              flagFirst.kvFormat == kv::Format::BFloat16,
+          "--no-speculation before --kv-format was not parsed");
+  require(options({"--kv-format", "int8"}).isSpeculationEnabled,
+          "--kv-format alone disabled speculation");
+}
+
+void testNativeOptionsRejectMalformedTails() {
+  requireUsageError({"--kv-format"}, "--kv-format without a value was accepted");
+  requireUsageError({"--kv-format", "fp8"}, "an unknown KV format was accepted");
+  requireUsageError({"--kv-format", "--no-speculation"},
+                    "--kv-format took a flag as its value");
+  requireUsageError({"--no-speculation", "--no-speculation"},
+                    "a repeated --no-speculation was accepted");
+  requireUsageError({"--kv-format", "int8", "--kv-format", "bf16"},
+                    "a repeated --kv-format was accepted");
+  requireUsageError({"--speculation"}, "an unknown option was accepted");
+}
+
+void testNativeConfigCarriesSpeculationToResources() {
+  NativeArguments arguments;
+  arguments.modelRoot = "/models/qwen";
+  arguments.options = options({"--no-speculation"});
+  const NativeProcessIdentity process{
+      .metallibPath = "/bin/splash.metallib", .buildId = "build",
+      .engineInstanceId = 7};
+
+  const RuntimeBootstrapConfig off = nativeBootstrapConfig(arguments, process);
+  arguments.options = options({});
+  const RuntimeBootstrapConfig on = nativeBootstrapConfig(arguments, process);
+
+  require(!off.resources.isSpeculationEnabled,
+          "--no-speculation did not reach RuntimeResourcesConfig");
+  require(on.resources.isSpeculationEnabled,
+          "speculation was off without --no-speculation");
+  require(off.resources.metallibPath == process.metallibPath &&
+              off.resources.buildId == "build" &&
+              off.nativeLoop.engineInstanceId == 7,
+          "the process identity did not reach the bootstrap configuration");
+}
+
 } // namespace
 
 int main() {
@@ -782,6 +852,9 @@ int main() {
     testEveryWarmupFailureIsFailClosed();
     testWarmupErrorsCannotMasqueradeAsMemoryLimits();
     testExceptionsMemoryAndReadyWriteAreFailClosed();
+    testNativeOptionsAcceptEitherOrder();
+    testNativeOptionsRejectMalformedTails();
+    testNativeConfigCarriesSpeculationToResources();
     std::cout << "native bootstrap tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {
