@@ -2,6 +2,7 @@
 #include "engine/RuntimeResources.hpp"
 #include "engine/Status.hpp"
 
+#include <cstddef>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -68,6 +69,8 @@ void testCleanRuntimeStatus() {
   engine.junctionMaterializations = 1;
   engine.checkpointPublications = 3;
   engine.checkpointPublicationFailures = 1;
+  engine.checkpointPublicationFailureCauses[static_cast<std::size_t>(
+      PublicationFailure::SnapshotDenied)] = 1;
   engine.resourceReplayTokens = 1234;
   engine.resourceDecodeSuspensions = 5;
   engine.resourceDecodeReplayTokens = 678;
@@ -272,7 +275,11 @@ void testCleanRuntimeStatus() {
               std::string::npos &&
           json.find("\"lazy_junctions\":1") != std::string::npos &&
           json.find("\"checkpoint_publications\":3,"
-                    "\"checkpoint_publication_failures\":1") !=
+                    "\"checkpoint_publication_failures\":1,"
+                    "\"checkpoint_publication_failure_causes\":{"
+                    "\"missed_boundary\":0,\"retire_blocked\":0,"
+                    "\"snapshot_denied\":1,\"decode_overshoot\":0,"
+                    "\"error\":0},\"resource_suspensions\":") !=
               std::string::npos &&
           json.find("\"draft_context\":{\"target_prefill_rows\":10000,\"active_"
                     "rows\":2048,\"materialization_rows\":31,\"avoided_rows\":"

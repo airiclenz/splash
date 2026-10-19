@@ -62,6 +62,14 @@ SERVER_NORMAL = "normal"
 SWAP_ABORT_EXIT_CODE = 3
 BYTES_PER_MB = 2**20
 
+# The `/status` causes that split checkpoint_publication_failures.
+CHECKPOINT_FAILURE_CAUSES = (
+    "missed_boundary",
+    "retire_blocked",
+    "snapshot_denied",
+    "decode_overshoot",
+    "error",
+)
 # (record key, `/status` path) of the cumulative counters diffed per phase.
 PHASE_COUNTERS = (
     ("prefill_tokens", ("metrics", "prefill_input_tokens")),
@@ -79,6 +87,13 @@ PHASE_COUNTERS = (
     ("checkpoint_retirements", ("state", "checkpoint_retirements")),
     ("kv_evictions", ("kv", "evictions")),
     ("checkpoint_publication_failures", ("cache", "checkpoint_publication_failures")),
+    *(
+        (
+            f"checkpoint_failures_{cause}",
+            ("cache", "checkpoint_publication_failure_causes", cause),
+        )
+        for cause in CHECKPOINT_FAILURE_CAUSES
+    ),
     (
         "replay_publication_failures",
         ("cache", "replay_state_publication_failures"),

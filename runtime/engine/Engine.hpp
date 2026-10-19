@@ -7,6 +7,8 @@
 #include "engine/Types.hpp"
 #include "ops/PagedKv.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -42,6 +44,22 @@ struct ResourceWaitSnapshot final {
   bool draining = false;
 };
 
+// Why a checkpoint publication failed: its prefill boundary passed inside a
+// command (MissedBoundary), the previous checkpoint could not be retired before
+// allocating (RetireBlocked), no state could be captured even after recycling
+// one (SnapshotDenied), a decode commit passed its boundary without landing on
+// it (DecodeOvershoot), or the publication threw (Error). Indexes
+// EngineSnapshot::checkpointPublicationFailureCauses.
+enum class PublicationFailure : uint8_t {
+  MissedBoundary,
+  RetireBlocked,
+  SnapshotDenied,
+  DecodeOvershoot,
+  Error,
+};
+inline constexpr std::size_t kPublicationFailureCauses =
+    static_cast<std::size_t>(PublicationFailure::Error) + 1;
+
 struct EngineSnapshot final {
   SchedulerSnapshot scheduler;
   CacheSnapshot resources;
@@ -64,6 +82,9 @@ struct EngineSnapshot final {
   // boundary without landing on it counts as a failure.
   uint64_t checkpointPublications = 0;
   uint64_t checkpointPublicationFailures = 0;
+  // checkpointPublicationFailures split by PublicationFailure; sums to it.
+  std::array<uint64_t, kPublicationFailureCauses>
+      checkpointPublicationFailureCauses{};
   uint64_t resourceSuspensions = 0;
   uint64_t resourceResumptions = 0;
   // Prefill rows after preemption that recompute tokens the request had
@@ -257,6 +278,7 @@ private:
   void recordKeptCheckpoint(Request &request, uint64_t promptEndBlock);
   [[nodiscard]] std::shared_ptr<const CompositeState>
   captureState(uint64_t requestId, bool checkpoint);
+  void countCheckpointFailure(PublicationFailure cause) noexcept;
   void publishReachedStateBoundaries(Request &request,
                                      uint32_t promptProcessed);
   [[nodiscard]] uint32_t

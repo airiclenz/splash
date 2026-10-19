@@ -197,6 +197,36 @@ class DecodeSuspensionMetricsTests(unittest.TestCase):
         self.assertNotIn("splash_cache_resource_decode_", text)
 
 
+class CheckpointFailureCauseMetricsTests(unittest.TestCase):
+    def test_failure_causes_render_as_one_labelled_counter(self):
+        causes = {
+            "missed_boundary": 1,
+            "retire_blocked": 2,
+            "snapshot_denied": 3,
+            "decode_overshoot": 4,
+            "error": 5,
+        }
+        lines = prometheus_metrics(
+            {"cache": {"checkpoint_publication_failure_causes": causes}}
+        ).splitlines()
+
+        name = "splash_cache_checkpoint_publication_failures_total"
+        start = lines.index(f"# TYPE {name} counter")
+        self.assertTrue(lines[start - 1].startswith(f"# HELP {name} "))
+        self.assertEqual(
+            lines[start + 1 : start + 6],
+            [f'{name}{{cause="{cause}"}} {count}' for cause, count in causes.items()],
+        )
+
+    def test_missing_failure_causes_render_no_lines(self):
+        for status in ({}, {"cache": {"checkpoint_publication_failures": 2}}):
+            with self.subTest(status=status):
+                self.assertNotIn(
+                    "splash_cache_checkpoint_publication_failures_total",
+                    prometheus_metrics(status),
+                )
+
+
 class StatusMetricsRenderingTests(unittest.TestCase):
     def test_fixture_renders_exactly_as_before(self):
         self.assertEqual(prometheus_metrics(FIXTURE_STATUS), FIXTURE_RENDERING)

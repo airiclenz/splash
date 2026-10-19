@@ -129,6 +129,24 @@ _STATUS_METRICS = {
     "splash_cache_cold_misses_total": ("cache", "cold_misses"),
     "splash_cache_reused_tokens_total": ("cache", "reused_tokens"),
     "splash_cache_lazy_junctions_total": ("cache", "lazy_junctions"),
+    "splash_cache_checkpoint_publication_failures_total": LabelledCounter(
+        help_text=(
+            "Checkpoint publication failures by cause: a missed prefill "
+            "boundary, a blocked retirement, a denied snapshot, a decode "
+            "overshoot, or an error."
+        ),
+        label="cause",
+        paths={
+            cause: ("cache", "checkpoint_publication_failure_causes", cause)
+            for cause in (
+                "missed_boundary",
+                "retire_blocked",
+                "snapshot_denied",
+                "decode_overshoot",
+                "error",
+            )
+        },
+    ),
     "splash_target_prefill_rows_total": (
         "draft_context",
         "target_prefill_rows",

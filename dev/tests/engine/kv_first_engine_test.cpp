@@ -2,6 +2,8 @@
 #include "engine/Engine.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <initializer_list>
 #include <iostream>
@@ -483,6 +485,16 @@ EngineRequest request(uint64_t id, const std::vector<uint32_t> &prompt) {
   result.maxNewTokens = 1;
   result.deadlineMilliseconds = 10000;
   return result;
+}
+
+using FailureCauses = std::array<uint64_t, kPublicationFailureCauses>;
+
+// The checkpoint failure causes of a run that counted `count` under `cause`
+// and nothing under any other.
+FailureCauses onlyCause(PublicationFailure cause, uint64_t count) {
+  FailureCauses causes{};
+  causes[static_cast<std::size_t>(cause)] = count;
+  return causes;
 }
 
 void runUntilIdle(engine::Engine &engine) {
@@ -1065,10 +1077,14 @@ void testDeniedSnapshotCostsOnlyThatAttempt() {
   require(executor.snapshotAttempts == 2 && executor.snapshots == 0 &&
               engine.snapshot().junctionMaterializationFailures == 1 &&
               engine.snapshot().replayStatePublicationFailures == 1 &&
+              engine.snapshot().checkpointPublicationFailures == 0 &&
+              engine.snapshot().checkpointPublicationFailureCauses ==
+                  FailureCauses{} &&
               events.starts.back().first == EngineCacheStatus::Miss &&
               executor.prefillRows == 130 && events.completedCount == 2 &&
               events.failedCount == 0,
-          "denied lazy junction failed the request or was not counted");
+          "denied lazy junction failed the request, was not counted, or "
+          "counted a checkpoint failure cause");
 
   // The denial is transient: the next lane over the same prefix lands it.
   executor.deniedSnapshots = 0;
@@ -4360,6 +4376,9 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
   require(engine.snapshot().checkpointPublications == 1 &&
               engine.snapshot().checkpointPublicationFailures ==
                   prompt.size() / defaultCheckpointTokens - 1 &&
+              engine.snapshot().checkpointPublicationFailureCauses ==
+                  onlyCause(PublicationFailure::RetireBlocked,
+                            prompt.size() / defaultCheckpointTokens - 1) &&
               executor.snapshotAttempts == 2 &&
               resources.snapshot().stateCache.entries == 2 &&
               resources.snapshot().stateCache.checkpointEntries == 1 &&
@@ -4543,6 +4562,9 @@ void testFailedReplacementContinuesWithoutRecoveryPoint() {
               resources.snapshot().stateCache.entries == 0 &&
               events.failedCount == 0,
           "denied replacement kept the retired checkpoint or failed inference");
+  require(engine.snapshot().checkpointPublicationFailureCauses ==
+              onlyCause(PublicationFailure::SnapshotDenied, 1),
+          "a denied checkpoint snapshot was not counted as snapshot_denied");
   runUntilIdle(engine);
   require(events.completedCount == 1 && executor.prefillRows == prompt.size() &&
               resources.snapshot().stateCache.entries == 2 &&

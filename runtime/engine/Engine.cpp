@@ -876,6 +876,14 @@ void Engine::recordKeptCheckpoint(Request &active, uint64_t promptEndBlock) {
   cache_.recordKeptCheckpoint(promptEndBlock, own);
 }
 
+// Counts one checkpoint publication failure in the total and under its cause,
+// so the causes always sum to the total. Runs only on a failed publication.
+void Engine::countCheckpointFailure(PublicationFailure cause) noexcept {
+  ++counters_.checkpointPublicationFailures;
+  ++counters_.checkpointPublicationFailureCauses[static_cast<std::size_t>(
+      cause)];
+}
+
 // Copies the lane's live state for a publication. When no slot is free it
 // recycles one cached state, a checkpoint for a checkpoint, and retries once;
 // nullptr when that fails too.
@@ -902,16 +910,23 @@ void Engine::publishReachedStateBoundaries(Request &active,
         objective.purpose == Request::StateBoundary::Purpose::Checkpoint;
     const bool junction =
         objective.purpose == Request::StateBoundary::Purpose::Junction;
-    uint64_t &failures = checkpoint ? counters_.checkpointPublicationFailures
-                         : junction ? counters_.junctionMaterializationFailures
-                                    : counters_.replayStatePublicationFailures;
+    uint64_t &failures = junction ? counters_.junctionMaterializationFailures
+                                  : counters_.replayStatePublicationFailures;
+    // A checkpoint failure also names its cause; Replay and Junction
+    // failures count only their totals.
+    const auto countFailure = [&](PublicationFailure cause) {
+      if (checkpoint)
+        countCheckpointFailure(cause);
+      else
+        ++failures;
+    };
     uint64_t &publications = checkpoint ? counters_.checkpointPublications
                              : junction ? counters_.junctionMaterializations
                                         : counters_.replayStatePublications;
     // The scheduler ends a command exactly at an armed boundary; a boundary
     // passed inside a command has no materialized state to copy.
     if (objective.tokens != promptProcessed) {
-      ++failures;
+      countFailure(PublicationFailure::MissedBoundary);
       continue;
     }
     materialized = true;
@@ -931,13 +946,13 @@ void Engine::publishReachedStateBoundaries(Request &active,
         // replacement; at the prompt end it was kept instead. A restore lease
         // can delay this optional publication.
         if (!retireCheckpoint(active) && checkpoint) {
-          ++failures;
+          countFailure(PublicationFailure::RetireBlocked);
           continue;
         }
         std::shared_ptr<const CompositeState> state =
             captureState(active.request.id, checkpoint);
         if (!state) {
-          ++failures;
+          countFailure(PublicationFailure::SnapshotDenied);
           continue;
         }
         cache_.publishCompositeState(block, std::move(state), checkpoint);
@@ -950,7 +965,7 @@ void Engine::publishReachedStateBoundaries(Request &active,
       setLatestCheckpoint(active, checkpoint ? cache_.checkpointState(block)
                                              : StateCheckpoint{});
     } catch (const std::exception &) {
-      ++failures;
+      countFailure(PublicationFailure::Error);
     }
   }
   // Late siblings can extend the remaining plan only where both target and
@@ -1002,7 +1017,7 @@ void Engine::publishDecodeCheckpoint(Request &active, uint32_t previousTokens,
   if (storedTokens < boundary)
     return;
   if (storedTokens > boundary) {
-    ++counters_.checkpointPublicationFailures;
+    countCheckpointFailure(PublicationFailure::DecodeOvershoot);
     return;
   }
   try {
@@ -1013,7 +1028,7 @@ void Engine::publishDecodeCheckpoint(Request &active, uint32_t previousTokens,
       std::shared_ptr<const CompositeState> state =
           captureState(active.request.id, true);
       if (!state) {
-        ++counters_.checkpointPublicationFailures;
+        countCheckpointFailure(PublicationFailure::SnapshotDenied);
         return;
       }
       cache_.publishCompositeState(block, std::move(state), true);
@@ -1026,7 +1041,7 @@ void Engine::publishDecodeCheckpoint(Request &active, uint32_t previousTokens,
     }
     setLatestCheckpoint(active, cache_.checkpointState(block));
   } catch (const std::exception &) {
-    ++counters_.checkpointPublicationFailures;
+    countCheckpointFailure(PublicationFailure::Error);
   }
 }
 

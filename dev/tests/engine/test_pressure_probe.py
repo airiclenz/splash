@@ -108,6 +108,28 @@ class CounterDeltaTests(unittest.TestCase):
         self.assertIsNone(delta["state_evictions"])
         self.assertIsNone(delta["kv_evictions"])
 
+    def test_counterDelta_diffsEachCheckpointFailureCause(self):
+        before = snapshot()
+        before["cache"]["checkpoint_publication_failure_causes"] = {
+            cause: 1 for cause in probe.CHECKPOINT_FAILURE_CAUSES
+        }
+        after = snapshot()
+        after["cache"]["checkpoint_publication_failure_causes"] = {
+            cause: 1 + index
+            for index, cause in enumerate(probe.CHECKPOINT_FAILURE_CAUSES)
+        }
+        del after["cache"]["checkpoint_publication_failure_causes"]["error"]
+
+        delta = probe.counter_delta(before, after)
+
+        self.assertEqual(
+            [
+                delta[f"checkpoint_failures_{cause}"]
+                for cause in probe.CHECKPOINT_FAILURE_CAUSES
+            ],
+            [0, 1, 2, 3, None],
+        )
+
 
 class LaneRecordTests(unittest.TestCase):
     def test_laneRecord_readsCachedTokensFromUsage(self):

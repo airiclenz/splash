@@ -6,6 +6,8 @@
 #include "metal/abi/ExecutionGeometry.h"
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -43,6 +45,21 @@ void appendHostPages(std::ostringstream &out,
   out << ",\"host_inactive_bytes\":" << memoryGovernor.hostInactiveBytes
       << ",\"host_wired_bytes\":" << memoryGovernor.hostWiredBytes
       << ",\"host_compressor_bytes\":" << memoryGovernor.hostCompressorBytes;
+}
+
+// Status key of each PublicationFailure, in enumerator order.
+constexpr std::array<const char *, kPublicationFailureCauses>
+    kPublicationFailureKeys = {"missed_boundary", "retire_blocked",
+                               "snapshot_denied", "decode_overshoot", "error"};
+
+// checkpoint_publication_failures split by cause, every key always present.
+void appendCheckpointFailureCauses(std::ostringstream &out,
+                                   const EngineSnapshot &core) {
+  out << ",\"checkpoint_publication_failure_causes\":{";
+  for (std::size_t cause = 0; cause < kPublicationFailureCauses; ++cause)
+    out << (cause ? "," : "") << '"' << kPublicationFailureKeys[cause]
+        << "\":" << core.checkpointPublicationFailureCauses[cause];
+  out << '}';
 }
 
 } // namespace
@@ -211,8 +228,9 @@ std::string runtimeStatusJson(
       << core.junctionMaterializationFailures
       << ",\"checkpoint_publications\":" << core.checkpointPublications
       << ",\"checkpoint_publication_failures\":"
-      << core.checkpointPublicationFailures
-      << ",\"resource_suspensions\":" << core.resourceSuspensions
+      << core.checkpointPublicationFailures;
+  appendCheckpointFailureCauses(out, core);
+  out << ",\"resource_suspensions\":" << core.resourceSuspensions
       << ",\"resource_resumptions\":" << core.resourceResumptions
       << ",\"resource_replay_tokens\":" << core.resourceReplayTokens
       << ",\"resource_decode_suspensions\":" << core.resourceDecodeSuspensions
