@@ -3583,6 +3583,147 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
           "released recovery pin did not rejoin the lower-priority queue");
 }
 
+// A lane's checkpoint at 8192 of a 10241-token prompt, published before
+// the lane's next 2048-token chunk.
+std::vector<uint32_t> checkpointLanePrompt(uint32_t token) {
+  return std::vector<uint32_t>(defaultCheckpointTokens + 2049, token);
+}
+
+// Under paused growth the lane's next chunk takes idle cached pages: the
+// idle prefix's state and KV go, and the lane's fresh checkpoint stays.
+void testPausedGrowthReclaimKeepsTheResidentLanesCheckpoint() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  bool paused = false;
+  EngineConfig config;
+  config.growthPaused = [&] { return paused; };
+  engine::Engine engine(config, resources, executor, events);
+  const std::vector<uint32_t> idle(4097, 600);
+  engine.submit(request(600, idle));
+  runUntilIdle(engine);
+  engine.submit(request(601, checkpointLanePrompt(601)));
+  runUntilCheckpoint(engine, 1);
+  const uint64_t evictions = resources.snapshot().stateCache.evictions;
+
+  paused = true;
+  backing.growthBlocked = true;
+  backing.allocationFailure = metal::AllocationFailure::HostPressure;
+  runUntilIdle(engine);
+
+  const StateCacheSnapshot states = resources.snapshot().stateCache;
+  require(events.completedCount == 2 && executor.suspensions == 0 &&
+              resources.cachedTokens(idle) == 0 &&
+              states.evictions == evictions + 1 &&
+              states.checkpointEvictions == 0 &&
+              states.checkpointRetirements == 1,
+          "paused growth reclaim evicted the resident lane's checkpoint");
+}
+
+// With the lane's protected checkpoint the only state left, growth reclaim
+// for a new lane takes it rather than stall the admission.
+void testGrowthReclaimTakesAResidentCheckpointRatherThanStall() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  engine.submit(request(610, checkpointLanePrompt(610)));
+  runUntilCheckpoint(engine, 1);
+  require(resources.snapshot().stateCache.entries == 1 &&
+              resources.snapshot().stateCache.checkpointEntries == 1,
+          "fixture did not leave the lane's checkpoint as the only state");
+  executor.holdPrefillUntil = std::make_shared<bool>(false);
+  executor.beginGrowthBlocked = [&] {
+    return resources.snapshot().stateCache.entries != 0;
+  };
+
+  engine.submit(request(611, std::vector<uint32_t>(65, 611)));
+  for (double now = 200; now < 1000 && events.starts.size() < 2; ++now)
+    static_cast<void>(engine.tick(now));
+
+  require(events.starts.size() == 2 &&
+              resources.snapshot().stateCache.checkpointEvictions == 1,
+          "growth reclaim stalled on the resident lane's protected checkpoint");
+  *executor.holdPrefillUntil = true;
+  runUntilIdle(engine);
+  require(events.completedCount == 2 && events.failedCount == 0,
+          "requests did not complete after taking the protected checkpoint");
+}
+
+// A lane suspended by host pressure resumes from its latest checkpoint and,
+// once finished, leaves no protection behind.
+void testHostPressureSuspensionResumesFromTheLanesCheckpoint() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  bool paused = false;
+  EngineConfig config;
+  config.growthPaused = [&] { return paused; };
+  engine::Engine engine(config, resources, executor, events);
+  engine.submit(request(620, checkpointLanePrompt(620)));
+  runUntilCheckpoint(engine, 1);
+  const uint32_t restored = executor.restored;
+  paused = true;
+  backing.growthBlocked = true;
+  backing.allocationFailure = metal::AllocationFailure::HostPressure;
+  static_cast<void>(engine.tick(200));
+  require(executor.suspensions == 1,
+          "host pressure did not suspend the lane");
+
+  static_cast<void>(engine.reclaimMemory(
+      warningReclaim(std::numeric_limits<uint64_t>::max())));
+  paused = false;
+  backing.growthBlocked = false;
+  for (double now = 201; now < 1000 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+
+  require(engine.idle() && events.completedCount == 1 &&
+              executor.restored - restored == defaultCheckpointTokens,
+          "suspended lane did not resume from its checkpoint");
+  static_cast<void>(engine.reclaimMemory(
+      warningReclaim(std::numeric_limits<uint64_t>::max())));
+  require(resources.snapshot().stateCache.entries == 0,
+          "a finished lane left a protection behind");
+}
+
+// A pinned checkpoint survives the lane's rolling replacement; once the lane
+// moves its recovery point to an ordinary state, the checkpoint carries no
+// protection even while the lane stays resident.
+void testOverwrittenCheckpointLeavesNoProtectionBehind() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  const std::vector<uint32_t> prompt(18001, 630);
+  engine.submit(request(630, prompt));
+  runUntilCheckpoint(engine, 1);
+  auto pinned = resources.lookup(prompt);
+  require(pinned.resumeBoundary() == defaultCheckpointTokens,
+          "fixture did not pin its checkpoint");
+  for (uint32_t step = 0;
+       step < 128 && !engine.snapshot().replayStatePublications; ++step)
+    static_cast<void>(engine.tick(200 + step));
+  require(engine.snapshot().replayStatePublications == 1 && !engine.idle() &&
+              resources.snapshot().stateCache.checkpointEntries == 1,
+          "fixture did not move the lane past its pinned checkpoint");
+
+  pinned = {};
+  static_cast<void>(engine.reclaimMemory(
+      warningReclaim(std::numeric_limits<uint64_t>::max())));
+
+  require(resources.snapshot().stateCache.checkpointEntries == 0,
+          "an overwritten checkpoint kept the lane's protection");
+  runUntilIdle(engine);
+}
+
 void testFailedReplacementContinuesWithoutRecoveryPoint() {
   Backing backing(1024);
   KvPool pool(backing);
@@ -3880,6 +4021,10 @@ int main() {
     testRestoredCheckpointAtReplayEndBecomesOrdinary();
     testRetryRetiresCheckpointAtDeeperJunction();
     testPinnedCheckpointSkipsReplacementButNotOrdinaryState();
+    testPausedGrowthReclaimKeepsTheResidentLanesCheckpoint();
+    testGrowthReclaimTakesAResidentCheckpointRatherThanStall();
+    testHostPressureSuspensionResumesFromTheLanesCheckpoint();
+    testOverwrittenCheckpointLeavesNoProtectionBehind();
     testFailedReplacementContinuesWithoutRecoveryPoint();
     testRollingHandleCannotRetirePromotedState();
     testCheckpointDenialPreservesUnrelatedHotState();

@@ -344,9 +344,12 @@ CacheReclaimResult Cache::reclaimOneForGrowth(CacheReclaimMode mode) {
 }
 
 bool Cache::reclaimOneState(bool checkpointsOnly) {
+  // checkpointsOnly bounds what qualifies in the spare pass too: an
+  // unprotected ordinary state it would reject must not hide a protected
+  // checkpoint from the fallback.
   std::optional<CacheEvictionCandidate> state =
       states_.evictionCandidate(false, true);
-  if (!state)
+  if (!state || (checkpointsOnly && !states_.checkpoint(state->id)))
     state = states_.evictionCandidate();
   return state && (!checkpointsOnly || states_.checkpoint(state->id)) &&
          states_.evict(state->id).evicted;

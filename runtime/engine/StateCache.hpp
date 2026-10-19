@@ -20,10 +20,10 @@ struct StateCheckpoint final {
   [[nodiscard]] explicit operator bool() const noexcept { return kvBlock != 0; }
 };
 
-// Names one publication a waiting request needs: a suspended request's
-// resume state or a queued request's cached prefix. A handle outlives
-// neither the publication's eviction nor its replacement: releasing a stale
-// handle is a no-op.
+// Names one publication a request needs: a suspended request's resume state,
+// a queued request's cached prefix or a resident lane's latest checkpoint.
+// A handle outlives neither the publication's eviction nor its replacement:
+// releasing a stale handle is a no-op.
 struct StateProtection final {
   uint64_t kvBlock = 0;
   uint64_t publication = 0;
@@ -111,7 +111,7 @@ public:
   void touch(uint64_t kvBlock) noexcept;
 
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
-  // Marks the resident publication as one a waiting request needs.
+  // Marks the resident publication as one a request needs.
   // Protection takes no pin and no lease: the state stays evictable, and only
   // a candidate search that spares protected states walks past it. Each call
   // needs one matching unprotect; lanes sharing a state count separately.
@@ -141,7 +141,8 @@ private:
   struct Entry {
     std::shared_ptr<const CompositeState> state;
     uint32_t pins = 0;
-    // Waiting requests, suspended or queued, that need this publication.
+    // Requests that need this publication: suspended, queued, or resident
+    // lanes holding it as their latest checkpoint.
     uint32_t protections = 0;
     uint64_t lastUsed = 0;
     uint64_t previousEvictable = 0;

@@ -95,7 +95,8 @@ public:
   // Runs only at a command-completion safe point. Reclaim order follows
   // ownership and preserves reusable prefixes for as long as possible: idle
   // model state, unused KV backing, disposable checkpoints, then ordinary
-  // state/KV in LRU order.
+  // state/KV in LRU order. A resident lane's latest checkpoint is protected:
+  // Warning spares it and Critical takes it.
   // Live command buffers are never eviction candidates. Physical KV release
   // is paced one extent at a time; reclaimDeferred() reports that the pass
   // stopped behind an in-flight release and should run again shortly.
@@ -144,7 +145,13 @@ private:
     std::optional<CacheProbe> admissionProbe;
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
+    // Written only through setLatestCheckpoint, which moves
+    // checkpointProtection with it.
     StateCheckpoint latestCheckpoint;
+    // A resident lane's latestCheckpoint, spared by Warning reclaim and taken
+    // by growth reclaim and publication recycling only after every
+    // unprotected state. Dropped when the lane suspends or ends.
+    StateProtection checkpointProtection;
     // The state a suspended request resumes from, spared by Warning reclaim
     // until the resume succeeds or the request ends.
     StateProtection resumeProtection;
@@ -184,6 +191,7 @@ private:
   void armNextStateBoundary(Request &request);
   void discardPendingStateBoundaries(Request &request) noexcept;
   [[nodiscard]] bool retireCheckpoint(Request &request);
+  void setLatestCheckpoint(Request &request, StateCheckpoint checkpoint);
   void publishReachedStateBoundaries(Request &request,
                                      uint32_t promptProcessed);
   [[nodiscard]] bool prepare(BatchPlan &plan,

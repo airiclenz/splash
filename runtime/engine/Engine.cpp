@@ -525,11 +525,12 @@ bool Engine::admit(Request &active, double now) {
                                      active.replayTokens);
     DraftContextPlan draft = configureDraftStatePlan(
         active, resumeBoundary, lookup.junctionBoundary());
-    active.latestCheckpoint = {};
+    setLatestCheckpoint(active, {});
     if (lookup.state) {
       model_.restore(active.request.id, resumeBoundary, lookup.state->state(),
                      !draft.draftStateRestoreSkipped);
-      active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
+      setLatestCheckpoint(active,
+                          cache_.checkpointState(lookup.state->kvBlock()));
       // A restored endpoint already has the ordinary replay state we need.
       // Other restored progress points retain their rolling lifetime.
       if (active.latestCheckpoint &&
@@ -537,7 +538,7 @@ bool Engine::admit(Request &active, double now) {
         static_cast<void>(
             cache_.reuseCompositeState(active.latestCheckpoint.kvBlock));
         ++counters_.deduplicatedStatePublications;
-        active.latestCheckpoint = {};
+        setLatestCheckpoint(active, {});
       }
     }
     model_.setDraftContextPlan(active.request.id, std::move(draft));
@@ -718,13 +719,23 @@ bool Engine::retireCheckpoint(Request &active) {
                peer.latestCheckpoint.kvBlock == point.kvBlock &&
                peer.latestCheckpoint.publication == point.publication;
       })) {
-    active.latestCheckpoint = {};
+    setLatestCheckpoint(active, {});
     return true;
   }
   if (!cache_.retireCheckpointState(active.latestCheckpoint))
     return false;
-  active.latestCheckpoint = {};
+  setLatestCheckpoint(active, {});
   return true;
+}
+
+// Points the lane's recovery point at checkpoint and moves the lane's
+// protection with it, so no write leaves a stale protection count behind.
+// Costs one state-table lookup per side: O(1) per publication.
+void Engine::setLatestCheckpoint(Request &active, StateCheckpoint checkpoint) {
+  cache_.unprotectState(std::exchange(active.checkpointProtection, {}));
+  active.latestCheckpoint = checkpoint;
+  if (checkpoint)
+    active.checkpointProtection = cache_.protectState(checkpoint.kvBlock);
 }
 
 void Engine::publishReachedStateBoundaries(Request &active,
@@ -779,8 +790,8 @@ void Engine::publishReachedStateBoundaries(Request &active,
       }
       if (active.latestCheckpoint.kvBlock != block)
         static_cast<void>(retireCheckpoint(active));
-      active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
-                                           : StateCheckpoint{};
+      setLatestCheckpoint(active, checkpoint ? cache_.checkpointState(block)
+                                             : StateCheckpoint{});
     } catch (const std::exception &) {
       ++failures;
     }
@@ -1005,6 +1016,9 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
   // reclaim takes this state only after every unprotected one, and Critical
   // reclaim takes it outright.
   active.resumeProtection = cache_.protectDeepestState(active.request.id);
+  // A suspended lane is no longer resident: its recovery point is protected
+  // only as the resume state, when it is the deepest one.
+  cache_.unprotectState(std::exchange(active.checkpointProtection, {}));
   cache_.endRequest(active.request.id);
   active.stateCell.reset();
   active.suspended = true;
@@ -1066,8 +1080,8 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
   // Critical pressure releases every empty KV extent. A warning pass, even a
   // zero-byte one, releases them too, except one kept mapped while a running
   // lane's next chunk needs it. A warning pass also spares each protected
-  // state, a suspended request's resume state or a queued request's prefix;
-  // Critical evicts it.
+  // state, a suspended request's resume state, a queued request's prefix or
+  // a resident lane's latest checkpoint; Critical evicts it.
   const bool warning = !directive.evictAllUnpinnedPrefixes;
   reclaimKeptKvRunway_ = warning && residentLaneNeedsKvRunway();
   released += cache_.reclaimCache(remaining, directive.evictAllUnpinnedPrefixes,
@@ -1281,6 +1295,7 @@ void Engine::release(Request &active) {
   active.resourceWait = {};
   cache_.unprotectState(std::exchange(active.resumeProtection, {}));
   cache_.unprotectState(std::exchange(active.queuedProtection, {}));
+  cache_.unprotectState(std::exchange(active.checkpointProtection, {}));
   if (active.stateCell || active.suspended) {
     discardPendingStateBoundaries(active);
     model_.end(active.request.id);

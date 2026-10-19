@@ -131,7 +131,8 @@ public:
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
 
   // One cache reclaimer for memory growth and pressure warnings. After empty
-  // backing, disposable checkpoints are reclaimed first. Ordinary states and
+  // backing, disposable checkpoints are reclaimed first, except protected
+  // ones such as a resident lane's latest checkpoint. Ordinary states and
   // state-free KV leaves retain their shared oldest-first access order.
   // Active requests and pinned restores are never selected. Physical release
   // is paced by the backing: while an earlier release is still being torn
@@ -147,9 +148,9 @@ public:
   // bytes count toward targetBytes, so no cache is evicted to make up for
   // them. Without it every empty extent is released.
   // A pass without evictAll (Warning pressure) spares every protected state
-  // (a suspended request's resume state, a queued request's prefix) and
-  // evicts the next publication instead; evictAll (Critical pressure) takes
-  // protected states too.
+  // (a suspended request's resume state, a queued request's prefix, a
+  // resident lane's latest checkpoint) and evicts the next publication
+  // instead; evictAll (Critical pressure) takes protected states too.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
                                       bool keepResumePoint = false,
                                       bool keepRunway = false);
@@ -164,20 +165,22 @@ public:
   // One reclaim step for an allocation a request is waiting on: spares
   // protected states while any other state or KV qualifies, then takes the
   // oldest protected state rather than stall. Costs the protected states at
-  // the head of each eviction queue, bounded by waiting requests.
+  // the head of each eviction queue, bounded by waiting and resident lanes.
   [[nodiscard]] CacheReclaimResult reclaimOneForGrowth(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
   // Recycles an unpinned state, preferring checkpoints, for a required state
   // publication. KV bytes only return once an extent unmaps. A protected
-  // state is taken only when no other state qualifies.
+  // state is taken only when no other state qualifies; with checkpointsOnly
+  // only an unprotected checkpoint qualifies, so a protected checkpoint is
+  // recycled rather than none.
   [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
   // Protects the deepest composite state on the request's published prefix,
   // the one its resume would restore, from Warning reclaim. Call before
   // endRequest; returns an empty handle when the prefix holds no state. Reads
   // the request's own block list: no lookup, hashing or pin.
   [[nodiscard]] StateProtection protectDeepestState(uint64_t requestId);
-  // Protects the state published at kvBlock for a request that holds no
-  // cache request yet: the prefix a queued request found and will restore.
+  // Protects the state published at kvBlock: the prefix a queued request
+  // found and will restore, or a resident lane's latest checkpoint.
   // Returns an empty handle when no state is published there.
   [[nodiscard]] StateProtection protectState(uint64_t kvBlock);
   // Ends one protection. No-op once its publication is gone.

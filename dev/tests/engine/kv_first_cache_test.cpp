@@ -855,6 +855,78 @@ void testGrowthReclaimFallsBackToProtectedState() {
           "growth reclaim stalled when only protected states remained");
 }
 
+// A resident lane's latest checkpoint at block 0, protected, beside an
+// unprotected ordinary state at block 3.
+struct ProtectedCheckpointFixture final {
+  ProtectedCheckpointFixture() {
+    fixture.cache.publishCompositeState(
+        fixture.blocks[0], std::make_shared<TestState>(150), true);
+    fixture.publish(3, 100);
+    protection = fixture.cache.protectState(fixture.blocks[0]);
+    require(static_cast<bool>(protection),
+            "fixture did not protect its checkpoint");
+  }
+
+  bool checkpointKept() {
+    return static_cast<bool>(
+        fixture.cache.checkpointState(fixture.blocks[0]));
+  }
+
+  CacheFixture fixture;
+  StateProtection protection;
+};
+
+void testWarningSparesAProtectedCheckpointButCriticalTakesIt() {
+  ProtectedCheckpointFixture checkpoint;
+  const uint64_t everything = std::numeric_limits<uint64_t>::max();
+
+  static_cast<void>(checkpoint.fixture.cache.reclaimCache(everything, false));
+  require(checkpoint.checkpointKept(),
+          "warning reclaim evicted a protected checkpoint");
+  static_cast<void>(checkpoint.fixture.cache.reclaimCache(everything, true));
+
+  require(checkpoint.fixture.cache.snapshot().stateCache.entries == 0,
+          "critical reclaim spared a protected checkpoint");
+}
+
+void testGrowthReclaimTakesAProtectedCheckpointLast() {
+  ProtectedCheckpointFixture checkpoint;
+  engine::Cache &cache = checkpoint.fixture.cache;
+
+  const CacheReclaimResult first = cache.reclaimOneForGrowth();
+  require(first.madeProgress && first.reclaimedBytes == 100 &&
+              checkpoint.checkpointKept(),
+          "growth reclaim took a protected checkpoint before an ordinary state");
+  for (uint32_t step = 0; step < 8 && checkpoint.checkpointKept(); ++step)
+    require(cache.reclaimOneForGrowth().madeProgress,
+            "growth reclaim stalled beside a protected checkpoint");
+
+  require(!checkpoint.checkpointKept() &&
+              cache.snapshot().kvCache.blocks == 1,
+          "growth reclaim took the protected checkpoint before state-free KV");
+}
+
+void testReclaimOneStateTakesAProtectedCheckpointLast() {
+  ProtectedCheckpointFixture checkpoint;
+  engine::Cache &cache = checkpoint.fixture.cache;
+
+  require(cache.reclaimOneState() && checkpoint.checkpointKept() &&
+              cache.snapshot().stateCache.entries == 1,
+          "recycling took a protected checkpoint before an ordinary state");
+  require(cache.reclaimOneState() && !checkpoint.checkpointKept(),
+          "recycling did not fall back to the protected checkpoint");
+}
+
+void testCheckpointRecyclingTakesAProtectedCheckpointOverNone() {
+  ProtectedCheckpointFixture checkpoint;
+
+  require(checkpoint.fixture.cache.reclaimOneState(true) &&
+              !checkpoint.checkpointKept() &&
+              checkpoint.fixture.cache.snapshot().stateCache.entries == 1,
+          "an unprotected ordinary state hid the protected checkpoint from "
+          "checkpoint recycling");
+}
+
 int main() {
   try {
     testCheckpointLookupProbeDoesNotPromote();
@@ -889,6 +961,10 @@ int main() {
     testProtectStateSparesAPublicationFromWarningReclaim();
     testGrowthReclaimTakesUnprotectedStateFirst();
     testGrowthReclaimFallsBackToProtectedState();
+    testWarningSparesAProtectedCheckpointButCriticalTakesIt();
+    testGrowthReclaimTakesAProtectedCheckpointLast();
+    testReclaimOneStateTakesAProtectedCheckpointLast();
+    testCheckpointRecyclingTakesAProtectedCheckpointOverNone();
     std::cout << "KV-first cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {
