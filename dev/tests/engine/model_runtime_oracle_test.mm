@@ -778,14 +778,16 @@ int main(int argc, char **argv) {
     const auto &device = backend.capabilities();
     if (const auto error = device.validationError())
       fail(*error);
-    const uint64_t hostReserveBytes =
-        EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
+    const HostCushion hostCushion =
+        EngineMemoryPolicy::hostCushion(device.physicalMemoryBytes);
+    // Production's startup floor: the reserve plus the warning margin.
+    const uint64_t hostProtectedBytes = hostCushion.admissionFloorBytes();
     const auto hostAvailableBytes = queryHostAvailableMemory();
     require(hostAvailableBytes.has_value(),
             "cannot measure available host memory before loading the oracle model");
-    require(*hostAvailableBytes > hostReserveBytes,
+    require(*hostAvailableBytes > hostProtectedBytes,
             "available host memory does not cover the protected macOS reserve");
-    uint64_t remainingModelBytes = *hostAvailableBytes - hostReserveBytes;
+    uint64_t remainingModelBytes = *hostAvailableBytes - hostProtectedBytes;
     const std::filesystem::path modelRoot(argv[2]);
     bool hasModelBytes = false;
     // Match production's packed-file preflight before any model mappings.
@@ -798,7 +800,7 @@ int main(int argc, char **argv) {
         const auto bytes = entry.file_size();
         require(bytes <= remainingModelBytes,
                 "oracle model loading exceeds available host memory after protecting " +
-                    std::to_string(hostReserveBytes) + " bytes for macOS");
+                    std::to_string(hostProtectedBytes) + " bytes for macOS");
         remainingModelBytes -= bytes;
         hasModelBytes |= bytes != 0;
       }
@@ -835,7 +837,7 @@ int main(int argc, char **argv) {
             "runtime reserves consume the oracle Metal budget");
     const uint64_t elasticGrowthCeiling = budget.hardBudgetBytes -
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
-    MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes);
+    MemoryGovernor governor(backend, elasticGrowthCeiling, hostCushion);
     AllocationFault allocationFault;
     const metal::AllocationAdmission admission =
         [admit = governor.allocationAdmission(), &allocationFault](

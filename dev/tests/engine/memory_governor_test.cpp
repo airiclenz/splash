@@ -11,16 +11,16 @@ using namespace splash::engine;
 
 namespace {
 
-constexpr uint64_t kGiB = 1ULL << 30;
-constexpr uint64_t kHostReserveBytes = 64 * 1024;
+constexpr HostCushion kCushion{64 * 1024, 1 * kGiB, 2 * kGiB};
 constexpr uint64_t kLimitBytes = 8 * kGiB;
 constexpr uint64_t kResidentBytes = 1 * kGiB;
-constexpr uint64_t kAmpleHostBytes = kHostReserveBytes + 3 * kGiB;
+constexpr uint64_t kAmpleHostBytes = kCushion.reserveBytes + 3 * kGiB;
 constexpr uint64_t kLowHostBytes =
-    kHostReserveBytes + kHostWarningMarginBytes / 2;
-constexpr uint64_t kHysteresisHostBytes =
-    kHostReserveBytes +
-    (kHostWarningMarginBytes + kHostRecoveryMarginBytes) / 2;
+    kCushion.reserveBytes + kCushion.warningMarginBytes / 2;
+// Above the warning margin, below the recovery margin: a held latch stays.
+constexpr uint64_t kLatchedHostBytes =
+    kCushion.reserveBytes +
+    (kCushion.warningMarginBytes + kCushion.recoveryMarginBytes) / 2;
 constexpr int kRepeatedSnapshots = 16;
 
 void require(bool value, const char *message) {
@@ -34,14 +34,15 @@ struct FakeHost {
   int samples = 0;
 };
 
-MemoryGovernor makeGovernor(FakeHost &host) {
+MemoryGovernor makeGovernor(FakeHost &host,
+                            HostCushion cushion = kCushion) {
   return MemoryGovernor(
       [](bool) {
         metal::MetalMemoryStats stats;
         stats.allocatedBytes = kResidentBytes;
         return stats;
       },
-      kLimitBytes, kHostReserveBytes,
+      kLimitBytes, cushion,
       [&host] {
         ++host.samples;
         return host.availableBytes;
@@ -100,7 +101,7 @@ void testObserveLatchesWarningAndClearsAtRecovery() {
               !state.hostGrowthAllowed && !state.growthAllowed,
           "observe() did not latch Warning below the warning margin");
 
-  host.availableBytes = kHysteresisHostBytes;
+  host.availableBytes = kLatchedHostBytes;
   governor.observe();
   require(governor.snapshot().pressure == MemoryPressure::Warning,
           "the latch cleared before the recovery margin");
@@ -139,6 +140,95 @@ void testTryReserveAdvancesLatch() {
           "tryReserve() did not clear the latch at recovery");
 }
 
+void testReservationThatFitsIsGrantedWhileWarningLatched() {
+  FakeHost host;
+  MemoryGovernor governor = makeGovernor(host);
+  host.availableBytes = kLowHostBytes;
+  governor.observe();
+  host.availableBytes = kLatchedHostBytes;
+  governor.observe();
+
+  const MemoryGovernorSnapshot latched = governor.snapshot();
+  auto reservation = governor.tryReserve(1);
+
+  require(latched.pressure == MemoryPressure::Warning &&
+              latched.hostGrowthAllowed && latched.growthAllowed,
+          "a held latch reported host growth paused");
+  require(reservation.has_value() &&
+              governor.snapshot().pressure == MemoryPressure::Warning,
+          "the Warning latch denied a reservation that fits");
+}
+
+// requireStartupHeadroom refuses at or below admissionFloorBytes(); a one-byte
+// reservation must meet the same floor, and the snapshot must agree with it.
+void testStartupAndServingShareOneFloor() {
+  FakeHost host;
+  MemoryGovernor governor = makeGovernor(host);
+
+  host.availableBytes = kCushion.admissionFloorBytes();
+  metal::AllocationFailure failure = metal::AllocationFailure::None;
+  const bool grantedAtFloor = governor.tryReserve(1, &failure).has_value();
+  const bool reportedAtFloor = governor.snapshot().hostGrowthAllowed;
+  host.availableBytes = kCushion.admissionFloorBytes() + 1;
+  const bool grantedAboveFloor = governor.tryReserve(1).has_value();
+  host.availableBytes = kCushion.admissionFloorBytes() - 1;
+  governor.observe();
+  const bool reportedBelowFloor = governor.snapshot().hostGrowthAllowed;
+
+  require(!grantedAtFloor &&
+              failure == metal::AllocationFailure::HostPressure,
+          "serving admitted growth at the startup floor");
+  require(grantedAboveFloor, "serving refused growth above the startup floor");
+  require(reportedAtFloor && !reportedBelowFloor,
+          "the snapshot's host test differs from the reservation's");
+}
+
+void testCushionScalesWithPhysicalMemory() {
+  struct Case {
+    uint64_t physicalBytes;
+    uint64_t reserveBytes;
+    uint64_t warningBytes;
+    uint64_t recoveryBytes;
+  };
+  const uint64_t sixteenGiBReserve = 16 * kGiB / 10;
+  const Case cases[] = {
+      {8 * kGiB, 8 * kGiB / 10, 256 * kMiB, 512 * kMiB},
+      {16 * kGiB, sixteenGiBReserve, sixteenGiBReserve / 4,
+       sixteenGiBReserve / 2},
+      {32 * kGiB, 2 * kGiB, 512 * kMiB, 1 * kGiB},
+      {128 * kGiB, 2 * kGiB, 512 * kMiB, 1 * kGiB},
+  };
+
+  for (const Case &expected : cases) {
+    const HostCushion cushion =
+        EngineMemoryPolicy::hostCushion(expected.physicalBytes);
+    require(cushion.reserveBytes == expected.reserveBytes &&
+                cushion.warningMarginBytes == expected.warningBytes &&
+                cushion.recoveryMarginBytes == expected.recoveryBytes,
+            "the host cushion does not follow the ratified formulas");
+  }
+}
+
+void testInvalidCushionRejected() {
+  FakeHost host;
+  const HostCushion invalid[] = {
+      {0, kCushion.warningMarginBytes, kCushion.recoveryMarginBytes},
+      {kCushion.reserveBytes, 0, kCushion.recoveryMarginBytes},
+      {kCushion.reserveBytes, kCushion.recoveryMarginBytes,
+       kCushion.warningMarginBytes},
+  };
+
+  for (const HostCushion &cushion : invalid) {
+    bool rejected = false;
+    try {
+      static_cast<void>(makeGovernor(host, cushion));
+    } catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    require(rejected, "an incoherent host cushion was accepted");
+  }
+}
+
 void testSystemPressureReadsWithoutSampling() {
   FakeHost host;
   MemoryGovernor governor = makeGovernor(host);
@@ -159,6 +249,10 @@ int main() {
     testSnapshotNeitherSamplesNorLatches();
     testObserveLatchesWarningAndClearsAtRecovery();
     testTryReserveAdvancesLatch();
+    testReservationThatFitsIsGrantedWhileWarningLatched();
+    testStartupAndServingShareOneFloor();
+    testCushionScalesWithPhysicalMemory();
+    testInvalidCushionRejected();
     testSystemPressureReadsWithoutSampling();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;

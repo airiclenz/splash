@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/MemoryPlan.hpp"
 #include "metal/MetalBackend.hpp"
 
 #include <cstdint>
@@ -50,12 +51,6 @@ memoryPressureName(MemoryPressure pressure) noexcept {
 
 [[nodiscard]] std::optional<MemoryPressure> querySystemMemoryPressure() noexcept;
 
-// Allocation and recovery use separate watermarks to avoid oscillation.
-// Low availability causes paced reclaim; unavailable telemetry pauses growth;
-// the OS critical signal causes full eviction of unpinned cache entries.
-inline constexpr uint64_t kHostWarningMarginBytes = 1ULL << 30;
-inline constexpr uint64_t kHostRecoveryMarginBytes = 2ULL << 30;
-
 struct MemoryGovernorSnapshot {
   uint64_t limitBytes = 0;
   uint64_t observedResidentBytes = 0;
@@ -67,6 +62,10 @@ struct MemoryGovernorSnapshot {
   bool hostMeasurementValid = false;
   uint64_t hostAvailableBytes = 0;
   uint64_t hostReserveBytes = 0;
+  // The cushion's margins over the reserve: growth needs the warning margin
+  // left after it; a Warning reclaim episode ends at the recovery margin.
+  uint64_t hostWarningMarginBytes = 0;
+  uint64_t hostRecoveryMarginBytes = 0;
   uint64_t hostHeadroomBytes = 0;
   MemoryPressure systemPressure = MemoryPressure::Normal;
   bool growthAllowed = true;
@@ -131,27 +130,38 @@ public:
     friend class MemoryGovernor;
   };
 
+  // Derives the margins from a bare reserve per EngineMemoryPolicy.
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                  uint64_t hostReserveBytes)
-      : MemoryGovernor(backend, limitBytes, hostReserveBytes,
+      : MemoryGovernor(backend, limitBytes,
+                       EngineMemoryPolicy::hostCushionForReserve(
+                           hostReserveBytes)) {}
+  MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
+                 HostCushion hostCushion)
+      : MemoryGovernor(backend, limitBytes, hostCushion,
                        queryHostAvailableMemory) {}
   // The backend adapters live here so MemoryGovernor.cpp never calls into
   // MetalBackend and links without it.
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
-                 uint64_t hostReserveBytes,
+                 HostCushion hostCushion,
                  HostAvailableMemoryProvider hostAvailableMemory)
       : MemoryGovernor(
             [metalBackend = &backend](bool refreshDevice) {
               return refreshDevice ? metalBackend->refreshMemoryStats()
                                    : metalBackend->memoryStats();
             },
-            limitBytes, hostReserveBytes, std::move(hostAvailableMemory)) {}
+            limitBytes, hostCushion, std::move(hostAvailableMemory)) {}
   // Samples the host once and stores that sample, and the latch it sets, as
-  // the first state snapshot() reports.
+  // the first state snapshot() reports. Throws std::invalid_argument for a
+  // zero reserve or warning margin, or a recovery margin below the warning
+  // margin.
   MemoryGovernor(MetalMemoryStatsProvider metalMemoryStats,
-                 uint64_t limitBytes, uint64_t hostReserveBytes,
+                 uint64_t limitBytes, HostCushion hostCushion,
                  HostAvailableMemoryProvider hostAvailableMemory);
 
+  // Grants while the engine budget fits, the host keeps at least the warning
+  // margin above the reserve after the growth, and pressure is not Critical.
+  // The Warning latch never denies on its own.
   [[nodiscard]] std::optional<Reservation> tryReserve(
       uint64_t bytes, metal::AllocationFailure *failure = nullptr);
   // Low-level storage/model components receive only this transactional
@@ -159,9 +169,10 @@ public:
   // reverse dependency on engine policy.
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
   void setPressure(MemoryPressure pressure) noexcept;
-  // Samples host memory, stores the sample and advances the Warning latch.
-  // Only this and tryReserve() move the latch, so admission never depends on
-  // how often anyone reads snapshot().
+  // Samples host memory, stores the sample and advances the Warning latch,
+  // which drives reported pressure and paced reclaim, never admission. Only
+  // this and tryReserve() move the latch, so reported pressure never depends
+  // on how often anyone reads snapshot().
   void observe() noexcept;
   // Reads the stored host sample and latch, plus the backend's cached
   // accounting: no host sample, no latch write.
@@ -176,6 +187,10 @@ private:
                     uint64_t reservedBytes) const noexcept;
   // Stores hostAvailable as the current sample and advances the latch from
   // it. Callers hold mutex_ (or own the governor exclusively).
+  // The host half of admission, shared by tryReserve() and snapshot() so
+  // hostGrowthAllowed reports exactly what a reservation would be told.
+  [[nodiscard]] bool hostAdmits(uint64_t hostHeadroom,
+                                MemoryPressure pressure) const noexcept;
   [[nodiscard]] MemoryPressure updateEffectivePressure(
       const std::optional<uint64_t> &hostAvailable,
       uint64_t reservedBytes) noexcept;
@@ -184,7 +199,7 @@ private:
 
   MetalMemoryStatsProvider metalMemoryStats_;
   uint64_t limitBytes_ = 0;
-  uint64_t hostReserveBytes_ = 0;
+  HostCushion hostCushion_;
   HostAvailableMemoryProvider hostAvailableMemory_;
   mutable std::mutex mutex_;
   uint64_t reservedBytes_ = 0;

@@ -44,6 +44,21 @@ struct ModelMemoryProfile final {
 
 [[nodiscard]] std::string modelStatusJson(const ModelMemoryProfile &model);
 
+// The host memory kept free of the engine. Growth is admitted while
+// reclaimable memory stays at or above reserve + warning margin after the
+// growth; the recovery margin only ends a Warning reclaim episode.
+struct HostCushion {
+  uint64_t reserveBytes = 0;
+  uint64_t warningMarginBytes = 0;
+  uint64_t recoveryMarginBytes = 0;
+
+  // The least reclaimable host memory that may remain after growth, and the
+  // floor startup must stand strictly above.
+  [[nodiscard]] constexpr uint64_t admissionFloorBytes() const noexcept {
+    return reserveBytes + warningMarginBytes;
+  }
+};
+
 struct EngineMemoryPolicy {
   // recommendedMaxWorkingSetSize already describes Metal's performance-safe
   // working set. Keep only a small runtime/measurement margin below it; the
@@ -73,10 +88,35 @@ struct EngineMemoryPolicy {
                : automatic;
   }
 
-  // A bounded host cushion, independent of the engine's Metal capacity.
+  static constexpr uint64_t maximumHostReserveBytes = 2 * kGiB;
+  static constexpr uint64_t minimumHostWarningMarginBytes = 256 * kMiB;
+  static constexpr uint64_t minimumHostRecoveryMarginBytes = 512 * kMiB;
+
+  // The memory protected for macOS: a tenth of a small machine, 2 GiB from
+  // 20 GiB up. Independent of the engine's Metal capacity.
   [[nodiscard]] static constexpr uint64_t
   hostAvailableReserveBytes(uint64_t physicalMemoryBytes) noexcept {
-    return std::min<uint64_t>(physicalMemoryBytes / 10, 2 * kGiB);
+    return std::min<uint64_t>(physicalMemoryBytes / 10,
+                              maximumHostReserveBytes);
+  }
+
+  // The margins scale with the reserve so a small machine is not held to a
+  // large machine's cushion; the floors keep them above telemetry noise.
+  [[nodiscard]] static constexpr HostCushion
+  hostCushionForReserve(uint64_t reserveBytes) noexcept {
+    return {reserveBytes,
+            std::max<uint64_t>(reserveBytes / 4,
+                               minimumHostWarningMarginBytes),
+            std::max<uint64_t>(reserveBytes / 2,
+                               minimumHostRecoveryMarginBytes)};
+  }
+
+  // The one cushion startup and serving share. At most 2 GiB reserve plus a
+  // 512 MiB warning margin (1 GiB recovery) on a machine of 20 GiB or more.
+  [[nodiscard]] static constexpr HostCushion
+  hostCushion(uint64_t physicalMemoryBytes) noexcept {
+    return hostCushionForReserve(
+        hostAvailableReserveBytes(physicalMemoryBytes));
   }
 };
 

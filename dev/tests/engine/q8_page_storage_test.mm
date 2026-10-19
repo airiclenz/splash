@@ -106,9 +106,12 @@ void run(const std::string &metallib) {
         baseline.allocatedBytes, baseline.deviceCurrentAllocatedBytes);
     constexpr uint64_t giB = 1ULL << 30;
     constexpr uint64_t hostReserve = 64 * 1024;
+    // An explicit 1 GiB warning / 2 GiB recovery cushion keeps the giB
+    // thresholds below independent of the derived margins.
+    constexpr HostCushion boundedCushion{hostReserve, giB, 2 * giB};
     std::optional<uint64_t> fakeHostAvailable = hostReserve + 3 * giB;
     MemoryGovernor bounded(
-        backend, observed + 64 * 1024, hostReserve,
+        backend, observed + 64 * 1024, boundedCushion,
         [&fakeHostAvailable] {
             return fakeHostAvailable;
         });
@@ -180,7 +183,13 @@ void run(const std::string &metallib) {
     fakeHostAvailable = hostReserve + 3 * giB / 2;
     bounded.observe();
     require(bounded.snapshot().pressure == MemoryPressure::Warning,
-            "warning pressure recovered without crossing the hysteresis");
+            "warning pressure recovered below the recovery margin");
+    // The latch paces reclaim only: growth that leaves the warning margin
+    // is admitted while it holds.
+    require(bounded.snapshot().growthAllowed &&
+                bounded.tryReserve(1).has_value() &&
+                bounded.snapshot().pressure == MemoryPressure::Warning,
+            "the Warning latch denied growth that fits the host cushion");
     fakeHostAvailable = hostReserve + 3 * giB;
     bounded.observe();
     require(bounded.snapshot().pressure == MemoryPressure::Normal &&
@@ -252,6 +261,8 @@ void run(const std::string &metallib) {
     policySnapshot.pressure = MemoryPressure::Warning;
     policySnapshot.hostMeasurementValid = true;
     policySnapshot.systemPressure = MemoryPressure::Warning;
+    policySnapshot.hostWarningMarginBytes = giB;
+    policySnapshot.hostRecoveryMarginBytes = 2 * giB;
     policySnapshot.hostHeadroomBytes = 3 * giB / 2;
     auto firstDirective = policy.update(policySnapshot, 0.0, false);
     require(firstDirective.reclaimEmptyKvExtents &&
@@ -303,7 +314,7 @@ void run(const std::string &metallib) {
     std::optional<uint64_t> elasticHostAvailable = 2ULL * 1024 * 1024 * 1024;
     MemoryGovernor hostGated(
         backend, backend.capabilities().recommendedMaxWorkingSetBytes,
-        128ULL * 1024 * 1024,
+        EngineMemoryPolicy::hostCushionForReserve(128ULL * 1024 * 1024),
         [&elasticHostAvailable] { return elasticHostAvailable; });
     kv::PageStorage hostGatedStorage(
         backend, hostGated.allocationAdmission(), kvLayout, 256);

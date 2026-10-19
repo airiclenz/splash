@@ -164,6 +164,40 @@ void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
   }
 }
 
+// Startup stands on the serving governor's floor, reserve plus warning
+// margin, and the refusal names that floor rather than the bare reserve.
+void testStartupRefusalNamesServingFloor(const char *metallibPath) {
+  TemporaryModelRoot root;
+  RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
+  const HostCushion cushion = EngineMemoryPolicy::hostCushion(
+      NSProcessInfo.processInfo.physicalMemory);
+  const uint64_t floorBytes = cushion.admissionFloorBytes();
+  const std::string expected =
+      std::to_string(floorBytes / kMiB) + " MiB required (" +
+      std::to_string(cushion.reserveBytes / kMiB) +
+      " MiB protected for macOS + " +
+      std::to_string(cushion.warningMarginBytes / kMiB) +
+      " MiB warning margin)";
+  config.hostAvailableMemory = [floorBytes] {
+    return std::optional<uint64_t>(floorBytes);
+  };
+
+  try {
+    auto resources = RuntimeResources::create(config);
+    throw std::runtime_error("startup admitted host memory at the floor");
+  } catch (const RuntimeResourcesError &error) {
+    require(error.failure() == RuntimeResourceFailure::HostCapacity &&
+                error.message().find(expected) != std::string::npos,
+            "the startup refusal did not name reserve plus warning margin");
+  }
+
+  config.hostAvailableMemory = [floorBytes] {
+    return std::optional<uint64_t>(floorBytes + 1);
+  };
+  requireReachesModelLoader(config, root.path,
+                            "startup refused host memory above the floor");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -172,6 +206,7 @@ int main(int argc, char **argv) {
       require(argc == 2, "expected metallib path");
       testWeightBudgetBeforeLoading(argv[1]);
       testStartupAdmissionIgnoresPackageSize(argv[1]);
+      testStartupRefusalNamesServingFloor(argv[1]);
       std::cout << "runtime resources tests passed\n";
       return EXIT_SUCCESS;
     } catch (const std::exception &error) {

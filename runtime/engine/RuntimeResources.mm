@@ -108,11 +108,12 @@ uint64_t mebibytes(uint64_t bytes) noexcept { return bytes / kMiB; }
 // weights are mapped, not copied, so the package never has to fit in
 // reclaimable memory at once. Residency is what must fit, and it is checked
 // here again at every Metal operation as loading and warmup build it up.
+// The floor is the serving governor's: reserve plus warning margin.
 void requireStartupHeadroom(
     const MemoryGovernor::HostAvailableMemoryProvider &hostAvailableMemory,
-    uint64_t reserveBytes, MemoryPressure pressure) {
+    const HostCushion &cushion, MemoryPressure pressure) {
   const std::optional<uint64_t> available = hostAvailableMemory();
-  if (!available || *available <= reserveBytes ||
+  if (!available || *available <= cushion.admissionFloorBytes() ||
       pressure == MemoryPressure::Critical) {
     std::ostringstream message;
     message << "not enough free memory to start: ";
@@ -120,8 +121,12 @@ void requireStartupHeadroom(
       message << "reclaimable host memory cannot be measured";
     else
       message << mebibytes(*available) << " MiB reclaimable, "
-              << mebibytes(reserveBytes) << " MiB protected for macOS, system "
-              << "pressure " << memoryPressureName(pressure);
+              << mebibytes(cushion.admissionFloorBytes())
+              << " MiB required (" << mebibytes(cushion.reserveBytes)
+              << " MiB protected for macOS + "
+              << mebibytes(cushion.warningMarginBytes)
+              << " MiB warning margin), system pressure "
+              << memoryPressureName(pressure);
     message << "; close memory-heavy applications and retry";
     throw metal::MetalAllocationError(message.str(),
                                       metal::AllocationFailure::HostPressure);
@@ -304,17 +309,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
                                 *error, deviceStatusJson(device));
   }
 
-  const uint64_t hostReserveBytes =
-      EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
+  const HostCushion hostCushion =
+      EngineMemoryPolicy::hostCushion(device.physicalMemoryBytes);
   MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
       config.hostAvailableMemory ? config.hostAvailableMemory
                                  : queryHostAvailableMemory;
   backend->setOperationGuard(
       [cancelled = config.cancelled, pressure = config.memoryPressure,
-       hostAvailableMemory, hostReserveBytes] {
+       hostAvailableMemory, hostCushion] {
         if (cancelled && cancelled())
           throw metal::MetalBackendError("Metal operation cancelled");
-        requireStartupHeadroom(hostAvailableMemory, hostReserveBytes,
+        requireStartupHeadroom(hostAvailableMemory, hostCushion,
             pressure ? pressure() : MemoryPressure::Normal);
       });
   try {
@@ -333,7 +338,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     }
     // Fail before opening the package when the machine has no headroom at
     // all; the guard installed above keeps checking as residency grows.
-    requireStartupHeadroom(hostAvailableMemory, hostReserveBytes,
+    requireStartupHeadroom(hostAvailableMemory, hostCushion,
         config.memoryPressure ? config.memoryPressure() : MemoryPressure::Normal);
   } catch (const RuntimeResourcesError &) {
     throw;
@@ -432,7 +437,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     const uint64_t elasticGrowthCeiling =
         baselineBudget.hardBudgetBytes - runtimeReserve;
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
-        *backend, elasticGrowthCeiling, hostReserveBytes, hostAvailableMemory);
+        *backend, elasticGrowthCeiling, hostCushion, hostAvailableMemory);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     std::string rejected;
