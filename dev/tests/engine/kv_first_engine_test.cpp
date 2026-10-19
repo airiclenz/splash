@@ -1507,6 +1507,34 @@ KvPoolSnapshot reclaimBesideRunningLane(
   return after;
 }
 
+// Queues a request for memory with no resident lane: a host-pressure begin
+// denial while growth is paused, as in QueuedPrefixFixture, beside two empty
+// mapped extents. Applies one directive and returns the free resident pages.
+uint32_t reclaimBesideQueuedRequest(const MemoryReclaimDirective &directive) {
+  bool blocked = true;
+  Backing backing(16);
+  KvPool pool(mapLeadingPages(backing, 8));
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return blocked; };
+  Events events;
+  EngineConfig config;
+  config.growthPaused = [&] { return blocked; };
+  engine::Engine engine(config, resources, executor, events);
+  engine.submit(request(41, {41}));
+  static_cast<void>(engine.tick(1));
+  require(engine.resourceWaitSnapshot(1).memory == 1 &&
+              resources.snapshot().pool.pagesActive == 0,
+          "runway setup did not queue a request beside no resident lane");
+
+  static_cast<void>(engine.reclaimMemory(directive));
+  const uint32_t freeResident = resources.snapshot().pool.pagesFreeResident;
+  engine.cancel(41);
+  runUntilIdle(engine);
+  return freeResident;
+}
+
 void testPressureReclaimKeepsRunwayOnlyForWarning() {
   const MemoryReclaimDirective warning{.reclaimEmptyKvExtents = true};
   const MemoryReclaimDirective critical{
@@ -1528,7 +1556,14 @@ void testPressureReclaimKeepsRunwayOnlyForWarning() {
               criticalAfterWarning.reclaimableExtents == 0,
           "critical reclaim left an empty extent mapped");
 
-  // With no running lane the runway serves nothing; warning unmaps it too.
+  // A queued request takes the runway next, even with no resident lane.
+  require(reclaimBesideQueuedRequest(warning) > 0,
+          "warning reclaim unmapped the runway a queued request needs");
+  require(reclaimBesideQueuedRequest(critical) == 0,
+          "critical reclaim kept a runway for a queued request");
+
+  // With no running lane and no waiting request the runway serves nothing;
+  // warning unmaps it too.
   Backing backing(16);
   KvPool pool(mapLeadingPages(backing, 8));
   engine::Cache resources(pool, CacheNamespace{});
@@ -1537,7 +1572,7 @@ void testPressureReclaimKeepsRunwayOnlyForWarning() {
   engine::Engine engine({}, resources, executor, events);
   static_cast<void>(engine.reclaimMemory(warning));
   require(resources.snapshot().pool.pagesFreeResident == 0,
-          "warning reclaim kept a runway no running lane needs");
+          "warning reclaim kept a runway no request needs");
 }
 
 void testConcurrencyLimitDoesNotEvictCache() {

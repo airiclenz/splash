@@ -1139,7 +1139,8 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
 // wait on a mapping a host-constrained governor denies, suspending the lane.
 // The prefill chunk is bounded by the full token budget, so this errs toward
 // keeping the runway. Costs one scheduler and one page-table lookup per
-// resident request, without allocation.
+// resident request, without allocation. A request still waiting for admission
+// keeps the runway through waitingRequestNeedsKvRunway() instead.
 bool Engine::residentLaneNeedsKvRunway() const {
   const uint64_t packedFreePages = cache_.partlyUsedFreePages();
   uint64_t neededPages = 0;
@@ -1168,6 +1169,23 @@ bool Engine::residentLaneNeedsKvRunway() const {
   return neededPages > packedFreePages;
 }
 
+// A request waiting for admission (queued, waiting on resources or suspended)
+// takes its first pages next; with no resident lane the last empty extent is
+// the only mapping it can take while a host-constrained governor denies new
+// ones. Costs one scheduler lookup per request, without allocation, and stops
+// at the first waiter.
+bool Engine::waitingRequestNeedsKvRunway() const {
+  return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
+    const auto &[id, active] = entry;
+    if (active.finalized || active.failure)
+      return false;
+    if (active.suspended)
+      return true;
+    const Phase phase = scheduler_.phase(id);
+    return phase == Phase::Queued || phase == Phase::WaitingResources;
+  });
+}
+
 uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
   if (!directive.reclaimEmptyKvExtents)
     return 0;
@@ -1179,11 +1197,14 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
       released >= directive.targetBytes ? 0 : directive.targetBytes - released;
   // Critical pressure releases every empty KV extent. A warning pass, even a
   // zero-byte one, releases them too, except one kept mapped while a running
-  // lane's next chunk needs it. A warning pass also spares each protected
-  // state, a suspended request's resume state, a queued request's prefix or
-  // a resident lane's latest checkpoint; Critical evicts it.
+  // lane's next chunk or a waiting request's admission needs it; each check
+  // walks the request table once per pressure pass, never per token. A
+  // warning pass also spares each protected state, a suspended request's
+  // resume state, a queued request's prefix or a resident lane's latest
+  // checkpoint; Critical evicts it.
   const bool warning = !directive.evictAllUnpinnedPrefixes;
-  reclaimKeptKvRunway_ = warning && residentLaneNeedsKvRunway();
+  reclaimKeptKvRunway_ = warning && (residentLaneNeedsKvRunway() ||
+                                     waitingRequestNeedsKvRunway());
   released += cache_.reclaimCache(remaining, directive.evictAllUnpinnedPrefixes,
                                  directive.keepResumePoint,
                                  reclaimKeptKvRunway_);

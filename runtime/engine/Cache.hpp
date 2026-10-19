@@ -153,9 +153,10 @@ public:
   // hybrid model cannot resume from cached KV without the recurrent state.
   // Older publications and state-free KV are still reclaimed.
   // keepRunway leaves one empty extent mapped: the free resident runway a
-  // running request's next chunk takes without asking for a new mapping. Its
-  // bytes count toward targetBytes, so no cache is evicted to make up for
-  // them. Without it every empty extent is released.
+  // running request's next chunk, or a waiting request's admission, takes
+  // without asking for a new mapping. Its bytes count toward targetBytes, so
+  // no cache is evicted to make up for them. Without it every empty extent is
+  // released.
   // A pass without evictAll (Warning pressure) spares every protected state
   // (a suspended request's resume state, a queued request's prefix, a
   // resident lane's latest checkpoint) and evicts the next publication

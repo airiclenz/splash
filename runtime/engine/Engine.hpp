@@ -101,7 +101,8 @@ public:
   // is paced one extent at a time; reclaimDeferred() reports that the pass
   // stopped behind an in-flight release and should run again shortly.
   // A warning pass keeps one empty KV extent mapped while a running lane's
-  // next chunk needs it; a critical pass releases every empty extent.
+  // next chunk needs it or a request waits for admission (queued, waiting on
+  // resources or suspended); a critical pass releases every empty extent.
   [[nodiscard]] uint64_t reclaimMemory(const MemoryReclaimDirective &directive);
   [[nodiscard]] bool reclaimDeferred() const noexcept {
     return cache_.releaseDeferred(reclaimKeptKvRunway_);
@@ -217,6 +218,7 @@ private:
   [[nodiscard]] bool growthPaused() const;
   [[nodiscard]] uint32_t completedTokens(const Request &request) const;
   [[nodiscard]] bool residentLaneNeedsKvRunway() const;
+  [[nodiscard]] bool waitingRequestNeedsKvRunway() const;
   struct KvAdmission {
     TokenAdmission allocation;
     bool retryableBudget = false;
