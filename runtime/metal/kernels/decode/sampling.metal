@@ -766,8 +766,9 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                                 device uint &next_anchor,
                                 device uint &accepted_count,
                                 AcceptParams params) {
+  uint proposals = params.no_proposals ? 0u : SPLASH_DRAFT_PROPOSAL_TOKENS;
   uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS) {
+  while (accepted < proposals) {
     uint token = draft_tokens[accepted];
     float q = sparse_lookup(draft_ids + accepted * 16,
                             draft_probs + accepted * 16, 16, token);
@@ -778,10 +779,12 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
     output_tokens[accepted] = token;
     ++accepted;
   }
-  if (accepted == SPLASH_DRAFT_PROPOSAL_TOKENS) {
+  // Every proposal accepted, or none offered: draw the bonus token from the
+  // target row after the last proposal, without a residual against q.
+  if (accepted == proposals) {
     output_tokens[accepted] =
-        sparse_sample(target_ids + SPLASH_DRAFT_PROPOSAL_TOKENS * 32,
-                      target_probs + SPLASH_DRAFT_PROPOSAL_TOKENS * 32,
+        sparse_sample(target_ids + accepted * 32,
+                      target_probs + accepted * 32,
                       uniforms[2 * SPLASH_TARGET_VERIFY_ROWS - 1]);
   } else {
     output_tokens[accepted] = sparse_residual_sample(
@@ -878,8 +881,9 @@ inline void accept_greedy_lane(device const uint *draft_tokens,
                                device uint &next_anchor,
                                device uint &accepted_count,
                                AcceptParams params) {
+  uint proposals = params.no_proposals ? 0u : SPLASH_DRAFT_PROPOSAL_TOKENS;
   uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS &&
+  while (accepted < proposals &&
          draft_tokens[accepted] == target_tokens[accepted]) {
     ++accepted;
   }
@@ -904,7 +908,7 @@ kernel void decode_accept_dflash(
     return;
   uint remaining = params.remaining[batch];
   AcceptParams lane_params{remaining, params.stop_token_0,
-                           params.stop_token_1};
+                           params.stop_token_1, params.no_proposals};
   device const uint *lane_draft =
       draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS;
   device uint *lane_target =

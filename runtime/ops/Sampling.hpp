@@ -100,11 +100,14 @@ public:
       metal::CommandGraph &graph, DraftSelectorBuffers buffers,
       std::span<const uint32_t> anchors,
       std::span<const SamplingPolicy> policies, uint32_t proposalTokens) const;
+  // shouldSkipProposals accepts a step that carried no draft proposals:
+  // each lane retains only the target's row-0 token (argmax when greedy, a
+  // plain draw from row 0 when sampling) and ignores the proposal buffers.
   void addAcceptance(
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,
       std::span<const SamplingPolicy> policies, uint32_t stopToken0,
-      uint32_t stopToken1) const;
+      uint32_t stopToken1, bool shouldSkipProposals = false) const;
   void addVerifyInput(metal::CommandGraph &graph,
                       metal::MetalBuffer draftInputTokens,
                       metal::MetalBuffer proposedTokens,

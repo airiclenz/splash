@@ -210,13 +210,14 @@ void Sampling::addAcceptance(
     metal::CommandGraph &graph, AcceptanceBuffers buffers,
     std::span<const uint32_t> maximumRetained,
     std::span<const SamplingPolicy> policies, uint32_t stopToken0,
-    uint32_t stopToken1) const {
+    uint32_t stopToken1, bool shouldSkipProposals) const {
   if (maximumRetained.empty() || maximumRetained.size() != policies.size() ||
       maximumRetained.size() > kMaximumLanes)
     throw std::invalid_argument("invalid DFlash acceptance batch");
   AcceptBatchParams params{};
   params.stop_token_0 = stopToken0;
   params.stop_token_1 = stopToken1;
+  params.no_proposals = shouldSkipProposals ? 1U : 0U;
   params.lanes = static_cast<uint32_t>(maximumRetained.size());
   for (uint32_t lane = 0; lane < params.lanes; ++lane) {
     if (!maximumRetained[lane] || maximumRetained[lane] > rowsPerLane_)

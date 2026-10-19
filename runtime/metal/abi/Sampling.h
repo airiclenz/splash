@@ -61,10 +61,11 @@ struct AcceptParams {
   uint32_t remaining;
   uint32_t stop_token_0;
   uint32_t stop_token_1;
+  uint32_t no_proposals;
 };
 
-static_assert(sizeof(AcceptParams) == 12,
-              "Acceptance lane parameters are 12 bytes on both sides");
+static_assert(sizeof(AcceptParams) == 16,
+              "Acceptance lane parameters are 16 bytes on both sides");
 
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -72,7 +73,10 @@ struct AcceptBatchParams {
   uint32_t stop_token_1;
   uint32_t lanes;
   uint32_t sampling_mask;
+  // Non-zero when the step carried no draft proposals: every lane retains
+  // exactly the target's row-0 token. Zero keeps the seven-proposal path.
+  uint32_t no_proposals;
 };
 
-static_assert(sizeof(AcceptBatchParams) == 32,
-              "Batched acceptance parameters are 32 bytes on both sides");
+static_assert(sizeof(AcceptBatchParams) == 36,
+              "Batched acceptance parameters are 36 bytes on both sides");
