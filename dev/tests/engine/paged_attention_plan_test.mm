@@ -95,6 +95,7 @@ void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout,
 void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   const std::string geometrySuffix = layout.kvHeads == 4 ? "" : "_kv2_g8";
   const std::array<uint32_t, 4> zeroHistory{};
+  uint32_t oneSplitPrefillPlans = 0, g8OneSplitPrefillPlans = 0;
   for (const auto config : ops::PagedAttention::prefillCandidates()) {
     const std::string splitPipeline = std::string(layout.format == kv::Format::Int8 ? "prefill_attention_q8_split" : "prefill_attention_bf16_split") +
         (layout.format == kv::Format::Int8 && config.scalePlacement == ops::AttentionScalePlacement::Cooperative
@@ -131,32 +132,46 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
         require(plan.splitThreads.x == 256 && plan.splitThreads.y == 1 &&
                     plan.splitThreads.z == 1,
                 "MPP prefill tile left its 256-thread threadgroup");
+        require(plan.hasReduce(), "MPP prefill plan dropped its reduce");
         // As for verify: the register tile changes only the split entry and
-        // its width, never the partition, scratch or reduce.
+        // its width, never the partition or scratch. At one split its G6
+        // INT8 entry writes the output itself and the plan carries no reduce;
+        // G8 keeps split + reduce.
         auto registerConfig = config;
         registerConfig.tile = ops::AttentionTile::Register;
         const auto registerPlan = ops::PagedAttention::prefillPlan(
             rows, queryHeads, layout, history, registerConfig);
         const bool int8 = layout.format == kv::Format::Int8;
+        const bool oneSplit = int8 && splits == 1 && layout.kvHeads == 4;
+        oneSplitPrefillPlans += oneSplit;
+        g8OneSplitPrefillPlans += int8 && splits == 1 && layout.kvHeads == 2;
         require(registerPlan.splitPipeline ==
-                        (int8 ? "prefill_attention_q8_split_sgf" + geometrySuffix
-                              : splitPipeline) &&
+                        (oneSplit ? std::string("prefill_attention_q8_one_split_sgf")
+                         : int8   ? "prefill_attention_q8_split_sgf" + geometrySuffix
+                                  : splitPipeline) &&
                     registerPlan.configuration.tile ==
                         (int8 ? ops::AttentionTile::Register : ops::AttentionTile::Mpp) &&
                     registerPlan.splitThreads.x ==
                         (int8 ? 32 * queryHeads / layout.kvHeads : 256) &&
-                    registerPlan.reducePipeline == plan.reducePipeline &&
+                    registerPlan.hasReduce() == !oneSplit &&
+                    registerPlan.reducePipeline ==
+                        (oneSplit ? std::string_view{} : plan.reducePipeline) &&
                     registerPlan.splits == plan.splits &&
                     registerPlan.workspace.partialsBytes == plan.workspace.partialsBytes &&
                     registerPlan.workspace.statisticsBytes ==
                         plan.workspace.statisticsBytes &&
                     sameGrid(registerPlan.splitGroups, plan.splitGroups) &&
-                    sameGrid(registerPlan.reduceGroups, plan.reduceGroups),
+                    sameGrid(registerPlan.reduceGroups,
+                             oneSplit ? metal::DispatchSize{0, 0, 0} : plan.reduceGroups),
                 "register prefill tile changed more than its split entry");
         require(int8 != registerPlan.sameExecutionAs(plan),
                 "prefill plan equality ignored the split tile");
       }
   }
+  // The G6 one-split entry is exercised, and G8 at one split keeps its reduce.
+  require(layout.format != kv::Format::Int8 ||
+              (layout.kvHeads == 4 ? oneSplitPrefillPlans > 0 : g8OneSplitPrefillPlans > 0),
+          "prefill plans omitted the one-split register cases");
   for (const auto config : ops::PagedAttention::verifyCandidates()) {
     const std::string splitPipeline = std::string(layout.format == kv::Format::Int8 ? "verify_attention_q8_split" : "verify_attention_bf16_split") +
         (layout.format == kv::Format::Int8 && config.scalePlacement == ops::AttentionScalePlacement::Cooperative
@@ -636,8 +651,8 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
                                         data.tables[0], data.stores[0], data.layout);
   encode(graph, partials, statistics);
   if constexpr (std::is_same_v<Config, ops::PrefillAttentionConfig>) {
-    require(graph.dispatches().size() == 3,
-            "production prefill should encode store/split/reduce");
+    require(graph.dispatches().size() == (plan.hasReduce() ? 3U : 2U),
+            "production prefill should encode store/split/reduce, or store/split at one split");
     const auto checkDispatch = [&](const auto &dispatch, auto groups, std::string_view pipeline) {
       require(dispatch.pipelineName == pipeline && dispatch.threadgroups.x == groups.x &&
                   dispatch.threadgroups.y == groups.y && dispatch.threadgroups.z == groups.z &&
@@ -657,7 +672,8 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
     checkDispatch(graph.dispatches()[1], plan.splitGroups, plan.splitPipeline);
     require(sameGrid(graph.dispatches()[1].threadsPerThreadgroup, plan.splitThreads),
             "production prefill split left its planned threadgroup width");
-    checkDispatch(graph.dispatches()[2], plan.reduceGroups, plan.reducePipeline);
+    if (plan.hasReduce())
+      checkDispatch(graph.dispatches()[2], plan.reduceGroups, plan.reducePipeline);
   } else {
     require(graph.dispatches().size() == 3, "production verify should encode store/split/reduce");
     const auto &split = graph.dispatches()[1];

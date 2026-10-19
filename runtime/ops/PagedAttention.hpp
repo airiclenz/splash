@@ -186,7 +186,10 @@ struct VerifyAttentionConfig final {
 };
 
 // Immutable factory-built plans are shared by allocation, measurement and
-// encoding. Each prefill uses one split dispatch followed by one reduction.
+// encoding. Each attention call uses one split dispatch followed by one
+// reduction, except a G6 (four KV heads) INT8 Register-tile prefill at one
+// history split: its split kernel writes the output itself, reducePipeline is
+// empty and reduceGroups is zero.
 // Callers cannot replace a dispatch or reduce its scratch bound.
 struct PrefillAttentionPlan final {
   const kv::Format format;
@@ -203,6 +206,8 @@ struct PrefillAttentionPlan final {
 
   // Policy provenance is irrelevant when its resolved execution is identical.
   [[nodiscard]] bool sameExecutionAs(const PrefillAttentionPlan &other) const noexcept;
+  // False when the split kernel writes the output and no reduce is encoded.
+  [[nodiscard]] bool hasReduce() const noexcept { return !reducePipeline.empty(); }
 
 private:
   friend class PagedAttention;

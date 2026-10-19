@@ -132,6 +132,16 @@ uint64_t splitThreads(AttentionTile tile, uint32_t queryHeads, kv::Layout layout
                                          : metal::CommandGraph::kDefaultThreads;
 }
 
+// Only the G6 INT8 Register prefill tile has a split kernel that writes the
+// output, and only one history split leaves nothing for the reduce to
+// combine. G8 and verify keep split + reduce: G8's output-writing tile
+// measured slower than the reduce it saves, and verify defaults to 32 splits.
+bool prefillWritesOutput(KernelLayout layout, kv::Format format, AttentionTile tile,
+                         uint32_t splits) noexcept {
+  return layout == KernelLayout::Kv4Group6 && format == kv::Format::Int8 &&
+         tile == AttentionTile::Register && splits == 1;
+}
+
 std::string_view verifySplitPipeline(KernelLayout layout,
                                      VerifyAttentionConfig configuration) noexcept {
   if (configuration.tile == AttentionTile::Register)
@@ -210,12 +220,15 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
   const uint32_t fusedRows =
       kv::kQ8PrefillAttentionTileRows * (queryHeads / layout.kvHeads);
   const bool cooperative = configuration.scalePlacement == AttentionScalePlacement::Cooperative;
+  const bool output = prefillWritesOutput(kernel, layout.format, configuration.tile, splits);
   return {configuration, rows, historyTokens, splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              layout.headDimension),
           layout.format == kv::Format::BFloat16
               ? pipeline(kernel, "prefill_attention_bf16_split",
                          "prefill_attention_bf16_split_kv2_g8")
+          : output
+              ? std::string_view{"prefill_attention_q8_one_split_sgf"}
           : configuration.tile == AttentionTile::Register
               ? pipeline(kernel, "prefill_attention_q8_split_sgf",
                          "prefill_attention_q8_split_sgf_kv2_g8")
@@ -224,11 +237,14 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
                                : "prefill_attention_q8_split",
                    cooperative ? "prefill_attention_q8_split_cooperative_scale_kv2_g8"
                                : "prefill_attention_q8_split_kv2_g8"),
-          pipeline(kernel, "prefill_attention_q8_reduce",
-                   "prefill_attention_q8_reduce_kv2_g8"),
+          output ? std::string_view{}
+                 : pipeline(kernel, "prefill_attention_q8_reduce",
+                            "prefill_attention_q8_reduce_kv2_g8"),
           {layout.kvHeads, tiles, splits},
           {splitThreads(configuration.tile, queryHeads, layout), 1, 1},
-          {layout.kvHeads, fusedRows, tiles}, layout.format};
+          output ? metal::DispatchSize{0, 0, 0}
+                 : metal::DispatchSize{layout.kvHeads, fusedRows, tiles},
+          layout.format};
 }
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
@@ -438,6 +454,13 @@ void PagedAttention::addPrefill(
   const kv::Q8PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, chunk.physical_page_count, plan.splits, 0, 0};
+  if (!plan.hasReduce()) {
+    auto buffers = kvBuffers(layer, plan.format, {queries},
+                             std::array{std::move(output), pageTable});
+    graph.add(std::string(plan.splitPipeline), std::move(buffers),
+              params, plan.splitGroups, plan.splitThreads);
+    return;
+  }
   auto buffers = kvBuffers(layer, plan.format, {queries},
                            std::array{partials, statistics, pageTable});
   graph.add(std::string(plan.splitPipeline), std::move(buffers),

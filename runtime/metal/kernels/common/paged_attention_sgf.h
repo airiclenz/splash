@@ -18,7 +18,9 @@
 // scores in exactly the fragment layout PV = V^T P^T takes as its B operand,
 // so no threadgroup memory or barrier is needed. The tile's G simdgroups read
 // the same K/V page. Partials and statistics use the MPP tile's layout, so
-// the shared prefill and verify reduces are unchanged. Both scale placements
+// the shared prefill and verify reduces are unchanged. A G6 prefill at one
+// history split instead writes the normalized output itself, with the
+// reduce's arithmetic, and no reduce runs (Epilogue). Both scale placements
 // of the MPP tile compute score x key scale x 1/sqrt(D) in that order, as
 // this tile does.
 namespace q8sgf {
@@ -62,17 +64,27 @@ inline uint block_dimension(uint k, uint t) {
   return 16 * (k >> 1) + 4 * (t >> 1) + (t & 1) + 2 * (k & 1);
 }
 
+// Where a tile's result goes. Split writes fp32 partials and statistics at
+// slot for the shared reduce (partials and statistics must be bound,
+// tile_output is unused). PrefillOutput runs only with one split and writes
+// the bfloat output prefill_attention_q8_reduce would write (tile_output must
+// be bound; partials, statistics and slot are unused), leaving rows past
+// active_rows untouched as that reduce does.
+enum class Epilogue { Split, PrefillOutput };
+
 // One tile of eight query rows x G heads over its split's pages, as
 // splash_paged_attention_tile: row r of the tile sees committed_tokens + r + 1
 // tokens, and rows past active_rows repeat the last active row's mask.
-template <uint KVHeads, uint QueryHeadsPerKVHead>
+// tile_output is the tile's output, [fused row][dimension] like its queries;
+// only the PrefillOutput epilogue reads it.
+template <uint KVHeads, uint QueryHeadsPerKVHead, Epilogue E = Epilogue::Split>
 __attribute__((always_inline)) inline void tile(
     device const bfloat *tile_queries, device const int8_t *cache_keys,
     device const float *key_scales, device const int8_t *cache_values,
     device const float *value_scales, device const uint *page_table,
     uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
-    uint sg, uint lane) {
+    uint sg, uint lane, device bfloat *tile_output = nullptr) {
   constexpr uint G = QueryHeadsPerKVHead;
   constexpr uint Rows = 8;
   constexpr uint M = Rows * G;
@@ -218,18 +230,35 @@ __attribute__((always_inline)) inline void tile(
     }
   }
 
-  device float *target = partials + slot * M * D;
+  if (E == Epilogue::Split) {
+    device float *target = partials + slot * M * D;
+#pragma unroll
+    for (uint d = 0; d < 32; ++d) {
+      target[row * D + 8 * d + fm] = output[d].x;
+      target[(row + 1) * D + 8 * d + fm] = output[d].y;
+    }
+    if (fm == 0) {
+      device float *stat = statistics + (slot * M + row) * 2;
+      stat[0] = row_max.x;
+      stat[1] = row_sum.x;
+      stat[2] = row_max.y;
+      stat[3] = row_sum.y;
+    }
+    return;
+  }
+  // With one split the reduce's weight exp(max - max) is 1, so it writes the
+  // accumulator over the row sum, behind the same zero-denominator guard.
+  const bool2 active(row / G < active_rows, (row + 1) / G < active_rows);
+  if (!active.x && !active.y)
+    return;
 #pragma unroll
   for (uint d = 0; d < 32; ++d) {
-    target[row * D + 8 * d + fm] = output[d].x;
-    target[(row + 1) * D + 8 * d + fm] = output[d].y;
-  }
-  if (fm == 0) {
-    device float *stat = statistics + (slot * M + row) * 2;
-    stat[0] = row_max.x;
-    stat[1] = row_sum.x;
-    stat[2] = row_max.y;
-    stat[3] = row_sum.y;
+    const float x = row_sum.x > 0.0f ? output[d].x / row_sum.x : 0.0f;
+    const float y = row_sum.y > 0.0f ? output[d].y / row_sum.y : 0.0f;
+    if (active.x)
+      tile_output[row * D + 8 * d + fm] = bfloat(x);
+    if (active.y)
+      tile_output[(row + 1) * D + 8 * d + fm] = bfloat(y);
   }
 }
 } // namespace q8sgf

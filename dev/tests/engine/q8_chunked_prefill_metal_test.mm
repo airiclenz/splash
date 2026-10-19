@@ -32,13 +32,17 @@ constexpr std::string_view kPrefillAttentionSplitPipeline =
     "prefill_attention_q8_split";
 constexpr std::string_view kPrefillAttentionRegisterSplitPipeline =
     "prefill_attention_q8_split_sgf";
+constexpr std::string_view kPrefillAttentionRegisterOneSplitPipeline =
+    "prefill_attention_q8_one_split_sgf";
 constexpr std::string_view kPrefillAttentionReducePipeline =
     "prefill_attention_q8_reduce";
-// The MPP split or the Apple7/8 register split, with the shared reduce.
+// The MPP split or the Apple7/8 register split, with the shared reduce. The
+// register tile also has the one-split entry that writes the output itself.
 struct AttentionPipelines {
   id<MTLComputePipelineState> split;
   id<MTLComputePipelineState> reduce;
   splash::ops::AttentionTile tile = splash::ops::AttentionTile::Mpp;
+  id<MTLComputePipelineState> oneSplit = nil;
 };
 
 uint64_t attentionIndex(uint32_t stride, uint32_t head, uint32_t row,
@@ -277,10 +281,38 @@ void encodeStore(id<MTLComputeCommandEncoder> encoder,
              threadsPerThreadgroup:MTLSizeMake(kHeadDimension, 1, 1)];
 }
 
+// The one-split register entry: the split bindings without partials and
+// statistics, writing the output over the plan's split grid.
+void encodeOneSplit(id<MTLComputeCommandEncoder> encoder,
+                    const AttentionPipelines &pipelines, const Case &data,
+                    const splash::ops::PrefillAttentionPlan &plan,
+                    const Q8PrefillAttentionParams &params) {
+  require(pipelines.oneSplit != nil, "attention tile has no one-split entry");
+  [encoder setComputePipelineState:pipelines.oneSplit];
+  [encoder setBuffer:data.queries offset:0 atIndex:0];
+  [encoder setBuffer:data.q8Keys offset:0 atIndex:1];
+  [encoder setBuffer:data.keyScales offset:0 atIndex:2];
+  [encoder setBuffer:data.q8Values offset:0 atIndex:3];
+  [encoder setBuffer:data.valueScales offset:0 atIndex:4];
+  [encoder setBuffer:data.output offset:0 atIndex:5];
+  [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:6];
+  [encoder setBytes:&params length:sizeof(params) atIndex:7];
+  require(plan.splitThreads.x <= pipelines.oneSplit.maxTotalThreadsPerThreadgroup,
+          "prefill one-split threadgroup exceeds its pipeline");
+  [encoder dispatchThreadgroups:MTLSizeMake(plan.splitGroups.x, plan.splitGroups.y,
+                                           plan.splitGroups.z)
+             threadsPerThreadgroup:MTLSizeMake(plan.splitThreads.x, plan.splitThreads.y,
+                                               plan.splitThreads.z)];
+}
+
+// Encodes the plan's dispatches: split and reduce, or the one-split entry
+// alone when the plan carries no reduce. forceReduce keeps split and reduce
+// for a one-split plan, the reference its one-split entry must match.
 void encodeAttention(id<MTLComputeCommandEncoder> encoder,
                      const AttentionPipelines &pipelines, const Case &data,
                      splash::ops::PrefillAttentionConfig config = {},
-                     const Q8PrefillAttentionParams *overrideParams = nullptr) {
+                     const Q8PrefillAttentionParams *overrideParams = nullptr,
+                     bool forceReduce = false) {
   config.tile = pipelines.tile;
   const auto plan = splash::ops::PagedAttention::prefillPlan(
       data.params.chunk_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension},
@@ -292,6 +324,12 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
       Q8PrefillAttentionParams{data.params.committed_tokens, data.params.chunk_tokens,
                               data.params.chunk_stride, data.params.page_table_entries,
                               data.params.physical_page_count, plan.splits, 0, 0};
+  if (!plan.hasReduce() && !forceReduce) {
+    require(plan.splitPipeline == kPrefillAttentionRegisterOneSplitPipeline,
+            "one-split prefill plan named another entry");
+    encodeOneSplit(encoder, pipelines, data, plan, params);
+    return;
+  }
   [encoder setComputePipelineState:pipelines.split];
   [encoder setBuffer:data.queries offset:0 atIndex:0];
   [encoder setBuffer:data.q8Keys offset:0 atIndex:1];
@@ -313,8 +351,13 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
   [encoder setBuffer:data.statistics offset:0 atIndex:1];
   [encoder setBuffer:data.output offset:0 atIndex:2];
   [encoder setBytes:&params length:sizeof(params) atIndex:3];
-  [encoder dispatchThreadgroups:MTLSizeMake(plan.reduceGroups.x, plan.reduceGroups.y,
-                                           plan.reduceGroups.z)
+  // A one-split plan carries no reduce grid: the forced reduce covers every
+  // fused row of each (KV head, query tile) the split grid enumerates.
+  const MTLSize reduceGroups =
+      plan.hasReduce()
+          ? MTLSizeMake(plan.reduceGroups.x, plan.reduceGroups.y, plan.reduceGroups.z)
+          : MTLSizeMake(plan.splitGroups.x, 8 * kQueryHeadsPerKvHead, plan.splitGroups.y);
+  [encoder dispatchThreadgroups:reduceGroups
              threadsPerThreadgroup:MTLSizeMake(kHeadDimension, 1, 1)];
 }
 
@@ -696,6 +739,59 @@ void testChunkAndSplitReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
     }
 }
 
+// At one split the register entry that writes the output must match its own
+// split + reduce bit for bit, inactive rows included: a ragged last tile, a
+// mid-page history, the smallest one-split chunk and a full-budget chunk.
+void testOneSplitMatchesReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                               id<MTLComputePipelineState> store,
+                               const AttentionPipelines &attention) {
+  struct Geometry {
+    uint32_t committed;
+    uint32_t chunk;
+    uint32_t stride;
+  };
+  for (const Geometry &geometry : {Geometry{5, 1056, 1056}, Geometry{100, 257, 288},
+                                   Geometry{0, 249, 256}, Geometry{4093, 2048, 2048}}) {
+    Case data = makeCase(device, geometry.committed, geometry.chunk, geometry.stride);
+    fillHistory(data);
+    fillCurrent(data);
+    const auto plan = splash::ops::PagedAttention::prefillPlan(
+        geometry.chunk, kQueryHeads, {1, kKvHeads, kHeadDimension}, geometry.committed,
+        {splash::ops::PrefillSplitMultiplier::One,
+         splash::ops::AttentionScalePlacement::Softmax, attention.tile});
+    require(plan.splits == 1 && !plan.hasReduce(),
+            "one-split geometry did not plan the output-writing entry");
+    std::vector<uint8_t> outputs[2];
+    for (const bool forceReduce : {true, false}) {
+      std::memset(data.output.contents, 0xff, data.output.length);
+      id<MTLCommandBuffer> command = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+      encodeStore(encoder, store, data);
+      encodeAttention(encoder, attention, data, {}, nullptr, forceReduce);
+      [encoder endEncoding];
+      finish(command);
+      const auto *bytes = static_cast<const uint8_t *>(data.output.contents);
+      outputs[forceReduce ? 0 : 1].assign(bytes, bytes + data.output.length);
+    }
+    if (outputs[0] != outputs[1]) {
+      const auto *reduced = reinterpret_cast<const BFloat16Bits *>(outputs[0].data());
+      const auto *direct = reinterpret_cast<const BFloat16Bits *>(outputs[1].data());
+      const size_t elements = outputs[0].size() / sizeof(BFloat16Bits);
+      size_t differing = 0, first = elements;
+      for (size_t i = 0; i < elements; ++i)
+        if (reduced[i] != direct[i]) {
+          ++differing;
+          first = std::min(first, i);
+        }
+      std::cout << "one-split prefill differs: committed=" << geometry.committed
+                << " chunk=" << geometry.chunk << " differing=" << differing << " of "
+                << elements << " first=" << first << " reduced=" << reduced[first]
+                << " direct=" << direct[first] << '\n';
+      throw std::runtime_error("one-split prefill output differs from its split + reduce");
+    }
+  }
+}
+
 void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
                                 const AttentionPipelines &attention) {
   Case data = makeCase(device, 33, 17, 32);
@@ -717,6 +813,12 @@ void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
     id<MTLCommandBuffer> command = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     encodeAttention(encoder, attention, data, {}, &params);
+    // The one-split entry also refuses any split count but one.
+    if (attention.oneSplit) {
+      auto oneSplit = params;
+      if (invalidField == 1) oneSplit.split_count = 2;
+      encodeOneSplit(encoder, attention, data, plan, oneSplit);
+    }
     [encoder endEncoding];
     finish(command);
     for (id<MTLBuffer> buffer : {data.partials, data.statistics, data.output}) {
@@ -941,12 +1043,18 @@ void run(const char *libraryPath) {
   for (const auto [name, tile] :
        {std::pair{kPrefillAttentionSplitPipeline, AttentionTile::Mpp},
         std::pair{kPrefillAttentionRegisterSplitPipeline, AttentionTile::Register}}) {
-    const AttentionPipelines attention{makePipeline(device, library, name.data()),
-                                       reduce, tile};
+    const bool registerTile = tile == AttentionTile::Register;
+    const AttentionPipelines attention{
+        makePipeline(device, library, name.data()), reduce, tile,
+        registerTile ? makePipeline(device, library,
+                                    kPrefillAttentionRegisterOneSplitPipeline.data())
+                     : nil};
     std::cout << "prefill attention tile: " << name << '\n';
     testAttentionAndDirectStore(device, queue, store, attention);
     testAttentionGeometries(device, queue, store, attention);
     testChunkAndSplitReference(device, queue, store, attention);
+    if (registerTile)
+      testOneSplitMatchesReduce(device, queue, store, attention);
     testInvalidAttentionParams(device, queue, attention);
   }
   testCommitIndexOverwrite(device, queue, store);
