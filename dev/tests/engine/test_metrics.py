@@ -170,6 +170,33 @@ class DraftStateResetMetricsTests(unittest.TestCase):
                 )
 
 
+class DecodeSuspensionMetricsTests(unittest.TestCase):
+    def test_decode_suspension_counters_render_after_replay_tokens(self):
+        lines = prometheus_metrics(
+            {
+                "cache": {
+                    "resource_replay_tokens": 4096,
+                    "resource_decode_suspensions": 2,
+                    "resource_decode_replay_tokens": 3072,
+                }
+            }
+        ).splitlines()
+
+        start = lines.index("splash_cache_resource_replay_tokens_total 4096")
+        self.assertEqual(
+            lines[start + 1 : start + 3],
+            [
+                "splash_cache_resource_decode_suspensions_total 2",
+                "splash_cache_resource_decode_replay_tokens_total 3072",
+            ],
+        )
+
+    def test_missing_decode_suspension_counters_render_no_lines(self):
+        text = prometheus_metrics({"cache": {"resource_replay_tokens": 1}})
+
+        self.assertNotIn("splash_cache_resource_decode_", text)
+
+
 class StatusMetricsRenderingTests(unittest.TestCase):
     def test_fixture_renders_exactly_as_before(self):
         self.assertEqual(prometheus_metrics(FIXTURE_STATUS), FIXTURE_RENDERING)

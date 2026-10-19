@@ -213,7 +213,10 @@ std::string runtimeStatusJson(
       << core.checkpointPublicationFailures
       << ",\"resource_suspensions\":" << core.resourceSuspensions
       << ",\"resource_resumptions\":" << core.resourceResumptions
-      << ",\"resource_replay_tokens\":" << core.resourceReplayTokens << "}"
+      << ",\"resource_replay_tokens\":" << core.resourceReplayTokens
+      << ",\"resource_decode_suspensions\":" << core.resourceDecodeSuspensions
+      << ",\"resource_decode_replay_tokens\":"
+      << core.resourceDecodeReplayTokens << "}"
       << ",\"draft_context\":{\"target_prefill_rows\":"
       << executorTelemetry.targetPrefillRows
       << ",\"active_rows\":" << executorTelemetry.draftContextRowsActive

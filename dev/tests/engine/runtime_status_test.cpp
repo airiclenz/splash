@@ -69,6 +69,8 @@ void testCleanRuntimeStatus() {
   engine.checkpointPublications = 3;
   engine.checkpointPublicationFailures = 1;
   engine.resourceReplayTokens = 1234;
+  engine.resourceDecodeSuspensions = 5;
+  engine.resourceDecodeReplayTokens = 678;
   engine.deduplicatedStatePublications = 2;
   engine.recycledStatePublications = 1;
   engine.scheduler.waitingPrefix = 3;
@@ -257,7 +259,10 @@ void testCleanRuntimeStatus() {
           "status omitted the zero mixed decode count");
   require(
       json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
-          json.find("\"resource_replay_tokens\":1234") != std::string::npos &&
+          json.find("\"resource_replay_tokens\":1234,"
+                    "\"resource_decode_suspensions\":5,"
+                    "\"resource_decode_replay_tokens\":678}") !=
+              std::string::npos &&
           json.find("\"waiting_prefix\":3") != std::string::npos &&
           json.find("\"deduplicated_state_publications\":2,"
                     "\"recycled_state_publications\":1,") !=

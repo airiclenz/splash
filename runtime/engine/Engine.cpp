@@ -1112,6 +1112,8 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
     scheduler_.setPrefillBoundary(active.request.id, std::nullopt);
   }
   const uint32_t position = completedTokens(active);
+  const bool decodePhase =
+      scheduler_.phase(active.request.id) != Phase::Prefill;
   active.suspended = true;
   active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
   suspendModel(active, position);
@@ -1132,6 +1134,12 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
   scheduler_.suspendForResources(active.request.id);
   deferResourceRetry(active, now);
   ++counters_.resourceSuspensions;
+  if (decodePhase) {
+    // Never cleared here: a suspension during the replay is Prefill phase
+    // and the replay it interrupts still recomputes decode history.
+    active.hasDecodeSuspension = true;
+    ++counters_.resourceDecodeSuspensions;
+  }
 }
 
 // A running lane whose next chunk overflows the free pages of partly used
@@ -1260,11 +1268,17 @@ void Engine::apply(const BatchPlan &plan,
           item.promptOffset + result.consumedPromptTokens;
       inputTokens += result.consumedPromptTokens;
       // Rows past the suspension point were never processed: ordinary prefill.
-      if (active.replaying && item.promptOffset < active.replayCountEnd)
-        counters_.resourceReplayTokens +=
+      if (active.replaying && item.promptOffset < active.replayCountEnd) {
+        const uint32_t replayed =
             std::min(promptProcessed, active.replayCountEnd) - item.promptOffset;
-      if (promptProcessed == active.replayTokens)
+        counters_.resourceReplayTokens += replayed;
+        if (active.hasDecodeSuspension)
+          counters_.resourceDecodeReplayTokens += replayed;
+      }
+      if (promptProcessed == active.replayTokens) {
         active.replaying = false;
+        active.hasDecodeSuspension = false;
+      }
       static_cast<void>(cache_.publishCommittedBlocks(
           active.request.id, active.exactTokens, promptProcessed,
           active.request.images));

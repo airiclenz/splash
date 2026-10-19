@@ -2197,6 +2197,9 @@ void testMidPrefillSuspensionCountsOnlyProcessedTokensAsReplay() {
   // ordinary prefill, not replay.
   require(engine.snapshot().resourceReplayTokens == 2048,
           "unprocessed prompt suffix was counted as cache replay");
+  require(engine.snapshot().resourceDecodeSuspensions == 0 &&
+              engine.snapshot().resourceDecodeReplayTokens == 0,
+          "a prefill suspension was counted as a decode suspension");
 }
 
 void testRepeatedSuspensionKeepsTheFirstReplayEnd() {
@@ -2229,6 +2232,53 @@ void testRepeatedSuspensionKeepsTheFirstReplayEnd() {
   // before the first suspension; the rest of the prompt is ordinary prefill.
   require(engine.snapshot().resourceReplayTokens == 2048 + 4096,
           "a second suspension lowered the replay end of the first");
+}
+
+void testSuspensionDuringDecodeReplayKeepsCountingDecodeReplay() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  // Nothing is restored, so every resume replays from the first token.
+  executor.deniedSnapshots = std::numeric_limits<uint32_t>::max();
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  backing.growthAllowed = [&] {
+    return std::count_if(executor.requests.begin(), executor.requests.end(),
+                         [](const auto &entry) { return entry.second.resident; }) < 2;
+  };
+  auto decoding = request(48, std::vector<uint32_t>(4096, 48));
+  decoding.maxNewTokens = 64;
+  engine.submit(std::move(decoding));
+  double now = 1;
+  for (; now < kSuspensionPointTickLimit && !events.outputs.contains(48); ++now)
+    static_cast<void>(engine.tick(now));
+  auto foreground = request(49, std::vector<uint32_t>(8192, 49));
+  foreground.priority = RequestPriority::Foreground;
+  engine.submit(std::move(foreground));
+  for (; now < kSuspensionPointTickLimit && executor.suspensions == 0; ++now)
+    static_cast<void>(engine.tick(now));
+  require(executor.suspensions == 1 &&
+              engine.snapshot().resourceDecodeSuspensions == 1,
+          "foreground peer did not suspend the decoding lane");
+  const uint64_t history = 4096 + events.outputs.at(48).size();
+
+  // The second suspension lands inside the replay of the decode history.
+  suspendPrefillForForegroundPeer(engine, resources, executor, 50, 2048, now);
+  for (; now < 256 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+
+  require(engine.idle() && events.completedCount == 3 &&
+              events.failedCount == 0 &&
+              engine.snapshot().resourceSuspensions == 2,
+          "decode replay suspension fixture did not finish every request");
+  require(engine.snapshot().resourceDecodeSuspensions == 1,
+          "a suspension during replay was counted as a decode suspension");
+  // First partial replay: 2048 rows. Second replay: the whole decode history.
+  require(engine.snapshot().resourceReplayTokens == 2048 + history &&
+              engine.snapshot().resourceDecodeReplayTokens == 2048 + history,
+          "a suspension during decode replay stopped counting decode replay");
 }
 
 // testMidPrefillSuspensionCountsOnlyProcessedTokensAsReplay's fixture, with
@@ -2807,6 +2857,10 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
               std::vector<std::vector<uint32_t>>{committedHistory, {252}} &&
               engine.snapshot().resourceReplayTokens == committedHistory.size(),
           "replay omitted or duplicated committed generated history");
+  require(engine.snapshot().resourceDecodeSuspensions == 1 &&
+              engine.snapshot().resourceDecodeReplayTokens ==
+                  committedHistory.size(),
+          "decode preemption did not count its suspension and replay");
   require(events.outputs.at(250) == std::vector<uint32_t>(4, 42) &&
               events.outputs.at(251) == std::vector<uint32_t>(4, 42) &&
               events.usage.at(250) == std::pair<uint32_t, uint32_t>{24, 4} &&
@@ -4583,6 +4637,7 @@ int main() {
     testRejectedTargetOnlySuspensionStateFallsBack();
     testSuspensionStateIsProtectedUntilUnprotectedStatesGo();
     testRepeatedSuspensionKeepsTheFirstReplayEnd();
+    testSuspensionDuringDecodeReplayKeepsCountingDecodeReplay();
     testPrefillGrowthPreservesAnActiveDecodePeer();
     testPhysicalKvPressureSuspendsInsteadOfKillingActiveWork();
     testRecoveryDrainDoesNotConsumeResourceWaitBudget();

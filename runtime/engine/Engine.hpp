@@ -65,6 +65,12 @@ struct EngineSnapshot final {
   // already processed before a suspension; an unfinished prompt suffix is
   // ordinary prefill and never counts.
   uint64_t resourceReplayTokens = 0;
+  // The resourceSuspensions taken in the Decode or WaitingMask phase.
+  uint64_t resourceDecodeSuspensions = 0;
+  // The resourceReplayTokens of requests whose replay a decode-phase
+  // suspension started, including rows replayed again after a further
+  // suspension during that replay.
+  uint64_t resourceDecodeReplayTokens = 0;
 };
 
 // KV blocks define prefix identity; composite recurrent state is attached
@@ -165,6 +171,10 @@ private:
     bool finalized = false;
     std::optional<Failure> failure;
     bool replaying = false;
+    // Set by a Decode or WaitingMask suspension and kept until the replay of
+    // the committed history ends, even across a further suspension during
+    // that replay, so every replayed row counts as decode replay.
+    bool hasDecodeSuspension = false;
     // Captured once the final prompt chunk completes; emitted with Done.
     std::vector<float> scoreLogits;
   };

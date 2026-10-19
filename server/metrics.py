@@ -59,6 +59,14 @@ _STATUS_METRICS = {
         "cache",
         "resource_replay_tokens",
     ),
+    "splash_cache_resource_decode_suspensions_total": (
+        "cache",
+        "resource_decode_suspensions",
+    ),
+    "splash_cache_resource_decode_replay_tokens_total": (
+        "cache",
+        "resource_decode_replay_tokens",
+    ),
     "splash_scheduler_prefilling": ("scheduler", "prefilling"),
     "splash_scheduler_decoding": ("scheduler", "decoding"),
     "splash_scheduler_waiting_mask": ("scheduler", "waiting_mask"),
