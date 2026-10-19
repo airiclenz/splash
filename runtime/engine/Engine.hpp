@@ -155,6 +155,11 @@ private:
     ResourceWait resourceWait;
     std::vector<uint32_t> exactTokens;
     std::optional<CacheProbe> admissionProbe;
+    // First denial of a sole resident decode lane backing off under host
+    // pressure instead of suspending; its retry time is resourceWait's, whose
+    // deadline stays 0 while the lane is resident. Ends on a grant, at
+    // suspension and at release.
+    std::optional<double> backoffStartedMilliseconds;
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     // Written only through setLatestCheckpoint, which moves
@@ -241,9 +246,17 @@ private:
   decodeRetainedTokenLimit(uint64_t storedTokens) const noexcept;
   void publishDecodeCheckpoint(Request &request, uint32_t previousTokens,
                                uint32_t storedTokens);
-  [[nodiscard]] bool prepare(BatchPlan &plan,
-                             std::vector<ModelBatchItem> &items,
-                             double nowMilliseconds);
+  // What prepare left for tick: a batch to submit, a lane suspended or
+  // failed, or only back-off skips, which leave the loop to sleep until
+  // nextWakeupMilliseconds.
+  enum class PrepareOutcome : uint8_t { Submit, Yielded, BackedOff };
+  [[nodiscard]] PrepareOutcome prepare(BatchPlan &plan,
+                                       std::vector<ModelBatchItem> &items,
+                                       double nowMilliseconds);
+  [[nodiscard]] bool backOffSoleDecodeLane(Request &request,
+                                           const TokenAdmission &admission,
+                                           WorkKind kind,
+                                           double nowMilliseconds);
   [[nodiscard]] bool reclaimForGrowth(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
   [[nodiscard]] bool reclaimIdleState() noexcept;

@@ -221,7 +221,10 @@ bool Engine::tick(double now) {
   if (!plan)
     return progressed;
   std::vector<ModelBatchItem> items;
-  if (!prepare(*plan, items, now)) {
+  const PrepareOutcome prepared = prepare(*plan, items, now);
+  if (prepared == PrepareOutcome::BackedOff)
+    return progressed;
+  if (prepared == PrepareOutcome::Yielded) {
     sweepTerminal();
     return true;
   }
@@ -290,7 +293,17 @@ ResourceWaitSnapshot Engine::resourceWaitSnapshot(double now) const {
   ResourceWaitSnapshot result;
   result.draining = drainingForRecovery();
   for (const auto &[id, active] : requests_) {
-    if (active.finalized || scheduler_.phase(id) != Phase::WaitingResources)
+    if (active.finalized)
+      continue;
+    // A resident lane backing off waits on memory without leaving Decode.
+    if (active.backoffStartedMilliseconds) {
+      ++result.memory;
+      result.oldestWaitMilliseconds =
+          std::max(result.oldestWaitMilliseconds,
+                   now - *active.backoffStartedMilliseconds);
+      continue;
+    }
+    if (scheduler_.phase(id) != Phase::WaitingResources)
       continue;
     if (active.resourceWait.reason == StateFailure::ConcurrencyLimit)
       ++result.concurrency;
@@ -969,8 +982,9 @@ void Engine::publishDecodeCheckpoint(Request &active, uint32_t previousTokens,
   }
 }
 
-bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
-                     double now) {
+Engine::PrepareOutcome Engine::prepare(BatchPlan &plan,
+                                       std::vector<ModelBatchItem> &items,
+                                       double now) {
   items.reserve(plan.items.size());
   std::vector<BatchItem> admitted;
   admitted.reserve(plan.items.size());
@@ -982,10 +996,18 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
   };
   std::vector<Denied> denied;
   denied.reserve(plan.items.size());
+  bool backedOff = false;
   for (const BatchItem &scheduled : plan.items) {
     Request &active = request(scheduled.requestId);
     if (!active.stateCell)
       throw std::logic_error("scheduled request is not resident");
+    // nextWakeupMilliseconds skips every retry wake while draining, so a
+    // draining engine sends the lane to admitKv, suspending it if denied.
+    if (active.backoffStartedMilliseconds && !resourceRetryReady(active, now) &&
+        !drainingForRecovery()) {
+      backedOff = true;
+      continue;
+    }
     const uint64_t position = plan.kind == WorkKind::Prefill
                                   ? scheduled.promptOffset
                                   : active.exactTokens.size();
@@ -998,6 +1020,10 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
       denied.push_back(
           Denied{active.request.id, admission, workEnd, retryableBudget});
       continue;
+    }
+    if (active.backoffStartedMilliseconds) {
+      active.backoffStartedMilliseconds.reset();
+      active.resourceWait = {};
     }
     admitted.push_back(scheduled);
     ModelBatchItem item;
@@ -1021,14 +1047,17 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
   }
   if (!admitted.empty()) {
     plan.items = std::move(admitted);
-    return true;
+    return PrepareOutcome::Submit;
   }
 
   // Partial admissions execute at their actual width. If no lane fits, choose
   // among all runnable residents: an unstarted peer can release its state
   // cell before completed prefill is discarded.
-  if (denied.empty())
+  if (denied.empty()) {
+    if (backedOff)
+      return PrepareOutcome::BackedOff;
     throw std::logic_error("empty resource admission result");
+  }
   const auto yieldsBefore = [&](const Request &a, const Request &b) {
     if (a.request.priority != b.request.priority)
       return a.request.priority > b.request.priority;
@@ -1061,6 +1090,8 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
     }
   }
   Request &active = *selected;
+  if (backOffSoleDecodeLane(active, victim.admission, plan.kind, now))
+    return PrepareOutcome::BackedOff;
   const bool anotherResident =
       std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
         return entry.first != active.request.id && entry.second.stateCell;
@@ -1069,10 +1100,45 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
       victim.admission.allocationFailure ==
           metal::AllocationFailure::HostPressure) {
     suspendForGrowth(active, resumeTarget, now);
-    return false;
+    return PrepareOutcome::Yielded;
   }
   finishCapacity(request(victim.requestId), victim.admission);
-  return false;
+  return PrepareOutcome::Yielded;
+}
+
+// ============================================================================
+// Holds the sole resident decode lane, denied for host pressure, instead of
+// suspending it into a full replay: it retries after
+// kResourceRetryBackoffMilliseconds, or sooner on resource progress, while no
+// Queued or WaitingResources request has a more important priority and no
+// request is suspended. Once resourceWaitTimeoutMilliseconds have passed since
+// its first denial it suspends as usual, with a fresh resource wait. Runs on
+// the denial path only: one scan of the requests, no allocation.
+bool Engine::backOffSoleDecodeLane(Request &active,
+                                   const TokenAdmission &admission,
+                                   WorkKind kind, double now) {
+  if (kind != WorkKind::Decode ||
+      admission.allocationFailure != metal::AllocationFailure::HostPressure ||
+      drainingForRecovery())
+    return false;
+  const std::optional<double> started = active.backoffStartedMilliseconds;
+  if (started && now >= *started + config_.resourceWaitTimeoutMilliseconds)
+    return false;
+  for (const auto &[id, peer] : requests_) {
+    if (id == active.request.id || peer.finalized)
+      continue;
+    if (peer.stateCell)
+      return false;
+    const Phase phase = scheduler_.phase(id);
+    if ((phase == Phase::Queued || phase == Phase::WaitingResources) &&
+        peer.request.priority < active.request.priority)
+      return false;
+  }
+  if (!started)
+    active.backoffStartedMilliseconds = now;
+  active.resourceWait.epoch = resourceEpoch_;
+  active.resourceWait.retryMilliseconds = now + kResourceRetryBackoffMilliseconds;
+  return true;
 }
 
 Engine::KvAdmission Engine::admitKv(Request &active, uint64_t workEnd) {
@@ -1241,6 +1307,11 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
   // before the first suspension.
   active.replayCountEnd = std::max(active.replayCountEnd, position);
   scheduler_.suspendForResources(active.request.id);
+  // A lane that backed off has waited on memory since its first denial; the
+  // suspension still takes a fresh wait deadline.
+  if (active.backoffStartedMilliseconds)
+    active.resourceWait.startedMilliseconds =
+        std::exchange(active.backoffStartedMilliseconds, std::nullopt);
   deferResourceRetry(active, now);
   ++counters_.resourceSuspensions;
   if (decodePhase) {
@@ -1543,6 +1614,7 @@ void Engine::finishCapacity(Request &active, const TokenAdmission &admission) {
 
 void Engine::release(Request &active) {
   active.resourceWait = {};
+  active.backoffStartedMilliseconds.reset();
   cache_.unprotectState(std::exchange(active.resumeProtection, {}));
   cache_.unprotectState(std::exchange(active.queuedProtection, {}));
   cache_.unprotectState(std::exchange(active.checkpointProtection, {}));

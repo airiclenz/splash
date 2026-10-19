@@ -1832,6 +1832,204 @@ void testSingletonHostPressureWaitRecoversOrTerminates() {
   }
 }
 
+// A sole resident decode lane on a fresh cache. Its 100-token prompt leaves
+// the first extent's pages full once 21 tokens are decoded, so the next
+// step's verify rows need an extent that blocked growth denies for host
+// pressure.
+struct SoleDecodeLane final {
+  static constexpr uint64_t laneId = 270;
+  static constexpr uint32_t tokensBeforeDenial = 21;
+
+  Backing backing{32};
+  KvPool pool{backing};
+  engine::Cache resources{pool, CacheNamespace{}};
+  Executor executor{2};
+  Events events;
+  engine::Engine engine;
+  double now = 1;
+
+  explicit SoleDecodeLane(double resourceWaitTimeoutMilliseconds)
+      : engine(configured(resourceWaitTimeoutMilliseconds), resources,
+               executor, events) {
+    backing.allocationFailure = metal::AllocationFailure::HostPressure;
+    executor.decodeFinishes = false;
+    auto lane = request(laneId, std::vector<uint32_t>(100, 70));
+    lane.maxNewTokens = 10'000;
+    lane.deadlineMilliseconds = 100'000;
+    engine.submit(std::move(lane));
+    require(tickUntil([&] { return events.emitted > 0; }),
+            "sole decode lane fixture did not start decoding");
+  }
+
+  EngineConfig configured(double resourceWaitTimeoutMilliseconds) {
+    EngineConfig config;
+    config.resourceWaitTimeoutMilliseconds = resourceWaitTimeoutMilliseconds;
+    config.growthPaused = [this] { return backing.growthBlocked; };
+    return config;
+  }
+
+  // Ticks once a millisecond until `done` holds, at most 1000 ticks; `now`
+  // is left at the tick that satisfied it.
+  bool tickUntil(const std::function<bool()> &done) {
+    for (const double last = now + 1000; now < last; ++now) {
+      static_cast<void>(engine.tick(now));
+      if (done())
+        return true;
+    }
+    return false;
+  }
+
+  // Blocks growth and decodes until the lane is first denied, returning that
+  // denial's time.
+  double decodeUntilBackedOff() {
+    backing.growthBlocked = true;
+    require(tickUntil([&] {
+              return engine.resourceWaitSnapshot(now).memory == 1 ||
+                     executor.suspensions != 0;
+            }) && executor.suspensions == 0,
+            "sole decode lane under host pressure suspended instead of "
+            "backing off");
+    return now;
+  }
+
+  [[nodiscard]] bool resident(uint64_t id) const {
+    return executor.requests.at(id).resident;
+  }
+};
+
+void testSoleDecodeLaneBacksOffUnderHostPressure() {
+  SoleDecodeLane fixture(150.0);
+  const double denied = fixture.decodeUntilBackedOff();
+  const uint32_t emitted = fixture.events.emitted;
+  require(emitted == SoleDecodeLane::tokensBeforeDenial,
+          "fixture lane was denied at an unexpected position");
+
+  const ResourceWaitSnapshot waiting =
+      fixture.engine.resourceWaitSnapshot(denied + 40.0);
+  require(waiting.memory == 1 && waiting.suspended == 0 &&
+              waiting.oldestWaitMilliseconds == 40.0,
+          "backing-off lane was not reported as waiting on memory");
+  require(fixture.engine.nextWakeupMilliseconds() == denied + 100.0,
+          "next wakeup lost the backing-off lane's retry time");
+  for (double now = denied + 1.0; now < denied + 100.0; ++now)
+    require(!fixture.engine.tick(now), "back-off skip reported progress");
+  require(fixture.events.emitted == emitted &&
+              fixture.executor.suspensions == 0 &&
+              fixture.resident(SoleDecodeLane::laneId),
+          "backing-off lane decoded or left residency before its retry");
+
+  fixture.backing.growthBlocked = false;
+  require(fixture.engine.tick(denied + 100.0),
+          "backing-off lane did not retry at its retry time");
+  fixture.now = denied + 101.0;
+  require(fixture.tickUntil([&] { return fixture.events.emitted > emitted; }),
+          "lane did not resume decoding when memory returned");
+  require(fixture.engine.resourceWaitSnapshot(fixture.now).memory == 0,
+          "granted lane still reported a memory wait");
+
+  // Past the first denial's bound: only a reset back-off holds the lane.
+  const double deniedAgain = fixture.decodeUntilBackedOff();
+  require(deniedAgain > denied + 150.0 &&
+              fixture.engine.resourceWaitSnapshot(deniedAgain).
+                      oldestWaitMilliseconds == 0.0,
+          "a granted lane's back-off was not reset");
+
+  fixture.backing.growthBlocked = false;
+  fixture.executor.decodeFinishes = true;
+  fixture.now = deniedAgain + 100.0;
+  require(fixture.tickUntil([&] { return fixture.engine.idle(); }),
+          "backed-off lane did not finish");
+  require(fixture.events.completedCount == 1 &&
+              fixture.events.failedCount == 0 &&
+              fixture.engine.snapshot().resourceSuspensions == 0,
+          "backed-off lane failed or was suspended");
+}
+
+void testSoleDecodeLaneSuspendsAtTheResourceWaitBound() {
+  SoleDecodeLane fixture(100.0);
+  const double denied = fixture.decodeUntilBackedOff();
+
+  static_cast<void>(fixture.engine.tick(denied + 50.0));
+  require(fixture.executor.suspensions == 0,
+          "lane suspended before the resource wait bound");
+  static_cast<void>(fixture.engine.tick(denied + 100.0));
+  require(fixture.executor.suspensions == 1 &&
+              fixture.engine.snapshot().resourceDecodeSuspensions == 1 &&
+              !fixture.resident(SoleDecodeLane::laneId),
+          "lane was not suspended at the resource wait bound");
+  const ResourceWaitSnapshot waiting =
+      fixture.engine.resourceWaitSnapshot(denied + 100.0);
+  require(waiting.memory == 1 && waiting.suspended == 1 &&
+              waiting.oldestWaitMilliseconds == 100.0,
+          "suspension lost the back-off's wait time");
+
+  // The suspension takes a fresh wait deadline, not the first denial's.
+  static_cast<void>(fixture.engine.tick(denied + 150.0));
+  require(fixture.events.failedCount == 0,
+          "bound suspension failed on the first denial's wait deadline");
+  static_cast<void>(fixture.engine.tick(denied + 201.0));
+  require(fixture.events.failures ==
+              std::vector<std::string>{"resource_timeout"},
+          "bound suspension did not take a fresh resource wait deadline");
+}
+
+void testSolePrefillLaneStillSuspendsUnderHostPressure() {
+  Backing backing(32);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  backing.growthBlocked = true;
+  backing.allocationFailure = metal::AllocationFailure::HostPressure;
+  EngineConfig config;
+  config.growthPaused = [&] { return backing.growthBlocked; };
+  engine::Engine engine(config, resources, executor, events);
+
+  engine.submit(request(275, std::vector<uint32_t>(64, 75)));
+  for (double now = 1; now < 10 && executor.suspensions == 0; ++now)
+    static_cast<void>(engine.tick(now));
+
+  require(executor.suspensions == 1 &&
+              engine.resourceWaitSnapshot(10.0).suspended == 1,
+          "sole prefill lane backed off instead of suspending");
+}
+
+// A suspended peer drains the engine: the lane suspends at its denial, as
+// before the back-off, whether the peer suspended before the lane's first
+// denial or during its back-off. A waiting peer of more important priority
+// suspends it too.
+void testSoleDecodeLaneSuspendsBesideAWaitingPeer() {
+  constexpr uint64_t peerId = 276;
+  for (uint32_t scenario = 0; scenario < 3; ++scenario) {
+    SoleDecodeLane fixture(30'000.0);
+    auto peer = request(peerId, std::vector<uint32_t>(64, 76));
+    peer.deadlineMilliseconds = 100'000;
+    double backoffEnds = 100'000.0;
+    if (scenario == 1) {
+      backoffEnds = fixture.decodeUntilBackedOff() + 100.0;
+      ++fixture.now;
+    } else {
+      fixture.backing.growthBlocked = true;
+    }
+    if (scenario == 2) {
+      peer.priority = RequestPriority::Foreground;
+      fixture.executor.beginGrowthBlocked = [] { return true; };
+      fixture.executor.beginAllocationFailure =
+          metal::AllocationFailure::HostPressure;
+    }
+    fixture.engine.submit(std::move(peer));
+
+    const uint32_t lanesSuspended = scenario == 2 ? 1 : 2;
+    require(fixture.tickUntil([&] {
+              return fixture.executor.suspensions == lanesSuspended;
+            }) && fixture.now < backoffEnds,
+            "lane backed off beside a suspended or more important peer");
+    require(!fixture.resident(SoleDecodeLane::laneId) &&
+                fixture.events.emitted == SoleDecodeLane::tokensBeforeDenial,
+            "lane did not suspend at its denial beside a waiting peer");
+  }
+}
+
 void testKvPressureNarrowsTheRealBatch() {
   Backing backing(3);
   KvPool pool(backing);
@@ -4838,6 +5036,10 @@ int main() {
     testHostPressureStillRecyclesLruStateForDeniedSnapshot();
     testSingletonHostPressureReusesIdleCacheInsteadOfSuspending();
     testSingletonHostPressureWaitRecoversOrTerminates();
+    testSoleDecodeLaneBacksOffUnderHostPressure();
+    testSoleDecodeLaneSuspendsAtTheResourceWaitBound();
+    testSolePrefillLaneStillSuspendsUnderHostPressure();
+    testSoleDecodeLaneSuspendsBesideAWaitingPeer();
     testKvPressureNarrowsTheRealBatch();
     testKvGrowthReclaimsCachedStateWhenBudgetIsShared();
     testRequiredWorkDoesNotReserveAnExtraPage();
