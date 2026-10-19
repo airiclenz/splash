@@ -2032,11 +2032,16 @@ Runtime::prefillAsync(const BatchPlan &plan,
       impl->counters.draftContextRowsMaterialization += materializationRows;
       impl->counters.draftContextRowsAvoided += item.tokenCount - capturedRows;
       for (const auto &capture : captures) {
-        const bool continues =
-            !capture.resetDraftState && entry.draftContextValid &&
-            entry.draftContextThrough == capture.absoluteBegin;
-        if (!continues) {
-          ++impl->counters.draftStateResets;
+        switch (classifyDraftCapture(entry.draftContextValid,
+                                     entry.draftContextThrough, capture)) {
+        case DraftCaptureContinuity::Continues:
+          break;
+        case DraftCaptureContinuity::PlannedReset:
+          ++impl->counters.draftStatePlannedResets;
+          break;
+        case DraftCaptureContinuity::UnplannedReset:
+          ++impl->counters.draftStateUnplannedResets;
+          break;
         }
         entry.draftContextValid = true;
         entry.draftContextThrough = capture.absoluteEnd;

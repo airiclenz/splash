@@ -146,4 +146,15 @@ draftCaptureSpansForDispatch(const DraftContextPlan &plan,
   return result;
 }
 
+DraftCaptureContinuity
+classifyDraftCapture(bool draftContextValid, uint64_t draftContextThrough,
+                     const DispatchDraftCaptureSpan &capture) noexcept {
+  if (!draftContextValid || capture.resetDraftState) {
+    return DraftCaptureContinuity::PlannedReset;
+  }
+  return draftContextThrough == capture.absoluteBegin
+             ? DraftCaptureContinuity::Continues
+             : DraftCaptureContinuity::UnplannedReset;
+}
+
 } // namespace splash

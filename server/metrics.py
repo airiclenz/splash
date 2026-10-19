@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 if __package__:
     from .latency import prometheus_latency
@@ -28,7 +29,16 @@ HOST_MEMORY_METRICS = {
 }
 
 
-# Metric name -> native status path, rendered in this order.
+@dataclass(frozen=True)
+class LabelledCounter:
+    """A counter family whose samples each come from their own status path."""
+
+    help_text: str
+    label: str
+    paths: dict
+
+
+# Metric name -> native status path (or labelled family), rendered in order.
 _STATUS_METRICS = {
     "splash_ready": ("ready",),
     "splash_metal_healthy": ("metal", "healthy"),
@@ -130,7 +140,17 @@ _STATUS_METRICS = {
         "draft_context",
         "restore_skipped",
     ),
-    "splash_draft_state_resets_total": ("draft_context", "resets"),
+    "splash_draft_state_resets_total": LabelledCounter(
+        help_text=(
+            "Draft-state resets: planned starts fresh by design; unplanned "
+            "lost a valid draft context."
+        ),
+        label="kind",
+        paths={
+            "planned": ("draft_context", "planned_resets"),
+            "unplanned": ("draft_context", "unplanned_resets"),
+        },
+    ),
     "splash_constraint_mask_overlap_batches_total": (
         "constraint_masks",
         "overlap_batches",
@@ -200,6 +220,18 @@ def _status_value(status, path):
     return None
 
 
+def _labelled_counter_lines(name, family, status):
+    """HELP, TYPE and one sample per present label; nothing when none is."""
+    samples = []
+    for label_value, path in family.paths.items():
+        metric_value = _status_value(status, path)
+        if metric_value is not None:
+            samples.append(f'{name}{{{family.label}="{label_value}"}} {metric_value}')
+    if not samples:
+        return []
+    return [f"# HELP {name} {family.help_text}", f"# TYPE {name} counter", *samples]
+
+
 def prometheus_metrics(status):
     """Render low-cardinality metrics directly from the native status."""
     lines = [
@@ -223,6 +255,9 @@ def prometheus_metrics(status):
                 f'splash_system_memory_pressure{{state="{state}"}} {gauge_value}'
             )
     for name, path in _STATUS_METRICS.items():
+        if isinstance(path, LabelledCounter):
+            lines.extend(_labelled_counter_lines(name, path, status))
+            continue
         metric_value = _status_value(status, path)
         if metric_value is not None:
             lines.append(f"{name} {metric_value}")

@@ -265,6 +265,35 @@ void testCheckpointWindowsAcrossSmallDispatches() {
   }
 }
 
+// A capture with no valid draft context behind it, or one the plan marks as a
+// reset, is a planned reset; only a valid context left behind is lost state.
+void testCaptureContinuityClassification() {
+  const auto cold = draftCaptureSpansForDispatch(activePlan(0, 4096), 0, 2048);
+  require(classifyDraftCapture(false, 0, cold[0]) ==
+              DraftCaptureContinuity::PlannedReset,
+          "cold first capture was not a planned reset");
+
+  const auto far = cachedPlan(0, 7000, std::nullopt, {4096});
+  const auto planned = draftCaptureSpansForDispatch(far, 4000, 6048);
+  require(classifyDraftCapture(true, 4096, planned[1]) ==
+              DraftCaptureContinuity::PlannedReset,
+          "planned window reset was counted as lost state");
+
+  const auto resumed = activePlan(4096, 5000, 4096);
+  const auto replay = draftCaptureSpansForDispatch(resumed, 4096, 5000);
+  require(!replay[0].resetDraftState &&
+              classifyDraftCapture(false, 0, replay[0]) ==
+                  DraftCaptureContinuity::PlannedReset,
+          "post-suspension replay was counted as lost state");
+  require(classifyDraftCapture(true, 4096, replay[0]) ==
+              DraftCaptureContinuity::Continues,
+          "restored draft context did not continue");
+
+  require(classifyDraftCapture(true, 3000, replay[0]) ==
+              DraftCaptureContinuity::UnplannedReset,
+          "valid draft context that skipped ahead was not unplanned");
+}
+
 void testInvalidInputs() {
   bool threw = false;
   try {
@@ -306,6 +335,7 @@ int main() {
     testFourRaggedLanes();
     testSparseCheckpointWindowsAndShortResume();
     testCheckpointWindowsAcrossSmallDispatches();
+    testCaptureContinuityClassification();
     testInvalidInputs();
     std::cout << "draft context plan tests passed\n";
     return EXIT_SUCCESS;

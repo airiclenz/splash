@@ -1268,7 +1268,8 @@ class ServerTest(unittest.TestCase):
                         "materialization_rows": 31,
                         "avoided_rows": 7921,
                         "restore_skipped": 1,
-                        "resets": 2,
+                        "planned_resets": 2,
+                        "unplanned_resets": 1,
                     },
                     "constraint_masks": {
                         "overlap_batches": 5,
@@ -1329,6 +1330,8 @@ class ServerTest(unittest.TestCase):
         self.assertIn("splash_draft_context_active_rows_total 2048", metrics)
         self.assertIn("splash_draft_context_avoided_rows_total 7921", metrics)
         self.assertIn("splash_draft_state_restore_skipped_total 1", metrics)
+        self.assertIn('splash_draft_state_resets_total{kind="planned"} 2', metrics)
+        self.assertIn('splash_draft_state_resets_total{kind="unplanned"} 1', metrics)
         self.assertIn("splash_constraint_mask_overlap_batches_total 5", metrics)
         self.assertIn("splash_constraint_mask_overlap_requests_total 8", metrics)
         self.assertIn(

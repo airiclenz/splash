@@ -149,7 +149,8 @@ void testCleanRuntimeStatus() {
   executorTelemetry.draftContextRowsMaterialization = 31;
   executorTelemetry.draftContextRowsAvoided = 7921;
   executorTelemetry.draftStateRestoreSkipped = 1;
-  executorTelemetry.draftStateResets = 2;
+  executorTelemetry.draftStatePlannedResets = 2;
+  executorTelemetry.draftStateUnplannedResets = 1;
   executorTelemetry.constrainedMaskOverlapBatches = 5;
   executorTelemetry.constrainedMaskOverlapRequests = 8;
   executorTelemetry.lastConstrainedTargetForwardGpuSeconds = 0.0725;
@@ -258,7 +259,8 @@ void testCleanRuntimeStatus() {
               std::string::npos &&
           json.find("\"draft_context\":{\"target_prefill_rows\":10000,\"active_"
                     "rows\":2048,\"materialization_rows\":31,\"avoided_rows\":"
-                    "7921,\"restore_skipped\":1,\"resets\":2}") !=
+                    "7921,\"restore_skipped\":1,\"planned_resets\":2,"
+                    "\"unplanned_resets\":1}") !=
               std::string::npos &&
           json.find("\"constraint_masks\":{\"overlap_batches\":5,\"overlap_"
                     "requests\":8,\"last_target_forward_gpu_ms\":72.5,"

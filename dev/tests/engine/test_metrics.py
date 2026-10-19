@@ -145,6 +145,31 @@ class TokenizerMetricsTests(unittest.TestCase):
         )
 
 
+class DraftStateResetMetricsTests(unittest.TestCase):
+    def test_reset_kinds_render_as_one_labelled_counter(self):
+        lines = prometheus_metrics(
+            {"draft_context": {"planned_resets": 4, "unplanned_resets": 1}}
+        ).splitlines()
+
+        start = lines.index("# TYPE splash_draft_state_resets_total counter")
+        self.assertTrue(lines[start - 1].startswith("# HELP "))
+        self.assertIn("unplanned lost a valid draft context", lines[start - 1])
+        self.assertEqual(
+            lines[start + 1 : start + 3],
+            [
+                'splash_draft_state_resets_total{kind="planned"} 4',
+                'splash_draft_state_resets_total{kind="unplanned"} 1',
+            ],
+        )
+
+    def test_missing_reset_kinds_render_no_lines(self):
+        for status in ({}, {"draft_context": {"resets": 2}}):
+            with self.subTest(status=status):
+                self.assertNotIn(
+                    "splash_draft_state_resets_total", prometheus_metrics(status)
+                )
+
+
 class StatusMetricsRenderingTests(unittest.TestCase):
     def test_fixture_renders_exactly_as_before(self):
         self.assertEqual(prometheus_metrics(FIXTURE_STATUS), FIXTURE_RENDERING)

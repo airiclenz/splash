@@ -209,7 +209,9 @@ std::string runtimeStatusJson(
       << executorTelemetry.draftContextRowsMaterialization
       << ",\"avoided_rows\":" << executorTelemetry.draftContextRowsAvoided
       << ",\"restore_skipped\":" << executorTelemetry.draftStateRestoreSkipped
-      << ",\"resets\":" << executorTelemetry.draftStateResets << "}"
+      << ",\"planned_resets\":" << executorTelemetry.draftStatePlannedResets
+      << ",\"unplanned_resets\":"
+      << executorTelemetry.draftStateUnplannedResets << "}"
       // Model-lifetime timings include warmup; request metrics do not.
       << ",\"model_timing\":{\"scope\":\"model_lifetime\""
       << ",\"prefill\":{\"last_gpu_ms\":"

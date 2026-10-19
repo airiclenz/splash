@@ -150,6 +150,23 @@ planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
 draftCaptureSpansForDispatch(const DraftContextPlan &plan,
                              uint32_t dispatchBegin, uint32_t dispatchEnd);
 
+// How a dispatched draft capture relates to the request's draft context.
+enum class DraftCaptureContinuity : uint8_t {
+  // Extends a valid draft context exactly where it ends.
+  Continues,
+  // Starts fresh by design: a cold first capture, a planned window reset, or a
+  // replay after suspension or restore left no valid draft context.
+  PlannedReset,
+  // A valid draft context did not reach this capture's start, so it was lost.
+  UnplannedReset,
+};
+
+// Classifies one dispatched capture against the request's draft context:
+// whether it is valid and the absolute token position it reaches.
+[[nodiscard]] DraftCaptureContinuity
+classifyDraftCapture(bool draftContextValid, uint64_t draftContextThrough,
+                     const DispatchDraftCaptureSpan &capture) noexcept;
+
 struct BatchItem final {
   uint64_t requestId = 0;
   uint32_t tokenCount = 0;
@@ -336,7 +353,8 @@ struct ModelTelemetry final {
   uint64_t draftContextRowsMaterialization = 0;
   uint64_t draftContextRowsAvoided = 0;
   uint64_t draftStateRestoreSkipped = 0;
-  uint64_t draftStateResets = 0;
+  uint64_t draftStatePlannedResets = 0;
+  uint64_t draftStateUnplannedResets = 0;
   uint64_t imageEncodes = 0;
   uint64_t imageEmbeddingReuses = 0;
   uint32_t lastDecodeWidth = 0;
