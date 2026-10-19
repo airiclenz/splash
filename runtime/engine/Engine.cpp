@@ -535,6 +535,7 @@ bool Engine::admit(Request &active, double now) {
       throw std::logic_error("target-only state was planned to restore draft");
     }
     setLatestCheckpoint(active, {});
+    retirePreviousCheckpoint(active);
     if (lookup.state) {
       model_.restore(active.request.id, resumeBoundary, lookup.state->state(),
                      !draft.draftStateRestoreSkipped);
@@ -767,16 +768,26 @@ void Engine::discardPendingStateBoundaries(Request &active) noexcept {
   active.stateBoundaryCursor = 0;
 }
 
+// Whether another live lane holds checkpoint as its latest or kept previous
+// recovery point. Walks the request table once.
+bool Engine::peerHoldsCheckpoint(const Request &active,
+                                 StateCheckpoint checkpoint) const {
+  const auto same = [&](StateCheckpoint held) {
+    return held.kvBlock == checkpoint.kvBlock &&
+           held.publication == checkpoint.publication;
+  };
+  return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
+    const auto &peer = entry.second;
+    return &peer != &active && !peer.finalized &&
+           (same(peer.latestCheckpoint) || same(peer.previousCheckpoint));
+  });
+}
+
 bool Engine::retireCheckpoint(Request &active) {
   // Shared progress points remain disposable under memory pressure, but a
   // lane's normal rolling replacement must not retire its peer's recovery point.
   const auto point = active.latestCheckpoint;
-  if (point && std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
-        const auto &peer = entry.second;
-        return &peer != &active && !peer.finalized &&
-               peer.latestCheckpoint.kvBlock == point.kvBlock &&
-               peer.latestCheckpoint.publication == point.publication;
-      })) {
+  if (point && peerHoldsCheckpoint(active, point)) {
     setLatestCheckpoint(active, {});
     return true;
   }
@@ -784,6 +795,24 @@ bool Engine::retireCheckpoint(Request &active) {
     return false;
   setLatestCheckpoint(active, {});
   return true;
+}
+
+// Ends the lane's kept previous checkpoint and retires its state, unless a
+// peer still holds it. A pinned state stays cached as a disposable checkpoint.
+void Engine::retirePreviousCheckpoint(Request &active) {
+  const StateCheckpoint point = std::exchange(active.previousCheckpoint, {});
+  cache_.unprotectState(
+      std::exchange(active.previousCheckpointProtection, {}));
+  if (point && !peerHoldsCheckpoint(active, point))
+    static_cast<void>(cache_.retireCheckpointState(point));
+}
+
+// Ends the lane's hold on its kept previous checkpoint and leaves the state
+// cached: a suspension may resume from it under its own protection.
+void Engine::dropPreviousCheckpoint(Request &active) noexcept {
+  active.previousCheckpoint = {};
+  cache_.unprotectState(
+      std::exchange(active.previousCheckpointProtection, {}));
 }
 
 // Points the lane's recovery point at checkpoint and moves the lane's
@@ -794,6 +823,20 @@ void Engine::setLatestCheckpoint(Request &active, StateCheckpoint checkpoint) {
   active.latestCheckpoint = checkpoint;
   if (checkpoint)
     active.checkpointProtection = cache_.protectState(checkpoint.kvBlock);
+}
+
+// Copies the lane's live state for a publication. When no slot is free it
+// recycles one cached state, a checkpoint for a checkpoint, and retries once;
+// nullptr when that fails too.
+std::shared_ptr<const CompositeState> Engine::captureState(uint64_t requestId,
+                                                           bool checkpoint) {
+  std::shared_ptr<const CompositeState> state = model_.snapshot(requestId);
+  if (!state && cache_.reclaimOneState(checkpoint)) {
+    state = model_.snapshot(requestId);
+    if (state)
+      ++counters_.recycledStatePublications;
+  }
+  return state;
 }
 
 void Engine::publishReachedStateBoundaries(Request &active,
@@ -833,12 +876,7 @@ void Engine::publishReachedStateBoundaries(Request &active,
           continue;
         }
         std::shared_ptr<const CompositeState> state =
-            model_.snapshot(active.request.id);
-        if (!state && cache_.reclaimOneState(checkpoint)) {
-          state = model_.snapshot(active.request.id);
-          if (state)
-            ++counters_.recycledStatePublications;
-        }
+            captureState(active.request.id, checkpoint);
         if (!state) {
           ++failures;
           continue;
@@ -864,6 +902,71 @@ void Engine::publishReachedStateBoundaries(Request &active,
     active.stateBoundaryCursor = 0;
   }
   armNextStateBoundary(active);
+}
+
+// The verify rows a decode step from storedTokens may retain so that its
+// commit lands on, never past, the next multiple of prefillCheckpointTokens;
+// 0 (no cap) while that boundary is beyond one step or checkpoints are
+// disabled. One division per decode lane per step.
+uint32_t
+Engine::decodeRetainedTokenLimit(uint64_t storedTokens) const noexcept {
+  const uint32_t interval = config_.prefillCheckpointTokens;
+  if (!interval)
+    return 0;
+  const uint64_t untilBoundary = interval - storedTokens % interval;
+  return untilBoundary < model::ExecutionLimits::targetVerifyRows
+             ? static_cast<uint32_t>(untilBoundary)
+             : 0;
+}
+
+// Rolls a decoding lane's checkpoint after a commit from previousTokens to
+// storedTokens. On the commit that lands on the next multiple B of
+// prefillCheckpointTokens, the live state is published at B as the lane's
+// checkpoint, or a state already cached at B is reused; the checkpoint it
+// replaces is kept until a later commit passes B, so a suspension at exactly
+// B, which cannot restore B's own state, resumes from it rather than from the
+// prompt end. A commit that passes B without landing counts one publication
+// failure. Never arms a scheduler boundary. Costs one division per decode
+// step and one state copy per interval; a lane holds two checkpoints only
+// between landing on B and its next commit.
+void Engine::publishDecodeCheckpoint(Request &active, uint32_t previousTokens,
+                                     uint32_t storedTokens) {
+  const uint32_t interval = config_.prefillCheckpointTokens;
+  if (!interval || storedTokens <= previousTokens)
+    return;
+  if (active.previousCheckpoint)
+    retirePreviousCheckpoint(active);
+  const uint64_t boundary =
+      (uint64_t{previousTokens} / interval + 1) * interval;
+  if (storedTokens < boundary)
+    return;
+  if (storedTokens > boundary) {
+    ++counters_.checkpointPublicationFailures;
+    return;
+  }
+  try {
+    const uint64_t block = cache_.blockAt(active.request.id, storedTokens);
+    if (cache_.reuseCompositeState(block, true)) {
+      ++counters_.deduplicatedStatePublications;
+    } else {
+      std::shared_ptr<const CompositeState> state =
+          captureState(active.request.id, true);
+      if (!state) {
+        ++counters_.checkpointPublicationFailures;
+        return;
+      }
+      cache_.publishCompositeState(block, std::move(state), true);
+      ++counters_.checkpointPublications;
+    }
+    if (active.latestCheckpoint.kvBlock != block) {
+      active.previousCheckpoint = std::exchange(active.latestCheckpoint, {});
+      active.previousCheckpointProtection =
+          std::exchange(active.checkpointProtection, {});
+    }
+    setLatestCheckpoint(active, cache_.checkpointState(block));
+  } catch (const std::exception &) {
+    ++counters_.checkpointPublicationFailures;
+  }
 }
 
 bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
@@ -904,6 +1007,8 @@ bool Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
     item.promptOffset =
         plan.kind == WorkKind::Prefill ? scheduled.promptOffset : 0;
     item.tokenCount = scheduled.tokenCount;
+    if (plan.kind == WorkKind::Decode)
+      item.retainedTokenLimit = decodeRetainedTokenLimit(position);
     const PageTableView pageTable = cache_.pageTable(active.request.id);
     item.pageTable = pageTable.pages;
     item.pageTableRevision = pageTable.revision;
@@ -1120,10 +1225,14 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
   // Warning reclaim must not turn the resume into a full replay; growth
   // reclaim takes this state, the one published at suspension included,
   // only after every unprotected one, and Critical reclaim takes it outright.
-  active.resumeProtection = cache_.protectDeepestState(active.request.id);
-  // A suspended lane is no longer resident: its recovery point is protected
-  // only as the resume state, when it is the deepest one.
+  // A decode lane suspended exactly on its checkpoint boundary protects the
+  // kept previous checkpoint: its resume cannot restore the boundary's state.
+  active.resumeProtection =
+      cache_.protectDeepestState(active.request.id, active.replayTokens);
+  // A suspended lane is no longer resident: its recovery points are protected
+  // only as the resume state, when one is the deepest usable one.
   cache_.unprotectState(std::exchange(active.checkpointProtection, {}));
+  dropPreviousCheckpoint(active);
   cache_.endRequest(active.request.id);
   active.stateCell.reset();
   active.resumeKvTargetTokens = workEnd;
@@ -1292,6 +1401,9 @@ void Engine::apply(const BatchPlan &plan,
         events_.promptProgress(active.request.id, processed);
       }
     }
+    const uint32_t previousTokens =
+        static_cast<uint32_t>(active.exactTokens.size());
+    uint32_t storedTokens = previousTokens;
     if (!result.outputTokens.empty()) {
       active.exactTokens.insert(active.exactTokens.end(),
                                 result.outputTokens.begin(),
@@ -1304,9 +1416,8 @@ void Engine::apply(const BatchPlan &plan,
       acceptedDraftTokens += result.acceptedDraftTokens;
       // A terminal anchor is emitted without a target KV row; it never enters
       // a cached block.
-      const uint32_t storedTokens =
-          static_cast<uint32_t>(active.exactTokens.size()) -
-          result.outputTokensWithoutKv;
+      storedTokens = static_cast<uint32_t>(active.exactTokens.size()) -
+                     result.outputTokensWithoutKv;
       static_cast<void>(cache_.publishCommittedBlocks(
           active.request.id, active.exactTokens, storedTokens,
           active.request.images));
@@ -1337,6 +1448,9 @@ void Engine::apply(const BatchPlan &plan,
     if (result.outputTokensWithoutKv && !complete) {
       throw std::logic_error("model emitted an uncommitted token and continued");
     }
+    // A finishing step publishes nothing: finish retires the lane's points.
+    if (plan.kind == WorkKind::Decode && !complete)
+      publishDecodeCheckpoint(active, previousTokens, storedTokens);
     schedulerResults.push_back({active.request.id, result.consumedPromptTokens,
                                 complete, result.nextDecodeStage});
     if (plan.kind == WorkKind::Decode && waitsForMask(result.nextDecodeStage)) {
@@ -1386,6 +1500,7 @@ void Engine::finish(Request &active, EngineFinishReason reason,
     ++counters_.cancelled;
   } else {
     static_cast<void>(retireCheckpoint(active));
+    retirePreviousCheckpoint(active);
     ++counters_.completed;
   }
   release(active);
@@ -1431,6 +1546,7 @@ void Engine::release(Request &active) {
   cache_.unprotectState(std::exchange(active.resumeProtection, {}));
   cache_.unprotectState(std::exchange(active.queuedProtection, {}));
   cache_.unprotectState(std::exchange(active.checkpointProtection, {}));
+  dropPreviousCheckpoint(active);
   if (active.stateCell || active.suspended) {
     discardPendingStateBoundaries(active);
     model_.end(active.request.id);

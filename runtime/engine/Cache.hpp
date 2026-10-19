@@ -184,11 +184,14 @@ public:
   // only an unprotected checkpoint qualifies, so a protected checkpoint is
   // recycled rather than none.
   [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
-  // Protects the deepest composite state on the request's published prefix,
-  // the one its resume would restore, from Warning reclaim. Call before
-  // endRequest; returns an empty handle when the prefix holds no state. Reads
-  // the request's own block list: no lookup, hashing or pin.
-  [[nodiscard]] StateProtection protectDeepestState(uint64_t requestId);
+  // Protects the deepest composite state on the request's published prefix
+  // that a resume of resumeTokens tokens can restore, from Warning reclaim:
+  // like lookup, it leaves one token to recompute, so a state on the block
+  // ending at resumeTokens is skipped. Call before endRequest; returns an
+  // empty handle when no such state exists. Reads the request's own block
+  // list: no lookup, hashing or pin.
+  [[nodiscard]] StateProtection protectDeepestState(uint64_t requestId,
+                                                    uint32_t resumeTokens);
   // Protects the state published at kvBlock: the prefix a queued request
   // found and will restore, or a resident lane's latest checkpoint.
   // Returns an empty handle when no state is published there.

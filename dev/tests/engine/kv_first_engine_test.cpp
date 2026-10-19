@@ -163,7 +163,9 @@ public:
             return entry.second.resident && entry.second.slot == slot;
           });
       if (!used) {
-        requests.emplace(request.id, Request{slot, 0, true});
+        requests.emplace(
+            request.id,
+            Request{slot, 0, true, false, 0, request.maxNewTokens});
         return {slot, StateFailure::None};
       }
     }
@@ -271,6 +273,8 @@ public:
                           DecodeStage::ApplyInitialMask,
                           0,
                           0});
+      } else if (decodeRowsPerStep) {
+        result.push_back(decodeRows(item));
       } else {
         ModelStepResult step{item.requestId, 0, {42}, decodeFinishes,
                              DecodeStage::Regular, 0, 0};
@@ -279,6 +283,23 @@ public:
       }
     }
     return result;
+  }
+  // Opt-in multi-token decode: like the production runtime, a step retains
+  // at most the remaining budget, decodeRowsPerStep rows and the engine's
+  // retained cap, each row with a KV row, advancing the lane's position.
+  ModelStepResult decodeRows(const ModelBatchItem &item) {
+    Request &lane = requests.at(item.requestId);
+    uint32_t rows =
+        std::min(decodeRowsPerStep, lane.maxNewTokens - lane.generated);
+    if (item.retainedTokenLimit) {
+      retainedLimits.push_back(item.retainedTokenLimit);
+      if (!ignoresRetainedLimit)
+        rows = std::min(rows, item.retainedTokenLimit);
+    }
+    lane.generated += rows;
+    lane.position += rows;
+    return {item.requestId, 0, std::vector<uint32_t>(rows, 42), false,
+            DecodeStage::Regular, 0, 0};
   }
   std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
@@ -343,6 +364,9 @@ public:
     uint32_t position = 0;
     bool resident = false;
     bool replaying = false;
+    // Output the host continuation emitted; survives suspension.
+    uint32_t generated = 0;
+    uint32_t maxNewTokens = 0;
   };
   std::unordered_map<uint64_t, Request> requests;
   std::unordered_map<uint64_t, DraftContextPlan> plans;
@@ -383,6 +407,12 @@ public:
   bool decodeFinishes = true;
   DecodeStage replayDecodeStage = DecodeStage::Regular;
   uint32_t decodeTokensWithoutKv = 0;
+  // Nonzero selects decodeRows: rows each Regular decode step may retain.
+  uint32_t decodeRowsPerStep = 0;
+  // decodeRows commits past the engine's cap, as an uncapped runtime would.
+  bool ignoresRetainedLimit = false;
+  // Every nonzero retained cap decodeRows received.
+  std::vector<uint32_t> retainedLimits;
   // Set when prefill itself ends the request: the value is `finished` (stop).
   std::optional<bool> prefillAnchor;
   std::shared_ptr<bool> holdDecodeUntil;
@@ -4552,6 +4582,195 @@ void testCheckpointIntervalValidationAndDisable() {
           "disabling checkpoints changed existing replay-state behavior");
 }
 
+// A lane decoding seven rows a step from a 100-token prompt, honouring the
+// engine's retained cap. Growth pauses on demand, so a suspension waits for
+// the test to resume it.
+struct RollingDecode {
+  static constexpr uint32_t promptTokens = 100;
+
+  Backing backing{1024};
+  KvPool pool{backing};
+  engine::Cache resources{pool, CacheNamespace{}};
+  Executor executor{2};
+  Events events;
+  bool paused = false;
+  engine::Engine engine;
+  double now = 1;
+
+  explicit RollingDecode(uint32_t checkpointTokens = defaultCheckpointTokens)
+      : engine(config(checkpointTokens, paused), resources, executor, events) {
+    executor.decodeRowsPerStep = 7;
+  }
+
+  static EngineConfig config(uint32_t checkpointTokens, const bool &paused) {
+    EngineConfig result;
+    result.prefillCheckpointTokens = checkpointTokens;
+    result.growthPaused = [&paused] { return paused; };
+    return result;
+  }
+
+  void submit(uint64_t id, uint32_t maxNewTokens) {
+    auto decoding = request(id, std::vector<uint32_t>(promptTokens, 51));
+    decoding.maxNewTokens = maxNewTokens;
+    decoding.deadlineMilliseconds = 100000;
+    engine.submit(std::move(decoding));
+  }
+
+  // Tokens of the lane's exact history: prompt plus emitted output.
+  uint32_t stored(uint64_t id) {
+    return promptTokens + static_cast<uint32_t>(events.outputs[id].size());
+  }
+
+  void decodeUntil(uint64_t id, uint32_t tokens) {
+    for (; now < 20000 && stored(id) < tokens; ++now)
+      static_cast<void>(engine.tick(now));
+    require(stored(id) >= tokens, "rolling decode did not reach its target");
+  }
+
+  void runToIdle() {
+    for (const double deadline = now + 20000; now < deadline && !engine.idle();
+         ++now)
+      static_cast<void>(engine.tick(now));
+    require(engine.idle() && events.failedCount == 0,
+            "rolling decode fixture did not finish its requests");
+  }
+};
+
+void testDecodePublishesRollingCheckpoints() {
+  RollingDecode fixture;
+  const uint32_t interval = defaultCheckpointTokens;
+  const uint32_t maxNewTokens = 2 * interval + 600;
+  fixture.submit(520, maxNewTokens);
+  fixture.decodeUntil(520, 2 * interval + 40);
+  require(fixture.engine.snapshot().checkpointPublications == 2 &&
+              fixture.engine.snapshot().checkpointPublicationFailures == 0 &&
+              !fixture.executor.retainedLimits.empty(),
+          "a long decode did not land a checkpoint on each boundary");
+
+  fixture.paused = fixture.backing.growthBlocked = true;
+  for (const double deadline = fixture.now + 64;
+       fixture.now < deadline && !fixture.executor.suspensions; ++fixture.now)
+    static_cast<void>(fixture.engine.tick(fixture.now));
+  require(fixture.executor.suspensions == 1 &&
+              fixture.engine.snapshot().resourceDecodeSuspensions == 1,
+          "paused growth did not suspend the decoding lane");
+  const uint32_t history = fixture.executor.suspendedPositions.back();
+  fixture.paused = fixture.backing.growthBlocked = false;
+  fixture.runToIdle();
+
+  require(fixture.executor.restoredLengths.contains(520) &&
+              fixture.executor.restoredLengths.at(520) == 2 * interval &&
+              fixture.engine.snapshot().resourceDecodeReplayTokens ==
+                  history - 2 * interval &&
+              history - 2 * interval <= interval,
+          "a decode suspension replayed past its latest checkpoint");
+  require(fixture.events.usage.at(520).second == maxNewTokens &&
+              fixture.events.outputs.at(520).size() == maxNewTokens,
+          "a capped decode step ended the reply early");
+}
+
+void testDecodeSuspensionOnTheBoundaryResumesFromThePreviousCheckpoint() {
+  const uint32_t interval = 2048;
+  RollingDecode fixture(interval);
+  fixture.submit(521, 3 * interval);
+  fixture.decodeUntil(521, 2 * interval);
+  require(fixture.stored(521) == 2 * interval &&
+              fixture.engine.snapshot().checkpointPublications == 2,
+          "the capped commit did not land on the second boundary");
+
+  // The foreground peer cannot grow while growth is paused; the decoding
+  // lane yields to it before decoding past the boundary.
+  fixture.paused = fixture.backing.growthBlocked = true;
+  auto foreground = request(522, std::vector<uint32_t>(4096, 52));
+  foreground.priority = RequestPriority::Foreground;
+  fixture.engine.submit(std::move(foreground));
+  for (const double deadline = fixture.now + kPeerSuspensionTicks;
+       fixture.now < deadline && !fixture.executor.suspensions; ++fixture.now)
+    static_cast<void>(fixture.engine.tick(fixture.now));
+  require(fixture.executor.suspensions == 1 &&
+              fixture.executor.suspendedPositions.back() == 2 * interval,
+          "the decoding lane did not suspend on its boundary");
+
+  static_cast<void>(fixture.resources.reclaimCache(
+      std::numeric_limits<uint64_t>::max(), false));
+  fixture.paused = fixture.backing.growthBlocked = false;
+  fixture.runToIdle();
+  require(fixture.executor.restoredLengths.contains(521) &&
+              fixture.executor.restoredLengths.at(521) == interval &&
+              fixture.engine.snapshot().resourceDecodeReplayTokens == interval,
+          "a suspension on the boundary did not resume from the previous "
+          "checkpoint");
+}
+
+void testDecodeBoundaryStateIsReusedNotPublishedTwice() {
+  const uint32_t interval = 2048;
+  RollingDecode fixture(interval);
+  fixture.submit(523, interval + 200);
+  fixture.submit(524, interval + 200);
+  fixture.decodeUntil(523, RollingDecode::promptTokens + 8);
+  fixture.decodeUntil(524, RollingDecode::promptTokens + 8);
+  const EngineSnapshot before = fixture.engine.snapshot();
+  const uint32_t snapshots = fixture.executor.snapshots;
+
+  fixture.decodeUntil(523, interval + 8);
+  fixture.decodeUntil(524, interval + 8);
+  const EngineSnapshot after = fixture.engine.snapshot();
+  require(after.checkpointPublications - before.checkpointPublications == 1 &&
+              after.deduplicatedStatePublications -
+                      before.deduplicatedStatePublications ==
+                  1 &&
+              fixture.executor.snapshots - snapshots == 1 &&
+              after.checkpointPublicationFailures == 0,
+          "two lanes published the same decode boundary twice");
+  fixture.runToIdle();
+}
+
+void testUncappedCommitPastTheBoundaryCountsOneFailure() {
+  const uint32_t interval = 2048;
+  RollingDecode fixture(interval);
+  fixture.executor.ignoresRetainedLimit = true;
+  // 100 + 7k never equals 2048: the uncapped lane passes the boundary.
+  fixture.submit(525, interval);
+  fixture.runToIdle();
+  require(fixture.engine.snapshot().checkpointPublications == 0 &&
+              fixture.engine.snapshot().checkpointPublicationFailures == 1 &&
+              fixture.events.outputs.at(525).size() == interval,
+          "an uncapped commit past the boundary was not one failure");
+}
+
+void testDisabledCheckpointsLeaveDecodeUncapped() {
+  RollingDecode fixture(0);
+  fixture.submit(527, 2100);
+  fixture.runToIdle();
+  require(fixture.executor.retainedLimits.empty() &&
+              fixture.engine.snapshot().checkpointPublications == 0 &&
+              fixture.engine.snapshot().checkpointPublicationFailures == 0,
+          "disabled checkpoints capped or checkpointed a decode");
+}
+
+void testPositionalBatchItemDecodesUncapped() {
+  Executor executor;
+  const std::vector<uint32_t> prompt(RollingDecode::promptTokens, 53);
+  ModelRequest modelRequest;
+  modelRequest.id = 526;
+  modelRequest.prompt = prompt;
+  modelRequest.maxNewTokens = 64;
+  require(executor.begin(modelRequest).granted(),
+          "fake did not admit the lane");
+  executor.decodeRowsPerStep = model::ExecutionLimits::targetVerifyRows;
+  const std::vector<uint32_t> pages{0};
+  const ModelBatchItem items[] = {{526, 0, 0, 0, 1, pages, 0, {}}};
+  BatchPlan plan;
+  plan.kind = WorkKind::Decode;
+
+  const auto results = executor.decode(plan, items);
+
+  require(items[0].retainedTokenLimit == 0 && executor.retainedLimits.empty() &&
+              results.front().outputTokens.size() ==
+                  model::ExecutionLimits::targetVerifyRows,
+          "a positional batch item was capped");
+}
+
 } // namespace
 
 int main() {
@@ -4589,6 +4808,12 @@ int main() {
     testShortSuffixContinuesCheckpointDraftState();
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testCheckpointIntervalValidationAndDisable();
+    testDecodePublishesRollingCheckpoints();
+    testDecodeSuspensionOnTheBoundaryResumesFromThePreviousCheckpoint();
+    testDecodeBoundaryStateIsReusedNotPublishedTwice();
+    testUncappedCommitPastTheBoundaryCountsOneFailure();
+    testDisabledCheckpointsLeaveDecodeUncapped();
+    testPositionalBatchItemDecodesUncapped();
     testColdPublishesReplayStateAndLazyJunctionCanRebuildIt();
     testConcurrentDuplicateStateSkipsSnapshotCapture();
     testImageSpansKeyPrefixIdentity();

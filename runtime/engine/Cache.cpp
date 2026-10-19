@@ -370,12 +370,18 @@ bool Cache::reclaimOneState(bool checkpointsOnly) {
          states_.evict(state->id).evicted;
 }
 
-StateProtection Cache::protectDeepestState(uint64_t requestId) {
+StateProtection Cache::protectDeepestState(uint64_t requestId,
+                                           uint32_t resumeTokens) {
   const Request &active = request(requestId);
-  for (auto block = active.cachedBlocks.rbegin();
-       block != active.cachedBlocks.rend(); ++block) {
-    if (states_.contains(*block))
-      return states_.protect(*block);
+  // matchedBlocks leaves one token to recompute: a state on the block that
+  // ends at resumeTokens is never restored by that resume.
+  const size_t usableBlocks =
+      resumeTokens ? std::min<size_t>(active.cachedBlocks.size(),
+                                      (resumeTokens - 1) / KvCache::pageTokens)
+                   : 0;
+  for (size_t index = usableBlocks; index > 0; --index) {
+    if (states_.contains(active.cachedBlocks[index - 1]))
+      return states_.protect(active.cachedBlocks[index - 1]);
   }
   return {};
 }

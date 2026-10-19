@@ -322,6 +322,18 @@ struct Runtime::Impl {
     return entry.sampling.temperature > 0.0F;
   }
 
+  // The verify rows a decode step may retain: the remaining output budget and
+  // the graph's rows, lowered to the engine's checkpoint cap when it sets one.
+  // The cap only shortens the commit; the terminal path still keys on the
+  // remaining budget alone.
+  static uint32_t maximumRetained(uint32_t remaining,
+                                  const ModelBatchItem &item) noexcept {
+    const uint32_t retained = std::min(remaining, kDecodeRows);
+    return item.retainedTokenLimit
+               ? std::min(retained, item.retainedTokenLimit)
+               : retained;
+  }
+
   // Qwen3.5 M-RoPE: text rows advance one counter shared by all three axes;
   // an image's rows spread over (t, h, w) from the counter at the image start
   // and the counter then advances by max(merged height, merged width).
@@ -1579,7 +1591,8 @@ struct Runtime::Impl {
 
           const uint32_t remaining = entry.maxNewTokens - entry.generatedTokens;
           laneResult.currentAnchor = *entry.pendingToken;
-          laneResult.maximumRetained = std::min(remaining, kDecodeRows);
+          laneResult.maximumRetained =
+              Impl::maximumRetained(remaining, items_[lane]);
           laneResult.verify = true;
           entries[lane] = &entry;
 
@@ -2227,7 +2240,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // output budget only lowers the token-exact commit count; it never
     // changes the Metal graph shape.
     laneResult.currentAnchor = *entry.pendingToken;
-    laneResult.maximumRetained = std::min(remaining, kDecodeRows);
+    laneResult.maximumRetained = Impl::maximumRetained(remaining, item);
 
     impl_->prepareDecodeLane(entry, item, lane);
     impl_->loadPolicyBuffers(entry, lane, {});

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -19,8 +20,10 @@ namespace splash::engine {
 struct EngineConfig final {
   uint32_t maxContext = kv::kMaximumLogicalTokens;
   uint32_t vocabularySize = std::numeric_limits<uint32_t>::max();
-  // Two draft windows balance recovery granularity and capture work.
-  // Zero disables progress checkpoints without changing reusable end states.
+  // Two draft windows balance recovery granularity and capture work. Prefill
+  // and decode both checkpoint at its multiples; a decode step's retained
+  // rows are capped so its commit lands on one. Zero disables progress
+  // checkpoints and the cap without changing reusable end states.
   uint32_t prefillCheckpointTokens =
       2 * model::ExecutionLimits::draftContextTokens;
   // Patches per image the model's vision scratch covers.
@@ -57,6 +60,8 @@ struct EngineSnapshot final {
   uint64_t replayStatePublicationFailures = 0;
   uint64_t junctionMaterializations = 0;
   uint64_t junctionMaterializationFailures = 0;
+  // Prefill and decode progress checkpoints; a decode commit that passed its
+  // boundary without landing on it counts as a failure.
   uint64_t checkpointPublications = 0;
   uint64_t checkpointPublicationFailures = 0;
   uint64_t resourceSuspensions = 0;
@@ -159,6 +164,14 @@ private:
     // by growth reclaim and publication recycling only after every
     // unprotected state. Dropped when the lane suspends or ends.
     StateProtection checkpointProtection;
+    // A decoding lane's checkpoint replaced at its last decode boundary B,
+    // kept until a later commit passes B: a suspension at exactly B cannot
+    // restore B's own state, its lookup leaving one token to recompute.
+    // Protected like latestCheckpoint; ends on the first commit past B, on
+    // admission, suspension and release, and is retired when the request
+    // finishes.
+    StateCheckpoint previousCheckpoint;
+    StateProtection previousCheckpointProtection;
     // The state a suspended request resumes from, spared by Warning reclaim
     // until the resume succeeds or the request ends.
     StateProtection resumeProtection;
@@ -214,10 +227,20 @@ private:
                         bool targetOnlyRestore = false) const;
   void armNextStateBoundary(Request &request);
   void discardPendingStateBoundaries(Request &request) noexcept;
+  [[nodiscard]] bool peerHoldsCheckpoint(const Request &request,
+                                         StateCheckpoint checkpoint) const;
   [[nodiscard]] bool retireCheckpoint(Request &request);
+  void retirePreviousCheckpoint(Request &request);
+  void dropPreviousCheckpoint(Request &request) noexcept;
   void setLatestCheckpoint(Request &request, StateCheckpoint checkpoint);
+  [[nodiscard]] std::shared_ptr<const CompositeState>
+  captureState(uint64_t requestId, bool checkpoint);
   void publishReachedStateBoundaries(Request &request,
                                      uint32_t promptProcessed);
+  [[nodiscard]] uint32_t
+  decodeRetainedTokenLimit(uint64_t storedTokens) const noexcept;
+  void publishDecodeCheckpoint(Request &request, uint32_t previousTokens,
+                               uint32_t storedTokens);
   [[nodiscard]] bool prepare(BatchPlan &plan,
                              std::vector<ModelBatchItem> &items,
                              double nowMilliseconds);

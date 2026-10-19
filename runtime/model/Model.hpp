@@ -223,6 +223,11 @@ struct ModelBatchItem final {
   std::span<const uint32_t> pageTable;
   uint64_t pageTableRevision = 0;
   std::span<const uint32_t> inputTokens{};
+  // Decode only: the most verify rows this step may retain, so its commit
+  // lands on the engine's next checkpoint boundary. 0 means no cap: the step
+  // retains at most min(remaining budget, verify rows). A cap never ends the
+  // reply; only the remaining budget or a stop token does.
+  uint32_t retainedTokenLimit = 0;
 };
 
 struct ModelStepResult final {
