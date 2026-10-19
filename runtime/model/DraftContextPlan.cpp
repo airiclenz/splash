@@ -7,7 +7,8 @@ namespace splash {
 DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
                  std::optional<uint32_t> restoredDraftBoundary,
-                 std::span<const uint32_t> materializationBoundaries) {
+                 std::span<const uint32_t> materializationBoundaries,
+                 bool targetOnlyRestore) {
   if (replayEnd < replayBegin) {
     throw std::invalid_argument("draft replay range is reversed");
   }
@@ -18,6 +19,10 @@ planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
   if (!restoredDraftBoundary && replayBegin != 0) {
     throw std::invalid_argument(
         "nonzero replay requires a restored composite state");
+  }
+  if (targetOnlyRestore && !restoredDraftBoundary) {
+    throw std::invalid_argument(
+        "target-only restore requires a restored composite state");
   }
 
   uint32_t previousMaterialization = 0;
@@ -39,6 +44,7 @@ planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
   result.replayBegin = replayBegin;
   result.replayEnd = replayEnd;
   result.restoredDraftBoundary = restoredDraftBoundary;
+  result.targetOnlyRestore = targetOnlyRestore;
   result.targetPrefillRows = replayEnd - replayBegin;
 
   constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
@@ -99,6 +105,12 @@ planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
   if (restoredDraftBoundary &&
       firstBoundary - *restoredDraftBoundary >= window) {
     result.draftStateRestoreSkipped = 1;
+  }
+  // A short first window would continue draft rows the state does not hold.
+  if (targetOnlyRestore && !result.draftStateRestoreSkipped) {
+    throw std::invalid_argument(
+        "target-only state is less than a draft window before its first "
+        "boundary");
   }
   return result;
 }

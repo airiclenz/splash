@@ -64,7 +64,12 @@ private:
 
 class State final : public CompositeState {
 public:
+  explicit State(bool carriesDraft = true) : carriesDraft_(carriesDraft) {}
   uint64_t bytes() const noexcept override { return 64; }
+  bool carriesDraft() const noexcept override { return carriesDraft_; }
+
+private:
+  bool carriesDraft_;
 };
 
 struct MaskOverlapState final {
@@ -187,6 +192,7 @@ public:
       throw std::runtime_error("empty restore state");
     requests.at(id).position = length;
     restored += length;
+    restoredLengths[id] = length;
     restoredDraft = restoreDraftState;
   }
   void setDraftContextPlan(uint64_t id, DraftContextPlan plan) override {
@@ -280,7 +286,8 @@ public:
       return nullptr;
     }
     ++snapshots;
-    return std::make_shared<State>();
+    return std::make_shared<State>(targetOnlyAtBoundary !=
+                                   requests.at(id).position);
   }
   uint64_t reclaimIdleState() noexcept override {
     if (idleStateReclaimable && !idleStateReclaimable())
@@ -312,6 +319,9 @@ public:
   uint32_t snapshotAttempts = 0;
   uint32_t deniedSnapshots = 0;
   std::optional<uint32_t> denySnapshotAtBoundary;
+  // A snapshot taken at this boundary is target-only.
+  std::optional<uint32_t> targetOnlyAtBoundary;
+  std::unordered_map<uint64_t, uint32_t> restoredLengths;
   uint32_t beginAttempts = 0;
   uint32_t deniedBegins = 0;
   uint32_t suspensions = 0;
@@ -1103,6 +1113,99 @@ void testLongSuffixSkipsDraftRestore() {
   require(!executor.restoredDraft &&
               executor.plans.at(11).draftStateRestoreSkipped,
           "long suffix copied a draft ring that its final window overwrites");
+}
+
+// One 65-token prefix cached as a full state at 32 and a target-only state
+// at 64, the deepest one a lookup of any extension of it finds.
+struct TargetOnlyFixture final {
+  TargetOnlyFixture()
+      : pool(backing), resources(pool, CacheNamespace{}), executor(1),
+        engine({}, resources, executor, events) {
+    for (uint32_t index = 0; index < prefix.size(); ++index)
+      prefix[index] = index + 1;
+    engine.submit(request(1, extended(33)));
+    runUntilIdle(engine);
+    executor.targetOnlyAtBoundary = 64;
+    engine.submit(request(2, prefix));
+    runUntilIdle(engine);
+    executor.targetOnlyAtBoundary.reset();
+    const auto lookup = resources.lookup(extended(4097));
+    require(lookup.resumeBoundary() == 64 &&
+                !lookup.state->state()->carriesDraft(),
+            "fixture did not cache a target-only state at 64");
+  }
+
+  // The prefix truncated or padded to length tokens.
+  std::vector<uint32_t> extended(uint32_t length) const {
+    std::vector<uint32_t> result(prefix.begin(),
+                                 prefix.begin() +
+                                     std::min<size_t>(length, prefix.size()));
+    result.resize(length, 99);
+    return result;
+  }
+
+  std::vector<uint32_t> prefix = std::vector<uint32_t>(65);
+  Backing backing{512};
+  KvPool pool;
+  engine::Cache resources;
+  Executor executor;
+  Events events;
+  engine::Engine engine;
+};
+
+// The first planned boundary lies a whole draft window past the target-only
+// state: it restores without draft and plans with the target-only input.
+void testTargetOnlyStateRestoresWithoutDraft() {
+  TargetOnlyFixture fixture;
+
+  fixture.engine.submit(request(3, fixture.extended(4097)));
+  runUntilIdle(fixture.engine);
+
+  const DraftContextPlan &plan = fixture.executor.plans.at(3);
+  require(fixture.executor.restoredLengths.at(3) == 64 &&
+              !fixture.executor.restoredDraft && plan.targetOnlyRestore &&
+              plan.draftStateRestoreSkipped &&
+              fixture.events.failedCount == 0,
+          "usable target-only state was not restored without its draft");
+}
+
+// A shorter remainder would continue draft rows the state lacks: admission
+// walks past it to the full state below before anything is restored.
+void testShortRemainderWalksPastTargetOnlyState() {
+  TargetOnlyFixture fixture;
+
+  fixture.engine.submit(request(3, fixture.extended(200)));
+  runUntilIdle(fixture.engine);
+
+  const DraftContextPlan &plan = fixture.executor.plans.at(3);
+  require(fixture.executor.restoredLengths.at(3) == 32 &&
+              fixture.executor.restoredDraft && !plan.targetOnlyRestore &&
+              fixture.events.failedCount == 0 &&
+              fixture.resources.snapshot().stateCache.pinned == 0,
+          "short remainder restored a target-only state");
+}
+
+// A queued peer's junction is a planned boundary too: one too close to the
+// target-only state makes it unusable although the replay point is far.
+void testQueuedPeerJunctionWalksPastTargetOnlyState() {
+  TargetOnlyFixture fixture;
+  const std::vector<uint32_t> prompt = fixture.extended(4097);
+  std::vector<uint32_t> peer = prompt;
+  std::fill(peer.begin() + 1024, peer.end(), 77);
+
+  fixture.engine.submit(request(3, prompt));
+  fixture.engine.submit(request(4, peer));
+  runUntilIdle(fixture.engine);
+
+  require(fixture.events.startIds.size() >= 4 &&
+              fixture.events.startIds[2] == 3,
+          "fixture did not admit the request ahead of its queued peer");
+  const DraftContextPlan &plan = fixture.executor.plans.at(3);
+  require(fixture.executor.restoredLengths.at(3) == 32 &&
+              !plan.targetOnlyRestore && plan.boundaries.front().boundary == 64 &&
+              fixture.events.failedCount == 0 &&
+              fixture.events.completedCount == 4,
+          "a queued peer's junction did not reject the target-only state");
 }
 
 // A lane cancelled while the command that ends at its armed boundary is in
@@ -4045,6 +4148,9 @@ int main() {
     testDeniedSnapshotRecyclesLruStateAndRetries();
     testPersistentSnapshotDenialRecyclesAtMostOneState();
     testLongSuffixSkipsDraftRestore();
+    testTargetOnlyStateRestoresWithoutDraft();
+    testShortRemainderWalksPastTargetOnlyState();
+    testQueuedPeerJunctionWalksPastTargetOnlyState();
     testCancellationInFlightAtBoundaryPublishesNoState();
     testActiveCellGrowthReclaimsCachedStateAndRetries();
     testKvGrowthReclaimsIdleStateBeforeCache();

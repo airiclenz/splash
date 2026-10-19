@@ -419,6 +419,10 @@ bool Engine::admit(Request &active, double now) {
       modelRequest.prompt, active.request.images,
       active.admissionProbe ? &*active.admissionProbe : nullptr);
   active.admissionProbe.reset();
+  // Decided before any restore pins the chain: a target-only state too close
+  // to its first planned boundary gives way to the next shallower state.
+  while (!restorable(active, lookup))
+    lookup = cache_.shallowerState(lookup);
   // Only unstarted requests wait for a resident producer. Recheck planned
   // boundaries each step so producer loss leaves no stale dependency or lease.
   if (!resuming && pendingSharedPrefill(active, lookup.resumeBoundary())) {
@@ -523,8 +527,13 @@ bool Engine::admit(Request &active, double now) {
     if (resuming)
       scheduler_.resumeFromResources(active.request.id, resumeBoundary,
                                      active.replayTokens);
+    const bool targetOnlyRestore =
+        lookup.state && !lookup.state->state()->carriesDraft();
     DraftContextPlan draft = configureDraftStatePlan(
-        active, resumeBoundary, lookup.junctionBoundary());
+        active, resumeBoundary, lookup.junctionBoundary(), targetOnlyRestore);
+    if (targetOnlyRestore && !draft.draftStateRestoreSkipped) {
+      throw std::logic_error("target-only state was planned to restore draft");
+    }
     setLatestCheckpoint(active, {});
     if (lookup.state) {
       model_.restore(active.request.id, resumeBoundary, lookup.state->state(),
@@ -607,7 +616,8 @@ void Engine::signalResourceProgress() noexcept {
 
 DraftContextPlan Engine::configureDraftStatePlan(Request &active,
                                                  uint32_t stateBoundary,
-                                                 uint32_t junctionBoundary) {
+                                                 uint32_t junctionBoundary,
+                                                 bool targetOnlyRestore) {
   if (!active.stateBoundaries.empty() || active.stateBoundaryCursor != 0) {
     throw std::logic_error("request already has a composite-state plan");
   }
@@ -647,7 +657,8 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   static_cast<void>(addSharedPrefillBoundaries(active, stateBoundary));
 
   try {
-    DraftContextPlan draft = pendingDraftStatePlan(active, stateBoundary);
+    DraftContextPlan draft =
+        pendingDraftStatePlan(active, stateBoundary, targetOnlyRestore);
     armNextStateBoundary(active);
     return draft;
   } catch (...) {
@@ -656,18 +667,59 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   }
 }
 
-bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
-  if (active.suspended || active.replaying)
-    return false;
-  bool changed = false;
+uint32_t Engine::peerJunction(const Request &active, uint64_t peerId,
+                              const Request &peer, uint32_t after) {
+  if (active.suspended || active.replaying || peerId == active.request.id ||
+      peer.stateCell || peer.suspended || peer.finalized || peer.failure ||
+      peer.request.priority < active.request.priority)
+    return 0;
+  const uint32_t shared = sharedPrefillBoundary(active, peer);
+  return shared > after && shared < replayStateBoundary(active.replayTokens)
+             ? shared
+             : 0;
+}
+
+uint32_t Engine::firstPlannedBoundary(const Request &active,
+                                      uint32_t stateBoundary,
+                                      uint32_t junctionBoundary) const {
+  // Mirrors the candidates configureDraftStatePlan plans; the draft plan
+  // ends at replayTokens when no state boundary lies before it.
+  uint32_t first = active.replayTokens;
+  const auto consider = [&](uint32_t tokens) {
+    if (tokens > stateBoundary && tokens < first)
+      first = tokens;
+  };
   const uint32_t replay = replayStateBoundary(active.replayTokens);
+  if (const uint32_t interval = config_.prefillCheckpointTokens) {
+    const uint64_t checkpoint = (uint64_t{stateBoundary} / interval + 1) * interval;
+    if (checkpoint < replay)
+      consider(static_cast<uint32_t>(checkpoint));
+  }
+  consider(junctionBoundary);
+  consider(replay);
+  for (const auto &[id, peer] : requests_)
+    consider(peerJunction(active, id, peer, stateBoundary));
+  return first;
+}
+
+bool Engine::restorable(const Request &active,
+                        const CacheLookup &lookup) const {
+  if (!lookup.state || lookup.state->state()->carriesDraft())
+    return true;
+  // Replay rebuilds a draft window only when the first planned boundary
+  // captures a whole one; a shorter span would continue draft rows the
+  // target-only state does not hold.
+  const uint32_t boundary = lookup.resumeBoundary();
+  return firstPlannedBoundary(active, boundary, lookup.junctionBoundary()) -
+             boundary >=
+         model::ExecutionLimits::draftContextTokens;
+}
+
+bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
+  bool changed = false;
   for (const auto &[id, peer] : requests_) {
-    if (id == active.request.id || peer.stateCell || peer.suspended ||
-        peer.finalized || peer.failure ||
-        peer.request.priority < active.request.priority)
-      continue;
-    const uint32_t shared = sharedPrefillBoundary(active, peer);
-    if (shared <= after || shared >= replay)
+    const uint32_t shared = peerJunction(active, id, peer, after);
+    if (!shared)
       continue;
     auto found = std::lower_bound(
         active.stateBoundaries.begin(), active.stateBoundaries.end(), shared,
@@ -684,7 +736,8 @@ bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
 }
 
 DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
-                                               uint32_t stateBoundary) const {
+                                               uint32_t stateBoundary,
+                                               bool targetOnlyRestore) const {
   std::vector<uint32_t> boundaries;
   boundaries.reserve(active.stateBoundaries.size() - active.stateBoundaryCursor);
   for (size_t i = active.stateBoundaryCursor; i < active.stateBoundaries.size(); ++i)
@@ -692,7 +745,7 @@ DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
   return planDraftContext(
       stateBoundary, active.replayTokens,
       stateBoundary ? std::optional<uint32_t>(stateBoundary) : std::nullopt,
-      boundaries);
+      boundaries, targetOnlyRestore);
 }
 
 void Engine::armNextStateBoundary(Request &active) {

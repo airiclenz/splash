@@ -135,6 +135,17 @@ void Cache::recordLookup(const CacheLookup &result) {
     ++lookup_.lazyJunctions;
 }
 
+CacheLookup Cache::shallowerState(const CacheLookup &lookup) {
+  CacheLookup result;
+  result.kvBoundary = lookup.kvBoundary;
+  if (!lookup.state)
+    return result;
+  const KvCache::Chain chain = kv_.chain(lookup.state->kvBlock());
+  result.state = states_.acquireDeepest(
+      std::span<const uint64_t>(chain.blocks).first(chain.blocks.size() - 1));
+  return result;
+}
+
 void Cache::restoreRequest(uint64_t requestId, const CacheLookup &lookup) {
   Request &active = request(requestId);
   if (!active.pages.empty() || !active.cachedBlocks.empty()) {

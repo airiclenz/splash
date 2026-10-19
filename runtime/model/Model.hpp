@@ -68,11 +68,17 @@ struct ImageSpan final {
   bool operator==(const ImageSpan &) const = default;
 };
 
-// Immutable target-recurrent plus draft-context state.  Concrete model
+// Immutable target-recurrent state, plus the draft-context window when the
+// producing lane had a complete one. A target-only state carries no draft
+// window: it restores only the target state, and replay can rebuild the draft
+// window only from a boundary a whole window past it. Concrete model
 // implementations own its buffers; the engine only pins and accounts it.
 class CompositeState {
 public:
   virtual ~CompositeState() = default;
+  // False for a target-only state, which must be restored without its draft
+  // state and planned with an explicit target-only restored boundary.
+  [[nodiscard]] virtual bool carriesDraft() const noexcept { return true; }
   // Footprint retained by the cache. A cached state owns a private copy of
   // the lane's state; dropping the reference returns that slot to the model's
   // pool, and idle-state reclaim frees it.
@@ -102,6 +108,9 @@ struct DraftContextPlan final {
   uint32_t replayBegin = 0;
   uint32_t replayEnd = 0;
   std::optional<uint32_t> restoredDraftBoundary;
+  // The state restored at restoredDraftBoundary carries no draft window; the
+  // plan rebuilds the first boundary's whole window from replayed rows.
+  bool targetOnlyRestore = false;
   std::vector<DraftCaptureSpan> captureSpans;
   std::vector<DraftBoundaryPlan> boundaries;
 
@@ -146,10 +155,15 @@ struct DispatchDraftCapturePlan final {
   [[nodiscard]] auto end() const noexcept { return values.begin() + count; }
 };
 
+// Plans the draft-context captures for one replay. A nonzero replayBegin
+// needs a restored composite state at that boundary. targetOnlyRestore marks
+// that state as carrying no draft window: the first planned boundary must then
+// lie at least draftContextTokens past it, else std::invalid_argument.
 [[nodiscard]] DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
                  std::optional<uint32_t> restoredDraftBoundary,
-                 std::span<const uint32_t> materializationBoundaries);
+                 std::span<const uint32_t> materializationBoundaries,
+                 bool targetOnlyRestore = false);
 
 [[nodiscard]] DispatchDraftCapturePlan
 draftCaptureSpansForDispatch(const DraftContextPlan &plan,

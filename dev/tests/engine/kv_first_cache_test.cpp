@@ -22,11 +22,16 @@ void require(bool condition, const char *message) {
 
 class TestState final : public CompositeState {
 public:
-  explicit TestState(uint64_t byteCount) : byteCount_(byteCount) {}
+  explicit TestState(uint64_t byteCount, bool carriesDraft = true)
+      : byteCount_(byteCount), carriesDraft_(carriesDraft) {}
   [[nodiscard]] uint64_t bytes() const noexcept override { return byteCount_; }
+  [[nodiscard]] bool carriesDraft() const noexcept override {
+    return carriesDraft_;
+  }
 
 private:
   uint64_t byteCount_;
+  bool carriesDraft_;
 };
 
 struct SharedBudget {
@@ -125,9 +130,9 @@ struct CacheFixture {
     cache.endRequest(1);
   }
 
-  void publish(uint32_t block, uint64_t bytes = 100) {
-    cache.publishCompositeState(blocks.at(block),
-                                std::make_shared<TestState>(bytes));
+  void publish(uint32_t block, uint64_t bytes = 100, bool carriesDraft = true) {
+    cache.publishCompositeState(
+        blocks.at(block), std::make_shared<TestState>(bytes, carriesDraft));
   }
 
   engine::CacheLookup lookup(uint32_t tokens) {
@@ -357,6 +362,34 @@ void testLazyJunctionMaterialization() {
   auto second = fixture.cache.lookup(fixture.prompt);
   require(second.resumeBoundary() == 128 && !second.junctionBoundary(),
           "second request did not resume from the lazy junction");
+}
+
+// Lookup returns the deepest state whatever it carries; the engine, which
+// knows the planned boundaries, swaps an unusable one for a shallower state.
+void testShallowerStateReplacesARejectedTargetOnlyState() {
+  CacheFixture fixture;
+  fixture.publish(0);
+  fixture.publish(2, 100, false);
+
+  auto lookup = fixture.cache.lookup(fixture.prompt);
+  require(lookup.state && lookup.state->kvBlock() == fixture.blocks[2] &&
+              !lookup.state->state()->carriesDraft() &&
+              fixture.cache.snapshot().stateCache.pinned == 1,
+          "lookup applied a usability rule to a target-only state");
+
+  lookup = fixture.cache.shallowerState(lookup);
+  require(lookup.state && lookup.state->kvBlock() == fixture.blocks[0] &&
+              lookup.state->state()->carriesDraft() &&
+              lookup.kvBoundary == 128 && lookup.resumeBoundary() == 32 &&
+              lookup.junctionBoundary() == 128,
+          "shallower state is not the full state on the same prefix");
+  require(fixture.cache.snapshot().stateCache.pinned == 1,
+          "the rejected target-only lease was not released");
+
+  lookup = fixture.cache.shallowerState(lookup);
+  require(!lookup.state && lookup.kvBoundary == 128 &&
+              fixture.cache.snapshot().stateCache.pinned == 0,
+          "a state below the shallowest one was found or pinned");
 }
 
 void testByteLruAndPins() {
@@ -948,6 +981,7 @@ int main() {
     testCacheLookupAndOneTokenReplay();
     testPage31Page32Page33Backoff();
     testLazyJunctionMaterialization();
+    testShallowerStateReplacesARejectedTargetOnlyState();
     testByteLruAndPins();
     testSpeculativeReclaimKeepsTheResumePoint();
     testWarningReclaimKeepsResidentRunway();

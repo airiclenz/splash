@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <functional>
 #include <initializer_list>
 #include <iostream>
 #include <optional>
@@ -321,6 +322,60 @@ void testInvalidInputs() {
   require(threw, "unsorted cache-state boundaries were accepted");
 }
 
+bool rejects(const std::function<void()> &plan) {
+  try {
+    plan();
+  } catch (const std::invalid_argument &) {
+    return true;
+  }
+  return false;
+}
+
+// A target-only state plans exactly as a skipped draft restore of a full
+// state does, and only when its first boundary lies a whole window past it.
+void testTargetOnlyRestore() {
+  constexpr std::array<uint32_t, 2> boundaries{6144, 8160};
+  const auto skipped = planDraftContext(4096, 8192, 4096, boundaries);
+  const auto targetOnly =
+      planDraftContext(4096, 8192, 4096, boundaries, true);
+  require(targetOnly.targetOnlyRestore && !skipped.targetOnlyRestore &&
+              targetOnly.draftStateRestoreSkipped == 1 &&
+              skipped.draftStateRestoreSkipped == 1,
+          "target-only restore did not skip its draft restore");
+  require(targetOnly.captureSpans.size() == skipped.captureSpans.size() &&
+              targetOnly.boundaries.size() == skipped.boundaries.size() &&
+              targetOnly.draftContextRows() == skipped.draftContextRows() &&
+              targetOnly.draftStateResets == skipped.draftStateResets,
+          "target-only restore planned different draft work");
+  for (size_t index = 0; index < skipped.captureSpans.size(); ++index) {
+    const DraftCaptureSpan &expected = skipped.captureSpans[index];
+    const DraftCaptureSpan &actual = targetOnly.captureSpans[index];
+    require(actual.begin == expected.begin && actual.end == expected.end &&
+                actual.resetDraftState == expected.resetDraftState,
+            "target-only restore planned a different capture span");
+  }
+  for (size_t index = 0; index < skipped.boundaries.size(); ++index) {
+    const DraftBoundaryPlan &expected = skipped.boundaries[index];
+    const DraftBoundaryPlan &actual = targetOnly.boundaries[index];
+    require(actual.boundary == expected.boundary &&
+                actual.purpose == expected.purpose &&
+                actual.captureBegin == expected.captureBegin,
+            "target-only restore planned a different boundary");
+  }
+
+  constexpr std::array<uint32_t, 1> shortBoundary{6112};
+  require(rejects([&] {
+            (void)planDraftContext(4096, 8192, 4096, shortBoundary, true);
+          }),
+          "target-only restore accepted a short first window");
+  require(rejects([] { (void)planDraftContext(4096, 6000, 4096, {}, true); }),
+          "target-only restore accepted a short final window");
+  require(rejects([] {
+            (void)planDraftContext(0, 4096, std::nullopt, {}, true);
+          }),
+          "target-only restore accepted no restored boundary");
+}
+
 } // namespace
 
 int main() {
@@ -336,6 +391,7 @@ int main() {
     testSparseCheckpointWindowsAndShortResume();
     testCheckpointWindowsAcrossSmallDispatches();
     testCaptureContinuityClassification();
+    testTargetOnlyRestore();
     testInvalidInputs();
     std::cout << "draft context plan tests passed\n";
     return EXIT_SUCCESS;

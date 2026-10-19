@@ -109,6 +109,11 @@ public:
       std::span<const ImageSpan> images = {},
       const CacheProbe *probe = nullptr);
   void recordLookup(const CacheLookup &lookup);
+  // Returns the lookup with its state replaced by the deepest one strictly
+  // below the rejected state's block, pinned, or none; kvBoundary is kept.
+  // Assigning the result over the argument releases the rejected lease. The
+  // engine calls it, before restoreRequest, for a state it cannot use.
+  [[nodiscard]] CacheLookup shallowerState(const CacheLookup &lookup);
   void restoreRequest(uint64_t requestId, const CacheLookup &lookup);
 
   [[nodiscard]] TokenAdmission ensureTokens(uint64_t requestId,

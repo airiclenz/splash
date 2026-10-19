@@ -126,8 +126,13 @@ QwenCompositeState::QwenCompositeState(
     QwenCacheSlot slot, CompositeStateLayout layout, QwenLogicalLengths lengths)
     : pool_(std::move(pool)), reserves_(std::move(reserves)), origin_(origin),
       slot_(std::move(slot)), layout_(layout), lengths_(lengths) {
-  if (!pool_ || !reserves_ || !slot_.gdn || !slot_.draft) {
+  if (!pool_ || !reserves_ || !slot_.gdn) {
     throw std::invalid_argument("composite state buffers are empty");
+  }
+  // Only a target-only state, whose lane had no complete draft window, may
+  // come without a draft ring.
+  if (!slot_.draft && lengths_.hasCompleteDraftWindow(layout_.draft.tokens)) {
+    throw std::invalid_argument("composite state lost its draft ring");
   }
   if (origin_.slot >= reserves_->size() || !origin_.requestId)
     throw std::invalid_argument("composite state origin is not a live slot");
@@ -293,6 +298,24 @@ QwenStateStorage::snapshot(uint32_t index) {
       std::move(cacheSlot), layout_, source.metadata.lengths));
 }
 
+std::shared_ptr<const QwenCompositeState>
+QwenStateStorage::moveState(uint32_t index) {
+  Slot &source = slot(index);
+  requireAssigned(source);
+  const uint32_t active = source.metadata.activeParity;
+  const QwenLogicalLengths lengths = source.metadata.lengths;
+  QwenCacheSlot moved;
+  moved.gdn = std::move(source.gdn[active]);
+  source.buffers.gdn[active] = {};
+  if (lengths.hasCompleteDraftWindow(layout_.draft.tokens)) {
+    moved.draft = std::move(source.draft);
+    source.buffers.draft.clear();
+  }
+  return std::shared_ptr<const QwenCompositeState>(new QwenCompositeState(
+      pool_, reserves_, {index, source.metadata.requestId}, std::move(moved),
+      layout_, lengths));
+}
+
 std::shared_ptr<QwenGdnCell>
 QwenStateStorage::acquireCell(std::string_view label) {
   if (pool_->cells.empty())
@@ -320,10 +343,18 @@ void QwenStateStorage::restore(uint32_t index, const CompositeState &state,
   if (typed->layout_ != layout_) {
     throw std::invalid_argument("composite state layout does not match model");
   }
-  validateLengths(typed->lengths_, true);
+  const QwenLogicalLengths &stored = typed->lengths_;
+  if (typed->carriesDraft()) {
+    validateLengths(stored, true);
+  } else if (restoreDraftState) {
+    throw std::invalid_argument("target-only composite state has no draft");
+  } else if (!stored.targetTokens || stored.targetTokens % kv::kPageTokens) {
+    throw std::invalid_argument(
+        "target-only composite state requires page-aligned target tokens");
+  }
   Slot &destination = slot(index);
   requireAssigned(destination);
-  if (!typed->slot_.gdn || !typed->slot_.draft) {
+  if (!typed->slot_.gdn) {
     throw std::invalid_argument("incompatible Qwen composite state");
   }
 
@@ -342,7 +373,7 @@ void QwenStateStorage::restore(uint32_t index, const CompositeState &state,
     }
   }
   uint64_t requestId = destination.metadata.requestId;
-  QwenLogicalLengths lengths = typed->lengths_;
+  QwenLogicalLengths lengths = stored;
   if (!restoreDraftState) {
     lengths.draftBase = lengths.targetTokens;
     lengths.draftLength = 0;

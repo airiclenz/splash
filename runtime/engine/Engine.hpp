@@ -182,12 +182,22 @@ private:
                                                       const Request &right);
   [[nodiscard]] bool pendingSharedPrefill(const Request &request,
                                           uint32_t resumeBoundary) const;
+  [[nodiscard]] static uint32_t peerJunction(const Request &request,
+                                             uint64_t peerId,
+                                             const Request &peer,
+                                             uint32_t after);
+  [[nodiscard]] uint32_t firstPlannedBoundary(const Request &request,
+                                              uint32_t stateBoundary,
+                                              uint32_t junctionBoundary) const;
+  [[nodiscard]] bool restorable(const Request &request,
+                                const CacheLookup &lookup) const;
   [[nodiscard]] DraftContextPlan
   configureDraftStatePlan(Request &request, uint32_t stateBoundary,
-                          uint32_t junctionBoundary);
+                          uint32_t junctionBoundary, bool targetOnlyRestore);
   [[nodiscard]] bool addSharedPrefillBoundaries(Request &request, uint32_t after);
   [[nodiscard]] DraftContextPlan
-  pendingDraftStatePlan(const Request &request, uint32_t stateBoundary) const;
+  pendingDraftStatePlan(const Request &request, uint32_t stateBoundary,
+                        bool targetOnlyRestore = false) const;
   void armNextStateBoundary(Request &request);
   void discardPendingStateBoundaries(Request &request) noexcept;
   [[nodiscard]] bool retireCheckpoint(Request &request);

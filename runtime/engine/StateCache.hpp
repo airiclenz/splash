@@ -81,8 +81,9 @@ struct StateEviction final {
   uint64_t reclaimedBytes = 0;
 };
 
-// Attaches one immutable target-recurrent + draft-context state to a complete
-// target-KV block. The pair is restored atomically.
+// Attaches one immutable composite state to a complete target-KV block: the
+// target-recurrent state, plus the draft-context window unless the state is
+// target-only. The pair is restored atomically.
 class StateCache final {
 public:
   StateCache(KvCache &kv, CacheRecency &recency) : kv_(kv), recency_(recency) {}

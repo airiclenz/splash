@@ -66,6 +66,90 @@ void testLayoutFormulas() {
           "prefix byte formula is wrong");
 }
 
+// A lane without a complete draft window yields a target-only state: its
+// active GDN cell moves out uncopied and unadmitted, and restores into another
+// lane with that lane's draft window reset. Snapshots stay strict.
+void testTargetOnlyStates(metal::MetalBackend &backend,
+                          const metal::AllocationAdmission &admitState,
+                          bool &admitNewAllocations) {
+  using model::QwenLogicalLengths;
+  using model::QwenStateStorage;
+
+  QwenStateStorage storage(backend, admitState, kStateLayout);
+  require(storage.tryActivateSlot(0, 501) && storage.tryActivateSlot(1, 502) &&
+              storage.tryActivateSlot(2, 503),
+          "target-only fixture lanes were not activated");
+  const auto &source = storage.buffers(0);
+  const auto &destination = storage.buffers(1);
+  const QwenLogicalLengths partial{4'096, 2'048, 1'024, 1'024};
+  storage.updateLengths(0, partial);
+  storage.swapParity(0);
+  word(source.gdn[1].convolutionBase) = 0x61616161;
+  word(source.gdn[1].recurrentBase) = 0x62626262;
+  word(destination.draft[0].keys) = 0x63636363;
+  requireThrows<std::invalid_argument>(
+      [&] { static_cast<void>(storage.snapshot(0)); },
+      "snapshot accepted an incomplete draft window");
+
+  const uint64_t backendBefore = backend.memoryStats().allocatedBytes;
+  const uint64_t storageBefore = storage.actualAllocatedBytes();
+  const uint32_t idleBefore = storage.idleCells();
+  admitNewAllocations = false;
+  const auto targetOnly = storage.moveState(0);
+  admitNewAllocations = true;
+  require(targetOnly && !targetOnly->carriesDraft() &&
+              targetOnly->bytes() == kTargetState.cellBytes(),
+          "incomplete draft window did not yield a target-only state");
+  require(backend.memoryStats().allocatedBytes == backendBefore &&
+              storage.actualAllocatedBytes() == storageBefore &&
+              storage.idleCells() == idleBefore,
+          "moving a lane's state allocated or took a buffer");
+  require(source.gdn[1].stateBase.contents() == nullptr &&
+              source.gdn[0].stateBase.contents() != nullptr &&
+              source.draft.size() == kDraftState.layers,
+          "move did not take exactly the active GDN cell");
+
+  requireThrows<std::invalid_argument>(
+      [&] { storage.restore(1, *targetOnly, true); },
+      "target-only state restored a draft it does not carry");
+  storage.restore(1, *targetOnly, false);
+  require(word(destination.gdn[0].convolutionBase) == 0x61616161 &&
+              word(destination.gdn[0].recurrentBase) == 0x62626262 &&
+              word(destination.draft[0].keys) == 0x63636363,
+          "target-only restore did not deliver only the moved GDN state");
+  require(storage.metadata(1).lengths ==
+              QwenLogicalLengths{4'096, 4'096, 0, 0},
+          "target-only restore kept draft metadata it does not carry");
+  storage.releaseSlot(0, 501);
+
+  for (const QwenLogicalLengths lengths :
+       {QwenLogicalLengths{100, 0, 50, 50}, QwenLogicalLengths{0, 0, 0, 1}}) {
+    storage.updateLengths(2, lengths);
+    const auto unaligned = storage.moveState(2);
+    require(!unaligned->carriesDraft(), "short lane state carried draft");
+    requireThrows<std::invalid_argument>(
+        [&] { storage.restore(1, *unaligned, false); },
+        "target-only restore accepted zero or unaligned target tokens");
+    storage.releaseSlot(2, 503);
+    require(static_cast<bool>(storage.tryActivateSlot(2, 503)),
+            "lane did not reactivate after a moved state");
+  }
+
+  // A complete window moves the ring too and restores as a full state.
+  require(static_cast<bool>(storage.tryActivateSlot(0, 504)),
+          "lane did not reactivate after a moved state");
+  const QwenLogicalLengths complete{2'048, 0, 2'048, 0};
+  storage.updateLengths(0, complete);
+  const auto full = storage.moveState(0);
+  require(full->carriesDraft() && full->bytes() == kStateLayout.cachedBytes() &&
+              source.draft.empty(),
+          "complete draft window did not move its ring");
+  storage.restore(1, *full, true);
+  require(storage.metadata(1).lengths == complete,
+          "moved full state did not restore its draft window");
+  storage.releaseSlot(0, 504);
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -434,6 +518,7 @@ void run(const std::string &metallib) {
     require(storage.actualAllocatedBytes() == 0,
             "reclaimed state cells remain accounted");
   }
+  testTargetOnlyStates(backend, admitState, admitNewAllocations);
   require(backend.memoryStats().allocatedBytes == beforeStorage,
           "destroyed state slots remained in actual allocation count");
 

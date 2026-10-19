@@ -1952,6 +1952,10 @@ void Runtime::setDraftContextPlan(uint64_t requestId, DraftContextPlan plan) {
                    : std::nullopt)) {
     throw std::invalid_argument("draft context plan restore boundary is stale");
   }
+  // A target-only plan rebuilds the draft window it would otherwise continue.
+  if (plan.targetOnlyRestore && entry.draftContextValid) {
+    throw std::invalid_argument("target-only draft plan follows a draft restore");
+  }
   entry.draftContextPlan = std::move(plan);
 }
 

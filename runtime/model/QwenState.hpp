@@ -121,9 +121,11 @@ struct QwenStateOrigin final {
 
 // An immutable composite snapshot owns a private copy of the state that
 // cannot be recovered from sealed Q8 pages. No mutating buffers are exposed
-// after construction. When it is dropped, each non-null buffer returns to its
-// origin: the producing slot's reserve when the state was retired while that
-// slot is still live and its reserve is short, otherwise the shared pool.
+// after construction. A target-only state, moved out of a lane whose draft
+// window was incomplete, holds a GDN cell and no draft ring. When it is
+// dropped, each non-null buffer returns to its origin: the producing slot's
+// reserve when the state was retired while that slot is still live and its
+// reserve is short, otherwise the shared pool.
 class QwenCompositeState final : public CompositeState {
 public:
   ~QwenCompositeState() override;
@@ -131,7 +133,10 @@ public:
   QwenCompositeState &operator=(const QwenCompositeState &) = delete;
 
   [[nodiscard]] uint64_t bytes() const noexcept override {
-    return layout_.cachedBytes();
+    return slot_.draft ? layout_.cachedBytes() : layout_.target.cellBytes();
+  }
+  [[nodiscard]] bool carriesDraft() const noexcept override {
+    return slot_.draft != nullptr;
   }
   void markRetired() const noexcept override { retired_ = true; }
 
@@ -193,6 +198,17 @@ public:
   // for retry.
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
   snapshot(uint32_t slot);
+  // Moves the lane's active-parity GDN cell, and its draft ring only when
+  // the draft window is complete, into a composite state: no copy, no
+  // allocation admission. Without the ring the state is target-only. The
+  // lane is left without the moved buffers, so its only valid next call is
+  // releaseSlot; the state's lengths are checked when it is restored.
+  [[nodiscard]] std::shared_ptr<const QwenCompositeState>
+  moveState(uint32_t slot);
+  // Copies a state into the lane's active parity. A state carrying draft
+  // needs equal page-aligned lengths; a target-only state needs nonzero
+  // page-aligned target tokens and restoreDraftState false. Violations throw
+  // std::invalid_argument.
   void restore(uint32_t slot, const CompositeState &state,
                bool restoreDraftState);
 
