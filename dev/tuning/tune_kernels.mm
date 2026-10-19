@@ -390,6 +390,7 @@ int main(int argc, char **argv) {
           backend, device.recommendedMaxWorkingSetBytes - margin,
           engine::EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes));
       const MeasurementStop underPressure = [&] {
+        governor.observe();
         const auto state = governor.snapshot();
         return state.pressure != engine::MemoryPressure::Normal || !state.growthAllowed ||
                NSProcessInfo.processInfo.thermalState >= NSProcessInfoThermalStateSerious;

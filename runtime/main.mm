@@ -371,6 +371,9 @@ int runNative(const NativeArguments &arguments) {
                            std::chrono::steady_clock::now().time_since_epoch())
                            .count();
     static_cast<void>(resources.backend().refreshMemoryStats());
+    // The 500 ms pressure tick is what advances the host latch; status
+    // polls and the engine's growth check only read the stored sample.
+    governor.observe();
     const auto memory = governor.snapshot();
     const engine::ResourceWaitSnapshot wait =
         published->nativeLoop().resourceWaitSnapshot();

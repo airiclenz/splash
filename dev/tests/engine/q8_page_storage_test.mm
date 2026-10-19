@@ -167,18 +167,22 @@ void run(const std::string &metallib) {
     require(bounded.snapshot().pressure == MemoryPressure::Warning,
             "reaching the host reserve was treated as critical");
     fakeHostAvailable = hostReserve / 2;
+    bounded.observe();
     require(bounded.snapshot().pressure == MemoryPressure::Warning &&
                 !bounded.tryReserve(1).has_value(),
             "low availability escalated to destructive system pressure");
     fakeHostAvailable = hostReserve + giB / 2;
+    bounded.observe();
     require(bounded.snapshot().pressure == MemoryPressure::Warning &&
                 !bounded.snapshot().growthAllowed &&
                 !bounded.tryReserve(1).has_value(),
             "low host headroom did not request proactive cache reclaim");
     fakeHostAvailable = hostReserve + 3 * giB / 2;
+    bounded.observe();
     require(bounded.snapshot().pressure == MemoryPressure::Warning,
             "warning pressure recovered without crossing the hysteresis");
     fakeHostAvailable = hostReserve + 3 * giB;
+    bounded.observe();
     require(bounded.snapshot().pressure == MemoryPressure::Normal &&
                 bounded.snapshot().growthAllowed,
             "host recovery did not reopen physical admission");
@@ -205,6 +209,7 @@ void run(const std::string &metallib) {
             "missing telemetry hid critical system pressure");
     bounded.setPressure(MemoryPressure::Normal);
     fakeHostAvailable = hostReserve + 3 * giB;
+    bounded.observe();
     require(bounded.snapshot().hostHeadroomBytes == 3 * giB,
             "host memory headroom accounting is wrong");
 
@@ -214,6 +219,7 @@ void run(const std::string &metallib) {
         .inactive = 24 * giB, .fileBacked = giB / 2};
     fakeHostAvailable = estimateHostAvailableMemory(
         pressurePages, 1, hostReserve + 24 * giB);
+    bounded.observe();
     MemoryPressurePolicy hostPolicy;
     auto hostDirective = hostPolicy.update(bounded.snapshot(), 0.0, false);
     require(!bounded.tryReserve(1).has_value() &&
@@ -225,6 +231,7 @@ void run(const std::string &metallib) {
     pressurePages.fileBacked = 3 * giB;
     fakeHostAvailable = estimateHostAvailableMemory(
         pressurePages, 1, hostReserve + 24 * giB);
+    bounded.observe();
     require(bounded.snapshot().growthAllowed &&
                 bounded.tryReserve(1).has_value() &&
                 !hostPolicy.update(bounded.snapshot(), 1000.0, false).reclaimEmptyKvExtents,

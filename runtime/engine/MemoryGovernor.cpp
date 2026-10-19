@@ -119,19 +119,16 @@ void MemoryGovernor::Reservation::release() noexcept {
   bytes_ = 0;
 }
 
-MemoryGovernor::MemoryGovernor(metal::MetalBackend &backend,
-                               uint64_t limitBytes,
-                               uint64_t hostReserveBytes)
-    : MemoryGovernor(backend, limitBytes, hostReserveBytes,
-                     queryHostAvailableMemory) {}
-
 MemoryGovernor::MemoryGovernor(
-    metal::MetalBackend &backend, uint64_t limitBytes,
+    MetalMemoryStatsProvider metalMemoryStats, uint64_t limitBytes,
     uint64_t hostReserveBytes,
     HostAvailableMemoryProvider hostAvailableMemory)
-    : backend_(backend), limitBytes_(limitBytes),
+    : metalMemoryStats_(std::move(metalMemoryStats)), limitBytes_(limitBytes),
       hostReserveBytes_(hostReserveBytes),
       hostAvailableMemory_(std::move(hostAvailableMemory)) {
+  if (!metalMemoryStats_) {
+    throw std::invalid_argument("Metal memory-stats provider must be present");
+  }
   if (!limitBytes_) {
     throw std::invalid_argument("memory governor limit must be positive");
   }
@@ -153,13 +150,14 @@ MemoryGovernor::MemoryGovernor(
         "host available memory does not satisfy the system reserve",
         metal::AllocationFailure::HostPressure);
   }
+  // Without a stored sample, a snapshot() before the first observe() would
+  // report host growth paused.
+  static_cast<void>(updateEffectivePressure(hostAvailable, reservedBytes_));
 }
 
 uint64_t
 MemoryGovernor::observedResidentBytes(bool refreshDevice) const noexcept {
-  metal::MetalMemoryStats memory = refreshDevice
-      ? backend_.refreshMemoryStats()
-      : backend_.memoryStats();
+  metal::MetalMemoryStats memory = metalMemoryStats_(refreshDevice);
   uint64_t accounted = memory.allocatedBytes;
   if (memory.sparseResidentBytes <=
       std::numeric_limits<uint64_t>::max() - accounted) {
@@ -246,6 +244,12 @@ void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
   systemPressure_ = pressure;
 }
 
+void MemoryGovernor::observe() noexcept {
+  std::lock_guard lock(mutex_);
+  static_cast<void>(
+      updateEffectivePressure(sampleHostAvailable(), reservedBytes_));
+}
+
 MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   std::lock_guard lock(mutex_);
   uint64_t observed = observedResidentBytes();
@@ -255,11 +259,10 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   } else {
     used = std::numeric_limits<uint64_t>::max();
   }
-  std::optional<uint64_t> hostAvailable = sampleHostAvailable();
-  uint64_t hostHeadroom = hostHeadroomBytes(hostAvailable, reservedBytes_);
-  MemoryPressure effectivePressure = updateEffectivePressure(
-      hostAvailable, reservedBytes_);
-  bool hostGrowthAllowed = effectivePressure != MemoryPressure::Critical &&
+  uint64_t hostHeadroom =
+      hostHeadroomBytes(sampledHostAvailable_, reservedBytes_);
+  MemoryPressure pressure = effectivePressure();
+  bool hostGrowthAllowed = pressure != MemoryPressure::Critical &&
       !hostConstrained_ && hostHeadroom >= kHostWarningMarginBytes;
   bool growthAllowed = hostGrowthAllowed && used < limitBytes_;
   return {
@@ -267,10 +270,10 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
       observed,
       reservedBytes_,
       used < limitBytes_ ? limitBytes_ - used : 0,
-      effectivePressure,
+      pressure,
       deniedReservations_,
-      hostAvailable.has_value(),
-      hostAvailable.value_or(0),
+      sampledHostAvailable_.has_value(),
+      sampledHostAvailable_.value_or(0),
       hostReserveBytes_,
       hostHeadroom,
       systemPressure_,
@@ -281,7 +284,8 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
 
 MemoryPressure MemoryGovernor::updateEffectivePressure(
     const std::optional<uint64_t> &hostAvailable,
-    uint64_t reservedBytes) const noexcept {
+    uint64_t reservedBytes) noexcept {
+  sampledHostAvailable_ = hostAvailable;
   uint64_t hostHeadroom = hostHeadroomBytes(hostAvailable, reservedBytes);
 
   // Availability controls growth and paced reclaim. Only the system's
@@ -289,13 +293,15 @@ MemoryPressure MemoryGovernor::updateEffectivePressure(
   hostConstrained_ = !hostAvailable ||
       hostHeadroom < kHostWarningMarginBytes ||
       (hostConstrained_ && hostHeadroom < kHostRecoveryMarginBytes);
-  MemoryPressure next = MemoryPressure::Normal;
-  if (systemPressure_ == MemoryPressure::Critical) {
-    next = MemoryPressure::Critical;
-  } else if (hostConstrained_ || systemPressure_ == MemoryPressure::Warning) {
-    next = MemoryPressure::Warning;
-  }
-  return next;
+  return effectivePressure();
+}
+
+MemoryPressure MemoryGovernor::effectivePressure() const noexcept {
+  if (systemPressure_ == MemoryPressure::Critical)
+    return MemoryPressure::Critical;
+  if (hostConstrained_ || systemPressure_ == MemoryPressure::Warning)
+    return MemoryPressure::Warning;
+  return MemoryPressure::Normal;
 }
 
 void MemoryGovernor::release(uint64_t bytes) noexcept {

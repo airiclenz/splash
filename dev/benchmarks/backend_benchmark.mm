@@ -897,8 +897,11 @@ int main(int argc, char **argv) {
     engine::EngineConfig engineConfig;
     engineConfig.maxContext = resources->memoryPlan().maximumContextTokens();
     engineConfig.vocabularySize = capabilities.vocabularySize;
+    // No pressure tick runs here, so each check samples the host itself.
     engineConfig.growthPaused = [resources] {
-      return !resources->memoryGovernor().snapshot().hostGrowthAllowed;
+      engine::MemoryGovernor &governor = resources->memoryGovernor();
+      governor.observe();
+      return !governor.snapshot().hostGrowthAllowed;
     };
     engine::Engine engine(engineConfig, resources->cache(),
                                   *executor, events);

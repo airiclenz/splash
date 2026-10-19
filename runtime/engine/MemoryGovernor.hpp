@@ -6,6 +6,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <utility>
 
 namespace splash::engine {
 
@@ -103,6 +104,10 @@ class MemoryGovernor final {
 public:
   using HostAvailableMemoryProvider =
       std::function<std::optional<uint64_t>()>;
+  // Reads the Metal footprint: the backend's refreshed device sample when
+  // its argument is true, its cached accounting otherwise. Must not throw.
+  using MetalMemoryStatsProvider =
+      std::function<metal::MetalMemoryStats(bool refreshDevice)>;
 
   class Reservation final {
   public:
@@ -127,9 +132,24 @@ public:
   };
 
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
-                 uint64_t hostReserveBytes);
+                 uint64_t hostReserveBytes)
+      : MemoryGovernor(backend, limitBytes, hostReserveBytes,
+                       queryHostAvailableMemory) {}
+  // The backend adapters live here so MemoryGovernor.cpp never calls into
+  // MetalBackend and links without it.
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                  uint64_t hostReserveBytes,
+                 HostAvailableMemoryProvider hostAvailableMemory)
+      : MemoryGovernor(
+            [metalBackend = &backend](bool refreshDevice) {
+              return refreshDevice ? metalBackend->refreshMemoryStats()
+                                   : metalBackend->memoryStats();
+            },
+            limitBytes, hostReserveBytes, std::move(hostAvailableMemory)) {}
+  // Samples the host once and stores that sample, and the latch it sets, as
+  // the first state snapshot() reports.
+  MemoryGovernor(MetalMemoryStatsProvider metalMemoryStats,
+                 uint64_t limitBytes, uint64_t hostReserveBytes,
                  HostAvailableMemoryProvider hostAvailableMemory);
 
   [[nodiscard]] std::optional<Reservation> tryReserve(
@@ -139,6 +159,12 @@ public:
   // reverse dependency on engine policy.
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
   void setPressure(MemoryPressure pressure) noexcept;
+  // Samples host memory, stores the sample and advances the Warning latch.
+  // Only this and tryReserve() move the latch, so admission never depends on
+  // how often anyone reads snapshot().
+  void observe() noexcept;
+  // Reads the stored host sample and latch, plus the backend's cached
+  // accounting: no host sample, no latch write.
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
 
 private:
@@ -148,12 +174,15 @@ private:
   [[nodiscard]] uint64_t
   hostHeadroomBytes(const std::optional<uint64_t> &hostAvailable,
                     uint64_t reservedBytes) const noexcept;
+  // Stores hostAvailable as the current sample and advances the latch from
+  // it. Callers hold mutex_ (or own the governor exclusively).
   [[nodiscard]] MemoryPressure updateEffectivePressure(
       const std::optional<uint64_t> &hostAvailable,
-      uint64_t reservedBytes) const noexcept;
+      uint64_t reservedBytes) noexcept;
+  [[nodiscard]] MemoryPressure effectivePressure() const noexcept;
   void release(uint64_t bytes) noexcept;
 
-  metal::MetalBackend &backend_;
+  MetalMemoryStatsProvider metalMemoryStats_;
   uint64_t limitBytes_ = 0;
   uint64_t hostReserveBytes_ = 0;
   HostAvailableMemoryProvider hostAvailableMemory_;
@@ -161,7 +190,8 @@ private:
   uint64_t reservedBytes_ = 0;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
-  mutable bool hostConstrained_ = false;
+  std::optional<uint64_t> sampledHostAvailable_;
+  bool hostConstrained_ = false;
 };
 
 } // namespace splash::engine
