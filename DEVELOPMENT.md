@@ -437,6 +437,23 @@ native wall time did not move prints as `unavailable`. Requests ask for
 `reasoning_effort: none`; a chat template that cannot turn thinking off is
 probed with its default effort instead, with a note on stderr.
 
+To see what a long cold prefill costs a request that is already decoding, run
+the two-lane contended probe against the same idle server, once per
+`--contended-prefill-rows` floor you compare:
+
+```sh
+.venv/bin/python -m dev.benchmarks.contended_probe --base-url http://127.0.0.1:8000 \
+  --prompt-tokens 16384 --decode-tokens 4096
+```
+
+It streams one long decode and, once its first token arrives, a cold prompt
+beside it. Over the cold request's prefill (from sending it to its first token)
+it prints the decode's client-side inter-chunk gap p50/p95/max, the cold TTFT,
+and the native prefill tok/s and average prefill chunk rows diffed from
+`/status`. A decode that ends before the cold prefill does is flagged on stderr;
+raise `--decode-tokens` then. `--api-key`, `--model` and `--json` work as for
+`live_probe`.
+
 For slow tool-bearing requests, the `latency` section of `/status` separates
 preparation, tokenization, grammar preparation, native queueing and TTFT. Grammar preparation
 includes construction, compilation/cache lookup and per-request cloning;
