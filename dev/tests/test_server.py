@@ -3470,6 +3470,32 @@ class ServerTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     api.parse_args([*required, option, value])
 
+    def test_native_command_forwards_no_speculation_only_when_given(self):
+        required = [
+            "target",
+            "draft",
+            "--tokenizer",
+            "tokenizer",
+            "--model",
+            "community/custom-splash",
+            "--binary",
+            "splash",
+        ]
+        native = ["splash", "serve-native", "target", "draft", "auto", "auto"]
+
+        for options, expected in (
+            ([], native),
+            (["--no-speculation"], [*native, "--no-speculation"]),
+            (
+                ["--no-speculation", "--kv-format", "bf16"],
+                [*native, "--kv-format", "bf16", "--no-speculation"],
+            ),
+        ):
+            with self.subTest(options=options):
+                args = api.parse_args([*required, *options])
+
+                self.assertEqual(api._native_command(args), expected)
+
     def test_public_ids_are_stable_and_unique_across_app_instances(self):
         tokenizer = FakeTokenizer()
         first_backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
@@ -3538,6 +3564,7 @@ class ServerTest(unittest.TestCase):
             port=0,
             binary="splash",
             kv_format="int8",
+            no_speculation=False,
             reasoning_loop_limit=7,
         )
         runtime = mock.Mock()
@@ -3646,6 +3673,7 @@ class ServerTest(unittest.TestCase):
             port=0,
             binary="splash",
             kv_format="int8",
+            no_speculation=False,
             reasoning_loop_limit=7,
         )
         runtime = mock.Mock()
@@ -3698,6 +3726,7 @@ class ServerTest(unittest.TestCase):
             port=8000,
             binary="splash",
             kv_format="int8",
+            no_speculation=False,
             reasoning_loop_limit=7,
         )
         server = mock.Mock()

@@ -227,6 +227,37 @@ class CheckpointFailureCauseMetricsTests(unittest.TestCase):
                 )
 
 
+ACCEPTANCE_RATIO_METRIC = "splash_draft_acceptance_ratio"
+
+
+def speculation_status(is_speculative):
+    return {
+        "metrics": {
+            "speculative_decoding": is_speculative,
+            "draft_acceptance_rate": 0.75,
+        }
+    }
+
+
+class SpeculationMetricsTests(unittest.TestCase):
+    def test_acceptance_ratio_is_omitted_when_speculation_is_off(self):
+        text = prometheus_metrics(speculation_status(False))
+
+        self.assertNotIn(ACCEPTANCE_RATIO_METRIC, text)
+
+    def test_acceptance_ratio_renders_when_speculation_is_on(self):
+        lines = prometheus_metrics(speculation_status(True)).splitlines()
+
+        self.assertIn(f"{ACCEPTANCE_RATIO_METRIC} 0.75", lines)
+
+    def test_acceptance_ratio_renders_when_status_predates_the_field(self):
+        lines = prometheus_metrics(
+            {"metrics": {"draft_acceptance_rate": 0.75}}
+        ).splitlines()
+
+        self.assertIn(f"{ACCEPTANCE_RATIO_METRIC} 0.75", lines)
+
+
 class StatusMetricsRenderingTests(unittest.TestCase):
     def test_fixture_renders_exactly_as_before(self):
         self.assertEqual(prometheus_metrics(FIXTURE_STATUS), FIXTURE_RENDERING)

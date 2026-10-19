@@ -143,6 +143,22 @@ class LauncherTests(unittest.TestCase):
                 flag = argv.index("--reasoning-loop-limit")
                 self.assertEqual(argv[flag + 1], str(expected))
 
+    def test_no_speculation_is_forwarded_to_the_server_only_when_given(self):
+        for options, is_forwarded in (([], False), (["--no-speculation"], True)):
+            with (
+                self.subTest(options=options),
+                tempfile.TemporaryDirectory() as tmp,
+                mock.patch.object(launcher, "RUNTIME_DIR", Path(tmp)),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher, "_ensure_installed"),
+                mock.patch.object(launcher.catalog, "spawn_refresh"),
+                mock.patch.object(launcher.os, "execve") as execute,
+            ):
+                launcher.main(["serve", "--model", MODEL_ID, *options])
+
+                argv = execute.call_args.args[1]
+                self.assertEqual("--no-speculation" in argv, is_forwarded)
+
     def test_size_validation(self):
         for value in ("1G", "1GB", "1GiB", "1073741824"):
             self.assertEqual(launcher._parse_max_memory(value), 1024**3)

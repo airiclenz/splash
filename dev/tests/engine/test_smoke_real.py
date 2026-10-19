@@ -51,6 +51,7 @@ class SmokeRealTests(unittest.TestCase):
                         max_context=None,
                         max_memory=None,
                         kv_format="bf16" if absolute else "int8",
+                        no_speculation=False,
                     )
                     with (
                         mock.patch.object(

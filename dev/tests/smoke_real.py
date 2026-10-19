@@ -98,6 +98,8 @@ class RealServer:
         if arguments.max_memory is not None:
             command.extend(("--max-memory", arguments.max_memory))
         command.extend(("--kv-format", arguments.kv_format))
+        if arguments.no_speculation:
+            command.append("--no-speculation")
         self.process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -1045,6 +1047,7 @@ def add_server_arguments(parser):
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
+    parser.add_argument("--no-speculation", action="store_true")
     parser.add_argument("--startup-timeout", type=float, default=1800)
 
 

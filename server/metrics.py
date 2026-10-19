@@ -234,6 +234,16 @@ _STATUS_METRICS = {
 }
 
 
+# Metrics that only mean something while the runtime proposes draft tokens.
+_SPECULATION_METRICS = frozenset(("splash_draft_acceptance_ratio",))
+
+
+def _is_speculation_disabled(status):
+    """True only when the status explicitly reports speculative decoding off."""
+    metrics = status.get("metrics")
+    return isinstance(metrics, dict) and metrics.get("speculative_decoding") is False
+
+
 def _status_value(status, path):
     current = status
     for key in path:
@@ -281,7 +291,10 @@ def prometheus_metrics(status):
             lines.append(
                 f'splash_system_memory_pressure{{state="{state}"}} {gauge_value}'
             )
+    is_speculation_disabled = _is_speculation_disabled(status)
     for name, path in _STATUS_METRICS.items():
+        if is_speculation_disabled and name in _SPECULATION_METRICS:
+            continue
         if isinstance(path, LabelledCounter):
             lines.extend(_labelled_counter_lines(name, path, status))
             continue

@@ -1926,6 +1926,12 @@ def parse_args(argv=None):
         help="target KV cache storage (default: int8); bf16 uses more memory",
     )
     parser.add_argument(
+        "--no-speculation",
+        action="store_true",
+        help="decode one token per step without draft proposals; the draft "
+        "stays loaded (default: speculative decoding on)",
+    )
+    parser.add_argument(
         "--max-request-size",
         type=_parse_request_size,
         default=DEFAULT_MAX_REQUEST_BYTES,
@@ -2001,6 +2007,8 @@ def _native_command(args):
     ]
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
+    if args.no_speculation:
+        command.append("--no-speculation")
     return command
 
 
