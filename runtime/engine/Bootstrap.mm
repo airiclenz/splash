@@ -3,6 +3,7 @@
 #include "model/Model.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <limits>
 #include <sstream>
@@ -13,6 +14,8 @@ namespace {
 
 constexpr std::string_view kKvFormatOption = "--kv-format";
 constexpr std::string_view kNoSpeculationOption = "--no-speculation";
+constexpr std::string_view kContendedPrefillRowsOption =
+    "--contended-prefill-rows";
 // One image may cover at most this many 16x16 patches (4,194,304 pixels).
 // The wire limit, the engine's request validation, and the model's vision
 // scratch are all sized from this one value.
@@ -24,6 +27,20 @@ kv::Format parseKvFormat(std::string_view value) {
   if (value == "bf16")
     return kv::Format::BFloat16;
   throw NativeUsageError("--kv-format requires int8 or bf16");
+}
+
+uint32_t parseContendedPrefillRows(std::string_view value) {
+  uint32_t rows = 0;
+  const char *end = value.data() + value.size();
+  const auto parsed = std::from_chars(value.data(), end, rows);
+  if (parsed.ec != std::errc{} || parsed.ptr != end ||
+      !Scheduler::isValidContendedPrefillRows(rows)) {
+    throw NativeUsageError(
+        "--contended-prefill-rows requires a power of two in [" +
+        std::to_string(Scheduler::kDefaultContendedPrefillRows) + ", " +
+        std::to_string(model::ExecutionLimits::prefillTokenBudget) + "]");
+  }
+  return rows;
 }
 
 RuntimeBootstrapReport reportForPlan(const EngineMemoryPlan &plan) {
@@ -355,6 +372,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
 NativeOptions parseNativeOptions(std::span<const std::string_view> arguments) {
   NativeOptions options;
   bool hasKvFormat = false;
+  bool hasContendedPrefillRows = false;
   for (size_t index = 0; index < arguments.size(); ++index) {
     const std::string_view argument = arguments[index];
     if (argument == kKvFormatOption) {
@@ -368,6 +386,14 @@ NativeOptions parseNativeOptions(std::span<const std::string_view> arguments) {
       if (!options.isSpeculationEnabled)
         throw NativeUsageError("--no-speculation given more than once");
       options.isSpeculationEnabled = false;
+    } else if (argument == kContendedPrefillRowsOption) {
+      if (hasContendedPrefillRows)
+        throw NativeUsageError("--contended-prefill-rows given more than once");
+      if (index + 1 == arguments.size())
+        throw NativeUsageError("--contended-prefill-rows requires a value");
+      options.contendedPrefillRows =
+          parseContendedPrefillRows(arguments[++index]);
+      hasContendedPrefillRows = true;
     } else {
       throw NativeUsageError("unknown option " + std::string(argument));
     }
@@ -391,6 +417,8 @@ RuntimeBootstrapConfig nativeBootstrapConfig(
   config.resources.maximumImagePatches = kMaximumImagePatches;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.maxImagePatches = kMaximumImagePatches;
+  config.nativeLoop.engine.contendedPrefillRows =
+      arguments.options.contendedPrefillRows;
   config.protocolLimits.maxImagePatches = kMaximumImagePatches;
   config.nativeLoop.engineInstanceId = process.engineInstanceId;
   config.nativeLoop.maskWordsPerToken = maskWordsPerToken;

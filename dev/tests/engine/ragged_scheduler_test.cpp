@@ -542,6 +542,61 @@ void testMeasuredBudgetUsesActualRowsAndRecovers() {
           "prefill budget did not adapt when measured execution became faster");
 }
 
+// One 128-row sample at the given wall time, then a contended prefill.
+uint32_t contendedRowsAfterShortSample(Scheduler &scheduler,
+                                       double wallMilliseconds) {
+  scheduler.submit(request(1, 128));
+  scheduler.resourcesReady(1, 0);
+  completePrefill(scheduler, *scheduler.next(), wallMilliseconds);
+  scheduler.submit(request(2, 20'000));
+  scheduler.resourcesReady(2, 0);
+  completeDecode(scheduler);
+  const BatchPlan plan = *scheduler.next();
+  require(plan.kind == WorkKind::Prefill,
+          "expected a contended prefill command");
+  return plan.items[0].tokenCount;
+}
+
+void testContendedFloorStopsHalving() {
+  require(Scheduler::kDefaultContendedPrefillRows == 64,
+          "the default contended floor changed");
+  Scheduler defaults;
+  Scheduler explicitDefault(Scheduler::kDefaultContendedPrefillRows);
+  Scheduler raised(256);
+  require(contendedRowsAfterShortSample(defaults, 512.0) == 64 &&
+              contendedRowsAfterShortSample(explicitDefault, 512.0) == 64,
+          "the default floor no longer stops halving at 64 rows");
+  require(contendedRowsAfterShortSample(raised, 512.0) == 256,
+          "a 256-row floor did not stop halving at 256 rows");
+}
+
+void testShortSampleUpdatesBudgetAboveFloor() {
+  // 128 rows in 32 ms: 0.25 ms/token gives 1024 contended rows. Unmeasured
+  // work would keep the full budget instead.
+  Scheduler raised(256);
+  require(contendedRowsAfterShortSample(raised, 32.0) == 1024,
+          "a sample below the 256-row floor did not update the budget");
+}
+
+void testInvalidContendedFloorsRejected() {
+  for (uint32_t rows : {0u, 1u, 32u, 63u, 96u, 100u, 192u, 4096u,
+                        std::numeric_limits<uint32_t>::max()}) {
+    require(!Scheduler::isValidContendedPrefillRows(rows),
+            "an invalid contended floor was reported valid");
+    try {
+      Scheduler scheduler(rows);
+    } catch (const std::invalid_argument &) {
+      continue;
+    }
+    throw std::runtime_error("an invalid contended floor was accepted");
+  }
+  for (uint32_t rows = 64; rows <= 2048; rows *= 2) {
+    require(Scheduler::isValidContendedPrefillRows(rows),
+            "a power-of-two floor in range was rejected");
+    Scheduler scheduler(rows);
+  }
+}
+
 void testMeasuredBudgetPreservesPriorityAndStateBoundaries() {
   engine::Scheduler scheduler;
   scheduler.submit(request(1, 20'000, BatchCohort::Greedy,
@@ -948,6 +1003,9 @@ int main() {
     testMeasuredBudgetOnlyLimitsContendedWork();
     testAuxiliaryWorkDoesNotTrainTextPrefillTiming();
     testMeasuredBudgetUsesActualRowsAndRecovers();
+    testContendedFloorStopsHalving();
+    testShortSampleUpdatesBudgetAboveFloor();
+    testInvalidContendedFloorsRejected();
     testMeasuredBudgetPreservesPriorityAndStateBoundaries();
     testUnavailableTimingAndMinimumBudget();
     testMeasuredBudgetDoesNotCountBlockedPeers();

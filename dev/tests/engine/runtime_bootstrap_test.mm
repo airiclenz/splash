@@ -835,6 +835,53 @@ void testNativeConfigCarriesSpeculationToResources() {
           "the process identity did not reach the bootstrap configuration");
 }
 
+void testContendedPrefillRowsReachConfigInAnyOrder() {
+  const std::vector<std::vector<std::string_view>> orders = {
+      {"--contended-prefill-rows", "256", "--kv-format", "bf16",
+       "--no-speculation"},
+      {"--kv-format", "bf16", "--contended-prefill-rows", "256",
+       "--no-speculation"},
+      {"--no-speculation", "--kv-format", "bf16", "--contended-prefill-rows",
+       "256"},
+  };
+  const NativeProcessIdentity process{
+      .metallibPath = "/bin/splash.metallib", .buildId = "build",
+      .engineInstanceId = 7};
+  NativeArguments arguments;
+  arguments.modelRoot = "/models/qwen";
+  for (const auto &order : orders) {
+    arguments.options = parseNativeOptions(order);
+    const RuntimeBootstrapConfig config =
+        nativeBootstrapConfig(arguments, process);
+    require(config.nativeLoop.engine.contendedPrefillRows == 256 &&
+                arguments.options.kvFormat == kv::Format::BFloat16 &&
+                !arguments.options.isSpeculationEnabled,
+            "--contended-prefill-rows did not reach the engine config");
+  }
+  arguments.options = options({});
+  require(nativeBootstrapConfig(arguments, process)
+                  .nativeLoop.engine.contendedPrefillRows ==
+              Scheduler::kDefaultContendedPrefillRows,
+          "the engine config lost the default contended floor");
+}
+
+void testContendedPrefillRowsRejectInvalidValues() {
+  requireUsageError({"--contended-prefill-rows"},
+                    "--contended-prefill-rows without a value was accepted");
+  for (std::string_view value :
+       {"0", "32", "96", "4096", "-64", "256x", " 256", "abc", "",
+        "--no-speculation", "99999999999"}) {
+    requireUsageError({"--contended-prefill-rows", value},
+                      "an invalid --contended-prefill-rows was accepted");
+  }
+  requireUsageError({"--contended-prefill-rows", "128",
+                     "--contended-prefill-rows", "256"},
+                    "a repeated --contended-prefill-rows was accepted");
+  require(options({"--contended-prefill-rows", "2048"}).contendedPrefillRows ==
+              2048,
+          "the full prefill budget was rejected as a floor");
+}
+
 } // namespace
 
 int main() {
@@ -855,6 +902,8 @@ int main() {
     testNativeOptionsAcceptEitherOrder();
     testNativeOptionsRejectMalformedTails();
     testNativeConfigCarriesSpeculationToResources();
+    testContendedPrefillRowsReachConfigInAnyOrder();
+    testContendedPrefillRowsRejectInvalidValues();
     std::cout << "native bootstrap tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

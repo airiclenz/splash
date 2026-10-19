@@ -30,6 +30,9 @@ struct EngineConfig final {
       2 * model::ExecutionLimits::draftContextTokens;
   // Patches per image the model's vision scratch covers.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
+  // Rows below which a contended prefill command never shrinks; a power of
+  // two in [64, model::ExecutionLimits::prefillTokenBudget].
+  uint32_t contendedPrefillRows = Scheduler::kDefaultContendedPrefillRows;
   double resourceWaitTimeoutMilliseconds = 30000.0;
   // Host growth admission, supplied by the runtime governor. Queried only on
   // failed allocation, never on the successful decode path.

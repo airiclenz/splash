@@ -112,7 +112,7 @@ void printUsage(std::string_view executable) {
   std::cerr << "usage: " << executable
             << " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
                " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [--kv-format int8|bf16]"
-               " [--no-speculation]\n";
+               " [--no-speculation] [--contended-prefill-rows N]\n";
 }
 
 template <typename T>

@@ -62,6 +62,20 @@ struct SchedulerSnapshot final {
 // M8/M16/M24/M32 shapes.
 class Scheduler final {
 public:
+  // A contended prefill command never shrinks below this many rows. The
+  // floor's decode-stall trade-off is stated beside the contended target in
+  // Scheduler.cpp.
+  static constexpr uint32_t kDefaultContendedPrefillRows = 64;
+
+  // A floor is a power of two in [64, ExecutionLimits::prefillTokenBudget],
+  // so halving from the full budget lands on it exactly.
+  [[nodiscard]] static bool
+  isValidContendedPrefillRows(uint32_t rows) noexcept;
+
+  Scheduler() = default;
+  // Throws std::invalid_argument unless isValidContendedPrefillRows(rows).
+  explicit Scheduler(uint32_t contendedPrefillRows);
+
   void submit(RequestSpec request);
   void observePrefill(uint32_t rows, double wallMilliseconds);
   void deferAdmission(uint64_t requestId);
@@ -136,6 +150,7 @@ private:
   uint64_t order_ = 0;
   uint64_t decodeDispatchOrder_ = 0;
   double prefillMillisecondsPerToken_ = 0.0;
+  uint32_t contendedPrefillRows_ = kDefaultContendedPrefillRows;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;
 };

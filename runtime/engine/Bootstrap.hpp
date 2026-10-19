@@ -2,6 +2,7 @@
 
 #include "engine/NativeRuntime.hpp"
 #include "engine/RuntimeResources.hpp"
+#include "engine/Scheduler.hpp"
 #include "engine/Status.hpp"
 
 #include <cstdint>
@@ -76,10 +77,13 @@ struct NativeOptions {
     kv::Format kvFormat = kv::Format::Int8;
     // Off keeps the target verify graph but skips the draft proposal.
     bool isSpeculationEnabled = true;
+    // The contended prefill floor; see Scheduler::kDefaultContendedPrefillRows.
+    uint32_t contendedPrefillRows = Scheduler::kDefaultContendedPrefillRows;
 };
 
-// Parses `[--kv-format int8|bf16] [--no-speculation]` in any order. Throws
-// NativeUsageError on an unknown, repeated or incomplete option.
+// Parses `[--kv-format int8|bf16] [--no-speculation]
+// [--contended-prefill-rows N]` in any order. Throws NativeUsageError on an
+// unknown, repeated, incomplete or invalid option.
 [[nodiscard]] NativeOptions parseNativeOptions(
     std::span<const std::string_view> arguments);
 

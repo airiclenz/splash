@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 
 namespace splash::engine {
 namespace {
@@ -12,10 +13,34 @@ namespace {
 constexpr uint32_t kMaximumOvertakes =
     model::ExecutionLimits::maximumBatchWidth - 1;
 
+// A contended prefill command targets this wall time; it halves toward the
+// contended floor (Scheduler::kDefaultContendedPrefillRows unless configured)
+// while its measured time exceeds it. A higher floor trades decode stall for
+// prefill throughput: ~0.85 s per contended command at 64 rows on M2 Pro,
+// ~3.3 s at 256.
 constexpr double kContendedPrefillMilliseconds = 500.0;
+// The minimum matrix shape: the lowest contended floor, and the smallest
+// command whose timing reflects prefill throughput rather than fixed costs.
 constexpr uint32_t kMinimumPrefillRows = 64;
+static_assert(Scheduler::kDefaultContendedPrefillRows == kMinimumPrefillRows,
+              "the default contended floor is the minimum matrix shape");
 
 } // namespace
+
+bool Scheduler::isValidContendedPrefillRows(uint32_t rows) noexcept {
+  return rows >= kMinimumPrefillRows &&
+         rows <= model::ExecutionLimits::prefillTokenBudget &&
+         (rows & (rows - 1)) == 0;
+}
+
+Scheduler::Scheduler(uint32_t contendedPrefillRows)
+    : contendedPrefillRows_(contendedPrefillRows) {
+  if (!isValidContendedPrefillRows(contendedPrefillRows))
+    throw std::invalid_argument(
+        "contended prefill rows must be a power of two in [" +
+        std::to_string(kMinimumPrefillRows) + ", " +
+        std::to_string(model::ExecutionLimits::prefillTokenBudget) + "]");
+}
 
 void Scheduler::submit(RequestSpec request) {
   Request state;
@@ -304,7 +329,7 @@ uint32_t Scheduler::prefillBudget(
   if (prefillMillisecondsPerToken_ <= 0.0)
     return maximum;
   uint32_t rows = maximum;
-  while (rows > kMinimumPrefillRows &&
+  while (rows > contendedPrefillRows_ &&
          rows * prefillMillisecondsPerToken_ > kContendedPrefillMilliseconds)
     rows /= 2;
   const bool leaderFinishing =
