@@ -210,6 +210,190 @@ inline void expert(device const bfloat *grouped_input,
   }
 }
 
+// The router's scores on the same register matrices: A = the q8 router
+// weight as exact half (byte | 0x6400 minus 1024), B = the input rows widened
+// from bf16 to exact fp32, fp32 accumulation, then per quant group
+// acc += scale * dot + bias * sum(x), the same affine step as the expert
+// tiles. The output fragment is experts x rows, so the lane map, the input
+// loads and the in-kernel row sums are expert()'s.
+//
+// A threadgroup is SGM row groups of four simdgroups, one per K slice. Each
+// simdgroup scores its row group's FM x 8 rows by FN x 8 experts over its
+// slice's quant groups; the group's slice 0 then adds the other slices'
+// partials in slice order and writes the bf16 scores. Every score therefore
+// takes the same operations in the same order whatever the tile shape, so
+// the 8- and 32-row tiles agree bit for bit and routing never depends on the
+// tile the row count selects.
+constexpr constant uint kRouteExperts = 256;  // scores per row: storage width
+constexpr constant uint kRouteSlices = kSimdgroups;
+
+// float2 partials the slices other than 0 hand to their row group's slice 0.
+constexpr uint routePartials(uint SGM, uint FM, uint FN) {
+  return SGM * (kRouteSlices - 1) * FN * FM * 32;
+}
+
+template <uint SGM, uint FM, uint FN>
+inline void route(device const bfloat *input, device const uchar *weights,
+                  device const bfloat *scales, device const bfloat *biases,
+                  device bfloat *scores, constant MoeRouteParams &params,
+                  threadgroup float2 *partials, uint2 tg, uint simdgroup,
+                  uint lane) {
+  constexpr uint Rows = SGM * FM * 8;
+  constexpr uint Experts = FN * 8;
+  static_assert(kRouteExperts % Experts == 0, "tiles cover the 256 experts");
+
+  if (tg.x * Rows >= params.rows)
+    return;
+  // A row group past the live rows still reaches the barrier below.
+  const uint sgm = simdgroup / kRouteSlices, sg = simdgroup % kRouteSlices;
+  partials += sgm * (kRouteSlices - 1) * FN * FM * 32;
+  const uint rowOrigin = tg.x * Rows + sgm * FM * 8;
+  const uint liveRows = params.rows > rowOrigin ? params.rows - rowOrigin : 0;
+  const uint expertOrigin = tg.y * Experts;
+  const uint K = params.input_size, groups = K / kGroup;
+  const uint first = sg * groups / kRouteSlices;
+  const uint last = (sg + 1) * groups / kRouteSlices;
+
+  // simdgroup_matrix lane layout: thread_elements() are M[fm][fn], M[fm][fn + 1].
+  const uint qid = lane >> 2;
+  const uint fm = (qid & 4) | ((lane >> 1) & 3);
+  const uint fn = ((qid & 2) << 1) | ((lane & 1) << 1);
+  // Expert fm of fragment i, inputs 8 fn .. 8 fn + 15 of each quant group:
+  // bytes 0-7 are k-step column fn, bytes 8-15 column fn + 1.
+  device const uchar *laneWeights =
+      weights + ulong(expertOrigin + fm) * kGroup + 8 * fn;
+  device const bfloat *laneScales = scales + expertOrigin + fm;
+  device const bfloat *laneBiases = biases + expertOrigin + fm;
+  device const bfloat *laneInput = input + ulong(rowOrigin + fn) * K + 8 * fm;
+  constexpr ulong groupWeights = ulong(kRouteExperts) * kGroup;
+  bool live[FM];
+  bool rowLive[FM][2];
+#pragma unroll
+  for (uint j = 0; j < FM; ++j) {
+    live[j] = j * 8 < liveRows;
+    rowLive[j][0] = j * 8 + fn < liveRows;
+    rowLive[j][1] = j * 8 + fn + 1 < liveRows;
+  }
+
+  float2 acc[FN][FM];
+#pragma unroll
+  for (uint i = 0; i < FN; ++i)
+#pragma unroll
+    for (uint j = 0; j < FM; ++j) acc[i][j] = float2(0);
+
+  uint4 w[FN];
+  if (first < last) {
+#pragma unroll
+    for (uint i = 0; i < FN; ++i)
+      w[i] = *reinterpret_cast<device const uint4 *>(
+          laneWeights + first * groupWeights + i * 8 * kGroup);
+  }
+  for (uint g = first; g < last; ++g) {
+    // x[j][e]: the eight bf16 of fragment j's row fn + e for all eight k-steps.
+    uint4 x[FM][2];
+    float2 sum[FM];
+#pragma unroll
+    for (uint j = 0; j < FM; ++j) {
+#pragma unroll
+      for (uint e = 0; e < 2; ++e) {
+        x[j][e] = rowLive[j][e] ? *reinterpret_cast<device const uint4 *>(
+                                      laneInput + ulong(j * 8 + e) * K + g * kGroup)
+                                : uint4(0);
+        float s = 0;
+#pragma unroll
+        for (uint v = 0; v < 4; ++v)
+          s += as_type<float>(x[j][e][v] << 16) + as_type<float>(x[j][e][v] & 0xFFFF0000u);
+        sum[j][e] = s;
+      }
+      // Lane bits 1, 2 and 4 select fm: the other 56 inputs of these rows.
+      sum[j] += simd_shuffle_xor(sum[j], 2);
+      sum[j] += simd_shuffle_xor(sum[j], 4);
+      sum[j] += simd_shuffle_xor(sum[j], 16);
+    }
+    float2 dot[FN][FM];
+#pragma unroll
+    for (uint i = 0; i < FN; ++i)
+#pragma unroll
+      for (uint j = 0; j < FM; ++j) dot[i][j] = float2(0);
+#pragma unroll
+    for (uint kb = 0; kb < 8; ++kb) {
+      simdgroup_float8x8 b[FM];
+      const uint shift = (kb & 1) ? 0 : 16;
+#pragma unroll
+      for (uint j = 0; j < FM; ++j)
+        reinterpret_cast<thread float2 &>(b[j].thread_elements()) =
+            float2(as_type<float>((x[j][0][kb >> 1] << shift) & 0xFFFF0000u),
+                   as_type<float>((x[j][1][kb >> 1] << shift) & 0xFFFF0000u));
+#pragma unroll
+      for (uint i = 0; i < FN; ++i) {
+        const uint byte = 8 * (kb & 3);
+        const uint low = ((kb < 4 ? w[i].x : w[i].y) >> byte) & 0xFFu;
+        const uint high = ((kb < 4 ? w[i].z : w[i].w) >> byte) & 0xFFu;
+        // 0x6400 is half 1024, whose ulp is 1: the OR adds q exactly.
+        simdgroup_half8x8 a;
+        reinterpret_cast<thread half2 &>(a.thread_elements()) =
+            as_type<half2>(low | (high << 16) | 0x64006400u) - half2(1024.0h);
+#pragma unroll
+        for (uint j = 0; j < FM; ++j) {
+          if (!live[j])
+            continue;
+          simdgroup_float8x8 c, d;
+          reinterpret_cast<thread float2 &>(c.thread_elements()) = dot[i][j];
+          simdgroup_multiply_accumulate(d, a, b[j], c);
+          dot[i][j] = reinterpret_cast<thread float2 &>(d.thread_elements());
+        }
+      }
+    }
+    float scale[FN], bias[FN];
+#pragma unroll
+    for (uint i = 0; i < FN; ++i) {
+      scale[i] = float(laneScales[ulong(g) * kRouteExperts + i * 8]);
+      bias[i] = float(laneBiases[ulong(g) * kRouteExperts + i * 8]);
+    }
+    if (g + 1 < last) {
+#pragma unroll
+      for (uint i = 0; i < FN; ++i)
+        w[i] = *reinterpret_cast<device const uint4 *>(
+            laneWeights + (g + 1) * groupWeights + i * 8 * kGroup);
+    }
+#pragma unroll
+    for (uint j = 0; j < FM; ++j)
+#pragma unroll
+      for (uint i = 0; i < FN; ++i) {
+        acc[i][j] = fma(dot[i][j], scale[i], acc[i][j]);
+        acc[i][j] = fma(sum[j], bias[i], acc[i][j]);
+      }
+  }
+
+  if (sg) {
+#pragma unroll
+    for (uint i = 0; i < FN; ++i)
+#pragma unroll
+      for (uint j = 0; j < FM; ++j)
+        partials[(((sg - 1) * FN + i) * FM + j) * 32 + lane] = acc[i][j];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg)
+    return;
+#pragma unroll
+  for (uint j = 0; j < FM; ++j) {
+    if (!live[j])
+      continue;
+#pragma unroll
+    for (uint i = 0; i < FN; ++i) {
+      float2 total = acc[i][j];
+      for (uint s = 1; s < kRouteSlices; ++s)
+        total += partials[(((s - 1) * FN + i) * FM + j) * 32 + lane];
+#pragma unroll
+      for (uint e = 0; e < 2; ++e) {
+        if (rowLive[j][e])
+          scores[ulong(rowOrigin + j * 8 + fn + e) * kRouteExperts +
+                 expertOrigin + i * 8 + fm] = bfloat(total[e]);
+      }
+    }
+  }
+}
+
 } // namespace moemma
 
 #define MOE_MMA_THREADS                                                        \
@@ -249,4 +433,27 @@ inline void expert(device const bfloat *grouped_input,
 MOE_MMA_KERNELS(8)
 MOE_MMA_KERNELS(32)
 #undef MOE_MMA_KERNELS
+
+// Router scores: 8 rows x 16 experts on four simdgroups, and 32 rows x 16
+// experts on two row groups of four (256 threads). On an M2 Pro both beat
+// taller per-simdgroup tiles, whose input loads and row sums grow with the
+// rows they hold; 512-thread tiles exceed the pipeline's threadgroup limit
+// under shader validation. Bindings match moe_route_scores_q8_m8.
+#define MOE_ROUTE_KERNEL(Rows, SGM, FM, FN)                                    \
+  kernel void moe_route_scores_q8_m##Rows##_sgf(                               \
+      device const bfloat *input [[buffer(0)]],                                \
+      device const uchar *router_weights [[buffer(1)]],                        \
+      device const bfloat *router_scales [[buffer(2)]],                        \
+      device const bfloat *router_biases [[buffer(3)]],                        \
+      device bfloat *scores [[buffer(4)]],                                     \
+      constant MoeRouteParams &params [[buffer(5)]], MOE_MMA_THREADS) {        \
+    threadgroup float2 partials[moemma::routePartials(SGM, FM, FN)];           \
+    moemma::route<SGM, FM, FN>(input, router_weights, router_scales,           \
+                               router_biases, scores, params, partials, group, \
+                               simd_group, simd_lane);                         \
+  }
+
+MOE_ROUTE_KERNEL(8, 1, 1, 2)
+MOE_ROUTE_KERNEL(32, 2, 2, 2)
+#undef MOE_ROUTE_KERNEL
 #undef MOE_MMA_THREADS

@@ -108,6 +108,25 @@ ExpertPasses fusedExpertPasses(const MoeConfig &config) noexcept {
           threads};
 }
 
+// Pipeline, rows x experts per threadgroup and threadgroup width of a plan's
+// router scores at its row count. The register tiles run four simdgroups,
+// one per K slice, per row group; see moe_mma.metal for their geometry.
+struct RoutePass final {
+  const char *pipeline;
+  MoeRouteTile tile;
+  uint32_t threads;
+};
+
+RoutePass routePass(const MoeConfig &config, uint32_t rows) noexcept {
+  const MoeRouteTile route = moeRouteTile(rows, config.routeWideRows);
+  const bool wide = route.rows == 32;
+  if (config.kernel == MoeExpertKernel::Register)
+    return wide ? RoutePass{"moe_route_scores_q8_m32_sgf", {32, 16}, 256}
+                : RoutePass{"moe_route_scores_q8_m8_sgf", {8, 16}, 128};
+  return {wide ? "moe_route_scores_q8_m32" : "moe_route_scores_q8_m8", route,
+          metal::CommandGraph::kDefaultThreads};
+}
+
 } // namespace
 
 MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
@@ -152,15 +171,16 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
       buffers.expertOutput.sizeBytes() < required.expertOutputBytes) {
     throw std::invalid_argument("MoE grouped scratch is smaller than its bound");
   }
-  const MoeRouteTile route = moeRouteTile(rows, plan.config().routeWideRows);
+  const RoutePass route = routePass(plan.config(), rows);
   const MoeRouteParams routeParams{rows, shape.hiddenSize, shape.experts,
                                    shape.expertsPerToken};
-  graph.add(route.rows == 8 ? "moe_route_scores_q8_m8"
-                            : "moe_route_scores_q8_m32",
+  graph.add(route.pipeline,
             {buffers.input, weights.router.weights, weights.router.scales,
              weights.router.biases, buffers.groupedInput},
             routeParams,
-            {(rows + route.rows - 1) / route.rows, 256 / route.experts, 1});
+            {(rows + route.tile.rows - 1) / route.tile.rows,
+             256 / route.tile.experts, 1},
+            {route.threads, 1, 1});
   graph.add("moe_route_select_q8",
             {buffers.groupedInput, buffers.input,
              weights.sharedExpertGate.weights,

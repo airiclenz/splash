@@ -620,8 +620,16 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   const bool m8 = plan.config().expertTile == MoeExpertTile::M8;
   const auto route =
       splash::ops::moeRouteTile(plan.rows(), plan.config().routeWideRows);
-  const std::string scores = route.rows == 8 ? "moe_route_scores_q8_m8"
-                                             : "moe_route_scores_q8_m32";
+  // The register router keeps the row tile but scores 8 x 16 on four
+  // simdgroups or 32 x 16 on eight.
+  const bool registerRoute =
+      plan.config().kernel == splash::ops::MoeExpertKernel::Register;
+  const uint32_t routeExperts = registerRoute ? 16 : route.experts;
+  const uint32_t routeThreads = registerRoute && route.rows == 8 ? 128 : 256;
+  const std::string scores =
+      std::string(route.rows == 8 ? "moe_route_scores_q8_m8"
+                                  : "moe_route_scores_q8_m32") +
+      (registerRoute ? "_sgf" : "");
   const size_t experts = 4;
   const size_t combine = experts + expertPasses;
   require(dispatches[0].pipelineName == scores &&
@@ -683,14 +691,15 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
     tileGrids &= dispatches[pass].threadgroups.y == plan.maximumTiles();
   for (size_t pass = 0; pass <= combine; ++pass) {
     const bool expertPass = pass >= experts && pass < combine;
-    require((expertPass || dispatches[pass].threadsPerThreadgroup.x == 256) &&
+    const uint32_t threads = pass == 0 ? routeThreads : 256;
+    require((expertPass || dispatches[pass].threadsPerThreadgroup.x == threads) &&
                 dispatches[pass].threadsPerThreadgroup.y == 1 &&
                 dispatches[pass].threadsPerThreadgroup.z == 1,
             "MoE plan changed a non-expert threadgroup width");
   }
   require(dispatches[0].threadgroups.x ==
                   (plan.rows() + route.rows - 1) / route.rows &&
-              dispatches[0].threadgroups.y == kStorageN / route.experts &&
+              dispatches[0].threadgroups.y == kStorageN / routeExperts &&
               dispatches[1].threadgroups.x == plan.rows() &&
               dispatches[3].threadgroups.x == plan.maximumTiles() && tileGrids &&
               dispatches[combine].threadgroups.x == plan.rows(),
@@ -799,18 +808,49 @@ Q8Projection randomRouter(MetalBackend &backend, Random &random) {
   return projection;
 }
 
-// Both scores tiles must write bitwise-identical scores for the same rows, so
-// routing never depends on the tile the row count selects, and the scores
-// must match an fp64 reference of the affine Q8 projection to bf16 rounding.
-void routerTiles(MetalBackend &backend, const Fixture &fixture) {
-  Random random(0x7a11);
-  const Q8Projection router = randomRouter(backend, random);
+// One tile's scores against an fp64 reference of the affine Q8 projection,
+// to bf16 rounding.
+void checkScores(const Fixture &fixture, const Q8Projection &router,
+                 const MetalBuffer &scores, uint32_t rows,
+                 const std::string &label) {
   const auto *weights = static_cast<const uint8_t *>(router.weights.contents());
   const auto *scales = static_cast<const __bf16 *>(router.scales.contents());
   const auto *biases = static_cast<const __bf16 *>(router.biases.contents());
+  const auto *values = static_cast<const __bf16 *>(scores.contents());
+  for (uint32_t row = 0; row < rows; ++row) {
+    for (uint32_t expert = 0; expert < kStorageN; ++expert) {
+      double reference = 0;
+      for (uint32_t g = 0; g < kHidden / 64; ++g) {
+        double dot = 0;
+        double sum = 0;
+        for (uint32_t k = g * 64; k < g * 64 + 64; ++k) {
+          const double x = fixture.input[row][k];
+          dot += x * weights[(uint64_t{g} * kStorageN + expert) * 64 + k % 64];
+          sum += x;
+        }
+        reference += dot * float(scales[g * kStorageN + expert]) +
+                     sum * float(biases[g * kStorageN + expert]);
+      }
+      const float value = float(values[uint64_t{row} * kStorageN + expert]);
+      require(std::isfinite(value) && std::abs(value - reference) <=
+                                          std::abs(reference) / 128 + 1e-3,
+              label + ": scores differ from the fp64 reference");
+    }
+  }
+}
+
+// Both scores tiles of each kernel family (MPP and the Apple7/8 register
+// tiles) must write bitwise-identical scores for the same rows, so routing
+// never depends on the tile the row count selects, and the scores must match
+// an fp64 reference of the affine Q8 projection to bf16 rounding.
+void routerTiles(MetalBackend &backend, const Fixture &fixture) {
+  Random random(0x7a11);
+  const Q8Projection router = randomRouter(backend, random);
   const uint64_t scoreBytes = uint64_t{kMaximumRows} * kStorageN * 2;
   MetalBuffer narrow = shared(backend, scoreBytes, "scores-m8");
   MetalBuffer wide = shared(backend, scoreBytes, "scores-m32");
+  MetalBuffer registerNarrow = shared(backend, scoreBytes, "scores-m8-sgf");
+  MetalBuffer registerWide = shared(backend, scoreBytes, "scores-m32-sgf");
   for (const uint32_t rows : {8U, 33U, kMaximumRows}) {
     const MoeRouteParams params{rows, kHidden, kExperts, kTopK};
     CommandGraph graph;
@@ -822,33 +862,24 @@ void routerTiles(MetalBackend &backend, const Fixture &fixture) {
               {fixture.buffers.input, router.weights, router.scales,
                router.biases, wide},
               params, {(rows + 31) / 32, kStorageN / 128, 1});
+    graph.add("moe_route_scores_q8_m8_sgf",
+              {fixture.buffers.input, router.weights, router.scales,
+               router.biases, registerNarrow},
+              params, {(rows + 7) / 8, kStorageN / 16, 1}, {128, 1, 1});
+    graph.add("moe_route_scores_q8_m32_sgf",
+              {fixture.buffers.input, router.weights, router.scales,
+               router.biases, registerWide},
+              params, {(rows + 31) / 32, kStorageN / 16, 1});
     (void)backend.submitCommand(graph.dispatches());
     const std::string label = "router tiles rows=" + std::to_string(rows);
-    require(std::memcmp(narrow.contents(), wide.contents(),
-                        uint64_t{rows} * kStorageN * 2) == 0,
+    const uint64_t bytes = uint64_t{rows} * kStorageN * 2;
+    require(std::memcmp(narrow.contents(), wide.contents(), bytes) == 0,
             label + ": 8-row and 32-row tiles disagree");
-    const auto *values = static_cast<const __bf16 *>(narrow.contents());
-    for (uint32_t row = 0; row < rows; ++row) {
-      for (uint32_t expert = 0; expert < kStorageN; ++expert) {
-        double reference = 0;
-        for (uint32_t g = 0; g < kHidden / 64; ++g) {
-          double dot = 0;
-          double sum = 0;
-          for (uint32_t k = g * 64; k < g * 64 + 64; ++k) {
-            const double x = fixture.input[row][k];
-            dot += x * weights[(uint64_t{g} * kStorageN + expert) * 64 +
-                               k % 64];
-            sum += x;
-          }
-          reference += dot * float(scales[g * kStorageN + expert]) +
-                       sum * float(biases[g * kStorageN + expert]);
-        }
-        const float value = float(values[uint64_t{row} * kStorageN + expert]);
-        require(std::isfinite(value) && std::abs(value - reference) <=
-                                            std::abs(reference) / 128 + 1e-3,
-                label + ": scores differ from the fp64 reference");
-      }
-    }
+    require(std::memcmp(registerNarrow.contents(), registerWide.contents(),
+                        bytes) == 0,
+            label + ": 8-row and 32-row register tiles disagree");
+    checkScores(fixture, router, narrow, rows, label);
+    checkScores(fixture, router, registerNarrow, rows, label + " register");
   }
 }
 

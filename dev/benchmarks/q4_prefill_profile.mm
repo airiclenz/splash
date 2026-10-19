@@ -247,11 +247,32 @@ void profileRmsSums(MetalBackend &backend, uint32_t rows, uint32_t width,
             << " speedup=" << separate / fusedMilliseconds << '\n';
 }
 
+// A router scores pipeline and the rows x experts and threads per
+// threadgroup that MoE::add dispatches it with.
+struct RouterTile final {
+  const char *pipeline;
+  uint32_t rows;
+  uint32_t experts;
+  uint32_t threads;
+};
+
+constexpr std::array<RouterTile, 2> kMppRouterTiles{{
+    {"moe_route_scores_q8_m8", 8, 32, 256},
+    {"moe_route_scores_q8_m32", 32, 128, 256},
+}};
+constexpr std::array<RouterTile, 2> kRegisterRouterTiles{{
+    {"moe_route_scores_q8_m8_sgf", 8, 16, 128},
+    {"moe_route_scores_q8_m32_sgf", 32, 16, 256},
+}};
+
 // The MoE router scores at the 35B-A3B shape (hidden 2048, 256 experts,
-// top 8): both score tiles over the same synthetic q8 router, whose weights,
+// top 8): every score tile over the same synthetic q8 router, whose weights,
 // scales and biases sit per quant group as (group * 256 + expert) [* 64].
-// The samples alternate the tiles so drift lands on both alike.
-void profileRouter(MetalBackend &backend, uint32_t rows) {
+// The samples alternate the tiles so drift lands on all of them alike. The
+// Apple7/8 register tiles (_sgf) are timed beside the MPP tiles whenever the
+// metallib carries them.
+void profileRouter(MetalBackend &backend, uint32_t rows,
+                   bool registerTiles) {
   constexpr uint32_t kHidden = 2048;
   constexpr uint32_t kExperts = 256;
   constexpr uint32_t kTopK = 8;
@@ -273,33 +294,30 @@ void profileRouter(MetalBackend &backend, uint32_t rows) {
   std::memset(biases.contents(), 0x3c, biases.sizeBytes());
   const MoeRouteParams params{rows, kHidden, kExperts, kTopK};
 
-  // Rows x experts per threadgroup, as MoE::add dispatches each tile.
-  const auto route = [&](const std::string &pipeline, uint32_t tileRows,
-                         uint32_t tileExperts) {
-    return ComputeDispatch{pipeline,
-                           {{0, input}, {1, weights}, {2, scales},
-                            {3, biases}, {4, scores}},
-                           {{5, &params, sizeof(params)}},
-                           {(rows + tileRows - 1) / tileRows,
-                            kExperts / tileExperts, 1},
-                           {256, 1, 1}};
-  };
-  const ComputeDispatch narrow = route("moe_route_scores_q8_m8", 8, 32);
-  const ComputeDispatch wide = route("moe_route_scores_q8_m32", 32, 128);
-  for (uint32_t warmup = 0; warmup < 2; ++warmup) {
-    static_cast<void>(backend.submit(narrow));
-    static_cast<void>(backend.submit(wide));
-  }
-  std::vector<double> narrowSamples;
-  std::vector<double> wideSamples;
-  for (uint32_t repeat = 0; repeat < 7; ++repeat) {
-    narrowSamples.push_back(backend.submit(narrow).gpuSeconds * 1000.0);
-    wideSamples.push_back(backend.submit(wide).gpuSeconds * 1000.0);
-  }
-  std::cout << "moe_route_scores_q8_m8 rows=" << rows
-            << " router_ms=" << median(narrowSamples) << '\n'
-            << "moe_route_scores_q8_m32 rows=" << rows
-            << " router_ms=" << median(wideSamples) << '\n';
+  std::vector<RouterTile> tiles(kMppRouterTiles.begin(),
+                                kMppRouterTiles.end());
+  if (registerTiles)
+    tiles.insert(tiles.end(), kRegisterRouterTiles.begin(),
+                 kRegisterRouterTiles.end());
+  std::vector<ComputeDispatch> dispatches;
+  for (const RouterTile &tile : tiles)
+    dispatches.push_back(
+        {tile.pipeline,
+         {{0, input}, {1, weights}, {2, scales}, {3, biases}, {4, scores}},
+         {{5, &params, sizeof(params)}},
+         {(rows + tile.rows - 1) / tile.rows, kExperts / tile.experts, 1},
+         {tile.threads, 1, 1}});
+  for (uint32_t warmup = 0; warmup < 2; ++warmup)
+    for (const ComputeDispatch &dispatch : dispatches)
+      static_cast<void>(backend.submit(dispatch));
+  std::vector<std::vector<double>> samples(dispatches.size());
+  for (uint32_t repeat = 0; repeat < 7; ++repeat)
+    for (size_t index = 0; index < dispatches.size(); ++index)
+      samples[index].push_back(backend.submit(dispatches[index]).gpuSeconds *
+                               1000.0);
+  for (size_t index = 0; index < tiles.size(); ++index)
+    std::cout << tiles[index].pipeline << " rows=" << rows
+              << " router_ms=" << median(samples[index]) << '\n';
 }
 
 void run(const std::string &metallibPath) {
@@ -397,8 +415,11 @@ void run(const std::string &metallibPath) {
                    "prefill_norm_rms_sums32", "rms_sums_m32");
   }
   // Batch 1 verifies eight rows; the prefill chunks use the profile rows.
-  profileRouter(backend, 8);
-  for (uint32_t rows : kProfileRows) profileRouter(backend, rows);
+  const bool registerRouter =
+      hasFunction(metallibPath, kRegisterRouterTiles[0].pipeline);
+  profileRouter(backend, 8, registerRouter);
+  for (uint32_t rows : kProfileRows)
+    profileRouter(backend, rows, registerRouter);
 }
 
 } // namespace
