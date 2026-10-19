@@ -283,6 +283,8 @@ public:
     return std::make_shared<State>();
   }
   uint64_t reclaimIdleState() noexcept override {
+    if (idleStateReclaimable && !idleStateReclaimable())
+      return 0;
     const uint64_t released = reclaimableIdleStateBytes;
     reclaimableIdleStateBytes = 0;
     reclaimedIdleStateBytes += released;
@@ -324,6 +326,8 @@ public:
   bool restoredDraft = false;
   metal::AllocationFailure beginAllocationFailure = metal::AllocationFailure::None;
   uint64_t reclaimableIdleStateBytes = 0;
+  // When set, idle state is reclaimable only while this holds.
+  std::function<bool()> idleStateReclaimable;
   uint64_t reclaimedIdleStateBytes = 0;
   bool *physicalGrowthBlocked = nullptr;
   bool unblockGrowthOnSuspend = true;
@@ -2910,6 +2914,135 @@ void testSuspendedLanesSharingAResumeStateKeepItUntilBothRelease() {
           "the shared state stayed exempt after both lanes released it");
 }
 
+// Request 301 queued for memory by a host-pressure begin denial while growth
+// is paused, after request 300 left a composite state at 64 of their shared
+// 65-token prompt. A host denial skips admit's growth reclaim, so the state
+// survives until the reclaim under test.
+struct QueuedPrefixFixture final {
+  QueuedPrefixFixture()
+      : pool(backing), resources(pool, CacheNamespace{}), executor(1),
+        engine(pausedWhileBlocked(), resources, executor, events) {
+    engine.submit(request(300, prompt));
+    runUntilIdle(engine);
+    require(resources.cachedTokens(prompt) == 64,
+            "queued-prefix fixture did not cache the 64-token state");
+    blocked = true;
+    executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+    executor.beginGrowthBlocked = [this] { return blocked; };
+    engine.submit(request(301, prompt));
+    static_cast<void>(engine.tick(1));
+    require(engine.resourceWaitSnapshot(1).memory == 1,
+            "queued-prefix fixture did not queue the request for memory");
+    evictionsBefore = resources.snapshot().stateCache.evictions;
+  }
+
+  EngineConfig pausedWhileBlocked() {
+    EngineConfig config;
+    config.growthPaused = [this] { return blocked; };
+    return config;
+  }
+
+  // Ticks past the retry backoff until the queued request is admitted.
+  void admit() {
+    for (double now = 2; now < 1000 && events.starts.size() < 2; ++now)
+      static_cast<void>(engine.tick(now));
+    require(events.starts.size() == 2, "the queued request was not admitted");
+  }
+
+  bool blocked = false;
+  const std::vector<uint32_t> prompt = std::vector<uint32_t>(65, 300);
+  Backing backing{16};
+  KvPool pool;
+  engine::Cache resources;
+  Executor executor;
+  Events events;
+  engine::Engine engine;
+  uint64_t evictionsBefore = 0;
+};
+
+void testWarningReclaimKeepsQueuedRequestsPrefix() {
+  QueuedPrefixFixture fixture;
+
+  static_cast<void>(fixture.engine.reclaimMemory(
+      warningReclaim(std::numeric_limits<uint64_t>::max())));
+  fixture.blocked = false;
+  fixture.admit();
+
+  require(fixture.events.starts.back().first == EngineCacheStatus::PrefixHit &&
+              fixture.events.starts.back().second == 64 &&
+              fixture.resources.snapshot().stateCache.evictions ==
+                  fixture.evictionsBefore,
+          "warning reclaim evicted a queued request's cached prefix");
+}
+
+void testRetriedQueuedRequestHoldsOneProtection() {
+  QueuedPrefixFixture fixture;
+  const uint32_t attempts = fixture.executor.beginAttempts;
+  for (double now = 2;
+       now < 1000 && fixture.executor.beginAttempts == attempts; ++now)
+    static_cast<void>(fixture.engine.tick(now));
+  require(fixture.executor.beginAttempts == attempts + 1 &&
+              fixture.engine.resourceWaitSnapshot(1000).memory == 1,
+          "the queued request was not denied a second time");
+
+  fixture.engine.cancel(301);
+  static_cast<void>(fixture.engine.reclaimMemory(
+      warningReclaim(std::numeric_limits<uint64_t>::max())));
+
+  require(fixture.resources.cachedTokens(fixture.prompt) == 0,
+          "a twice-denied request left a protection behind on cancel");
+}
+
+void testQueuedRequestAdmittedColdDropsItsProtection() {
+  QueuedPrefixFixture fixture;
+  // The retry is denied while its own lookup pins the state, so admission
+  // drops the pin; idle model state freed only then admits it cold with the
+  // found state still cached. The prefill stays in flight meanwhile.
+  const auto unpinned = [&] {
+    return fixture.resources.snapshot().stateCache.pinned == 0;
+  };
+  fixture.executor.beginAllocationFailure = metal::AllocationFailure::None;
+  fixture.executor.beginGrowthBlocked = [unpinned] { return !unpinned(); };
+  fixture.executor.reclaimableIdleStateBytes = 1;
+  fixture.executor.idleStateReclaimable = unpinned;
+  fixture.executor.holdPrefillUntil = std::make_shared<bool>(false);
+  fixture.blocked = false;
+  fixture.admit();
+  require(fixture.events.starts.back().first == EngineCacheStatus::Miss &&
+              fixture.resources.cachedTokens(fixture.prompt) == 64,
+          "the queued request did not start cold beside its found state");
+
+  static_cast<void>(fixture.engine.reclaimMemory(
+      warningReclaim(std::numeric_limits<uint64_t>::max())));
+
+  require(fixture.resources.snapshot().stateCache.evictions ==
+              fixture.evictionsBefore + 1,
+          "a request admitted cold kept protecting the prefix it found");
+  *fixture.executor.holdPrefillUntil = true;
+  runUntilIdle(fixture.engine);
+}
+
+void testGrowthReclaimTakesAQueuedPrefixRatherThanStall() {
+  QueuedPrefixFixture fixture;
+  // Admission fits only once the queued request's own protected state is
+  // gone: growth reclaim must fall back to it.
+  fixture.executor.beginAllocationFailure = metal::AllocationFailure::None;
+  fixture.executor.beginGrowthBlocked = [&] {
+    return fixture.resources.snapshot().stateCache.entries != 0;
+  };
+  fixture.blocked = false;
+  fixture.admit();
+
+  require(fixture.events.starts.back().first == EngineCacheStatus::Miss &&
+              fixture.resources.snapshot().stateCache.evictions ==
+                  fixture.evictionsBefore + 1,
+          "growth reclaim stalled on the queued request's protected state");
+  runUntilIdle(fixture.engine);
+  require(fixture.events.completedCount == 2 &&
+              fixture.events.failedCount == 0,
+          "the queued request did not complete after growth reclaim");
+}
+
 void testAdmissionReopensAfterLastSuspendedRequestResumes() {
   Backing backing(32);
   KvPool pool(backing);
@@ -3809,6 +3942,10 @@ int main() {
     testCriticalReclaimEvictsSuspendedRequestsResumeState();
     testCancelledSuspendedRequestReleasesItsResumeExemption();
     testSuspendedLanesSharingAResumeStateKeepItUntilBothRelease();
+    testWarningReclaimKeepsQueuedRequestsPrefix();
+    testRetriedQueuedRequestHoldsOneProtection();
+    testQueuedRequestAdmittedColdDropsItsProtection();
+    testGrowthReclaimTakesAQueuedPrefixRatherThanStall();
     testStateAdmissionWaitsForKvRelease();
     testAdmissionsWaitForBackgroundRelease();
     testAllocationCausesRemainRetryableAndDistinct();

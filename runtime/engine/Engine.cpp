@@ -433,6 +433,10 @@ bool Engine::admit(Request &active, double now) {
       return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest);
     };
     const uint64_t releaseGeneration = cache_.releaseGeneration();
+    // The lease drop below forgets the state this lookup found; a request
+    // sent to wait still protects it by block.
+    const uint64_t foundStateBlock =
+        lookup.state ? lookup.state->kvBlock() : 0;
     StateAdmission admission = activate();
     bool reclaimedForAdmission = false;
     while (!admission.granted() &&
@@ -475,6 +479,13 @@ bool Engine::admit(Request &active, double now) {
                        true});
         return true;
       }
+      if (!resuming) {
+        // Warning reclaim must not evict the prefix this request will
+        // restore. A retried wait swaps its protection rather than stack it.
+        cache_.unprotectState(std::exchange(active.queuedProtection, {}));
+        if (foundStateBlock)
+          active.queuedProtection = cache_.protectState(foundStateBlock);
+      }
       scheduler_.waitForResources(active.request.id);
       deferResourceRetry(active, now, admission.failure);
       return false;
@@ -507,6 +518,8 @@ bool Engine::admit(Request &active, double now) {
       active.resumeKvTargetTokens = 0;
     }
     active.resourceWait = {};
+    // Admitted: the wait, and the queued prefix's protection, end here.
+    cache_.unprotectState(std::exchange(active.queuedProtection, {}));
     if (resuming)
       scheduler_.resumeFromResources(active.request.id, resumeBoundary,
                                      active.replayTokens);
@@ -930,7 +943,7 @@ bool Engine::reclaimForGrowth(CacheReclaimMode mode) {
   // any reclaimed bytes.
   if (growthPaused())
     return false;
-  const CacheReclaimResult reclaimed = cache_.reclaimOne(mode);
+  const CacheReclaimResult reclaimed = cache_.reclaimOneForGrowth(mode);
   if (reclaimed.madeProgress)
     signalResourceProgress();
   return reclaimed.madeProgress;
@@ -958,7 +971,7 @@ bool Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
   if (reusable < admission.additionalPages)
     return false;
   const CacheReclaimResult reused =
-      cache_.reclaimOne(CacheReclaimMode::ReuseBacking);
+      cache_.reclaimOneForGrowth(CacheReclaimMode::ReuseBacking);
   if (reused.madeProgress) {
     // An evicted state parks its buffers in the model's pool; under pressure
     // that memory goes back to the host now rather than waiting for the
@@ -987,8 +1000,9 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
     scheduler_.setPrefillBoundary(active.request.id, std::nullopt);
   }
   model_.suspend(active.request.id);
-  // Warning reclaim must not turn the resume into a full replay; Critical
-  // reclaim and growth eviction still take this state.
+  // Warning reclaim must not turn the resume into a full replay; growth
+  // reclaim takes this state only after every unprotected one, and Critical
+  // reclaim takes it outright.
   active.resumeProtection = cache_.protectDeepestState(active.request.id);
   cache_.endRequest(active.request.id);
   active.stateCell.reset();
@@ -1050,8 +1064,9 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
       released >= directive.targetBytes ? 0 : directive.targetBytes - released;
   // Critical pressure releases every empty KV extent. A warning pass, even a
   // zero-byte one, releases them too, except one kept mapped while a running
-  // lane's next chunk needs it. A warning pass also spares each suspended
-  // request's resume state; Critical evicts it.
+  // lane's next chunk needs it. A warning pass also spares each protected
+  // state, a suspended request's resume state or a queued request's prefix;
+  // Critical evicts it.
   const bool warning = !directive.evictAllUnpinnedPrefixes;
   reclaimKeptKvRunway_ = warning && residentLaneNeedsKvRunway();
   released += cache_.reclaimCache(remaining, directive.evictAllUnpinnedPrefixes,
@@ -1263,6 +1278,7 @@ void Engine::finishCapacity(Request &active, const TokenAdmission &admission) {
 void Engine::release(Request &active) {
   active.resourceWait = {};
   cache_.unprotectState(std::exchange(active.resumeProtection, {}));
+  cache_.unprotectState(std::exchange(active.queuedProtection, {}));
   if (active.stateCell || active.suspended) {
     discardPendingStateBoundaries(active);
     model_.end(active.request.id);

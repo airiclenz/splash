@@ -338,6 +338,11 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
                     : 0};
 }
 
+CacheReclaimResult Cache::reclaimOneForGrowth(CacheReclaimMode mode) {
+  const CacheReclaimResult spared = reclaimOne(mode, false, false, true);
+  return spared.madeProgress ? spared : reclaimOne(mode);
+}
+
 bool Cache::reclaimOneState(bool checkpointsOnly) {
   std::optional<CacheEvictionCandidate> state =
       states_.evictionCandidate(false, true);
@@ -355,6 +360,10 @@ StateProtection Cache::protectDeepestState(uint64_t requestId) {
       return states_.protect(*block);
   }
   return {};
+}
+
+StateProtection Cache::protectState(uint64_t kvBlock) {
+  return states_.protect(kvBlock);
 }
 
 void Cache::unprotectState(StateProtection protection) noexcept {

@@ -146,30 +146,40 @@ public:
   // running request's next chunk takes without asking for a new mapping. Its
   // bytes count toward targetBytes, so no cache is evicted to make up for
   // them. Without it every empty extent is released.
-  // A pass without evictAll (Warning pressure) spares every state protected
-  // for a suspended request and evicts the next publication instead; evictAll
-  // (Critical pressure) takes protected states too.
+  // A pass without evictAll (Warning pressure) spares every protected state
+  // (a suspended request's resume state, a queued request's prefix) and
+  // evicts the next publication instead; evictAll (Critical pressure) takes
+  // protected states too.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
                                       bool keepResumePoint = false,
                                       bool keepRunway = false);
   // One bounded reclaim step for an allocation retry. Progress is distinct
   // from physical bytes because evicting a KV reference can make a resident
   // page reusable without immediately emptying its extent.
-  // spareProtectedStates walks past states protected for suspended requests.
+  // spareProtectedStates walks past protected states and never takes one.
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
       bool keepResumePoint = false, bool keepRunway = false,
       bool spareProtectedStates = false);
+  // One reclaim step for an allocation a request is waiting on: spares
+  // protected states while any other state or KV qualifies, then takes the
+  // oldest protected state rather than stall. Costs the protected states at
+  // the head of each eviction queue, bounded by waiting requests.
+  [[nodiscard]] CacheReclaimResult reclaimOneForGrowth(
+      CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
   // Recycles an unpinned state, preferring checkpoints, for a required state
-  // publication. KV bytes only return once an extent unmaps. A state
-  // protected for a suspended request is taken only when no other state
-  // qualifies.
+  // publication. KV bytes only return once an extent unmaps. A protected
+  // state is taken only when no other state qualifies.
   [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
   // Protects the deepest composite state on the request's published prefix,
   // the one its resume would restore, from Warning reclaim. Call before
   // endRequest; returns an empty handle when the prefix holds no state. Reads
   // the request's own block list: no lookup, hashing or pin.
   [[nodiscard]] StateProtection protectDeepestState(uint64_t requestId);
+  // Protects the state published at kvBlock for a request that holds no
+  // cache request yet: the prefix a queued request found and will restore.
+  // Returns an empty handle when no state is published there.
+  [[nodiscard]] StateProtection protectState(uint64_t kvBlock);
   // Ends one protection. No-op once its publication is gone.
   void unprotectState(StateProtection protection) noexcept;
   // Empty resident backing exists but the previous release is still in

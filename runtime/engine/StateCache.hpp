@@ -20,7 +20,8 @@ struct StateCheckpoint final {
   [[nodiscard]] explicit operator bool() const noexcept { return kvBlock != 0; }
 };
 
-// Names one publication a suspended request resumes from. A handle outlives
+// Names one publication a waiting request needs: a suspended request's
+// resume state or a queued request's cached prefix. A handle outlives
 // neither the publication's eviction nor its replacement: releasing a stale
 // handle is a no-op.
 struct StateProtection final {
@@ -110,7 +111,7 @@ public:
   void touch(uint64_t kvBlock) noexcept;
 
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
-  // Marks the resident publication as a suspended request's resume state.
+  // Marks the resident publication as one a waiting request needs.
   // Protection takes no pin and no lease: the state stays evictable, and only
   // a candidate search that spares protected states walks past it. Each call
   // needs one matching unprotect; lanes sharing a state count separately.
@@ -125,7 +126,9 @@ public:
   // keep their disposable priority: one is withheld only when no ordinary
   // state exists. spareProtected walks each queue past protected states, at
   // a cost bounded by the protected states ahead of the first other one;
-  // without it the search is O(1).
+  // without it the search is O(1). Growth reclaim and publication recycling
+  // spare them first and fall back to them; only Warning reclaim never takes
+  // one.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   evictionCandidate(bool keepResumePoint = false,
                     bool spareProtected = false) const noexcept;
@@ -138,7 +141,7 @@ private:
   struct Entry {
     std::shared_ptr<const CompositeState> state;
     uint32_t pins = 0;
-    // Suspended requests resuming from this publication.
+    // Waiting requests, suspended or queued, that need this publication.
     uint32_t protections = 0;
     uint64_t lastUsed = 0;
     uint64_t previousEvictable = 0;

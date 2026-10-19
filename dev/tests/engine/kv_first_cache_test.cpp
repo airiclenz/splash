@@ -806,6 +806,55 @@ void testLogicalKvPressureStillReclaimsPages() {
 
 } // namespace
 
+// A queued request protects the state it found by block, with no cache
+// request of its own: Warning reclaim spares it until the protection ends.
+void testProtectStateSparesAPublicationFromWarningReclaim() {
+  CacheFixture fixture;
+  const uint64_t everything = std::numeric_limits<uint64_t>::max();
+  require(!fixture.cache.protectState(fixture.blocks[1]),
+          "a block without a state returned a protection");
+  fixture.publish(1);
+
+  const StateProtection protection =
+      fixture.cache.protectState(fixture.blocks[1]);
+  static_cast<void>(fixture.cache.reclaimCache(everything, false));
+
+  require(protection && fixture.cache.snapshot().stateCache.entries == 1,
+          "warning reclaim evicted a protected queued prefix");
+  fixture.cache.unprotectState(protection);
+  static_cast<void>(fixture.cache.reclaimCache(everything, false));
+  require(fixture.cache.snapshot().stateCache.entries == 0,
+          "an ended protection still spared its state");
+}
+
+void testGrowthReclaimTakesUnprotectedStateFirst() {
+  CacheFixture fixture;
+  fixture.publish(0, 150);
+  fixture.publish(3, 100);
+  const StateProtection protection =
+      fixture.cache.protectState(fixture.blocks[0]);
+
+  const CacheReclaimResult reclaimed = fixture.cache.reclaimOneForGrowth();
+
+  require(protection && reclaimed.madeProgress &&
+              reclaimed.reclaimedBytes == 100 &&
+              fixture.lookup(33).resumeBoundary() == 32,
+          "growth reclaim took a protected state while a newer one qualified");
+}
+
+void testGrowthReclaimFallsBackToProtectedState() {
+  CacheFixture fixture;
+  fixture.publish(3, 100);
+  const StateProtection protection =
+      fixture.cache.protectState(fixture.blocks[3]);
+
+  const CacheReclaimResult reclaimed = fixture.cache.reclaimOneForGrowth();
+
+  require(protection && reclaimed.madeProgress &&
+              fixture.cache.snapshot().stateCache.entries == 0,
+          "growth reclaim stalled when only protected states remained");
+}
+
 int main() {
   try {
     testCheckpointLookupProbeDoesNotPromote();
@@ -837,6 +886,9 @@ int main() {
     testDuplicateProbePromotesStateWithoutLookupAccounting();
     testUnifiedRecencyAndPhysicalReclaimAccounting();
     testFinishedRequestLeavesTailKvBeforeItsState();
+    testProtectStateSparesAPublicationFromWarningReclaim();
+    testGrowthReclaimTakesUnprotectedStateFirst();
+    testGrowthReclaimFallsBackToProtectedState();
     std::cout << "KV-first cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {
