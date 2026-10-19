@@ -152,6 +152,19 @@ bool StateCache::retireCheckpoint(StateCheckpoint checkpoint) noexcept {
   return erase(checkpoint.kvBlock, true).evicted;
 }
 
+void StateCache::recordKeptCheckpoint(uint64_t kvBlock,
+                                      StateCheckpoint checkpoint) noexcept {
+  const auto found = entries_.find(kvBlock);
+  if (found != entries_.end())
+    found->second.keptCheckpoint = checkpoint;
+}
+
+StateCheckpoint StateCache::keptCheckpoint(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found == entries_.end() ? StateCheckpoint{}
+                                 : found->second.keptCheckpoint;
+}
+
 bool StateCache::contains(uint64_t kvBlock) const noexcept {
   return entries_.contains(kvBlock);
 }

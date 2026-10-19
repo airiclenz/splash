@@ -138,6 +138,14 @@ public:
   [[nodiscard]] bool carriesState(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
+  // Records the checkpoint kept beside the prompt-end state at kvBlock, so a
+  // later request that resumes from that state can find and retire it.
+  // No-op when no state is published at kvBlock.
+  void recordKeptCheckpoint(uint64_t kvBlock,
+                            StateCheckpoint checkpoint) noexcept;
+  // The checkpoint recorded beside the state at kvBlock, or an empty handle;
+  // possibly stale.
+  [[nodiscard]] StateCheckpoint keptCheckpoint(uint64_t kvBlock) const noexcept;
 
   // One cache reclaimer for memory growth and pressure warnings. After empty
   // backing, disposable checkpoints are reclaimed first, except protected

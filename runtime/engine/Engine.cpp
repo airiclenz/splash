@@ -552,6 +552,9 @@ bool Engine::admit(Request &active, double now) {
     if (lookup.state) {
       model_.restore(active.request.id, resumeBoundary, lookup.state->state(),
                      !draft.draftStateRestoreSkipped);
+      if (!resuming)
+        active.inheritedCheckpoint =
+            cache_.keptCheckpoint(lookup.state->kvBlock());
       setLatestCheckpoint(active,
                           cache_.checkpointState(lookup.state->kvBlock()));
       // A restored endpoint already has the ordinary replay state we need.
@@ -838,6 +841,41 @@ void Engine::setLatestCheckpoint(Request &active, StateCheckpoint checkpoint) {
     active.checkpointProtection = cache_.protectState(checkpoint.kvBlock);
 }
 
+// At the prompt-end publication, moves the lane's deepest prefill checkpoint
+// out of latestCheckpoint, and out of its protection, into keptCheckpoint, so
+// the publication neither retires it before its capture nor after. A
+// checkpoint on the prompt-end block itself is no extra state: the
+// publication promotes it. O(1).
+void Engine::keepDeepestCheckpoint(Request &active, uint64_t promptEndBlock) {
+  active.promptEndPublished = true;
+  if (!active.latestCheckpoint ||
+      active.latestCheckpoint.kvBlock == promptEndBlock)
+    return;
+  active.keptCheckpoint = active.latestCheckpoint;
+  setLatestCheckpoint(active, {});
+}
+
+// Records the conversation's one kept checkpoint on the prompt-end state at
+// promptEndBlock. A lane whose kept checkpoint is still cached records it and
+// retires the one it inherited, unless a peer holds that as a recovery point;
+// otherwise the inherited handle is carried forward. O(1), plus one walk of
+// the request table when retiring.
+void Engine::recordKeptCheckpoint(Request &active, uint64_t promptEndBlock) {
+  const StateCheckpoint own = active.keptCheckpoint;
+  const StateCheckpoint cached = cache_.checkpointState(own.kvBlock);
+  const bool keepsOwn = own && cached.publication == own.publication;
+  if (!keepsOwn) {
+    cache_.recordKeptCheckpoint(promptEndBlock, active.inheritedCheckpoint);
+    return;
+  }
+  const StateCheckpoint inherited = active.inheritedCheckpoint;
+  const bool sameAsOwn = inherited.kvBlock == own.kvBlock &&
+                         inherited.publication == own.publication;
+  if (inherited && !sameAsOwn && !peerHoldsCheckpoint(active, inherited))
+    static_cast<void>(cache_.retireCheckpointState(inherited));
+  cache_.recordKeptCheckpoint(promptEndBlock, own);
+}
+
 // Copies the lane's live state for a publication. When no slot is free it
 // recycles one cached state, a checkpoint for a checkpoint, and retries once;
 // nullptr when that fails too.
@@ -879,11 +917,19 @@ void Engine::publishReachedStateBoundaries(Request &active,
     materialized = true;
     try {
       const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
+      // The prompt-end state, whatever purpose merged there, keeps the
+      // deepest prefill checkpoint beside it rather than retiring it.
+      const bool promptEnd =
+          !checkpoint && !active.promptEndPublished &&
+          objective.tokens == replayStateBoundary(active.promptTokens);
+      if (promptEnd)
+        keepDeepestCheckpoint(active, block);
       if (cache_.reuseCompositeState(block, checkpoint)) {
         ++counters_.deduplicatedStatePublications;
       } else {
-        // Recycle the previous recovery point before allocating its replacement.
-        // A restore lease can delay this optional publication.
+        // Recycle the previous recovery point before allocating its
+        // replacement; at the prompt end it was kept instead. A restore lease
+        // can delay this optional publication.
         if (!retireCheckpoint(active) && checkpoint) {
           ++failures;
           continue;
@@ -897,6 +943,8 @@ void Engine::publishReachedStateBoundaries(Request &active,
         cache_.publishCompositeState(block, std::move(state), checkpoint);
         ++publications;
       }
+      if (promptEnd)
+        recordKeptCheckpoint(active, block);
       if (active.latestCheckpoint.kvBlock != block)
         static_cast<void>(retireCheckpoint(active));
       setLatestCheckpoint(active, checkpoint ? cache_.checkpointState(block)

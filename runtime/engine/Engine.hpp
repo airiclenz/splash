@@ -177,6 +177,21 @@ private:
     // finishes.
     StateCheckpoint previousCheckpoint;
     StateProtection previousCheckpointProtection;
+    // The deepest prefill checkpoint below the prompt end, moved out of
+    // latestCheckpoint at the prompt-end publication, before its capture, so
+    // it stays cached beside the prompt-end state: a later prompt diverging
+    // between the two resumes from it. Unprotected, so reclaim takes it
+    // before any ordinary state. Written at most once per request; decode
+    // checkpoint rolling and finish never touch it.
+    StateCheckpoint keptCheckpoint;
+    // The kept checkpoint recorded on the state this request restored at its
+    // first admission: retired once this request keeps its own, otherwise
+    // carried forward onto its prompt-end state, so a conversation holds at
+    // most one kept checkpoint.
+    StateCheckpoint inheritedCheckpoint;
+    // The prompt-end publication was attempted; a resumed replay passing the
+    // prompt end again keeps nothing further.
+    bool promptEndPublished = false;
     // The state a suspended request resumes from, spared by Warning reclaim
     // until the resume succeeds or the request ends.
     StateProtection resumeProtection;
@@ -238,6 +253,8 @@ private:
   void retirePreviousCheckpoint(Request &request);
   void dropPreviousCheckpoint(Request &request) noexcept;
   void setLatestCheckpoint(Request &request, StateCheckpoint checkpoint);
+  void keepDeepestCheckpoint(Request &request, uint64_t promptEndBlock);
+  void recordKeptCheckpoint(Request &request, uint64_t promptEndBlock);
   [[nodiscard]] std::shared_ptr<const CompositeState>
   captureState(uint64_t requestId, bool checkpoint);
   void publishReachedStateBoundaries(Request &request,

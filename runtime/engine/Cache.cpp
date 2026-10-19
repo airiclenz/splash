@@ -297,6 +297,15 @@ bool Cache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
   return states_.retireCheckpoint(checkpoint);
 }
 
+void Cache::recordKeptCheckpoint(uint64_t kvBlock,
+                                 StateCheckpoint checkpoint) noexcept {
+  states_.recordKeptCheckpoint(kvBlock, checkpoint);
+}
+
+StateCheckpoint Cache::keptCheckpoint(uint64_t kvBlock) const noexcept {
+  return states_.keptCheckpoint(kvBlock);
+}
+
 uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
                              bool keepResumePoint, bool keepRunway) {
   // Empty backing that is waiting behind an in-flight release will satisfy

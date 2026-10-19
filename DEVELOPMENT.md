@@ -255,9 +255,11 @@ Greedy and sampled requests can share an unconstrained decode batch; each lane
 keeps its own sampling policy and RNG. Pure greedy batches retain their argmax
 path. Constrained requests use a separate batch for the host mask exchange.
 
-Long prefill uses disposable rolling checkpoints every 4096 tokens. Contended
-prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long unopposed
-work. These policies do not extend client deadlines. Memory recovery waits are
+Long prefill uses disposable rolling checkpoints every 4096 tokens. A completed
+request keeps its deepest one beside its prompt-end state, one per conversation,
+so a prompt edited within its last interval re-prefills at most 4096 tokens.
+Contended prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long
+unopposed work. These policies do not extend client deadlines. Memory recovery waits are
 bounded, but readiness does not guarantee that a request-sized allocation fits.
 
 ### Judgment contracts

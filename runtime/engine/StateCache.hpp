@@ -110,6 +110,14 @@ public:
   bool retireCheckpoint(StateCheckpoint checkpoint) noexcept;
   // Refreshes recency within the state's class. No-op when absent or pinned.
   void touch(uint64_t kvBlock) noexcept;
+  // Records on the state published at kvBlock the checkpoint kept beside it:
+  // the deepest prefill checkpoint of the conversation whose prompt ended
+  // there. Replaces any earlier record; no-op when no state is published.
+  void recordKeptCheckpoint(uint64_t kvBlock,
+                            StateCheckpoint checkpoint) noexcept;
+  // The checkpoint recorded beside the state at kvBlock, or an empty handle.
+  // The handle may be stale: retiring a stale handle is a no-op.
+  [[nodiscard]] StateCheckpoint keptCheckpoint(uint64_t kvBlock) const noexcept;
 
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
   // Marks the resident publication as one a request needs.
@@ -151,6 +159,9 @@ private:
     bool evictable = false;
     bool checkpoint = false;
     uint64_t publication = 0;
+    // The checkpoint kept beside this prompt-end state; see
+    // recordKeptCheckpoint.
+    StateCheckpoint keptCheckpoint;
   };
 
   struct EvictionQueue {
