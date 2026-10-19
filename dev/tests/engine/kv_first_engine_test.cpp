@@ -72,6 +72,22 @@ private:
   bool carriesDraft_;
 };
 
+// A live state moved out at suspension. Dropping it parks its bytes in the
+// fake's idle pool, as the production state returns its cell to the model's
+// pool, where only idle-state reclaim frees it.
+class ParkingState final : public CompositeState {
+public:
+  ParkingState(bool carriesDraft, std::shared_ptr<uint64_t> idlePool)
+      : carriesDraft_(carriesDraft), idlePool_(std::move(idlePool)) {}
+  ~ParkingState() override { *idlePool_ += bytes(); }
+  uint64_t bytes() const noexcept override { return 64; }
+  bool carriesDraft() const noexcept override { return carriesDraft_; }
+
+private:
+  bool carriesDraft_;
+  std::shared_ptr<uint64_t> idlePool_;
+};
+
 struct MaskOverlapState final {
   uint64_t requestId = 0;
   bool emitted = false;
@@ -157,11 +173,27 @@ public:
     Request &entry = requests.at(id);
     if (!entry.resident)
       throw std::logic_error("request is already suspended");
+    suspendedPositions.push_back(entry.position);
     entry.resident = false;
     entry.position = 0;
     ++suspensions;
     if (physicalGrowthBlocked && unblockGrowthOnSuspend)
       *physicalGrowthBlocked = false;
+  }
+  // Opt-in: the production model moves the lane's live state out at its
+  // committed boundary. Off, the fake keeps the default (suspend, nothing
+  // handed over), so the existing suspension pins still replay.
+  std::shared_ptr<const CompositeState>
+  suspendWithState(uint64_t id, uint32_t boundaryTokens) override {
+    if (!moveStateOnSuspend)
+      return model::Model::suspendWithState(id, boundaryTokens);
+    if (!boundaryTokens || boundaryTokens % KvCache::pageTokens ||
+        requests.at(id).position != boundaryTokens)
+      throw std::logic_error("suspension boundary is not the lane's length");
+    suspend(id);
+    ++movedStates;
+    return std::make_shared<ParkingState>(
+        targetOnlyAtBoundary != boundaryTokens, parkedStateBytes);
   }
   StateAdmission resume(const ModelRequest &request) override {
     ++resumeAttempts;
@@ -292,8 +324,9 @@ public:
   uint64_t reclaimIdleState() noexcept override {
     if (idleStateReclaimable && !idleStateReclaimable())
       return 0;
-    const uint64_t released = reclaimableIdleStateBytes;
+    const uint64_t released = reclaimableIdleStateBytes + *parkedStateBytes;
     reclaimableIdleStateBytes = 0;
+    *parkedStateBytes = 0;
     reclaimedIdleStateBytes += released;
     if (released && physicalGrowthBlocked)
       *physicalGrowthBlocked = false;
@@ -325,6 +358,12 @@ public:
   uint32_t beginAttempts = 0;
   uint32_t deniedBegins = 0;
   uint32_t suspensions = 0;
+  // The lane position each suspension found, before it was reset.
+  std::vector<uint32_t> suspendedPositions;
+  bool moveStateOnSuspend = false;
+  uint32_t movedStates = 0;
+  // Bytes of dropped moved states, parked until idle-state reclaim.
+  std::shared_ptr<uint64_t> parkedStateBytes = std::make_shared<uint64_t>(0);
   uint32_t resumptions = 0;
   uint32_t resumeAttempts = 0;
   uint32_t maximumCells = model::ExecutionLimits::maximumBatchWidth;
@@ -2155,6 +2194,329 @@ void testRepeatedSuspensionKeepsTheFirstReplayEnd() {
   // before the first suspension; the rest of the prompt is ordinary prefill.
   require(engine.snapshot().resourceReplayTokens == 2048 + 4096,
           "a second suspension lowered the replay end of the first");
+}
+
+// testMidPrefillSuspensionCountsOnlyProcessedTokensAsReplay's fixture, with
+// the fake moving its live state out at suspension.
+struct LiveStateSuspension {
+  Backing backing{512};
+  KvPool pool{backing};
+  engine::Cache resources{pool, CacheNamespace{}};
+  Executor executor{2};
+  Events events;
+  engine::Engine engine;
+  double now = 1;
+
+  explicit LiveStateSuspension(EngineConfig config = {})
+      : engine(config, resources, executor, events) {
+    executor.moveStateOnSuspend = true;
+    backing.growthAllowed = [this] {
+      return std::count_if(executor.requests.begin(), executor.requests.end(),
+                           [](const auto &entry) {
+                             return entry.second.resident;
+                           }) < 2;
+    };
+  }
+
+  void runToIdle() {
+    for (; now < 256 && !engine.idle(); ++now)
+      static_cast<void>(engine.tick(now));
+    require(engine.idle() && events.failedCount == 0,
+            "live-state suspension fixture did not finish its requests");
+  }
+
+  // The boundary of the deepest state cached on `tokens`.
+  uint32_t cachedBoundary(std::span<const uint32_t> tokens) {
+    return resources.lookup(tokens).resumeBoundary();
+  }
+};
+
+void testPageAlignedSuspensionResumesFromItsLiveState() {
+  LiveStateSuspension fixture;
+  const std::vector<uint32_t> prompt(4096, 48);
+  fixture.engine.submit(request(48, prompt));
+
+  suspendPrefillForForegroundPeer(fixture.engine, fixture.resources,
+                                  fixture.executor, 49, 2048, fixture.now);
+
+  require(fixture.executor.movedStates == 1 &&
+              fixture.engine.snapshot().checkpointPublications == 1 &&
+              fixture.cachedBoundary(prompt) == 2048,
+          "page-aligned suspension did not publish its live state");
+  fixture.runToIdle();
+  require(fixture.executor.restoredLengths.at(48) == 2048 &&
+              fixture.executor.restoredDraft &&
+              fixture.engine.snapshot().resourceReplayTokens == 0,
+          "resume replayed rows its live state covered");
+  // Adopted as the lane's checkpoint, the state is retired by its next
+  // publication: no mid-prompt state outlives the request.
+  require(fixture.cachedBoundary(std::span(prompt).first(2049)) == 0,
+          "a mid-prompt suspension state outlived its request");
+}
+
+void testUnalignedSuspensionPublishesNothing() {
+  LiveStateSuspension fixture;
+  fixture.backing.growthAllowed = nullptr;
+  fixture.executor.decodeFinishes = false;
+  fixture.engine.submit(request(48, std::vector<uint32_t>(4096, 48)));
+  // A short peer leads the first command, leaving request 48 an unaligned
+  // share of the budget; it then decodes while request 48 needs growth.
+  auto decoding = request(47, std::vector<uint32_t>(10, 47));
+  decoding.maxNewTokens = 32;
+  fixture.engine.submit(std::move(decoding));
+  require(fixture.engine.tick(1) &&
+              fixture.executor.requests.at(48).position == 2038,
+          "unaligned fixture did not stop request 48 mid-page");
+
+  fixture.backing.growthBlocked = true;
+  for (fixture.now = 2; fixture.now < 16 && !fixture.executor.suspensions;
+       ++fixture.now)
+    static_cast<void>(fixture.engine.tick(fixture.now));
+  require(fixture.executor.suspendedPositions ==
+                  std::vector<uint32_t>{2038} &&
+              fixture.executor.movedStates == 0 &&
+              fixture.engine.snapshot().checkpointPublications == 0,
+          "unaligned suspension published a state");
+  fixture.backing.growthBlocked = false;
+  fixture.executor.decodeFinishes = true;
+  fixture.runToIdle();
+
+  // No state lay below it, so the resume replays from the first token.
+  require(!fixture.executor.restoredLengths.contains(48) &&
+              fixture.engine.snapshot().resourceReplayTokens == 2038,
+          "unaligned suspension did not resume from the deepest state");
+}
+
+void testSuspensionAtAStateBlockKeepsThatState() {
+  bool paused = false;
+  EngineConfig config;
+  config.prefillCheckpointTokens = 2048;
+  // Paused growth suspends without the growth reclaim that would first
+  // evict the lane's checkpoint.
+  config.growthPaused = [&] { return paused; };
+  LiveStateSuspension fixture(config);
+  fixture.backing.growthAllowed = nullptr;
+  const std::vector<uint32_t> prompt(4096, 48);
+  fixture.engine.submit(request(48, prompt));
+  for (; fixture.now < 8 &&
+         fixture.engine.snapshot().checkpointPublications == 0;
+       ++fixture.now)
+    static_cast<void>(fixture.engine.tick(fixture.now));
+  require(fixture.executor.requests.at(48).position == 2048 &&
+              fixture.engine.snapshot().checkpointPublications == 1,
+          "state-block fixture did not checkpoint at 2048");
+
+  paused = fixture.backing.growthBlocked = true;
+  static_cast<void>(fixture.engine.tick(fixture.now++));
+
+  // The lane's checkpoint already sits at the block: nothing is moved.
+  require(fixture.executor.suspendedPositions ==
+                  std::vector<uint32_t>{2048} &&
+              fixture.executor.movedStates == 0 &&
+              fixture.engine.snapshot().checkpointPublications == 1 &&
+              fixture.cachedBoundary(prompt) == 2048,
+          "suspension at a state's block replaced or lost that state");
+  paused = fixture.backing.growthBlocked = false;
+  fixture.runToIdle();
+  require(fixture.executor.restoredLengths.at(48) == 2048 &&
+              fixture.engine.snapshot().resourceReplayTokens == 0,
+          "suspension at a state's block did not resume from it");
+}
+
+void testSuspensionStateReplacesTheLaneCheckpoint() {
+  bool paused = false;
+  EngineConfig config;
+  config.growthPaused = [&] { return paused; };
+  LiveStateSuspension fixture(config);
+  fixture.backing.growthAllowed = nullptr;
+  const std::vector<uint32_t> prompt(12288, 48);
+  fixture.engine.submit(request(48, prompt));
+  // The lane checkpoints at 4096; 6144 is no planned boundary.
+  const auto &lanes = fixture.executor.requests;
+  for (; fixture.now < 16 &&
+         !(lanes.contains(48) && lanes.at(48).position == 6144);
+       ++fixture.now)
+    static_cast<void>(fixture.engine.tick(fixture.now));
+  require(fixture.cachedBoundary(prompt) == 4096,
+          "replacement fixture did not checkpoint at 4096");
+
+  paused = fixture.backing.growthBlocked = true;
+  for (const double deadline = fixture.now + kPeerSuspensionTicks;
+       fixture.now < deadline && !fixture.executor.suspensions; ++fixture.now)
+    static_cast<void>(fixture.engine.tick(fixture.now));
+
+  // The suspension state is the lane's recovery point now; the earlier
+  // checkpoint is retired rather than left behind.
+  require(fixture.executor.suspendedPositions ==
+                  std::vector<uint32_t>{6144} &&
+              fixture.executor.movedStates == 1 &&
+              fixture.cachedBoundary(prompt) == 6144 &&
+              fixture.cachedBoundary(std::span(prompt).first(6143)) == 0,
+          "suspension state did not replace the lane's checkpoint");
+  paused = fixture.backing.growthBlocked = false;
+  fixture.runToIdle();
+  require(fixture.executor.restoredLengths.at(48) == 6144 &&
+              fixture.cachedBoundary(std::span(prompt).first(12256)) == 0,
+          "a mid-prompt checkpoint outlived its request");
+}
+
+void testDecodeSuspensionPublishesNothing() {
+  bool paused = false;
+  EngineConfig config;
+  // Paused growth suspends without the growth reclaim that would first
+  // evict the decoding lane's replay state.
+  config.growthPaused = [&] { return paused; };
+  LiveStateSuspension fixture(config);
+  fixture.backing.growthAllowed = nullptr;
+  fixture.executor.decodeFinishes = false;
+  const std::vector<uint32_t> prompt(4096, 48);
+  auto decoding = request(48, prompt);
+  decoding.maxNewTokens = 32;
+  fixture.engine.submit(std::move(decoding));
+  for (; fixture.now < 16 && fixture.events.outputs[48].empty(); ++fixture.now)
+    static_cast<void>(fixture.engine.tick(fixture.now));
+  require(!fixture.events.outputs[48].empty() &&
+              fixture.cachedBoundary(prompt) == 4064,
+          "decode fixture did not reach decode");
+
+  paused = fixture.backing.growthBlocked = true;
+  auto foreground = request(49, std::vector<uint32_t>(8192, 49));
+  foreground.priority = RequestPriority::Foreground;
+  fixture.engine.submit(std::move(foreground));
+  for (const double deadline = fixture.now + kPeerSuspensionTicks;
+       fixture.now < deadline && !fixture.executor.suspensions; ++fixture.now)
+    static_cast<void>(fixture.engine.tick(fixture.now));
+  require(fixture.executor.suspensions == 1 &&
+              fixture.executor.suspendedPositions.front() == prompt.size() &&
+              fixture.executor.movedStates == 0 &&
+              fixture.engine.snapshot().checkpointPublications == 0,
+          "decode suspension published a state");
+
+  // Warning reclaim keeps the deepest usable state for the resume.
+  static_cast<void>(fixture.resources.reclaimCache(
+      std::numeric_limits<uint64_t>::max(), false));
+  require(fixture.cachedBoundary(prompt) == 4064,
+          "Warning reclaim took a decode suspension's resume state");
+  paused = fixture.backing.growthBlocked = false;
+  fixture.executor.decodeFinishes = true;
+  fixture.runToIdle();
+  require(fixture.executor.restoredLengths.at(48) == 4064,
+          "decode suspension did not resume from its replay state");
+}
+
+void testSuspensionBeforeAnyPrefillPublishesNothing() {
+  Backing backing(8);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.moveStateOnSuspend = true;
+  executor.physicalGrowthBlocked = &backing.growthBlocked;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+
+  backing.growthBlocked = true;
+  engine.submit(request(50, {50}));
+  engine.submit(request(51, {51}));
+  runUntilIdle(engine);
+
+  require(executor.suspendedPositions == std::vector<uint32_t>{0} &&
+              executor.movedStates == 0 && events.completedCount == 2 &&
+              events.failedCount == 0,
+          "a suspension at position 0 moved state or failed");
+}
+
+void testShortTargetOnlySuspensionStateIsDropped() {
+  LiveStateSuspension fixture;
+  // The first planned boundary, 4064, lies less than a draft window past it.
+  fixture.executor.targetOnlyAtBoundary = 2048;
+  fixture.engine.submit(request(48, std::vector<uint32_t>(4096, 48)));
+
+  suspendPrefillForForegroundPeer(fixture.engine, fixture.resources,
+                                  fixture.executor, 49, 2048, fixture.now);
+
+  require(fixture.executor.movedStates == 1 &&
+              fixture.engine.snapshot().checkpointPublications == 0 &&
+              fixture.resources.snapshot().stateCache.entries == 0,
+          "an unusable target-only suspension state was published");
+  require(*fixture.executor.parkedStateBytes == 0 &&
+              fixture.executor.reclaimedIdleStateBytes == 64,
+          "the dropped moved state stayed parked in the idle pool");
+  fixture.runToIdle();
+  require(!fixture.executor.restoredLengths.contains(48) &&
+              fixture.engine.snapshot().resourceReplayTokens == 2048,
+          "dropped suspension state was restored");
+}
+
+// Publishes KV for `tokens` under a cache-only request, with an ordinary
+// full state at `stateBoundary`.
+void cachePrefix(engine::Cache &resources, uint64_t requestId,
+                 std::span<const uint32_t> tokens, uint32_t stateBoundary) {
+  resources.beginRequest(requestId);
+  require(resources.ensureTokens(requestId, tokens.size()).granted(),
+          "cache-only prefix pages were not acquired");
+  static_cast<void>(resources.publishCommittedBlocks(
+      requestId, tokens, static_cast<uint32_t>(tokens.size())));
+  resources.publishCompositeState(resources.blockAt(requestId, stateBoundary),
+                                  std::make_shared<State>());
+  resources.endRequest(requestId);
+}
+
+void testRejectedTargetOnlySuspensionStateFallsBack() {
+  LiveStateSuspension fixture;
+  // The first planned boundary, the 4096 checkpoint, lies a whole draft
+  // window past it: the suspension publishes the target-only state.
+  fixture.executor.targetOnlyAtBoundary = 2048;
+  const std::vector<uint32_t> prompt(8192, 48);
+  fixture.engine.submit(request(48, prompt));
+  suspendPrefillForForegroundPeer(fixture.engine, fixture.resources,
+                                  fixture.executor, 49, 2048, fixture.now);
+  require(fixture.engine.snapshot().checkpointPublications == 1 &&
+              fixture.cachedBoundary(prompt) == 2048,
+          "a usable target-only suspension state was not published");
+
+  // Cached KV to 3072 adds a junction admit plans before that checkpoint.
+  cachePrefix(fixture.resources, 999, std::span(prompt).first(3072), 1024);
+  fixture.runToIdle();
+  require(fixture.executor.restoredLengths.at(48) == 1024,
+          "admit did not walk past a target-only state it rejects");
+}
+
+void testSuspensionStateIsProtectedUntilUnprotectedStatesGo() {
+  LiveStateSuspension fixture;
+  const std::vector<uint32_t> prompt(4096, 48);
+  fixture.engine.submit(request(48, prompt));
+  suspendPrefillForForegroundPeer(fixture.engine, fixture.resources,
+                                  fixture.executor, 49, 2048, fixture.now);
+  uint64_t published = 0;
+  {
+    const CacheLookup lookup = fixture.resources.lookup(prompt);
+    require(lookup.resumeBoundary() == 2048,
+            "protection fixture did not publish the suspension state");
+    published = lookup.state->kvBlock();
+  }
+
+  static_cast<void>(fixture.resources.reclaimCache(
+      std::numeric_limits<uint64_t>::max(), false));
+  require(fixture.resources.carriesState(published),
+          "Warning reclaim took the published suspension state");
+
+  const std::vector<uint32_t> other(64, 998);
+  cachePrefix(fixture.resources, 998, other, 32);
+  uint64_t unprotected = 0;
+  {
+    const CacheLookup lookup = fixture.resources.lookup(other);
+    unprotected = lookup.state->kvBlock();
+  }
+  for (uint32_t step = 0;
+       step < 16 && fixture.resources.carriesState(unprotected); ++step) {
+    require(fixture.resources.carriesState(published),
+            "growth reclaim took the suspension state before an unprotected one");
+    static_cast<void>(fixture.resources.reclaimOneForGrowth());
+  }
+  require(!fixture.resources.carriesState(unprotected) &&
+              fixture.resources.carriesState(published),
+          "growth reclaim did not take the unprotected state first");
+  fixture.runToIdle();
 }
 
 void testPrefillGrowthPreservesAnActiveDecodePeer() {
@@ -4176,6 +4538,15 @@ int main() {
     testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield();
     testGrowthYieldsLowerPriorityResidentOutsideBatch();
     testMidPrefillSuspensionCountsOnlyProcessedTokensAsReplay();
+    testPageAlignedSuspensionResumesFromItsLiveState();
+    testUnalignedSuspensionPublishesNothing();
+    testSuspensionAtAStateBlockKeepsThatState();
+    testSuspensionStateReplacesTheLaneCheckpoint();
+    testDecodeSuspensionPublishesNothing();
+    testSuspensionBeforeAnyPrefillPublishesNothing();
+    testShortTargetOnlySuspensionStateIsDropped();
+    testRejectedTargetOnlySuspensionStateFallsBack();
+    testSuspensionStateIsProtectedUntilUnprotectedStatesGo();
     testRepeatedSuspensionKeepsTheFirstReplayEnd();
     testPrefillGrowthPreservesAnActiveDecodePeer();
     testPhysicalKvPressureSuspendsInsteadOfKillingActiveWork();

@@ -392,6 +392,29 @@ void testShallowerStateReplacesARejectedTargetOnlyState() {
           "a state below the shallowest one was found or pinned");
 }
 
+// carriesState answers for the block alone: a probe of a checkpoint's block
+// neither demotes it nor counts a deduplicated publication.
+void testCarriesStateLeavesTheStateUntouched() {
+  CacheFixture fixture;
+  fixture.publish(0);
+  fixture.cache.publishCompositeState(fixture.blocks[2],
+                                      std::make_shared<TestState>(100), true);
+  const StateCheckpoint checkpoint =
+      fixture.cache.checkpointState(fixture.blocks[2]);
+
+  const bool ordinary = fixture.cache.carriesState(fixture.blocks[0]);
+  const bool empty = fixture.cache.carriesState(fixture.blocks[1]);
+  const bool atCheckpoint = fixture.cache.carriesState(fixture.blocks[2]);
+
+  require(ordinary && atCheckpoint && !empty,
+          "carriesState misreported which blocks hold a state");
+  require(fixture.cache.checkpointState(fixture.blocks[2]).publication ==
+                  checkpoint.publication &&
+              fixture.cache.snapshot().stateCache.checkpointEntries == 1 &&
+              fixture.cache.snapshot().stateCache.deduplicatedPublications == 0,
+          "carriesState demoted a checkpoint or counted a publication");
+}
+
 void testByteLruAndPins() {
   CacheFixture fixture;
   fixture.publish(0, 150);
@@ -982,6 +1005,7 @@ int main() {
     testPage31Page32Page33Backoff();
     testLazyJunctionMaterialization();
     testShallowerStateReplacesARejectedTargetOnlyState();
+    testCarriesStateLeavesTheStateUntouched();
     testByteLruAndPins();
     testSpeculativeReclaimKeepsTheResumePoint();
     testWarningReclaimKeepsResidentRunway();

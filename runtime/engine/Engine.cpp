@@ -702,17 +702,22 @@ uint32_t Engine::firstPlannedBoundary(const Request &active,
   return first;
 }
 
+// Replay rebuilds a draft window only when the first planned boundary
+// captures a whole one; a shorter span would continue draft rows a
+// target-only state at stateBoundary does not hold.
+bool Engine::rebuildsDraftWindow(const Request &active, uint32_t stateBoundary,
+                                 uint32_t junctionBoundary) const {
+  return firstPlannedBoundary(active, stateBoundary, junctionBoundary) -
+             stateBoundary >=
+         model::ExecutionLimits::draftContextTokens;
+}
+
 bool Engine::restorable(const Request &active,
                         const CacheLookup &lookup) const {
   if (!lookup.state || lookup.state->state()->carriesDraft())
     return true;
-  // Replay rebuilds a draft window only when the first planned boundary
-  // captures a whole one; a shorter span would continue draft rows the
-  // target-only state does not hold.
-  const uint32_t boundary = lookup.resumeBoundary();
-  return firstPlannedBoundary(active, boundary, lookup.junctionBoundary()) -
-             boundary >=
-         model::ExecutionLimits::draftContextTokens;
+  return rebuildsDraftWindow(active, lookup.resumeBoundary(),
+                             lookup.junctionBoundary());
 }
 
 bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
@@ -1056,6 +1061,48 @@ uint32_t Engine::completedTokens(const Request &active) const {
              : static_cast<uint32_t>(active.exactTokens.size());
 }
 
+// Suspends the lane's model. Mid-prefill (0 < position < the exact history)
+// at a page boundary whose block carries no state, the lane's live state is
+// moved out and published there as its checkpoint, replacing the previous
+// one, so the resume restores at position instead of replaying from an
+// earlier state. A decode suspension publishes nothing: its position is the
+// whole history. Expects the lane marked suspended with its replay length
+// set, so the target-only test sees the plan its resume will make. Costs one
+// state-table lookup and a pointer move: no copy, no allocation.
+void Engine::suspendModel(Request &active, uint32_t position) {
+  const uint64_t id = active.request.id;
+  const bool midPrefill = position && position < active.exactTokens.size() &&
+                          position % KvCache::pageTokens == 0;
+  const uint64_t block = midPrefill ? cache_.blockAt(id, position) : 0;
+  if (!block || cache_.carriesState(block)) {
+    model_.suspend(id);
+    return;
+  }
+  std::shared_ptr<const CompositeState> state =
+      model_.suspendWithState(id, position);
+  if (!state)
+    return;
+  // A hint: admit's restorable check is authoritative. A KV junction past
+  // position, unknown here, only lowers the first boundary admit checks.
+  const bool usable =
+      state->carriesDraft() || rebuildsDraftWindow(active, position, 0);
+  const bool retiring = usable && active.latestCheckpoint;
+  if (usable) {
+    static_cast<void>(retireCheckpoint(active));
+    cache_.publishCompositeState(block, std::move(state), true);
+    ++counters_.checkpointPublications;
+    setLatestCheckpoint(active, cache_.checkpointState(block));
+  }
+  state.reset();
+  // The model drained its idle pool as it suspended; a dropped state or a
+  // retired checkpoint parks its buffers there, which the suspension returns
+  // to the host now.
+  if (!usable || retiring) {
+    while (model_.reclaimIdleState()) {
+    }
+  }
+}
+
 void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
   if (!active.stateCell || active.suspended) {
     throw std::logic_error("request cannot be suspended for growth");
@@ -1064,24 +1111,24 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
     discardPendingStateBoundaries(active);
     scheduler_.setPrefillBoundary(active.request.id, std::nullopt);
   }
-  model_.suspend(active.request.id);
+  const uint32_t position = completedTokens(active);
+  active.suspended = true;
+  active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
+  suspendModel(active, position);
   // Warning reclaim must not turn the resume into a full replay; growth
-  // reclaim takes this state only after every unprotected one, and Critical
-  // reclaim takes it outright.
+  // reclaim takes this state, the one published at suspension included,
+  // only after every unprotected one, and Critical reclaim takes it outright.
   active.resumeProtection = cache_.protectDeepestState(active.request.id);
   // A suspended lane is no longer resident: its recovery point is protected
   // only as the resume state, when it is the deepest one.
   cache_.unprotectState(std::exchange(active.checkpointProtection, {}));
   cache_.endRequest(active.request.id);
   active.stateCell.reset();
-  active.suspended = true;
   active.resumeKvTargetTokens = workEnd;
   recoveringResources_ = true;
-  active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
   // A suspension during resumed replay must keep counting the rows processed
   // before the first suspension.
-  active.replayCountEnd =
-      std::max(active.replayCountEnd, completedTokens(active));
+  active.replayCountEnd = std::max(active.replayCountEnd, position);
   scheduler_.suspendForResources(active.request.id);
   deferResourceRetry(active, now);
   ++counters_.resourceSuspensions;

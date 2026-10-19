@@ -189,6 +189,9 @@ private:
   [[nodiscard]] uint32_t firstPlannedBoundary(const Request &request,
                                               uint32_t stateBoundary,
                                               uint32_t junctionBoundary) const;
+  [[nodiscard]] bool rebuildsDraftWindow(const Request &request,
+                                         uint32_t stateBoundary,
+                                         uint32_t junctionBoundary) const;
   [[nodiscard]] bool restorable(const Request &request,
                                 const CacheLookup &lookup) const;
   [[nodiscard]] DraftContextPlan
@@ -221,6 +224,7 @@ private:
   [[nodiscard]] KvAdmission admitKv(Request &request, uint64_t workEnd);
   [[nodiscard]] bool budgetMayRecover(metal::AllocationFailure failure,
                                       uint64_t generation, bool reclaimed) const;
+  void suspendModel(Request &request, uint32_t position);
   void suspendForGrowth(Request &request, uint64_t workEnd,
                         double nowMilliseconds);
   [[nodiscard]] bool resourceRetryReady(const Request &request,

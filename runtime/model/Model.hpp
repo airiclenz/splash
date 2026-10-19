@@ -443,6 +443,22 @@ public:
   // request's host-side sampling/constraint continuation. Resume replays the
   // supplied committed history through the ordinary packed-prefill path.
   virtual void suspend(uint64_t requestId) = 0;
+  // Safe-point preemption as suspend(): releases execution backing and keeps
+  // the host-side continuation. Unlike suspend(), whose resume replays the
+  // whole committed history, it may first hand the lane's live state to the
+  // caller, which may cache it so the resume restores there: the composite
+  // state at boundaryTokens, moved out of the lane without a copy or a new
+  // allocation, target-only when the lane's draft window is incomplete.
+  // boundaryTokens must be the lane's nonzero, page-aligned committed length,
+  // else std::logic_error with the lane untouched. Returns nullptr when no
+  // state was handed over (the default). A dropped state parks its buffers
+  // as idle state, which reclaimIdleState returns to the host.
+  [[nodiscard]] virtual std::shared_ptr<const CompositeState>
+  suspendWithState(uint64_t requestId, uint32_t boundaryTokens) {
+    static_cast<void>(boundaryTokens);
+    suspend(requestId);
+    return nullptr;
+  }
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
   virtual void restore(uint64_t requestId, uint32_t restoredPrefixLength,
                        std::shared_ptr<const CompositeState> state,

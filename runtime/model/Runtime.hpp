@@ -23,6 +23,8 @@ public:
   [[nodiscard]] StateAdmission
   begin(const ModelRequest &request) override;
   void suspend(uint64_t requestId) override;
+  [[nodiscard]] std::shared_ptr<const CompositeState>
+  suspendWithState(uint64_t requestId, uint32_t boundaryTokens) override;
   [[nodiscard]] StateAdmission
   resume(const ModelRequest &request) override;
   void restore(uint64_t requestId, uint32_t restoredPrefixLength,

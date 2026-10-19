@@ -150,6 +150,49 @@ void testTargetOnlyStates(metal::MetalBackend &backend,
   storage.releaseSlot(0, 504);
 }
 
+// Runtime::suspendWithState's sequence: the live state moves out, then the
+// slot and the idle pool are released. The moved cell survives both without
+// a copy or an admitted allocation, restores at the lane's length, and parks
+// in the pool only once the state is dropped.
+void testSuspensionKeepsTheMovedCell(metal::MetalBackend &backend,
+                                     const metal::AllocationAdmission &admitState,
+                                     bool &admitNewAllocations) {
+  using model::QwenLogicalLengths;
+  using model::QwenStateStorage;
+
+  QwenStateStorage storage(backend, admitState, kStateLayout);
+  require(storage.tryActivateSlot(0, 601) && storage.tryActivateSlot(1, 602),
+          "suspension fixture lanes were not activated");
+  const QwenLogicalLengths boundary{2'048, 0, 2'048, 0};
+  storage.updateLengths(0, boundary);
+  const auto &source = storage.buffers(0);
+  const uint32_t active = storage.metadata(0).activeParity;
+  word(source.gdn[active].convolutionBase) = 0x71717171;
+  word(source.gdn[active].recurrentBase) = 0x72727272;
+  const uint64_t backendBefore = backend.memoryStats().allocatedBytes;
+
+  admitNewAllocations = false;
+  auto moved = storage.moveState(0);
+  storage.releaseSlot(0, 601);
+  static_cast<void>(storage.releaseIdle(0, 0));
+  admitNewAllocations = true;
+
+  require(moved && moved->carriesDraft() && storage.idleCells() == 0 &&
+              backend.memoryStats().allocatedBytes <= backendBefore,
+          "suspension copied or allocated the moved state");
+  storage.restore(1, *moved, true);
+  const auto &destination = storage.buffers(1);
+  const uint32_t restored = storage.metadata(1).activeParity;
+  require(word(destination.gdn[restored].convolutionBase) == 0x71717171 &&
+              word(destination.gdn[restored].recurrentBase) == 0x72727272 &&
+              storage.metadata(1).lengths == boundary,
+          "moved state lost its cell or its length across the release");
+  moved.reset();
+  require(storage.idleCells() == 1,
+          "a dropped moved state did not park its cell in the pool");
+  storage.releaseSlot(1, 602);
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -519,6 +562,7 @@ void run(const std::string &metallib) {
             "reclaimed state cells remain accounted");
   }
   testTargetOnlyStates(backend, admitState, admitNewAllocations);
+  testSuspensionKeepsTheMovedCell(backend, admitState, admitNewAllocations);
   require(backend.memoryStats().allocatedBytes == beforeStorage,
           "destroyed state slots remained in actual allocation count");
 

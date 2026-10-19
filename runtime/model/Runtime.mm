@@ -1797,6 +1797,25 @@ void Runtime::suspend(uint64_t requestId) {
   entry.resident = false;
 }
 
+std::shared_ptr<const CompositeState>
+Runtime::suspendWithState(uint64_t requestId, uint32_t boundaryTokens) {
+  Impl::Request &entry = impl_->request(requestId);
+  if (!entry.resident || entry.verifyMaskInFlight) {
+    throw std::logic_error("Qwen request cannot be suspended");
+  }
+  // CompositeState exposes no length; the moved state carries the lane's.
+  const uint64_t targetTokens =
+      impl_->states.metadata(entry.slot).lengths.targetTokens;
+  if (!boundaryTokens || boundaryTokens % kv::kPageTokens ||
+      targetTokens != boundaryTokens) {
+    throw std::logic_error("suspension boundary is not the lane's state length");
+  }
+  std::shared_ptr<const CompositeState> state =
+      impl_->states.moveState(entry.slot);
+  suspend(requestId);
+  return state;
+}
+
 StateAdmission Runtime::resume(const ModelRequest &request) {
   Impl::Request &entry = impl_->request(request.id);
   if (entry.resident) {

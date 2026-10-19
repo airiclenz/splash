@@ -132,6 +132,10 @@ public:
                              std::shared_ptr<const CompositeState> state,
                              bool checkpoint = false);
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
+  // True while a composite state is published at kvBlock. A side-effect-free
+  // test: unlike reuseCompositeState it neither touches recency nor demotes
+  // a checkpoint nor counts a deduplicated publication.
+  [[nodiscard]] bool carriesState(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
 
