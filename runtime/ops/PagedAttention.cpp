@@ -248,10 +248,12 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens,
-    VerifyAttentionConfig configuration) {
+    VerifyAttentionConfig configuration, kv::VerifySplitPolicy splitPolicy) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid attention workspace batch width");
+  if (!kv::q8VerifySplitPolicyIsValid(splitPolicy))
+    throw std::invalid_argument("invalid verify attention split policy");
   if (historyTokens.size() != lanes &&
       historyTokens.size() != SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid verify attention history vector");
@@ -265,7 +267,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
       throw std::invalid_argument(
           "verify attention history exceeds physical context");
     laneSplits[lane] = kv::q8VerifyAttentionSplits(
-        base, historyTokens[lane], kv::kQ8VerifyMaximumRows);
+        base, historyTokens[lane], kv::kQ8VerifyMaximumRows, splitPolicy);
     splits = std::max(splits, laneSplits[lane]);
   }
   return {configuration, lanes, laneSplits, splits,
@@ -286,7 +288,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
               : pipeline(kernel, "verify_attention_q8_store",
                          "verify_attention_q8_store_kv2_g8"),
           {uint64_t{lanes} * 2 * kv::kQ8VerifyMaximumRows * layout.kvHeads, 1, 1},
-          {layout.headDimension, 1, 1}, layout.format};
+          {layout.headDimension, 1, 1}, layout.format, splitPolicy};
 }
 
 AttentionWorkspace PagedAttention::prefillWorkspace(
@@ -510,7 +512,7 @@ void PagedAttention::addVerify(
     if (attention[lane].split_count !=
         kv::q8VerifyAttentionSplits(verifySplits(plan.configuration),
                                     attention[lane].committed_tokens,
-                                    kv::kQ8VerifyMaximumRows))
+                                    kv::kQ8VerifyMaximumRows, plan.splitPolicy_))
       throw std::invalid_argument("paged verify lane history does not match plan");
   }
   auto storeBuffers = kvBuffers(layer, plan.format,

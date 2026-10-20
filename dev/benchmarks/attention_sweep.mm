@@ -12,11 +12,20 @@
 // pipeline times are per pass (summed over the layers); --kv-format and --tile
 // do not apply to it.
 //
+// --verify-split-floor F --verify-min-pages P (given together) time verify
+// attention under that split policy (kv::VerifySplitPolicy): short histories
+// lower the configured split count to no fewer than F splits and no fewer than
+// one split per P visible pages. The policy applies to METALLIB only; a
+// --compare-metallib variant keeps the default policy, so the two time the
+// policies against each other in one process. Their verify outputs sum in a
+// different order, so verify skips the cross-metallib bit check under a policy.
+//
 // usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b]
 //                        [--lanes 1,4] [--repeat N]
 //                        [--phases all|both|verify|prefill|draft]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
 //                        [--tile mpp|register]
+//                        [--verify-split-floor F --verify-min-pages P]
 // `both` is prefill and verify; `all`, the default, adds draft.
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
@@ -34,6 +43,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -72,6 +82,7 @@ struct Plan final {
   AttentionShape shape;
   bool prefill = false;
   VerifyAttentionConfig verify;
+  kv::VerifySplitPolicy splitPolicy;
   uint32_t lanes = 0;
   uint32_t rows = 0;
   uint32_t stride = 0;
@@ -94,13 +105,14 @@ struct Plan final {
 };
 
 Plan makePlan(AttentionShape shape, bool prefill, uint32_t lanes, uint32_t history,
-              VerifyAttentionConfig verify = {}) {
+              VerifyAttentionConfig verify = {}, kv::VerifySplitPolicy splitPolicy = {}) {
   if (!lanes || lanes > kMaximumLanes)
     throw std::invalid_argument("--lanes must contain values from 1 to 4");
   Plan plan;
   plan.shape = shape;
   plan.prefill = prefill;
   plan.verify = verify;
+  plan.splitPolicy = splitPolicy;
   plan.lanes = prefill ? 1 : lanes;
   plan.rows = prefill ? kPrefillRows : kVerifyRows;
   for (uint32_t lane = 0; lane < plan.lanes; ++lane) plan.histories[lane] = history;
@@ -111,7 +123,7 @@ Plan makePlan(AttentionShape shape, bool prefill, uint32_t lanes, uint32_t histo
                   .workspace;
   } else {
     scratch = PagedAttention::verifyPlan(plan.lanes, shape.queryHeads, plan.layout(),
-                                         plan.laneHistories(), verify)
+                                         plan.laneHistories(), verify, splitPolicy)
                   .workspace;
   }
   plan.stride = (plan.rows + kPageRows - 1) / kPageRows * kPageRows;
@@ -186,7 +198,7 @@ public:
     } else {
       const auto attentionPlan = PagedAttention::verifyPlan(
           plan_.lanes, plan_.shape.queryHeads, plan_.layout(), plan_.laneHistories(),
-          plan_.verify);
+          plan_.verify, plan_.splitPolicy);
       PagedAttention::addVerify(
           result, layer_,
           {get(Tensor::ChunkKeys), get(Tensor::ChunkValues), get(Tensor::Queries),
@@ -431,14 +443,17 @@ double median(std::vector<double> values) {
   return values[values.size() / 2];
 }
 
+// plans holds one plan per backend. Outputs are compared bitwise across
+// backends only when shouldCompareBits is set.
 template <typename FixtureType, typename PlanType>
 std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
-                          const PlanType &plan, uint32_t repeat) {
+                          std::span<const PlanType> plans, uint32_t repeat,
+                          bool shouldCompareBits) {
   std::vector<std::unique_ptr<FixtureType>> fixtures;
   std::vector<metal::CommandGraph> graphs;
   std::vector<Case> results(backends.size());
   for (size_t i = 0; i < backends.size(); ++i) {
-    fixtures.push_back(std::make_unique<FixtureType>(*backends[i], plan));
+    fixtures.push_back(std::make_unique<FixtureType>(*backends[i], plans[i]));
     graphs.push_back(fixtures.back()->graph());
     results[i].kvBytes = fixtures.back()->historyBytes();
   }
@@ -447,7 +462,7 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
   while (warmup < 0.1)
     for (size_t i = 0; i < backends.size(); ++i)
       warmup += backends[i]->submitCommand(graphs[i].dispatches()).gpuSeconds;
-  for (size_t i = 1; i < fixtures.size(); ++i)
+  for (size_t i = 1; shouldCompareBits && i < fixtures.size(); ++i)
     if (!fixtures[0]->sameOutput(*fixtures[i]))
       throw std::runtime_error("comparison metallib changed attention output bits");
   std::vector<std::vector<double>> fused(backends.size());
@@ -526,7 +541,8 @@ int main(int argc, const char *argv[]) {
       std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b] "
                    "[--lanes LIST] [--repeat N] [--phases all|both|verify|prefill|draft] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16] "
-                   "[--tile mpp|register]\n";
+                   "[--tile mpp|register] "
+                   "[--verify-split-floor F --verify-min-pages P]\n";
       return 64;
     }
     std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
@@ -535,6 +551,7 @@ int main(int argc, const char *argv[]) {
     uint32_t repeat = 5;
     kv::Format format = kv::Format::Int8;
     VerifyAttentionConfig verifyConfig;
+    std::optional<uint32_t> splitFloor, minimumPagesPerSplit;
     std::string comparisonLibrary, phases = "all";
     for (int index = 2; index < argc; index += 2) {
       const std::string option(argv[index]);
@@ -554,6 +571,11 @@ int main(int argc, const char *argv[]) {
         format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
       }
       else if (option == "--compare-metallib") comparisonLibrary = argv[index + 1];
+      else if (option == "--verify-split-floor")
+        splitFloor = parseCount(argv[index + 1], 1, kv::kQ8VerifyMaximumSplits, option);
+      else if (option == "--verify-min-pages")
+        minimumPagesPerSplit = parseCount(argv[index + 1], 1,
+                                          kv::kMaximumPhysicalTokens / kPageRows, option);
       else if (option == "--tile") {
         const std::string_view value(argv[index + 1]);
         if (value != "mpp" && value != "register")
@@ -583,6 +605,12 @@ int main(int argc, const char *argv[]) {
         }
       } else throw std::invalid_argument("unknown option " + option);
     }
+    if (splitFloor.has_value() != minimumPagesPerSplit.has_value())
+      throw std::invalid_argument("--verify-split-floor and --verify-min-pages go together");
+    const bool hasSplitPolicy = splitFloor.has_value();
+    const kv::VerifySplitPolicy splitPolicy =
+        hasSplitPolicy ? kv::VerifySplitPolicy{*splitFloor, *minimumPagesPerSplit}
+                       : kv::VerifySplitPolicy{};
     metal::MetalBackend backend(argv[1]);
     std::unique_ptr<metal::MetalBackend> comparison;
     std::vector<metal::MetalBackend *> backends{&backend};
@@ -592,7 +620,14 @@ int main(int argc, const char *argv[]) {
     }
     std::cerr << "device " << backend.capabilities().deviceName << ", one attention layer, "
               << "Page32 " << kv::formatName(format) << " KV, median of " << repeat << " fused graphs (ms)\n";
-    std::cout << "{\"device\":\"" << backend.capabilities().deviceName << "\",\"kv_format\":\"" << kv::formatName(format) << "\",\"cases\":[";
+    if (hasSplitPolicy)
+      std::cerr << "verify split policy on variant 0: floor " << splitPolicy.floorSplits
+                << " splits, " << splitPolicy.minimumPagesPerSplit << " pages per split\n";
+    std::cout << "{\"device\":\"" << backend.capabilities().deviceName << "\",\"kv_format\":\"" << kv::formatName(format) << "\",";
+    if (hasSplitPolicy)
+      std::cout << "\"verify_split_floor\":" << splitPolicy.floorSplits
+                << ",\"verify_min_pages\":" << splitPolicy.minimumPagesPerSplit << ",";
+    std::cout << "\"cases\":[";
     bool firstCase = true;
     for (const std::string &shape : shapes) {
       const AttentionShape geometry = shape == "27b" ? AttentionShape{24, 4, 256, format}
@@ -621,17 +656,28 @@ int main(int argc, const char *argv[]) {
           }
         };
         auto report = [&](bool prefill, uint32_t lane) {
-          print(measure<Fixture>(backends, makePlan(geometry, prefill, lane, history, verifyConfig),
-                                 repeat),
+          // Only variant 0 verifies under the policy override.
+          const bool isPolicyCase = hasSplitPolicy && !prefill;
+          std::vector<Plan> plans;
+          for (size_t i = 0; i < backends.size(); ++i)
+            plans.push_back(makePlan(geometry, prefill, lane, history, verifyConfig,
+                                     i == 0 && isPolicyCase ? splitPolicy
+                                                            : kv::VerifySplitPolicy{}));
+          print(measure<Fixture>(backends, std::span<const Plan>(plans), repeat,
+                                 !isPolicyCase),
                 prefill ? "prefill" : "verify", lane);
         };
         const bool isAll = phases == "all", isTarget = isAll || phases == "both";
         if (isTarget || phases == "prefill") report(true, 1);
         if (isTarget || phases == "verify") for (uint32_t lane : lanes) report(false, lane);
         if (isAll || phases == "draft")
-          for (uint32_t lane : lanes)
-            print(measure<DraftFixture>(backends, makeDraftPlan(draft, lane, history), repeat),
+          for (uint32_t lane : lanes) {
+            const std::vector<DraftPlan> plans(backends.size(),
+                                               makeDraftPlan(draft, lane, history));
+            print(measure<DraftFixture>(backends, std::span<const DraftPlan>(plans), repeat,
+                                        true),
                   "draft", lane);
+          }
       }
     }
     std::cout << "]}\n";

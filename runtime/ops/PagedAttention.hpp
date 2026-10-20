@@ -36,19 +36,44 @@ inline constexpr uint32_t kQ8VerifyPagesPerSplit =
 static_assert(kQ8VerifySplits >= 1 && kQ8VerifySplits <= kQ8VerifyMaximumSplits);
 static_assert(kQ8VerifyPagesPerSplit >= 1);
 
-// One lane's verify split count: never fewer than the configured base, one
-// more split per kQ8VerifyPagesPerSplit visible pages, never more than the
-// maximum the partial workspace is sized for. It depends only on the lane's
-// own history, so batching never changes a lane's arithmetic.
+// How far verify attention may lower its configured base split count at short
+// history: to no fewer than floorSplits, and to no fewer than one split per
+// minimumPagesPerSplit visible pages. The default floor is the maximum split
+// count, which no base exceeds, so the default policy never lowers a base.
+// Valid policies have floorSplits in [1, kQ8VerifyMaximumSplits] and a nonzero
+// minimumPagesPerSplit; see q8VerifySplitPolicyIsValid.
+struct VerifySplitPolicy final {
+  uint32_t floorSplits = kQ8VerifyMaximumSplits;
+  uint32_t minimumPagesPerSplit = kQ8VerifyPagesPerSplit;
+  bool operator==(const VerifySplitPolicy &) const = default;
+};
+
+[[nodiscard]] constexpr bool
+q8VerifySplitPolicyIsValid(VerifySplitPolicy policy) noexcept {
+  return policy.floorSplits >= 1 &&
+         policy.floorSplits <= kQ8VerifyMaximumSplits &&
+         policy.minimumPagesPerSplit >= 1;
+}
+
+// One lane's verify split count: the configured base, lowered no further than
+// the policy allows, one more split per kQ8VerifyPagesPerSplit visible pages,
+// never more than the maximum the partial workspace is sized for. It depends
+// only on the lane's own history, so batching never changes a lane's
+// arithmetic. The policy must be valid (q8VerifySplitPolicyIsValid).
 [[nodiscard]] constexpr uint32_t
 q8VerifyAttentionSplits(uint32_t baseSplits, uint32_t committedTokens,
-                        uint32_t activeRows) noexcept {
+                        uint32_t activeRows,
+                        VerifySplitPolicy policy = {}) noexcept {
   const uint64_t visible = uint64_t{committedTokens} + activeRows;
   const uint64_t pages = (visible + kPageTokens - 1) / kPageTokens;
+  const uint64_t occupied = (pages + policy.minimumPagesPerSplit - 1) /
+                            policy.minimumPagesPerSplit;
+  const uint64_t loweredBase = std::min<uint64_t>(
+      baseSplits, std::max<uint64_t>(policy.floorSplits, occupied));
   const uint64_t scaled =
       (pages + kQ8VerifyPagesPerSplit - 1) / kQ8VerifyPagesPerSplit;
   return static_cast<uint32_t>(std::min<uint64_t>(
-      std::max<uint64_t>(baseSplits, scaled), kQ8VerifyMaximumSplits));
+      std::max<uint64_t>(loweredBase, scaled), kQ8VerifyMaximumSplits));
 }
 
 // Default parameters; the verify plan sets both split counts for each lane
@@ -244,6 +269,9 @@ struct VerifyAttentionPlan final {
 
 private:
   friend class PagedAttention;
+  // The policy laneSplits were resolved under; the encoder re-checks each
+  // lane's split count against it.
+  const kv::VerifySplitPolicy splitPolicy_;
   const std::string_view storePipeline_;
   const metal::DispatchSize storeGroups_;
   const metal::DispatchSize storeThreads_;
@@ -254,12 +282,13 @@ private:
                       metal::DispatchSize splitGroups, metal::DispatchSize splitThreads,
                       metal::DispatchSize reduceGroups,
                       std::string_view storePipeline, metal::DispatchSize storeGroups,
-                      metal::DispatchSize storeThreads, kv::Format format)
+                      metal::DispatchSize storeThreads, kv::Format format,
+                      kv::VerifySplitPolicy splitPolicy)
       : format(format), configuration(configuration), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
         splitGroups(splitGroups), splitThreads(splitThreads), reduceGroups(reduceGroups),
-        storePipeline_(storePipeline), storeGroups_(storeGroups), storeThreads_(storeThreads) {}
+        splitPolicy_(splitPolicy), storePipeline_(storePipeline), storeGroups_(storeGroups), storeThreads_(storeThreads) {}
 };
 
 struct PagedVerifyBuffers final {
@@ -286,10 +315,13 @@ public:
               uint32_t historyTokens, PrefillAttentionConfig configuration = {});
   // historyTokens holds each lane's committed tokens before its verify rows,
   // sized to the batch width or to the maximum width with inactive lanes zero.
+  // splitPolicy bounds how far short histories lower the configured split
+  // count; an invalid policy throws std::invalid_argument.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
              std::span<const uint32_t> historyTokens,
-             VerifyAttentionConfig configuration = {});
+             VerifyAttentionConfig configuration = {},
+             kv::VerifySplitPolicy splitPolicy = {});
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
