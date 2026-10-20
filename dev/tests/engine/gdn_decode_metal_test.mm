@@ -12,6 +12,7 @@
 
 #import <Foundation/Foundation.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -566,6 +567,55 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
   }
 }
 
+// The first-row decode stores the cell a commit of one retained row writes
+// after the last-row decode, byte for byte, and leaves every row's outputs as
+// the last-row decode writes them.
+void firstRowState(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
+  Fixture fixture(backend, shape, lanes);
+  auto decode = [&](GdnStoredRow storedRow) {
+    CommandGraph graph;
+    for (uint32_t layer = 0; layer < kLayers; ++layer)
+      GDN::addDecode(graph, fixture.decodeBuffers(layer), shape, lanes, layer,
+                     fixture.cell.strides(), storedRow);
+    static_cast<void>(backend.submitCommand(graph.dispatches()));
+  };
+  decode(GdnStoredRow::Last);
+  std::fill_n(static_cast<uint32_t *>(fixture.retained.contents()), kMaxLanes, 1U);
+  CommandGraph commit;
+  GDN::addCommit(commit, fixture.commitBuffers(), shape, kLayers, lanes,
+                 fixture.cell.strides());
+  static_cast<void>(backend.submitCommand(commit.dispatches()));
+  std::vector<std::vector<uint8_t>> committed;
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    committed.emplace_back(fixture.cellBytes(fixture.next[lane]),
+                           fixture.cellBytes(fixture.next[lane]) + fixture.cell.bytes);
+  std::vector<std::vector<uint8_t>> rows;
+  for (const MetalBuffer *buffer :
+       {&fixture.mixed, &fixture.decay, &fixture.beta, &fixture.recurrent, &fixture.hidden}) {
+    const auto *bytes = static_cast<const uint8_t *>(buffer->contents());
+    rows.emplace_back(bytes, bytes + buffer->sizeBytes());
+  }
+
+  fixture.clear();
+  decode(GdnStoredRow::First);
+  const std::string where = "first-row state, lanes " + std::to_string(lanes);
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+    if (lane >= lanes) {
+      requireUntouched(fixture, lane, where);
+      continue;
+    }
+    require(std::memcmp(fixture.next[lane].contents(), committed[lane].data(),
+                        fixture.cell.bytes) == 0,
+            where + " lane " + std::to_string(lane) +
+                ": cell differs from decode + commit at retained 1");
+  }
+  size_t index = 0;
+  for (const MetalBuffer *buffer :
+       {&fixture.mixed, &fixture.decay, &fixture.beta, &fixture.recurrent, &fixture.hidden})
+    require(std::memcmp(buffer->contents(), rows[index++].data(), buffer->sizeBytes()) == 0,
+            where + ": row outputs differ from the last-row decode");
+}
+
 void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
   Fixture fixture(backend, shape, lanes);
   const uint32_t width = shape.valueHeads * shape.headDimension;
@@ -638,6 +688,9 @@ int main(int argc, char **argv) {
     for (const GdnShape &shape : kShapes)
       for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
         runDecode(backend, shape, lanes);
+    for (const GdnShape &shape : kShapes)
+      for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
+        firstRowState(backend, shape, lanes);
     std::cout << "gdn_decode_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

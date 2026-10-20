@@ -393,11 +393,11 @@ void QwenTarget::addVerify(
     std::span<const kv::LayerStorage> kvLayers,
     std::span<const kv::Q8ChunkedPrefillParams> q8,
     std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-    ops::Q4DispatchStats &stats) const {
+    ops::GdnStoredRow storedRow, ops::Q4DispatchStats &stats) const {
   std::visit(
       [&](const auto *weights) {
         addVerifyImpl(*weights, graph, std::move(buffers), kvLayers, q8,
-                      verify, lanes, stats);
+                      verify, lanes, storedRow, stats);
       },
       weights_);
 }
@@ -409,7 +409,7 @@ void QwenTarget::addVerifyImpl(
     std::span<const kv::LayerStorage> kvLayers,
     std::span<const kv::Q8ChunkedPrefillParams> q8,
     std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-    ops::Q4DispatchStats &stats) const {
+    ops::GdnStoredRow storedRow, ops::Q4DispatchStats &stats) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
       q8.size() != ExecutionLimits::maximumBatchWidth ||
       verify.size() != ExecutionLimits::maximumBatchWidth ||
@@ -466,7 +466,8 @@ void QwenTarget::addVerifyImpl(
                 geometry_.gdnShape(), lanes, gdnIndex,
                 {geometry_.stateLayout.convolutionLayerBytes(),
                  geometry_.stateLayout.recurrentLayerBytes(),
-                 geometry_.stateLayout.convolutionBytes()});
+                 geometry_.stateLayout.convolutionBytes()},
+                storedRow);
             operators_.linear().addResidualBatch(
                 graph, buffers.gdnHidden,
                 mixer.outputProjection, input, buffers.gdnOutput, mixerOutput,

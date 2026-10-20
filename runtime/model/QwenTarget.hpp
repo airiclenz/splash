@@ -335,12 +335,14 @@ public:
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
       std::span<const kv::LayerStorage> kvLayers) const;
+  // storedRow is the verify row whose GDN state the decode stores; First
+  // replaces the state commit when only row 0 can be retained.
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const kv::LayerStorage> kvLayers,
       std::span<const kv::Q8ChunkedPrefillParams> q8,
       std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-      ops::Q4DispatchStats &stats) const;
+      ops::GdnStoredRow storedRow, ops::Q4DispatchStats &stats) const;
   void addHead(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
                uint32_t normalizedRows, ops::LinearScratch scratch = {}) const;
@@ -366,7 +368,7 @@ private:
       std::span<const kv::LayerStorage> kvLayers,
       std::span<const kv::Q8ChunkedPrefillParams> q8,
       std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-      ops::Q4DispatchStats &stats) const;
+      ops::GdnStoredRow storedRow, ops::Q4DispatchStats &stats) const;
 
   WeightView weights_;
   QwenTargetGeometry geometry_;

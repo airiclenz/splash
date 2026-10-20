@@ -22,12 +22,43 @@ inline void grid_completion(device atomic_uint &arrived,
   }
 }
 
+// One value head's conv carry after verify row 0, what a commit of one
+// retained row writes: carry rows 0 and 1 are incoming conv rows 1 and 2, row
+// 2 is packed row 0; v channels of the head, and q/k of its key head from the
+// key head's first value head. Strided over the threadgroup after the
+// prologue: as the prologue's per-simdgroup row copy it raised the kernel's
+// register count enough to cut the vh48 decode's occupancy.
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim>
+inline void gdn_decode_first_row_carry(device const bfloat *packed,
+                                       device const bfloat *conv_state_in,
+                                       device bfloat *conv_state_out,
+                                       uint value_head, uint thread_index) {
+  constexpr uint HeadsPerKey = ValueHeads / KeyHeads;
+  constexpr uint KeyWidth = KeyHeads * HeadDim;
+  const uint key_head = value_head / HeadsPerKey;
+  const uint channels = value_head % HeadsPerKey == 0 ? 3 * HeadDim : HeadDim;
+  for (uint element = thread_index; element < 3 * channels;
+       element += 32 * kDecodeSimdgroups) {
+    const uint row = element / channels;
+    const uint index = element % channels;
+    // index: the head's v channels, then the key head's q, then its k.
+    const uint channel =
+        index < HeadDim ? 2 * KeyWidth + value_head * HeadDim + index
+                        : (index < 2 * HeadDim ? 0 : KeyWidth) +
+                              key_head * HeadDim + index % HeadDim;
+    conv_state_out[row * ConvDim + channel] =
+        row < 2 ? conv_state_in[(row + 1) * ConvDim + channel] : packed[channel];
+  }
+}
+
 // Eight verify rows' conv+SiLU, q/k RMS norms and gates for one value head.
 // One simdgroup per row holds channels 32g + lane (g = 0..3). RMS reduction
 // sums each 32-channel group, then adds the four partials in channel order.
 // q/k go to threadgroup memory for the scan; v/gates go to device memory for
-// both scan and commit.
-template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim>
+// both scan and commit. WritesCarry also writes the conv carry after all
+// rows.
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
+          bool WritesCarry>
 inline void gdn_decode_prologue(
     device const bfloat *packed, device const bfloat *conv_weights,
     device const bfloat *conv_state_in, device bfloat *conv_state_out,
@@ -88,7 +119,7 @@ inline void gdn_decode_prologue(
     gdn_write_gates(packed + token * packed_width, dt_bias, a_scale, BOffset,
                     AOffset, value_head, beta[gate_index], decay[gate_index]);
   }
-  if (simd_group < 3) {
+  if (WritesCarry && simd_group < 3) {
     const uint row = simd_group;
     for (uint g = 0; g < Groups; ++g) {
       conv_state_out[row * ConvDim + v_channel + 32 * g] =
@@ -109,8 +140,11 @@ inline void gdn_decode_prologue(
 // Delta-rule recurrence over 128 state rows, four fp32 columns per lane.
 // RowsInFlight rows advance together to overlap their reductions and arithmetic.
 // Each row preserves the decay, memory, delta, update, output operation order.
+// The stored state is the one after row 0 when FirstRowState is set (the
+// commit's single retained row), else after the last row; every row's output
+// is written either way.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
-          uint RowsInFlight>
+          uint RowsInFlight, bool FirstRowState>
 inline void gdn_decode_scan(device const bfloat *mixed_qkv,
                             device const float *decay,
                             device const bfloat *beta,
@@ -162,6 +196,11 @@ inline void gdn_decode_scan(device const bfloat *mixed_qkv,
         }
         result[r] = simd_sum(result[r]);
       }
+      if (FirstRowState && token == 0) {
+        for (uint r = 0; r < RowsInFlight; ++r)
+          for (uint i = 0; i < 4; ++i)
+            state_out[state_base[r] + i] = state[r][i];
+      }
       if (lane == 0) {
         for (uint r = 0; r < RowsInFlight; ++r) {
           output[(ulong(token) * ValueHeads + value_head) * HeadDim +
@@ -169,9 +208,11 @@ inline void gdn_decode_scan(device const bfloat *mixed_qkv,
         }
       }
     }
-    for (uint r = 0; r < RowsInFlight; ++r)
-      for (uint i = 0; i < 4; ++i)
-        state_out[state_base[r] + i] = state[r][i];
+    if (!FirstRowState) {
+      for (uint r = 0; r < RowsInFlight; ++r)
+        for (uint i = 0; i < 4; ++i)
+          state_out[state_base[r] + i] = state[r][i];
+    }
   }
 }
 
@@ -308,7 +349,7 @@ GDN_COMMIT_ENTRY(verify_gdn_commit_vh32, 16, 32, 128, 8192)
 #undef GDN_COMMIT_ENTRY
 
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
-          uint RowsInFlight>
+          uint RowsInFlight, bool FirstRowState>
 inline void gdn_decode_batch_phase(
     device const bfloat *packed, device const bfloat *conv_weights,
     device const uchar *current0, device const uchar *current1,
@@ -354,12 +395,16 @@ inline void gdn_decode_batch_phase(
   device bfloat *lane_hidden = gdn_hidden + ulong(batch) * Rows * ValueWidth;
   threadgroup bfloat *queries = prepared;
   threadgroup bfloat *keys = prepared + Rows * HeadDim;
-  gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim>(
+  gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim, !FirstRowState>(
       packed, conv_weights, conv_state_in, conv_state_out, mixed, a_scale,
       dt_bias, decay, beta, params.packed_width, queries, keys, group.x, lane,
       simd_group);
+  if (FirstRowState)
+    gdn_decode_first_row_carry<KeyHeads, ValueHeads, HeadDim, ConvDim>(
+        packed, conv_state_in, conv_state_out, group.x, thread_index);
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  gdn_decode_scan<KeyHeads, ValueHeads, HeadDim, ConvDim, RowsInFlight>(
+  gdn_decode_scan<KeyHeads, ValueHeads, HeadDim, ConvDim, RowsInFlight,
+                  FirstRowState>(
       mixed, decay, beta, state_in, state_out, lane_recurrent, queries, keys,
       group.x, lane, simd_group);
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
@@ -401,30 +446,37 @@ inline void gdn_decode_batch_phase(
     uint2 group [[threadgroup_position_in_grid]], \
     uint thread_index [[thread_index_in_threadgroup]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
-#define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, Table, Sums) \
+#define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, FirstRow, Table, Sums) \
     threadgroup bfloat prepared[2 * SPLASH_TARGET_VERIFY_ROWS * HeadDim]; \
-    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 2>( \
+    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 2, FirstRow>( \
         packed, conv_weights, current0, current1, current2, current3, next0, \
         next1, next2, next3, mixed, a_scale, dt_bias, decay, beta, recurrent, \
         gdn_norm_weight, gdn_hidden, arrived, generation, params, group, \
         thread_index, lane, simd_group, prepared, Table, Sums);
-#define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim) \
+#define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, FirstRow) \
   kernel void Name(GDN_DECODE_BUFFERS, \
       constant GDNDecodeBatchParams &params [[buffer(20)]], GDN_DECODE_THREADS) { \
-    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, nullptr, nullptr) \
+    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, FirstRow, nullptr, nullptr) \
   }
-#define GDN_DECODE_Q4_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim) \
+#define GDN_DECODE_Q4_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, FirstRow) \
   kernel void Name(GDN_DECODE_BUFFERS, \
       device bfloat *q4_table [[buffer(20)]], device float *q4_sums [[buffer(21)]], \
       constant GDNDecodeBatchParams &params [[buffer(22)]], GDN_DECODE_THREADS) { \
-    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, q4_table, q4_sums) \
+    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, FirstRow, q4_table, q4_sums) \
   }
 
 // Two rows overlap reductions and arithmetic without the register cost of four.
-GDN_DECODE_ENTRY(verify_gdn_fused, 16, 48, 128, 10240)
-GDN_DECODE_ENTRY(verify_gdn_fused_vh32, 16, 32, 128, 8192)
-GDN_DECODE_Q4_ENTRY(verify_gdn_fused_q4, 16, 48, 128, 10240)
-GDN_DECODE_Q4_ENTRY(verify_gdn_fused_q4_vh32, 16, 32, 128, 8192)
+// The _first_row variants store row 0's state and carry, so speculation-off
+// decode needs no commit. Separate entry points, not a parameter flag: a
+// runtime branch slowed the last-row decode about 10%.
+GDN_DECODE_ENTRY(verify_gdn_fused, 16, 48, 128, 10240, false)
+GDN_DECODE_ENTRY(verify_gdn_fused_vh32, 16, 32, 128, 8192, false)
+GDN_DECODE_Q4_ENTRY(verify_gdn_fused_q4, 16, 48, 128, 10240, false)
+GDN_DECODE_Q4_ENTRY(verify_gdn_fused_q4_vh32, 16, 32, 128, 8192, false)
+GDN_DECODE_ENTRY(verify_gdn_fused_first_row, 16, 48, 128, 10240, true)
+GDN_DECODE_ENTRY(verify_gdn_fused_first_row_vh32, 16, 32, 128, 8192, true)
+GDN_DECODE_Q4_ENTRY(verify_gdn_fused_q4_first_row, 16, 48, 128, 10240, true)
+GDN_DECODE_Q4_ENTRY(verify_gdn_fused_q4_first_row_vh32, 16, 32, 128, 8192, true)
 #undef GDN_DECODE_ENTRY
 #undef GDN_DECODE_Q4_ENTRY
 #undef GDN_DECODE_BODY

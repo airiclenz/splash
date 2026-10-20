@@ -13,9 +13,14 @@
 // pre-change binary can be compared with a candidate whose host dispatch
 // differs. --allow-diff turns either mismatch into a warning.
 //
+// --first-row-state times, under each retained=1 commit case's name, the
+// decode that stores row 0's state itself (GdnStoredRow::First) and needs no
+// commit, hashing the same cells; its time compares with a run's decode plus
+// retained=1 commit, and --hash-in checks it against that run's commit hash.
+//
 // usage: gdn-profile METALLIB [--lanes 1,4] [--repeat N]
 //                    [--compare-metallib PATH] [--allow-diff]
-//                    [--hash-out FILE] [--hash-in FILE]
+//                    [--hash-out FILE] [--hash-in FILE] [--first-row-state]
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
@@ -191,12 +196,13 @@ struct DecodeFixture final {
   }
 
   // Every layer's decode, as the model graph encodes it per verify step.
-  CommandGraph decodeGraph(uint32_t lanes, const LinearScratch &scratch) const {
+  CommandGraph decodeGraph(uint32_t lanes, const LinearScratch &scratch,
+                           GdnStoredRow storedRow = GdnStoredRow::Last) const {
     CommandGraph graph;
     for (uint32_t layer = 0; layer < kLayers; ++layer) {
       GdnDecodeBuffers buffers = decodeBuffers(layer);
       buffers.linearScratch = scratch;
-      GDN::addDecode(graph, buffers, shape, lanes, layer, cell.strides());
+      GDN::addDecode(graph, buffers, shape, lanes, layer, cell.strides(), storedRow);
     }
     return graph;
   }
@@ -295,6 +301,15 @@ Workload commitWorkload(MetalBackend &backend, const GdnShape &shape, uint32_t l
   Workload workload;
   GDN::addCommit(workload.graph, fixture.commitBuffers(), shape, kLayers, lanes,
                  fixture.cell.strides());
+  workload.outputs.assign(fixture.next.begin(), fixture.next.begin() + lanes);
+  return workload;
+}
+
+// The speculation-off decode, which stores the cell a retained=1 commit
+// writes and so replaces the decode and that commit.
+Workload firstRowWorkload(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
+  const DecodeFixture fixture(backend, shape, lanes);
+  Workload workload{fixture.decodeGraph(lanes, {}, GdnStoredRow::First), {}};
   workload.outputs.assign(fixture.next.begin(), fixture.next.begin() + lanes);
   return workload;
 }
@@ -429,6 +444,7 @@ struct Options final {
   std::vector<uint32_t> lanes{1, kMaxLanes};
   uint32_t repeat = 5;
   bool isDiffAllowed = false;
+  bool isFirstRowState = false;
 };
 
 Options parseOptions(int argc, const char *argv[]) {
@@ -438,6 +454,10 @@ Options parseOptions(int argc, const char *argv[]) {
     const std::string option(argv[index]);
     if (option == "--allow-diff") {
       options.isDiffAllowed = true;
+      continue;
+    }
+    if (option == "--first-row-state") {
+      options.isFirstRowState = true;
       continue;
     }
     if (index + 1 >= argc)
@@ -498,7 +518,7 @@ struct Case final {
   WorkloadFactory factory;
 };
 
-std::vector<Case> cases(const std::vector<uint32_t> &laneCounts) {
+std::vector<Case> cases(const std::vector<uint32_t> &laneCounts, bool isFirstRowState) {
   std::vector<Case> result;
   for (const GdnShape &shape : kShapes) {
     const std::string heads = "vh" + std::to_string(shape.valueHeads);
@@ -511,8 +531,10 @@ std::vector<Case> cases(const std::vector<uint32_t> &laneCounts) {
                           }});
       for (uint32_t retained : kRetainedCounts)
         result.push_back({heads + "/commit" + lane + "/retained=" + std::to_string(retained),
-                          [&shape, lanes, retained](MetalBackend &backend) {
-                            return commitWorkload(backend, shape, lanes, retained);
+                          [&shape, lanes, retained, isFirstRowState](MetalBackend &backend) {
+                            return isFirstRowState && retained == 1
+                                       ? firstRowWorkload(backend, shape, lanes)
+                                       : commitWorkload(backend, shape, lanes, retained);
                           }});
     }
     result.push_back({heads + "/prefill/tokens=" + std::to_string(kPrefillTokens),
@@ -532,11 +554,13 @@ void run(const Options &options) {
   const std::map<std::string, uint64_t> expected =
       options.hashIn.empty() ? std::map<std::string, uint64_t>{} : readHashes(options.hashIn);
   std::cerr << "device " << backend.capabilities().deviceName << ", " << kLayers
-            << " GDN layers, median of " << options.repeat << " graphs (ms)\n";
+            << " GDN layers, median of " << options.repeat << " graphs (ms)"
+            << (options.isFirstRowState ? ", retained=1 commits as first-row decodes" : "")
+            << "\n";
   std::cout << "{\"device\":\"" << backend.capabilities().deviceName << "\",\"cases\":[";
   std::vector<std::pair<std::string, uint64_t>> hashes;
   bool isFirst = true;
-  for (const Case &item : cases(options.lanes)) {
+  for (const Case &item : cases(options.lanes, options.isFirstRowState)) {
     const std::vector<Result> results = measure(backends, item.factory, options.repeat);
     for (size_t i = 0; i < results.size(); ++i) {
       std::cout << (isFirst ? "" : ",") << json(item.name, results[i], i);
@@ -566,7 +590,7 @@ int main(int argc, const char *argv[]) {
   if (argc < 2) {
     std::cerr << "usage: gdn-profile METALLIB [--lanes LIST] [--repeat N] "
                  "[--compare-metallib PATH] [--allow-diff] [--hash-out FILE] "
-                 "[--hash-in FILE]\n";
+                 "[--hash-in FILE] [--first-row-state]\n";
     return 64;
   }
   try {

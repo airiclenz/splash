@@ -1357,8 +1357,13 @@ struct Runtime::Impl {
       chunkValues[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkValuesBase, layer, lanes);
     }
+    // Without speculation only row 0 is ever retained: the decode stores its
+    // GDN state and encodeBatchGdnCommit adds no commit.
     targetModel.addVerify(graph, std::move(buffers), kvLayers, q8, verify,
-                          lanes, stats);
+                          lanes,
+                          isSpeculationEnabled ? ops::GdnStoredRow::Last
+                                               : ops::GdnStoredRow::First,
+                          stats);
   }
 
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,
@@ -1490,6 +1495,10 @@ struct Runtime::Impl {
                             std::span<Request *const> lanes) {
     if (lanes.empty() || lanes.size() > kLaneCount)
       throw std::invalid_argument("invalid GDN commit batch");
+    // Acceptance without proposals retains row 0 alone, whose state the
+    // verify decode already stored (GdnStoredRow::First).
+    if (!isSpeculationEnabled)
+      return;
     const uint32_t width = static_cast<uint32_t>(lanes.size());
     std::array<MetalBuffer, kLaneCount> currentStates;
     std::array<MetalBuffer, kLaneCount> nextStates;

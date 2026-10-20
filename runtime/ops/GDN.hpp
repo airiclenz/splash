@@ -40,6 +40,11 @@ struct GdnStateStrides final {
   }
 };
 
+// The verify row after which a GDN decode stores the next state cell. First
+// is what a commit of one retained row writes, so a decode that only ever
+// retains row 0 (speculation off) needs no commit.
+enum class GdnStoredRow : uint8_t { Last, First };
+
 struct GdnPrefillBuffers final {
   metal::MetalBuffer packed;
   metal::MetalBuffer convolutionWeights;
@@ -93,7 +98,8 @@ public:
                          GdnShape shape, uint32_t tokens);
   static void addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                         GdnShape shape, uint32_t lanes, uint32_t layer,
-                        GdnStateStrides state);
+                        GdnStateStrides state,
+                        GdnStoredRow storedRow = GdnStoredRow::Last);
   static void addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                         GdnShape shape, uint32_t layers, uint32_t lanes,
                         GdnStateStrides state);

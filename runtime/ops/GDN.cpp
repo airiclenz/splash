@@ -72,7 +72,7 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
 
 void GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                     GdnShape shape, uint32_t lanes, uint32_t layer,
-                    GdnStateStrides state) {
+                    GdnStateStrides state, GdnStoredRow storedRow) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid())
     throw std::invalid_argument("invalid GDN decode geometry");
   // The fused Q4 decode is the widest production dispatch: two inputs, two
@@ -102,9 +102,17 @@ void GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                                     state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,
                                     state.convolutionStateBytes};
-  graph.add(prepare ? kernelName(kernel, "verify_gdn_fused_q4", "verify_gdn_fused_q4_vh32")
-                    : kernelName(kernel, "verify_gdn_fused", "verify_gdn_fused_vh32"),
-            std::move(bindings), params, {shape.valueHeads, lanes, 1});
+  const bool isFirstRow = storedRow == GdnStoredRow::First;
+  const char *name =
+      prepare ? (isFirstRow ? kernelName(kernel, "verify_gdn_fused_q4_first_row",
+                                         "verify_gdn_fused_q4_first_row_vh32")
+                            : kernelName(kernel, "verify_gdn_fused_q4",
+                                         "verify_gdn_fused_q4_vh32"))
+              : (isFirstRow ? kernelName(kernel, "verify_gdn_fused_first_row",
+                                         "verify_gdn_fused_first_row_vh32")
+                            : kernelName(kernel, "verify_gdn_fused",
+                                         "verify_gdn_fused_vh32"));
+  graph.add(name, std::move(bindings), params, {shape.valueHeads, lanes, 1});
 }
 
 void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
