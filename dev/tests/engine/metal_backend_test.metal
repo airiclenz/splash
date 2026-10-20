@@ -30,3 +30,8 @@ kernel void sparse_fill_copy_u32(device uint *sparseValues [[buffer(0)]],
         readback[gid] = sparseValues[gid];
     }
 }
+
+// The host-encode benchmark's dispatch: it does no work, so a graph's time is
+// all host encoding. Its name is longer than the short-string limit, as most
+// production pipeline names are.
+kernel void graph_encode_benchmark_noop_dispatch() {}

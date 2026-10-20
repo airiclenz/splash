@@ -121,6 +121,33 @@ std::shared_future<void> releaseMemoryQuery;
 std::atomic<unsigned> completionMemoryQueries{0};
 std::atomic<unsigned> memoryQueries{0};
 
+// A command whose dispatch binds one index twice fails submit before commit,
+// whether the clash is two buffers or a buffer and a byte payload, even when
+// an earlier dispatch of the same command is valid.
+void duplicateBindingFailsSubmit(MetalBackend &backend, const MetalBuffer &buffer,
+                                 const ComputeDispatch &valid) {
+    require(!valid.buffers.empty() && !valid.bytes.empty(),
+            "duplicate-binding probe needs a buffer and a byte binding");
+    const uint64_t submissions = backend.submissionCount();
+    ComputeDispatch twoBuffers = valid;
+    twoBuffers.buffers.push_back(
+        BufferBinding{valid.buffers.front().index, buffer});
+    ComputeDispatch bufferAndBytes = valid;
+    bufferAndBytes.bytes.push_back(BytesBinding{
+        valid.buffers.front().index, valid.bytes.front().data,
+        valid.bytes.front().sizeBytes});
+
+    for (const ComputeDispatch &duplicate : {twoBuffers, bufferAndBytes}) {
+        const std::vector<ComputeDispatch> command{valid, duplicate};
+        requireBackendError(
+            [&] { (void)backend.submitCommandAsync(command); },
+            "a dispatch binding one index twice was submitted");
+    }
+
+    require(backend.healthy() && backend.submissionCount() == submissions,
+            "a rejected duplicate binding was counted or poisoned the backend");
+}
+
 void observeCompletion(id command, SEL selector, MTLCommandBufferHandler handler) {
     reinterpret_cast<void (*)(id, SEL, MTLCommandBufferHandler)>(
         originalCompletedHandler)(command, selector, ^(id<MTLCommandBuffer> completed) {
@@ -1129,6 +1156,7 @@ void run(const std::string &metallibPath) {
         first.threadsPerThreadgroup = {kViewElementCount, 1, 1};
         std::vector<ComputeDispatch> command{first, first};
         (void)backend.submitCommand(command);
+        duplicateBindingFailsSubmit(backend, view, first);
     }
     require(backend.submissionCount() == 3,
             "explicit operation list did not use one command buffer");
