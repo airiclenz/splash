@@ -15,6 +15,13 @@ server.
 The burst prompt extends the warm prompt's filler words but drops its closing
 instruction, so it diverges just before the warm prompt's end: only a state
 published at or below the divergence can be reused.
+
+``--agent-turns N`` drives one conversation instead, the way an agent does:
+each turn is sent right after the previous one finishes and carries the
+previous prompt, the returned reply and ``--tool-tokens`` filler words, so the
+whole earlier conversation is reusable. Each turn is its own phase, reported
+with its cached tokens, TTFT, counter deltas and OS warn seconds; the probe
+exits AGENT_COLD_TURN_EXIT_CODE when a turn after the first reuses 0 tokens.
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ DEFAULT_LANES = 2
 DEFAULT_WARM_TOKENS = 50000
 DEFAULT_EXTEND_TOKENS = 8000
 DEFAULT_MAX_TOKENS = 1024
+DEFAULT_TOOL_TOKENS = 2000
 DEFAULT_SAMPLE_SECONDS = 3.0
 DEFAULT_SWAP_GUARD_MB = 512
 DEFAULT_TIMEOUT_SECONDS = 7200.0
@@ -60,6 +68,10 @@ OS_PRESSURE_SYSCTL = "kern.memorystatus_vm_pressure_level"
 OS_PRESSURE_WARN = 2
 SERVER_NORMAL = "normal"
 SWAP_ABORT_EXIT_CODE = 3
+AGENT_COLD_TURN_EXIT_CODE = 4
+AGENT_LANE = 0
+# The chat reply path of the server-side TTFT (prefill wall, no network).
+TTFT_PATH = ("metrics", "request_latency", "start_to_first_token_ms")
 BYTES_PER_MB = 2**20
 
 # The `/status` causes that split checkpoint_publication_failures.
@@ -132,6 +144,7 @@ LANE_COLUMNS = (
     ("prompt_tokens", "prompt"),
     ("cached_tokens", "cached"),
     ("completion_tokens", "completion"),
+    ("ttft_ms", "ttft ms"),
     ("wall_s", "wall s"),
 )
 
@@ -304,9 +317,15 @@ def lane_prompt(nonce: str, words: list[str], instruction: str) -> str:
 # ------------------------------------------------------------------------------
 def chat_body(model: str, prompt: str, max_tokens: int) -> dict:
     """Return a greedy, non-thinking chat request for `prompt`."""
+    return conversation_body(model, [{"role": "user", "content": prompt}], max_tokens)
+
+
+# ------------------------------------------------------------------------------
+def conversation_body(model: str, messages: list[dict], max_tokens: int) -> dict:
+    """Return a greedy, non-thinking chat request continuing `messages`."""
     return {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "max_completion_tokens": max_tokens,
         "temperature": 0,
         "reasoning_effort": "none",
@@ -324,14 +343,19 @@ def lane_record(lane: int, phase: str, reply, wall_s: float, error) -> dict:
         "prompt_tokens": usage.get("prompt_tokens"),
         "cached_tokens": details.get("cached_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
+        "ttft_ms": status_reading(reply or {}, TTFT_PATH),
         "wall_s": round(wall_s, 1),
         "error": error,
     }
 
 
 # ------------------------------------------------------------------------------
-def send_lane(client, lane, phase, body, timeout, records) -> None:
-    """Send one lane's request and append its row to `records`."""
+def send_lane(client, lane, phase, body, timeout, records, replies=None) -> None:
+    """Send one lane's request and append its row to `records`.
+
+    When `replies` is given, the decoded reply (None on failure) is stored
+    there under `lane`.
+    """
     started = time.monotonic()
     reply, error = None, None
     try:
@@ -339,15 +363,18 @@ def send_lane(client, lane, phase, body, timeout, records) -> None:
     except ProbeError as caught:
         error = str(caught)
     records.append(lane_record(lane, phase, reply, time.monotonic() - started, error))
+    if replies is not None:
+        replies[lane] = reply
 
 
 # ------------------------------------------------------------------------------
-def run_phase(client, sampler, guard, phase, bodies, timeout) -> dict:
+def run_phase(client, sampler, guard, phase, bodies, timeout, replies=None) -> dict:
     """Send `bodies` (lane -> request) concurrently and wait for all or the guard.
 
     Returns the phase row: lane rows, counter deltas and whether the swap guard
     stopped it. On a trip the unfinished lanes are left to the server and the
-    after-snapshot is taken at once.
+    after-snapshot is taken at once. `replies`, when given, receives each
+    finished lane's decoded reply.
     """
     sampler.phase = phase
     before = fresh_status(client)
@@ -355,7 +382,7 @@ def run_phase(client, sampler, guard, phase, bodies, timeout) -> dict:
     threads = [
         threading.Thread(
             target=send_lane,
-            args=(client, lane, phase, body, timeout, records),
+            args=(client, lane, phase, body, timeout, records, replies),
             daemon=True,
         )
         for lane, body in bodies.items()
@@ -414,6 +441,76 @@ def run_probe(client, model, args, sampler, guard) -> list[dict]:
 
 
 # ------------------------------------------------------------------------------
+def reply_text(reply) -> str | None:
+    """Return the assistant content of a chat reply, or None when it has none."""
+    choices = (reply or {}).get("choices") or []
+    message = (choices[0] if choices else {}).get("message") or {}
+    content = message.get("content")
+    return content if isinstance(content, str) else None
+
+
+# ------------------------------------------------------------------------------
+def run_agent(client, model, args, sampler, guard) -> list[dict]:
+    """Drive one conversation for `args.agent_turns` back-to-back turns.
+
+    Turn 0 is the warm-up-sized prompt; each later turn resends the whole
+    conversation, the previous reply and `args.tool_tokens` new filler words,
+    as an agent does after a tool call. Stops once the swap guard has tripped,
+    a turn fails or a reply carries no content to resend.
+    """
+    nonce = args.nonces[0]
+    instruction = f"Write the integers from 1 to {args.max_tokens * 2}, one per line."
+    words = lane_words(nonce, max(1, args.warm_tokens - PROMPT_FRAME_TOKENS))
+    messages = [{"role": "user", "content": lane_prompt(nonce, words, instruction)}]
+    phases = []
+    for turn in range(args.agent_turns):
+        if guard.tripped.is_set():
+            return phases
+        body = conversation_body(model, messages, args.max_tokens)
+        replies: dict = {}
+        phase = run_phase(
+            client,
+            sampler,
+            guard,
+            f"turn{turn}",
+            {AGENT_LANE: body},
+            args.request_timeout,
+            replies,
+        )
+        phases.append(phase)
+        content = reply_text(replies.get(AGENT_LANE))
+        record = phase["lanes"][0] if phase["lanes"] else None
+        if phase["swap_aborted"] or record is None or record["error"]:
+            return phases
+        if content is None:
+            record["error"] = "reply carries no message content to resend"
+            return phases
+        tool_words = lane_words(f"{nonce}-{turn}", args.tool_tokens)
+        messages = messages + [
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": f"{' '.join(tool_words)}\n{instruction}"},
+        ]
+    return phases
+
+
+# ------------------------------------------------------------------------------
+def has_cold_turn(phases: list[dict]) -> bool:
+    """Return whether a finished turn after the first reused 0 cached tokens."""
+    return any(
+        record["cached_tokens"] == 0
+        for phase in phases[1:]
+        for record in phase["lanes"]
+    )
+
+
+# ------------------------------------------------------------------------------
+def phase_os_warn_seconds(samples: list[dict], phase: str) -> float:
+    """Return the OS warn seconds of the samples taken during `phase`."""
+    taken = [sample for sample in samples if sample.get("phase") == phase]
+    return pressure_summary(taken)["os_warn_s"]
+
+
+# ------------------------------------------------------------------------------
 def format_report(document: dict) -> str:
     """Render the probe document as fixed-width text."""
     lines = [f"model: {document['model']}", f"nonces: {' '.join(document['nonces'])}"]
@@ -438,6 +535,10 @@ def format_report(document: dict) -> str:
             f"{format_value(phase[key]):>12}" for phase in document["phases"]
         )
         lines.append(f"{key:<{width}}{cells}")
+    cells = "".join(
+        f"{format_value(phase['os_warn_s']):>12}" for phase in document["phases"]
+    )
+    lines.append(f"{'os_warn_s':<{width}}{cells}")
     lines.append("")
     for key, value in document["pressure"].items():
         lines.append(f"{key:<{width}}{format_value(value):>12}")
@@ -467,6 +568,17 @@ def parse_args(argv=None):
     parser.add_argument("--extend-tokens", type=int, default=DEFAULT_EXTEND_TOKENS)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument(
+        "--agent-turns",
+        type=int,
+        help="drive one conversation for this many back-to-back turns instead",
+    )
+    parser.add_argument(
+        "--tool-tokens",
+        type=int,
+        default=DEFAULT_TOOL_TOKENS,
+        help="filler words each agent turn adds after the reply",
+    )
+    parser.add_argument(
         "--nonces", nargs="+", help="reuse lanes an earlier run warmed; skips warm-up"
     )
     parser.add_argument("--sample-seconds", type=float, default=DEFAULT_SAMPLE_SECONDS)
@@ -490,6 +602,12 @@ def parse_args(argv=None):
         parser.error(
             "--lanes, --extend-tokens, --max-tokens and --swap-guard-mb must be positive"
         )
+    if args.agent_turns is not None:
+        if min(args.agent_turns, args.tool_tokens) < 1:
+            parser.error("--agent-turns and --tool-tokens must be positive")
+        if args.nonces is not None:
+            parser.error("--agent-turns starts its own conversation; drop --nonces")
+        args.lanes = 1
     if args.sample_seconds <= 0 or args.request_timeout <= 0:
         parser.error("--sample-seconds and --request-timeout must be positive")
     if not args.base_url.startswith(("http://", "https://")):
@@ -504,7 +622,8 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     """Run the probe and print the report; return the process exit code.
 
-    Exits SWAP_ABORT_EXIT_CODE when the swap guard stopped the run.
+    Exits SWAP_ABORT_EXIT_CODE when the swap guard stopped the run, else
+    AGENT_COLD_TURN_EXIT_CODE when an agent turn after the first reused 0 tokens.
     """
     args = parse_args(argv)
     client = ProbeClient(args.base_url, args.api_key)
@@ -522,7 +641,8 @@ def main(argv=None) -> int:
         for thread in threads:
             thread.start()
         print(f"pressure_probe: nonces {' '.join(args.nonces)}", file=sys.stderr)
-        phases = run_probe(client, model, args, sampler, guard)
+        run = run_probe if args.agent_turns is None else run_agent
+        phases = run(client, model, args, sampler, guard)
     except (ProbeError, subprocess.CalledProcessError) as error:
         print(f"pressure_probe: {error}", file=sys.stderr)
         return 1
@@ -533,6 +653,8 @@ def main(argv=None) -> int:
             thread.join(STATUS_TIMEOUT_SECONDS)
         if sink:
             sink.close()
+    for phase in phases:
+        phase["os_warn_s"] = phase_os_warn_seconds(sampler.samples, phase["phase"])
     document = {
         "model": model,
         "nonces": args.nonces,
@@ -542,7 +664,11 @@ def main(argv=None) -> int:
         "swap_grown_bytes": guard.grown_bytes,
     }
     print(json.dumps(document, indent=2) if args.json else format_report(document))
-    return SWAP_ABORT_EXIT_CODE if document["swap_aborted"] else 0
+    if document["swap_aborted"]:
+        return SWAP_ABORT_EXIT_CODE
+    if args.agent_turns is not None and has_cold_turn(phases):
+        return AGENT_COLD_TURN_EXIT_CODE
+    return 0
 
 
 if __name__ == "__main__":

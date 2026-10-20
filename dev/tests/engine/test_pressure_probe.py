@@ -15,6 +15,8 @@ Pages free:                               12345.
 Swapins:                                      7.
 Swapouts:                                  {swapouts}.
 """
+REPLY_CONTENT = "1\n2\n3"
+TTFT_MS = 412.5
 
 
 def snapshot(pressure="normal", **counters):
@@ -34,9 +36,15 @@ def snapshot(pressure="normal", **counters):
 
 
 class StubServer:
-    """Serve one `/status` document and a chat reply that reports cached tokens."""
+    """Serve one `/status` document and a chat reply that reports cached tokens.
 
-    def __init__(self, status, cached_tokens=0, reply_delay=0.0):
+    `cached_tokens` is one count for every reply, or a list read one entry per
+    chat request in arrival order.
+    """
+
+    def __init__(
+        self, status, cached_tokens=0, reply_delay=0.0, reply_content=REPLY_CONTENT
+    ):
         self.status = status
         self.released = threading.Event()
         self.chat_bodies = []
@@ -63,14 +71,32 @@ class StubServer:
             def do_POST(self):
                 length = int(self.headers["Content-Length"])
                 stub.chat_bodies.append(json.loads(self.rfile.read(length)))
+                index = len(stub.chat_bodies) - 1
                 stub.released.wait(reply_delay)
+                cached = (
+                    cached_tokens[index]
+                    if isinstance(cached_tokens, list)
+                    else cached_tokens
+                )
                 self.reply(
                     {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": reply_content,
+                                },
+                            }
+                        ],
                         "usage": {
                             "prompt_tokens": 100,
                             "completion_tokens": 8,
-                            "prompt_tokens_details": {"cached_tokens": cached_tokens},
-                        }
+                            "prompt_tokens_details": {"cached_tokens": cached},
+                        },
+                        "metrics": {
+                            "request_latency": {"start_to_first_token_ms": TTFT_MS}
+                        },
                     }
                 )
 
@@ -170,6 +196,13 @@ class LaneRecordTests(unittest.TestCase):
         self.assertEqual(record["cached_tokens"], 45056)
         self.assertEqual(record["prompt_tokens"], 57860)
         self.assertEqual(record["wall_s"], 1247.3)
+
+    def test_laneRecord_readsServerTtftFromMetrics(self):
+        reply = {"metrics": {"request_latency": {"start_to_first_token_ms": 1830.5}}}
+
+        record = probe.lane_record(0, "turn1", reply, 2.0, None)
+
+        self.assertEqual(record["ttft_ms"], 1830.5)
 
     def test_laneRecord_failedRequest_keepsErrorAndNoCounts(self):
         record = probe.lane_record(0, "warm0", None, 2.0, "HTTP 503")
@@ -357,6 +390,112 @@ class MainTests(unittest.TestCase):
         self.assertIn("swap guard tripped", output)
         self.assertNotIn("burst", output)
         self.assertLessEqual(len(stub.chat_bodies), 1)
+
+
+AGENT_STATUS = snapshot(
+    cache__resource_suspensions=0,
+    cache__resource_replay_tokens=0,
+    memory_governor__denied_reservations=0,
+    memory_governor__denied_host_reservations=0,
+    memory_governor__denied_engine_reservations=0,
+)
+
+
+def agent_arguments(stub, turns, *extra):
+    return [
+        "--base-url",
+        stub.base_url,
+        "--agent-turns",
+        str(turns),
+        "--tool-tokens",
+        "20",
+        "--warm-tokens",
+        "80",
+        "--max-tokens",
+        "16",
+        *extra,
+    ]
+
+
+class AgentModeTests(unittest.TestCase):
+    def test_main_agentTurns_resendsPromptReplyAndToolWordsEachTurn(self):
+        with StubServer(AGENT_STATUS, cached_tokens=[0, 90, 150]) as stub:
+            code, _output = run_main(agent_arguments(stub, 3, "--json"))
+
+        self.assertEqual(code, 0)
+        conversations = [body["messages"] for body in stub.chat_bodies]
+        self.assertEqual([len(messages) for messages in conversations], [1, 3, 5])
+        for previous, following in zip(conversations, conversations[1:]):
+            self.assertEqual(following[: len(previous)], previous)
+            self.assertEqual(
+                following[len(previous)],
+                {"role": "assistant", "content": REPLY_CONTENT},
+            )
+            tool_words, _instruction = following[-1]["content"].split("\n")
+            self.assertEqual(len(tool_words.split()), 20)
+
+    def test_main_agentTurnAfterFirstReusesNothing_exitsColdTurnCode(self):
+        with StubServer(AGENT_STATUS, cached_tokens=[0, 90, 0]) as stub:
+            code, _output = run_main(agent_arguments(stub, 3, "--json"))
+
+        self.assertEqual(code, probe.AGENT_COLD_TURN_EXIT_CODE)
+
+    def test_main_agentTurns_reportsPerTurnFields(self):
+        with StubServer(AGENT_STATUS, cached_tokens=[0, 90], reply_delay=0.1) as stub:
+            code, output = run_main(
+                agent_arguments(stub, 2, "--sample-seconds", "0.01", "--json")
+            )
+
+        self.assertEqual(code, 0)
+        phases = json.loads(output)["phases"]
+        self.assertEqual([phase["phase"] for phase in phases], ["turn0", "turn1"])
+        turn = phases[1]
+        self.assertEqual(turn["lanes"][0]["cached_tokens"], 90)
+        self.assertEqual(turn["lanes"][0]["ttft_ms"], TTFT_MS)
+        for key in (
+            "suspensions",
+            "replay_tokens",
+            "denied_host_reservations",
+            "denied_engine_reservations",
+        ):
+            self.assertEqual(turn[key], 0, key)
+        self.assertGreater(turn["os_warn_s"], 0)
+
+    def test_formatReport_agentTurns_rendersTtftAndOsWarnRows(self):
+        with StubServer(AGENT_STATUS, cached_tokens=[0, 90]) as stub:
+            _code, output = run_main(agent_arguments(stub, 2))
+
+        self.assertIn("ttft ms", output)
+        self.assertIn("os_warn_s", output)
+        self.assertIn("turn1", output)
+
+    def test_main_agentReplyWithoutContent_stopsAfterThatTurn(self):
+        with StubServer(AGENT_STATUS, reply_content=None) as stub:
+            code, output = run_main(agent_arguments(stub, 3, "--json"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(stub.chat_bodies), 1)
+        self.assertIn(
+            "no message content", json.loads(output)["phases"][0]["lanes"][0]["error"]
+        )
+
+    def test_main_agentSwapGrowthPastCap_stopsWithExitCode3(self):
+        grown = 2 * 2**20 // PAGE_BYTES
+        with StubServer(AGENT_STATUS, reply_delay=30.0) as stub:
+            code, output = run_main(
+                agent_arguments(stub, 3, "--swap-guard-mb", "1"),
+                swapouts=(0, grown),
+            )
+
+        self.assertEqual(code, probe.SWAP_ABORT_EXIT_CODE)
+        self.assertIn("swap guard tripped", output)
+        self.assertLessEqual(len(stub.chat_bodies), 1)
+
+    def test_parseArgs_agentTurnsWithNonces_isRefused(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            probe.parse_args(
+                ["--base-url", "http://x", "--agent-turns", "2", "--nonces", "aaaa"]
+            )
 
 
 if __name__ == "__main__":
