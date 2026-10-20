@@ -67,6 +67,7 @@ TEST_DRAFT_CONTEXT_PLAN_TEST := $(ENGINE_TEST_BUILD)/draft-context-plan
 TEST_RAGGED_SCHEDULER_TEST := $(ENGINE_TEST_BUILD)/ragged-scheduler
 TEST_CACHE_TEST := $(ENGINE_TEST_BUILD)/engine-cache
 TEST_KV_FIRST_ENGINE_TEST := $(ENGINE_TEST_BUILD)/kv-first-engine
+TEST_PRESSURE_SESSION_TEST := $(ENGINE_TEST_BUILD)/pressure-session
 TEST_ELASTIC_KV_TEST := $(ENGINE_TEST_BUILD)/elastic-kv-pool
 TEST_PROTOCOL_TEST := $(ENGINE_TEST_BUILD)/protocol
 TEST_NATIVE_LOOP_TEST := $(ENGINE_TEST_BUILD)/native-engine-loop
@@ -151,6 +152,7 @@ TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_RAGGED_SCHEDULER_TEST) \
 	$(TEST_CACHE_TEST) \
 	$(TEST_KV_FIRST_ENGINE_TEST) \
+	$(TEST_PRESSURE_SESSION_TEST) \
 	$(TEST_ELASTIC_KV_TEST) \
 	$(TEST_PROTOCOL_TEST) \
 	$(TEST_NATIVE_LOOP_TEST) \
@@ -260,6 +262,17 @@ $(TEST_KV_FIRST_ENGINE_TEST): runtime/engine/Scheduler.cpp \
 		runtime/engine/Cache.cpp \
 		runtime/engine/Engine.cpp \
 		dev/tests/engine/kv_first_engine_test.cpp | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
+
+$(TEST_PRESSURE_SESSION_TEST): runtime/engine/Scheduler.cpp \
+		runtime/model/DraftContextPlan.cpp \
+		runtime/engine/KvPool.cpp \
+		runtime/engine/KvCache.cpp \
+		runtime/engine/StateCache.cpp \
+		runtime/engine/Cache.cpp \
+		runtime/engine/Engine.cpp \
+		runtime/engine/MemoryGovernor.cpp \
+		dev/tests/engine/pressure_session_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_KV_FIRST_CACHE_TEST): runtime/engine/KvPool.cpp \
@@ -638,6 +651,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
 	$(TEST_RAGGED_SCHEDULER_TEST)
 	$(TEST_CACHE_TEST)
 	$(TEST_KV_FIRST_ENGINE_TEST)
+	$(TEST_PRESSURE_SESSION_TEST)
 	$(TEST_ELASTIC_KV_TEST)
 	$(TEST_PROTOCOL_TEST)
 	$(TEST_NATIVE_LOOP_TEST)

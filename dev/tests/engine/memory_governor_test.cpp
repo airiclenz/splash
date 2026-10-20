@@ -1,3 +1,4 @@
+#include "TestFakeHost.hpp"
 #include "engine/MemoryGovernor.hpp"
 
 #include <cstdint>
@@ -31,13 +32,11 @@ void require(bool value, const char *message) {
     throw std::runtime_error(message);
 }
 
-// A host sampler whose answer the test sets and whose calls it counts.
-struct FakeHost {
-  std::optional<uint64_t> availableBytes = kAmpleHostBytes;
-  uint64_t inactiveBytes = kInactiveHostBytes;
-  uint64_t wiredBytes = kWiredHostBytes;
-  uint64_t compressorBytes = kCompressorHostBytes;
-  int samples = 0;
+// The shared fake host, starting ample.
+struct FakeHost final : engine::test::FakeHost {
+  FakeHost()
+      : engine::test::FakeHost{kAmpleHostBytes, kInactiveHostBytes,
+                               kWiredHostBytes, kCompressorHostBytes} {}
 };
 
 MemoryGovernor makeGovernor(FakeHost &host,
@@ -48,14 +47,7 @@ MemoryGovernor makeGovernor(FakeHost &host,
         stats.allocatedBytes = kResidentBytes;
         return stats;
       },
-      kLimitBytes, cushion,
-      [&host]() -> std::optional<HostMemorySample> {
-        ++host.samples;
-        if (!host.availableBytes)
-          return std::nullopt;
-        return HostMemorySample{*host.availableBytes, host.inactiveBytes,
-                                host.wiredBytes, host.compressorBytes};
-      });
+      kLimitBytes, cushion, host.sampler());
 }
 
 void testSnapshotAfterConstructionUsesStartupSample() {
