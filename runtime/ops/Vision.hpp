@@ -175,7 +175,8 @@ struct VisionKernelShapes final {
 // encode() appends one image's dispatches, from resized uint8 RGB pixels to
 // bf16 language embeddings; the first encode() after construction also zeroes
 // the GPU-private arena at the head of its graph, so that graph must be
-// submitted before any later one. Injection uses the encoded buffers
+// submitted before any later one, or reported with graphDropped() when it
+// never is. Injection uses the encoded buffers
 // independently, so the arena can be released after encoding while later
 // chunks inject rows.
 class Vision final {
@@ -216,6 +217,10 @@ public:
   void encode(metal::CommandGraph &graph, ImageGrid grid,
               const metal::MetalBuffer &pixels,
               const metal::MetalBuffer &embeddings);
+  // Call when a graph encode() appended to is dropped unsubmitted: it may
+  // carry the arena zero fill, so the next encode() queues the fill again.
+  // A fill repeated after a submitted one is redundant but harmless.
+  void graphDropped() noexcept { isArenaZeroQueued_ = false; }
 
   // Overwrites rows of a packed bf16 hidden buffer with embedding rows of
   // hiddenSize values each.

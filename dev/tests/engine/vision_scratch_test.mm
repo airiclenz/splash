@@ -5,6 +5,7 @@
 
 #include "ops/Vision.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +23,9 @@ namespace {
 constexpr std::string_view kZeroPipeline = "vision_zero_words";
 constexpr uint64_t kZeroWordBytes = 16;
 constexpr uint8_t kFillByte = 0xFF;
+// Arena garbage that reads back as a finite bf16 (0x7F7F), so copying it
+// through bf16 loads and stores keeps every bit.
+constexpr uint8_t kGarbageByte = 0x7F;
 
 // Largest relative deviation from an exact patch-count ratio that arena tile
 // padding and 16 KiB view alignment may add.
@@ -191,6 +195,62 @@ void testFirstEncodeZeroesArenaOnce(metal::MetalBackend &backend) {
           "the arena zero fill ran other than once");
 }
 
+// Copies words 16-byte words from source to destination through the
+// embedding injection kernel, the test's only way into the private arena.
+void copyWords(metal::MetalBackend &backend, const metal::MetalBuffer &source,
+               const metal::MetalBuffer &destination, uint32_t words) {
+  metal::CommandGraph graph;
+  ops::Vision::inject(graph, source, destination,
+                      kZeroWordBytes / sizeof(uint16_t), 0, 0, words);
+  static_cast<void>(backend.submitCommand(graph.dispatches()));
+}
+
+// A first encode() graph dropped unsubmitted takes the zero fill with it, so
+// after graphDropped() the next graph opens with the fill and, once
+// submitted, leaves a garbage-filled arena all zeros. Only the fill dispatch
+// runs: the rest of the graph needs real weights.
+void testDroppedGraphRequeuesArenaZero(metal::MetalBackend &backend) {
+  const ops::VisionWeights weights;
+  ops::Vision encoder(backend, weights, ops::kMinimumImagePatchCapacity);
+  const ops::ImageGrid grid{2, 2};
+  metal::MetalBuffer pixels = backend.allocateBuffer(
+      grid.pixelBytes(), metal::BufferStorage::Private, "pixels");
+  metal::MetalBuffer embeddings = backend.allocateBuffer(
+      uint64_t{ops::Vision::embeddingRows(grid)} *
+          weights.layout.outputHiddenSize * sizeof(uint16_t),
+      metal::BufferStorage::Private, "embeddings");
+  {
+    metal::CommandGraph dropped;
+    encoder.encode(dropped, grid, pixels, embeddings);
+    require(countZeroDispatches(dropped) == 1,
+            "first encode does not carry the arena zero fill");
+  }
+  encoder.graphDropped();
+  metal::CommandGraph submitted;
+
+  encoder.encode(submitted, grid, pixels, embeddings);
+
+  require(submitted.dispatches().front().pipelineName == kZeroPipeline &&
+              countZeroDispatches(submitted) == 1,
+          "the graph after a dropped one does not open with the zero fill");
+  const metal::MetalBuffer arena =
+      submitted.dispatches().front().buffers.front().buffer;
+  require(arena.sizeBytes() == encoder.arenaBytes() &&
+              arena.sizeBytes() % kZeroWordBytes == 0,
+          "the zero fill does not cover the arena in whole words");
+  const auto words = static_cast<uint32_t>(arena.sizeBytes() / kZeroWordBytes);
+  metal::MetalBuffer host = backend.allocateBuffer(
+      arena.sizeBytes(), metal::BufferStorage::Shared, "arena-readback");
+  std::memset(host.contents(), kGarbageByte, arena.sizeBytes());
+  copyWords(backend, host, arena, words);
+  static_cast<void>(backend.submitCommand(submitted.dispatches().first(1)));
+  copyWords(backend, arena, host, words);
+  const auto *contents = static_cast<const uint8_t *>(host.contents());
+  require(std::all_of(contents, contents + arena.sizeBytes(),
+                      [](uint8_t value) { return value == 0; }),
+          "the arena is not zeroed after a dropped first graph");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -207,6 +267,7 @@ int main(int argc, char **argv) {
     metal::MetalBackend backend(argv[1]);
     testZeroWordsClearsBuffer(backend);
     testFirstEncodeZeroesArenaOnce(backend);
+    testDroppedGraphRequeuesArenaZero(backend);
     std::cout << "vision scratch tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

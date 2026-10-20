@@ -48,6 +48,26 @@ using metal::CommandTiming;
 using metal::MetalBackend;
 using metal::MetalBuffer;
 
+// Reports a prefill graph to the vision encoder as dropped unless submitted()
+// runs first: the graph may carry the encoder's one-time arena zero fill.
+class VisionGraphGuard final {
+public:
+  explicit VisionGraphGuard(ops::Vision *vision) noexcept : vision_(vision) {}
+  ~VisionGraphGuard() {
+    if (vision_)
+      vision_->graphDropped();
+  }
+  VisionGraphGuard(const VisionGraphGuard &) = delete;
+  VisionGraphGuard &operator=(const VisionGraphGuard &) = delete;
+  VisionGraphGuard(VisionGraphGuard &&) = delete;
+  VisionGraphGuard &operator=(VisionGraphGuard &&) = delete;
+
+  void submitted() noexcept { vision_ = nullptr; }
+
+private:
+  ops::Vision *vision_;
+};
+
 class DeferredMetalTicket final : public ModelBatchTicket {
 public:
   using Completion = std::function<std::vector<ModelStepResult>(CommandTiming)>;
@@ -2126,6 +2146,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
 
   std::array<Impl::Request *, kLaneCount> entries{};
   CommandGraph graph = impl_->newGraph(Impl::GraphSite::Prefill);
+  VisionGraphGuard visionGuard(impl_->vision.get());
   impl_->encodePackedPrefillGraph(graph, items, entries);
   impl_->recordGraph(Impl::GraphSite::Prefill, graph);
   const bool encodesImages = std::any_of(
@@ -2142,6 +2163,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
   };
   CommandTicket command =
       impl_->backend.submitCommandAsync(graph.dispatches(), std::move(notify));
+  visionGuard.submitted();
   Impl *impl = impl_.get();
   auto finish = [impl, entries,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
