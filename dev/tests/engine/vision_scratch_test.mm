@@ -1,20 +1,26 @@
-// CPU checks of the vision scratch arena sizing: the power-of-two patch
-// capacity an image admits and how the arena's bytes scale with it. No GPU
-// work runs; the binary links the Metal backend only because Vision does.
+// Checks of the vision scratch arena: the power-of-two patch capacity an
+// image admits and how the arena's bytes scale with it (CPU), and the GPU zero
+// fill the arena gets before its first encode. No model weights load.
 
 #include "ops/Vision.hpp"
 
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 using namespace splash;
 
 namespace {
+
+constexpr std::string_view kZeroPipeline = "vision_zero_words";
+constexpr uint64_t kZeroWordBytes = 16;
+constexpr uint8_t kFillByte = 0xFF;
 
 // Largest relative deviation from an exact patch-count ratio that arena tile
 // padding and 16 KiB view alignment may add.
@@ -96,14 +102,79 @@ void testScratchBytesRejectsInvalidCapacity() {
   }
 }
 
+// vision_zero_words zeroes exactly word_count 16-byte words of a 0xFF buffer
+// through its grid-stride loop and leaves the words past the count untouched.
+void testZeroWordsClearsBuffer(metal::MetalBackend &backend) {
+  constexpr uint32_t groups = 2;
+  constexpr uint32_t words =
+      3 * groups * metal::CommandGraph::kDefaultThreads + 7;
+  constexpr uint32_t guardWords = 5;
+  constexpr uint64_t bytes = uint64_t{words + guardWords} * kZeroWordBytes;
+  metal::MetalBuffer buffer = backend.allocateBuffer(
+      bytes, metal::BufferStorage::Shared, "zero-words");
+  std::memset(buffer.contents(), kFillByte, bytes);
+  metal::CommandGraph graph;
+  graph.add(kZeroPipeline, {buffer}, words, {groups, 1, 1});
+
+  static_cast<void>(backend.submitCommand(graph.dispatches()));
+
+  const auto *contents = static_cast<const uint8_t *>(buffer.contents());
+  const uint64_t zeroed = uint64_t{words} * kZeroWordBytes;
+  for (uint64_t index = 0; index < bytes; ++index) {
+    require(contents[index] == (index < zeroed ? 0 : kFillByte),
+            "vision_zero_words did not zero exactly its words");
+  }
+}
+
+// Returns how many dispatches of graph run the arena zero fill.
+size_t countZeroDispatches(const metal::CommandGraph &graph) {
+  size_t count = 0;
+  for (const metal::ComputeDispatch &dispatch : graph.dispatches())
+    count += dispatch.pipelineName == kZeroPipeline;
+  return count;
+}
+
+// A new encoder zeroes its whole arena at dispatch 0 of its first encode()
+// graph and never again. Default weights suffice: graphs are only recorded.
+void testFirstEncodeZeroesArenaOnce(metal::MetalBackend &backend) {
+  const ops::VisionWeights weights;
+  ops::Vision encoder(backend, weights, ops::kMinimumImagePatchCapacity);
+  const ops::ImageGrid grid{2, 2};
+  metal::MetalBuffer pixels = backend.allocateBuffer(
+      grid.pixelBytes(), metal::BufferStorage::Private, "pixels");
+  metal::MetalBuffer embeddings = backend.allocateBuffer(
+      uint64_t{ops::Vision::embeddingRows(grid)} *
+          weights.layout.outputHiddenSize * sizeof(uint16_t),
+      metal::BufferStorage::Private, "embeddings");
+  metal::CommandGraph first;
+  metal::CommandGraph second;
+
+  encoder.encode(first, grid, pixels, embeddings);
+  encoder.encode(second, grid, pixels, embeddings);
+
+  const metal::ComputeDispatch &zero = first.dispatches().front();
+  require(zero.pipelineName == kZeroPipeline &&
+              zero.buffers.front().buffer.sizeBytes() == encoder.arenaBytes(),
+          "first encode does not open with the arena zero fill");
+  require(countZeroDispatches(first) == 1 && countZeroDispatches(second) == 0,
+          "the arena zero fill ran other than once");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    std::cerr << "usage: vision-scratch METALLIB\n";
+    return 2;
+  }
   try {
     testCapacityRounding();
     testCapacityCappedBySmallLimit();
     testScratchBytesScaleWithCapacity();
     testScratchBytesRejectsInvalidCapacity();
+    metal::MetalBackend backend(argv[1]);
+    testZeroWordsClearsBuffer(backend);
+    testFirstEncodeZeroesArenaOnce(backend);
     std::cout << "vision scratch tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

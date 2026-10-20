@@ -1,7 +1,8 @@
 // Vision encoder kernels for the Qwen3.5 vision tower: pixel patchify,
 // position/rope preparation, dense bf16 GEMMs with fused epilogues,
 // LayerNorm, 2D-rope QKV preparation, non-causal flash attention, and the
-// embedding injection into the language model's prefill hidden rows.
+// embedding injection into the language model's prefill hidden rows, plus
+// the one-time zero fill of a new scratch arena.
 //
 // Conventions match the text-model kernels: 256 threads (8 simdgroups) per
 // threadgroup, MPP cooperative-tensor matmuls with fp32 accumulation and
@@ -527,5 +528,21 @@ kernel void vision_inject_embeddings(
         uint dim = element % params.width;
         output[ulong(params.destination_row + row) * params.width + dim] =
             source[ulong(params.source_row + row) * params.width + dim];
+    }
+}
+
+// Zero fill: writes zeros over word_count 16-byte words with a grid-stride
+// loop, so a capped grid covers a buffer of any size. A new scratch arena runs
+// it once before its first encode: padding rows and tokens are read by whole
+// tiles and must be finite.
+
+kernel void vision_zero_words(
+    device uint4 *words [[buffer(0)]],
+    constant uint &word_count [[buffer(1)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]])
+{
+    for (ulong word = index; word < word_count; word += grid_size) {
+        words[word] = uint4(0);
     }
 }

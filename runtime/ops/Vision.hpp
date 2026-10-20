@@ -100,8 +100,11 @@ struct ImageGrid final {
 // GPU vision encoder with one reusable scratch arena sized for maximumPatches;
 // callers size it with imagePatchCapacity() for the largest image it encodes.
 // encode() appends one image's dispatches, from resized uint8 RGB pixels to
-// bf16 language embeddings. Injection uses the encoded buffers independently,
-// so the arena can be released after encoding while later chunks inject rows.
+// bf16 language embeddings; the first encode() after construction also zeroes
+// the GPU-private arena at the head of its graph, so that graph must be
+// submitted before any later one. Injection uses the encoded buffers
+// independently, so the arena can be released after encoding while later
+// chunks inject rows.
 class Vision final {
 public:
   // Scratch footprint before construction, so the caller can reserve it.
@@ -126,7 +129,7 @@ public:
 
   void encode(metal::CommandGraph &graph, ImageGrid grid,
               const metal::MetalBuffer &pixels,
-              const metal::MetalBuffer &embeddings) const;
+              const metal::MetalBuffer &embeddings);
 
   // Overwrites rows of a packed bf16 hidden buffer with embedding rows of
   // hiddenSize values each.
@@ -167,10 +170,13 @@ private:
   void addNorm(metal::CommandGraph &graph, const metal::MetalBuffer &input,
                const VisionNorm &weights,
                const metal::MetalBuffer &output, uint32_t rows) const;
+  void addArenaZero(metal::CommandGraph &graph) const;
 
   const VisionWeights &model_;
   uint32_t maximumPatches_ = 0;
   metal::MetalBuffer arena_;
+  // Whether an encode() graph already carries the arena's zero fill.
+  bool isArenaZeroQueued_ = false;
   metal::MetalBuffer scratch_[static_cast<uint32_t>(Scratch::Count)];
 };
 

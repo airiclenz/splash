@@ -159,8 +159,7 @@ TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_MEMORY_AUDIT_TEST) \
 	$(TEST_STATUS_TEST) \
 	$(TEST_MEMORY_GOVERNOR_TEST) \
-	$(TEST_Q8_CPU_TEST) \
-	$(TEST_VISION_SCRATCH_TEST)
+	$(TEST_Q8_CPU_TEST)
 
 TEST_METAL_TARGETS := $(TEST_Q4_SGMATRIX_TEST) $(TEST_TUNING_WORKLOADS) \
 	$(TEST_LINEAR_TUNING) \
@@ -185,6 +184,7 @@ TEST_METAL_TARGETS := $(TEST_Q4_SGMATRIX_TEST) $(TEST_TUNING_WORKLOADS) \
 	$(TEST_GDN_DECODE_TEST) \
 	$(TEST_DRAFT_SELECTOR_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
+	$(TEST_VISION_SCRATCH_TEST) \
 	$(LIB) $(TEST_METAL_BACKEND_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB)
 
 TEST_UNIT_TEST_TARGETS := $(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))
@@ -536,11 +536,11 @@ $(TEST_VISION_ENCODER_TEST): runtime/metal/DeviceCapabilities.cpp \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-# CPU-only arena sizing checks; Vision links the backend it would encode with.
+# Arena sizing checks on the CPU and the arena's GPU zero fill; no weights load.
 $(TEST_VISION_SCRATCH_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/metal/MetalBackend.mm \
 		runtime/ops/Vision.mm \
-		dev/tests/engine/vision_scratch_test.mm | $(ENGINE_TEST_BUILD)
+		dev/tests/engine/vision_scratch_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
@@ -631,7 +631,6 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
 	$(TEST_STATUS_TEST)
 	$(TEST_MEMORY_GOVERNOR_TEST)
 	$(TEST_Q8_CPU_TEST)
-	$(TEST_VISION_SCRATCH_TEST)
 
 $(TEST_Q4_SGMATRIX_TEST): dev/tests/engine/q4_sgmatrix_metal_test.mm $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
@@ -661,6 +660,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_GDN_DECODE_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_DRAFT_SELECTOR_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
+	$(METAL_TEST_ENV) $(TEST_VISION_SCRATCH_TEST) $(LIB)
 
 .PHONY: test-real
 VISION_FIXTURE_incoai/Qwen3.8-27B-Splash := qwen3.8-27b

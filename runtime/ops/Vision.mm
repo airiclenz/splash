@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -24,6 +23,9 @@ constexpr uint32_t kQueryTile = 64;
 constexpr uint32_t kQkDimension = 80; // head dimension 72 padded to 16
 constexpr uint64_t kArenaAlignment = 16 * 1024;
 constexpr uint64_t kBf16Bytes = 2;
+// The arena zero fill writes 16-byte words from at most this many threadgroups.
+constexpr uint64_t kZeroWordBytes = 16;
+constexpr uint64_t kZeroGroupLimit = 1024;
 
 uint32_t roundUp(uint32_t value, uint32_t multiple) noexcept {
   return (value + multiple - 1) / multiple * multiple;
@@ -107,11 +109,10 @@ Vision::Vision(metal::MetalBackend &backend, const VisionWeights &model,
                uint32_t maximumPatches)
     : model_(model), maximumPatches_(maximumPatches) {
   const uint64_t total = scratchBytes(model.layout, maximumPatches);
-  arena_ = backend.allocateBuffer(total, metal::BufferStorage::Shared,
+  // Only kernels touch the arena, so it lives in private storage; the first
+  // encode() zeroes it on the GPU (addArenaZero).
+  arena_ = backend.allocateBuffer(total, metal::BufferStorage::Private,
                                   "vision-scratch");
-  // Padding rows and tokens are read by whole tiles but never consumed as
-  // results; zeroed storage guarantees they are finite.
-  std::memset(arena_.contents(), 0, static_cast<size_t>(total));
   uint64_t cursor = 0;
   const auto layout = scratchLayout(model.layout, maximumPatches);
   for (uint32_t index = 0; index < layout.size(); ++index) {
@@ -139,9 +140,22 @@ void Vision::addNorm(CommandGraph &graph, const MetalBuffer &input,
             VisionNormParams{model_.layout.hiddenSize}, {rows, 1, 1});
 }
 
+// Appends the one-time zero fill of the whole arena. Padding rows and tokens
+// are read by whole tiles but never consumed as results; zeroed storage
+// guarantees they are finite. One GPU pass replaces a CPU write of the arena.
+void Vision::addArenaZero(CommandGraph &graph) const {
+  const uint64_t words = arena_.sizeBytes() / kZeroWordBytes;
+  if (words > std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("vision scratch arena exceeds the zero fill");
+  const uint64_t groups =
+      (words + CommandGraph::kDefaultThreads - 1) / CommandGraph::kDefaultThreads;
+  graph.add("vision_zero_words", {arena_}, static_cast<uint32_t>(words),
+            {std::min(groups, kZeroGroupLimit), 1, 1});
+}
+
 void Vision::encode(CommandGraph &graph, ImageGrid grid,
                     const MetalBuffer &pixels,
-                    const MetalBuffer &embeddings) const {
+                    const MetalBuffer &embeddings) {
   const VisionLayout &layout = model_.layout;
   const uint32_t tokens = grid.patches();
   if (!grid.valid() || tokens > maximumPatches_) {
@@ -154,6 +168,11 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
                                   layout.outputHiddenSize * kBf16Bytes;
   if (!embeddings || embeddings.sizeBytes() < embeddingBytes) {
     throw std::invalid_argument("embedding buffer is too small for the grid");
+  }
+
+  if (!isArenaZeroQueued_) {
+    addArenaZero(graph);
+    isArenaZeroQueued_ = true;
   }
 
   const uint32_t padded = roundUp(tokens, kKeyTile);

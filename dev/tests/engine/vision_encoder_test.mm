@@ -59,7 +59,7 @@ MetalBuffer upload(MetalBackend &backend, const std::vector<uint8_t> &bytes,
 }
 
 std::vector<float> encodeOnce(MetalBackend &backend,
-                              const Vision &encoder, ImageGrid grid,
+                              Vision &encoder, ImageGrid grid,
                               const MetalBuffer &pixels, uint32_t hiddenSize,
                               double *gpuSeconds) {
   const uint64_t rows = Vision::embeddingRows(grid);
@@ -221,8 +221,13 @@ int main(int argc, char **argv) {
       Vision encoder(backend, model.tensors, maximumPatches);
       MetalBuffer pixels = upload(backend, pixelBytes, "fixture pixels");
 
+      // The first encode also zeroes the new arena, so the reported GPU time
+      // is the second encode's: the per-image cost serving pays.
       double gpuSeconds = 0.0;
       const std::vector<float> first =
+          encodeOnce(backend, encoder, grid, pixels,
+                     model.tensors.layout.outputHiddenSize, nullptr);
+      const std::vector<float> second =
           encodeOnce(backend, encoder, grid, pixels,
                      model.tensors.layout.outputHiddenSize, &gpuSeconds);
       const Parity parity =
@@ -242,9 +247,6 @@ int main(int argc, char **argv) {
         }
       }
 
-      const std::vector<float> second =
-          encodeOnce(backend, encoder, grid, pixels,
-                     model.tensors.layout.outputHiddenSize, nullptr);
       if (first != second) {
         std::printf("FAIL: encoding is not deterministic\n");
         pass = false;
