@@ -2027,25 +2027,112 @@ void testSoleDecodeLaneSuspendsAtTheResourceWaitBound() {
           "bound suspension did not take a fresh resource wait deadline");
 }
 
-void testSolePrefillLaneStillSuspendsUnderHostPressure() {
-  Backing backing(32);
-  KvPool pool(backing);
-  engine::Cache resources(pool, CacheNamespace{});
-  Executor executor(1);
+// A sole resident prefill lane on a fresh cache. Its first dispatch fills
+// the first extent's pages at 128 of its 129 prompt tokens, so the last
+// prompt token needs an extent that blocked growth denies for host pressure.
+struct SolePrefillLane final {
+  static constexpr uint64_t laneId = 275;
+  static constexpr uint32_t tokensBeforeDenial = 128;
+
+  Backing backing{32};
+  KvPool pool{backing};
+  engine::Cache resources{pool, CacheNamespace{}};
+  Executor executor{1};
   Events events;
-  backing.growthBlocked = true;
-  backing.allocationFailure = metal::AllocationFailure::HostPressure;
-  EngineConfig config;
-  config.growthPaused = [&] { return backing.growthBlocked; };
-  engine::Engine engine(config, resources, executor, events);
+  engine::Engine engine;
+  double now = 1;
+  double denied = 0;
 
-  engine.submit(request(275, std::vector<uint32_t>(64, 75)));
-  for (double now = 1; now < 10 && executor.suspensions == 0; ++now)
-    static_cast<void>(engine.tick(now));
+  // Prefills until the first dispatch lands, then blocks growth and ticks
+  // until the lane's next chunk is denied, recording that denial's time.
+  explicit SolePrefillLane(double resourceWaitTimeoutMilliseconds)
+      : engine(configured(resourceWaitTimeoutMilliseconds), resources,
+               executor, events) {
+    backing.allocationFailure = metal::AllocationFailure::HostPressure;
+    engine.submit(request(laneId, std::vector<uint32_t>(129, 75)));
+    require(tickUntil([&] { return !executor.prefillWidths.empty(); }) &&
+                executor.requests.at(laneId).position == tokensBeforeDenial,
+            "sole prefill lane fixture did not prefill its first extent");
+    backing.growthBlocked = true;
+    require(tickUntil([&] {
+              return engine.resourceWaitSnapshot(now).memory == 1 ||
+                     executor.suspensions != 0;
+            }) && executor.suspensions == 0,
+            "sole prefill lane under host pressure suspended instead of "
+            "backing off");
+    denied = now;
+  }
 
-  require(executor.suspensions == 1 &&
-              engine.resourceWaitSnapshot(10.0).suspended == 1,
-          "sole prefill lane backed off instead of suspending");
+  EngineConfig configured(double resourceWaitTimeoutMilliseconds) {
+    EngineConfig config;
+    config.resourceWaitTimeoutMilliseconds = resourceWaitTimeoutMilliseconds;
+    config.growthPaused = [this] { return backing.growthBlocked; };
+    return config;
+  }
+
+  // Ticks once a millisecond until `done` holds, at most 1000 ticks; `now`
+  // is left at the tick that satisfied it.
+  bool tickUntil(const std::function<bool()> &done) {
+    for (const double last = now + 1000; now < last; ++now) {
+      static_cast<void>(engine.tick(now));
+      if (done())
+        return true;
+    }
+    return false;
+  }
+
+  [[nodiscard]] bool resident() const {
+    return executor.requests.at(laneId).resident;
+  }
+};
+
+void testSolePrefillLaneBacksOffUnderHostPressure() {
+  SolePrefillLane fixture(150.0);
+  const double denied = fixture.denied;
+
+  const ResourceWaitSnapshot waiting =
+      fixture.engine.resourceWaitSnapshot(denied + 40.0);
+  require(waiting.memory == 1 && waiting.suspended == 0 &&
+              waiting.oldestWaitMilliseconds == 40.0,
+          "backing-off prefill lane was not reported as waiting on memory");
+  for (double now = denied + 1.0; now < denied + 100.0; ++now)
+    require(!fixture.engine.tick(now),
+            "prefill back-off skip reported progress");
+  require(fixture.executor.prefillWidths.size() == 1 &&
+              fixture.executor.suspensions == 0 && fixture.resident(),
+          "backing-off prefill lane ran or left residency before its retry");
+
+  fixture.backing.growthBlocked = false;
+  require(fixture.engine.tick(denied + 100.0),
+          "backing-off prefill lane did not retry at its retry time");
+  fixture.now = denied + 101.0;
+  require(fixture.tickUntil([&] { return fixture.engine.idle(); }),
+          "backed-off prefill lane did not finish");
+  require(fixture.events.completedCount == 1 &&
+              fixture.events.failedCount == 0 &&
+              fixture.engine.snapshot().resourceSuspensions == 0 &&
+              fixture.engine.snapshot().resourceReplayTokens == 0,
+          "backed-off prefill lane failed, suspended or replayed");
+}
+
+void testSolePrefillLaneSuspendsAtTheResourceWaitBound() {
+  SolePrefillLane fixture(100.0);
+  const double denied = fixture.denied;
+
+  static_cast<void>(fixture.engine.tick(denied + 50.0));
+  require(fixture.executor.suspensions == 0,
+          "prefill lane suspended before the resource wait bound");
+  static_cast<void>(fixture.engine.tick(denied + 100.0));
+  require(fixture.executor.suspensions == 1 &&
+              fixture.engine.snapshot().resourceSuspensions == 1 &&
+              fixture.engine.snapshot().resourceDecodeSuspensions == 0 &&
+              !fixture.resident(),
+          "prefill lane was not suspended at the resource wait bound");
+  const ResourceWaitSnapshot waiting =
+      fixture.engine.resourceWaitSnapshot(denied + 100.0);
+  require(waiting.memory == 1 && waiting.suspended == 1 &&
+              waiting.oldestWaitMilliseconds == 100.0,
+          "prefill suspension lost the back-off's wait time");
 }
 
 // A suspended peer drains the engine: the lane suspends at its denial, as
@@ -3405,10 +3492,14 @@ void testAdmissionsWaitForBackgroundRelease() {
       config.resourceWaitTimeoutMilliseconds = 500;
       engine::Engine engine(config, cache, executor, events);
       engine.submit(request(285, {285}));
+      // The sole lane backs off at its first denial and suspends at the
+      // resource wait bound.
+      const double suspended = 1.0 + config.resourceWaitTimeoutMilliseconds;
       if (resuming) {
         backing.growthBlocked = true;
         backing.allocationFailure = metal::AllocationFailure::HostPressure;
         static_cast<void>(engine.tick(1));
+        static_cast<void>(engine.tick(suspended));
         require(executor.suspensions == 1, "fixture did not suspend request");
         backing.growthBlocked = false;
       }
@@ -3428,7 +3519,7 @@ void testAdmissionsWaitForBackgroundRelease() {
         executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
         executor.beginGrowthBlocked = [&] { return !backing.growthAllowed(); };
       }
-      const double start = resuming ? 101 : 1;
+      const double start = resuming ? suspended + 100 : 1;
       static_cast<void>(engine.tick(start));
       require(events.failedCount == 0 && events.capacityExhaustedCount == 0,
               "pending/just-completed release became terminal KV failure");
@@ -3505,6 +3596,10 @@ void testAllocationCausesRemainRetryableAndDistinct() {
 }
 
 void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
+  // The sole lane backs off at its first denial (tick 3) and suspends at this
+  // bound; the suspension's fresh wait outlasts the retries below.
+  constexpr double resourceWaitMilliseconds = 1000.0;
+  constexpr double suspended = 3.0 + resourceWaitMilliseconds;
   for (bool sharePrefix : {false, true}) {
     Backing backing(64);
     KvPool pool(backing);
@@ -3514,6 +3609,7 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
     executor.physicalGrowthBlocked = &backing.growthBlocked;
     Events events;
     EngineConfig config;
+    config.resourceWaitTimeoutMilliseconds = resourceWaitMilliseconds;
     // Models the request-sized headroom denial while global pressure is Normal.
     config.growthPaused = [] { return false; };
     engine::Engine engine(config, resources, executor, events);
@@ -3538,14 +3634,19 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
               "recovery fixture needs a state backed only by active prefix pages");
     }
     backing.growthBlocked = true;
-    require(engine.tick(3) && engine.snapshot().resourceSuspensions == 1,
+    static_cast<void>(engine.tick(3));
+    require(engine.snapshot().resourceSuspensions == 0,
+            "the sole prefill lane did not back off");
+    require(engine.tick(suspended) &&
+                engine.snapshot().resourceSuspensions == 1,
             "request-sized host denial was treated as permanent capacity");
     require(resources.snapshot().stateCache.entries == cached.stateCache.entries &&
                 resources.snapshot().stateCache.evictions == cached.stateCache.evictions,
             "active prefix pages were mistaken for idle backing and lost their state");
     const uint64_t rows = executor.prefillRows;
     const uint64_t replay = engine.snapshot().resourceReplayTokens;
-    for (double now : {103.0, 203.0, 303.0}) {
+    for (double now :
+         {suspended + 100.0, suspended + 200.0, suspended + 300.0}) {
       require(!engine.tick(now) && !engine.commandInFlight() &&
                   executor.prefillRows == rows && executor.restored == restored &&
                   engine.snapshot().resourceReplayTokens == replay &&
@@ -3557,8 +3658,11 @@ void testRecoveryAdmitsFailedKvTargetBeforeReplaying() {
     const auto reported = events.progress.at(280);
     require(reported.back() == 128, "prefill recovery lost completed progress");
     backing.growthBlocked = false;
-    require(engine.tick(403), "recovery did not resume when KV became available");
-    for (double now = 404; now < 425 && !engine.idle(); ++now)
+    require(engine.tick(suspended + 400.0),
+            "recovery did not resume when KV became available");
+    for (double now = suspended + 401.0; now < suspended + 422.0 &&
+                                         !engine.idle();
+         ++now)
       static_cast<void>(engine.tick(now));
     auto expected = reported;
     expected.push_back(129);
@@ -3588,7 +3692,8 @@ MemoryReclaimDirective warningReclaim(uint64_t targetBytes) {
 // stays Normal (growthPaused false), after its first dispatch left an ordinary
 // replay state at 128 of its 129 prompt tokens. With peerState, request 279
 // first leaves an unrelated state at 64 on the same prefix, cancelled past
-// its prompt end so no conversation end protects it.
+// its prompt end so no conversation end protects it. The sole lane backs off
+// at its first denial and suspends at the resource wait bound.
 struct SuspendedResumeFixture final {
   explicit SuspendedResumeFixture(bool peerState = false)
       : pool(backing), resources(pool, CacheNamespace{}), executor(2),
@@ -3604,13 +3709,18 @@ struct SuspendedResumeFixture final {
                 resources.cachedTokens(prompt) == 128,
             "suspension fixture did not publish the 128-token replay state");
     backing.growthBlocked = true;
-    require(engine.tick(3) && engine.snapshot().resourceSuspensions == 1,
+    static_cast<void>(engine.tick(3));
+    require(engine.snapshot().resourceSuspensions == 0,
+            "suspension fixture's sole lane did not back off");
+    require(engine.tick(3 + kResourceWaitMilliseconds) &&
+                engine.snapshot().resourceSuspensions == 1,
             "suspension fixture did not suspend the request");
     restoredBeforeResume = executor.restored;
   }
 
   static EngineConfig normalPressureConfig() {
     EngineConfig config;
+    config.resourceWaitTimeoutMilliseconds = kResourceWaitMilliseconds;
     config.growthPaused = [] { return false; };
     return config;
   }
@@ -3625,6 +3735,8 @@ struct SuspendedResumeFixture final {
             "suspended request did not resume and complete");
   }
 
+  // Long enough that the suspension's fresh wait outlasts resume().
+  static constexpr double kResourceWaitMilliseconds = 300.0;
   const std::vector<uint32_t> prompt = std::vector<uint32_t>(129, 280);
   const std::vector<uint32_t> peerPrompt = std::vector<uint32_t>(65, 280);
   Backing backing{64};
@@ -4691,9 +4803,9 @@ void testGrowthReclaimTakesAResidentCheckpointRatherThanStall() {
           "requests did not complete after taking the protected checkpoint");
 }
 
-// A lane suspended by host pressure resumes from its latest checkpoint and,
-// once finished, keeps only its conversation end, protected until pushed out
-// of the ring.
+// A lane suspended by host pressure, once its back-off reaches the resource
+// wait bound, resumes from its latest checkpoint and, once finished, keeps
+// only its conversation end, protected until pushed out of the ring.
 void testHostPressureSuspensionResumesFromTheLanesCheckpoint() {
   Backing backing(512);
   KvPool pool(backing);
@@ -4702,6 +4814,7 @@ void testHostPressureSuspensionResumesFromTheLanesCheckpoint() {
   Events events;
   bool paused = false;
   EngineConfig config;
+  config.resourceWaitTimeoutMilliseconds = 1000.0;
   config.growthPaused = [&] { return paused; };
   engine::Engine engine(config, resources, executor, events);
   const std::vector<uint32_t> prompt = checkpointLanePrompt(620);
@@ -4712,6 +4825,8 @@ void testHostPressureSuspensionResumesFromTheLanesCheckpoint() {
   backing.growthBlocked = true;
   backing.allocationFailure = metal::AllocationFailure::HostPressure;
   static_cast<void>(engine.tick(200));
+  require(executor.suspensions == 0, "the sole lane did not back off");
+  static_cast<void>(engine.tick(1200));
   require(executor.suspensions == 1,
           "host pressure did not suspend the lane");
 
@@ -4719,7 +4834,7 @@ void testHostPressureSuspensionResumesFromTheLanesCheckpoint() {
       warningReclaim(std::numeric_limits<uint64_t>::max())));
   paused = false;
   backing.growthBlocked = false;
-  for (double now = 201; now < 1000 && !engine.idle(); ++now)
+  for (double now = 1201; now < 3000 && !engine.idle(); ++now)
     static_cast<void>(engine.tick(now));
 
   require(engine.idle() && events.completedCount == 1 &&
@@ -5971,7 +6086,8 @@ int main() {
     testSingletonHostPressureWaitRecoversOrTerminates();
     testSoleDecodeLaneBacksOffUnderHostPressure();
     testSoleDecodeLaneSuspendsAtTheResourceWaitBound();
-    testSolePrefillLaneStillSuspendsUnderHostPressure();
+    testSolePrefillLaneBacksOffUnderHostPressure();
+    testSolePrefillLaneSuspendsAtTheResourceWaitBound();
     testSoleDecodeLaneSuspendsBesideAWaitingPeer();
     testKvPressureNarrowsTheRealBatch();
     testKvGrowthReclaimsCachedStateWhenBudgetIsShared();

@@ -204,10 +204,10 @@ private:
     ResourceWait resourceWait;
     std::vector<uint32_t> exactTokens;
     std::optional<CacheProbe> admissionProbe;
-    // First denial of a sole resident decode lane backing off under host
-    // pressure instead of suspending; its retry time is resourceWait's, whose
-    // deadline stays 0 while the lane is resident. Ends on a grant, at
-    // suspension and at release.
+    // First denial of a sole resident lane, prefill or decode, backing off
+    // under host pressure instead of suspending; its retry time is
+    // resourceWait's, whose deadline stays 0 while the lane is resident. Ends
+    // on a grant, at suspension and at release.
     std::optional<double> backoffStartedMilliseconds;
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
@@ -338,10 +338,9 @@ private:
   [[nodiscard]] PrepareOutcome prepare(BatchPlan &plan,
                                        std::vector<ModelBatchItem> &items,
                                        double nowMilliseconds);
-  [[nodiscard]] bool backOffSoleDecodeLane(Request &request,
-                                           const TokenAdmission &admission,
-                                           WorkKind kind,
-                                           double nowMilliseconds);
+  [[nodiscard]] bool backOffSoleLane(Request &request,
+                                     const TokenAdmission &admission,
+                                     double nowMilliseconds);
   [[nodiscard]] bool reclaimForGrowth(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
   [[nodiscard]] bool reclaimIdleState() noexcept;

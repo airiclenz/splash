@@ -343,7 +343,7 @@ ResourceWaitSnapshot Engine::resourceWaitSnapshot(double now) const {
   for (const auto &[id, active] : requests_) {
     if (active.finalized)
       continue;
-    // A resident lane backing off waits on memory without leaving Decode.
+    // A resident lane backing off waits on memory without leaving its phase.
     if (active.backoffStartedMilliseconds) {
       ++result.memory;
       result.oldestWaitMilliseconds =
@@ -1311,7 +1311,7 @@ Engine::PrepareOutcome Engine::prepare(BatchPlan &plan,
     }
   }
   Request &active = *selected;
-  if (backOffSoleDecodeLane(active, victim.admission, plan.kind, now))
+  if (backOffSoleLane(active, victim.admission, now))
     return PrepareOutcome::BackedOff;
   const bool anotherResident =
       std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
@@ -1328,18 +1328,16 @@ Engine::PrepareOutcome Engine::prepare(BatchPlan &plan,
 }
 
 // ============================================================================
-// Holds the sole resident decode lane, denied for host pressure, instead of
-// suspending it into a full replay: it retries after
-// kResourceRetryBackoffMilliseconds, or sooner on resource progress, while no
-// Queued or WaitingResources request has a more important priority and no
-// request is suspended. Once resourceWaitTimeoutMilliseconds have passed since
-// its first denial it suspends as usual, with a fresh resource wait. Runs on
-// the denial path only: one scan of the requests, no allocation.
-bool Engine::backOffSoleDecodeLane(Request &active,
-                                   const TokenAdmission &admission,
-                                   WorkKind kind, double now) {
-  if (kind != WorkKind::Decode ||
-      admission.allocationFailure != metal::AllocationFailure::HostPressure ||
+// Holds the sole resident lane, prefill or decode, denied for host pressure,
+// instead of suspending it into a replay of its completed work: it retries
+// after kResourceRetryBackoffMilliseconds, or sooner on resource progress,
+// while no Queued or WaitingResources request has a more important priority
+// and no request is suspended. Once resourceWaitTimeoutMilliseconds have
+// passed since its first denial it suspends as usual, with a fresh resource
+// wait. Runs on the denial path only: one scan of the requests, no allocation.
+bool Engine::backOffSoleLane(Request &active, const TokenAdmission &admission,
+                             double now) {
+  if (admission.allocationFailure != metal::AllocationFailure::HostPressure ||
       drainingForRecovery())
     return false;
   const std::optional<double> started = active.backoffStartedMilliseconds;
