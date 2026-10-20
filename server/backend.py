@@ -688,11 +688,13 @@ class NativeBackend:
         state = None
 
         def stop_matched():
+            # A stop sequence or reasoning-loop trip ends the request as a
+            # normal completion: native finishes it as stopped, not cancelled.
             call = None
             with self.lock:
                 call = state.call
             if call is not None:
-                call.cancel()
+                call.stop()
 
         def emit(text):
             job.events.put(("text", text))

@@ -68,6 +68,7 @@ class FakeCall:
         self.callback_errors = ()
         self.cancel_requested = False
         self.cancel_writes = 0
+        self.stop_writes = 0
         self._result = None
         self._error = None
         self._done = False
@@ -100,6 +101,13 @@ class FakeCall:
             return False
         self.cancel_requested = True
         self.cancel_writes += 1
+        return True
+
+    def stop(self):
+        if self._done or self.cancel_requested:
+            return False
+        self.cancel_requested = True
+        self.stop_writes += 1
         return True
 
 

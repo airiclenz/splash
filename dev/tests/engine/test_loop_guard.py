@@ -218,19 +218,18 @@ class NativeBackendLoopGuardTests(unittest.TestCase):
 
         with mock.patch.object(backend_api, "print_status") as print_status:
             call.emit(wire.TokensEvent(call.request_id, 0, (REPEATED_ID,) * 23))
-            cancelled_early = call.cancel_requested
+            stopped_early = call.stop_writes
             call.emit(wire.TokensEvent(call.request_id, 23, (REPEATED_ID,)))
-            cancelled = call.cancel_requested
+            stopped = call.stop_writes
             generated = (REPEATED_ID,) * 26
             call.complete(
                 result=success_result(
-                    call, reason=wire.FinishReason.CANCELLED, tokens=generated
+                    call, reason=wire.FinishReason.STOP, tokens=generated
                 )
             )
             kind, result = self.terminal(job)
 
-        self.assertFalse(cancelled_early)
-        self.assertTrue(cancelled)
+        self.assertEqual((stopped_early, stopped, call.cancel_writes), (0, 1, 0))
         self.assertEqual(kind, "done")
         self.assertEqual(result.reason, "length")
         self.assertEqual(result.completion_tokens, 24)

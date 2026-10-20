@@ -303,6 +303,7 @@ class Plan:
         if not block:
             self.release.set()
         self.cancelled = threading.Event()
+        self.stopped = False
         self.start_release = threading.Event()
         self.terminal = threading.Event()
         self.terminal_release = threading.Event()
@@ -357,11 +358,23 @@ class FakeCall:
             return self._result
 
     def cancel(self):
+        return self._request_end(stopped=False)
+
+    def stop(self):
+        return self._request_end(stopped=True)
+
+    def _request_end(self, *, stopped):
         with self._lock:
             if self._done or self.cancel_requested:
                 return False
             self.cancel_requested = True
-        self.runtime.cancel_count += 1
+        if stopped:
+            self.runtime.stop_count += 1
+            self.plan.stopped = True
+        else:
+            self.runtime.cancel_count += 1
+        # `cancelled` wakes the run loop for either ending; `stopped` picks
+        # the finish reason.
         self.plan.cancelled.set()
         self.plan.start_release.set()
         self.plan.release.set()
@@ -375,6 +388,7 @@ class FakeRuntime:
         self.requests = []
         self.calls = []
         self.cancel_count = 0
+        self.stop_count = 0
         self.closed = False
         self.ready = True
         self.pending_limit = 32
@@ -477,15 +491,16 @@ class FakeRuntime:
                 offset += len(tokens)
                 completion += len(tokens)
                 plan.cancelled.wait(plan.delay)
-        reason = (
-            native_wire.FinishReason.CANCELLED
-            if plan.cancelled.is_set()
-            else {
+        if plan.stopped:
+            reason = native_wire.FinishReason.STOP
+        elif plan.cancelled.is_set():
+            reason = native_wire.FinishReason.CANCELLED
+        else:
+            reason = {
                 "stop": native_wire.FinishReason.STOP,
                 "length": native_wire.FinishReason.LENGTH,
                 "cancelled": native_wire.FinishReason.CANCELLED,
             }[plan.reason]
-        )
         plan.terminal.set()
         plan.terminal_release.wait(2)
         if reason == native_wire.FinishReason.CANCELLED:
@@ -2982,7 +2997,7 @@ class ServerTest(unittest.TestCase):
             1000.0,
         )
 
-    def test_stop_sequence_cancels_native_without_emitting_the_marker(self):
+    def test_stop_sequence_stops_native_without_emitting_the_marker(self):
         runtime = FakeRuntime(Plan([[14], [15], [4]], reason="length", delay=0.01))
         harness = self.harness(runtime)
         status, _, payload = harness.request(
@@ -2995,7 +3010,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(response["choices"][0]["message"]["content"], "first ")
         self.assertEqual(response["choices"][0]["finish_reason"], "stop")
         self.assertEqual(response["usage"]["completion_tokens"], 2)
-        self.assertEqual(runtime.cancel_count, 1)
+        self.assertEqual((runtime.stop_count, runtime.cancel_count), (1, 0))
 
     def test_thinking_stop_sequence_matches_only_content(self):
         runtime = FakeRuntime(
@@ -3014,9 +3029,10 @@ class ServerTest(unittest.TestCase):
                 message["message"]["reasoning_content"],
                 message["message"]["content"],
                 message["finish_reason"],
+                runtime.stop_count,
                 runtime.cancel_count,
             ),
-            (200, "because second\n", "first ", "stop", 1),
+            (200, "because second\n", "first ", "stop", 1, 0),
         )
 
     def test_anthropic_thinking_stop_sequence_matches_only_content(self):
@@ -3060,9 +3076,10 @@ class ServerTest(unittest.TestCase):
                         content,
                         finish["stop_reason"],
                         finish["stop_sequence"],
+                        runtime.stop_count,
                         runtime.cancel_count,
                     ),
-                    ("because second\n", "first ", "stop_sequence", "second", 1),
+                    ("because second\n", "first ", "stop_sequence", "second", 1, 0),
                 )
 
     def test_anthropic_cache_usage_and_matched_stop_sequence(self):
@@ -3110,7 +3127,7 @@ class ServerTest(unittest.TestCase):
                     self.assertEqual(finish["stop_reason"], "stop_sequence")
                     self.assertEqual(finish["stop_sequence"], "second")
                     self.assertEqual(content, "first ")
-                    self.assertEqual(runtime.cancel_count, 1)
+                    self.assertEqual((runtime.stop_count, runtime.cancel_count), (1, 0))
 
     def test_usage_counts_only_tokens_before_the_thinking_delimiter(self):
         harness = self.harness(FakeRuntime(Plan([[1], [26], [27]])))

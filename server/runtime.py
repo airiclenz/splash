@@ -240,11 +240,29 @@ class RuntimeCall:
             return self._result
 
     def cancel(self) -> bool:
+        """Ask native to abandon this request; it finishes as cancelled.
+
+        Returns False, writing nothing, once the call is done or a cancel or
+        stop was already requested.
+        """
+        return self._request_end(wire.CancelFrame(self.request_id))
+
+    def stop(self) -> bool:
+        """Ask native to end this request at a client stop condition.
+
+        Native finishes it as stopped, a normal completion, or as cancelled
+        when it never started. Shares `cancel`'s latch: returns False, writing
+        nothing, once the call is done or a cancel or stop was already
+        requested, and later mask work is skipped.
+        """
+        return self._request_end(wire.StopFrame(self.request_id))
+
+    def _request_end(self, frame: wire.CancelFrame | wire.StopFrame) -> bool:
         with self._lock:
             if self._event.is_set() or self._cancel_requested:
                 return False
             self._cancel_requested = True
-        self._client._cancel_call(self)
+        self._client._end_call(self, frame)
         return True
 
     def _emit(self, message: wire.Message) -> None:
@@ -971,9 +989,12 @@ class MultiplexedRuntime:
         if failure:
             raise failure
 
-    def _cancel_call(self, call: RuntimeCall) -> None:
+    def _end_call(
+        self, call: RuntimeCall, frame: wire.CancelFrame | wire.StopFrame
+    ) -> None:
+        """Write a Cancel or Stop frame and arm the acknowledgement watchdog."""
         try:
-            encoded = wire.serialize_message(wire.CancelFrame(call.request_id))
+            encoded = wire.serialize_message(frame)
             self._write_bytes(encoded, call.generation, call=call)
             with call._lock:
                 if not call.done:
@@ -1236,7 +1257,7 @@ class MultiplexedRuntime:
 
     def _mask_failed(self, call: RuntimeCall, error: MaskComputationFailed) -> None:
         call._record_mask_error(error)
-        self._cancel_call(call)
+        self._end_call(call, wire.CancelFrame(call.request_id))
 
     def _finish_call(
         self,
