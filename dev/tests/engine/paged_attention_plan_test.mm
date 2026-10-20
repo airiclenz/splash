@@ -188,7 +188,8 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
       uint32_t maximum = 0;
       for (uint32_t lane = 0; lane < lanes; ++lane) {
         const uint32_t expected = kv::q8VerifyAttentionSplits(base, histories[lane], 8);
-        require(plan.laneSplits[lane] == expected && expected >= base &&
+        require(plan.laneSplits[lane] == expected &&
+                    expected >= std::min(base, kv::kQ8VerifyFloorSplits) &&
                     expected <= kv::kQ8VerifyMaximumSplits,
                 "verify lane split count does not follow its own history");
         maximum = std::max(maximum, expected);
@@ -204,7 +205,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
                   plan.reduceGroups.z == lanes,
               "verify split/reduce/scratch disagree");
       if (config == ops::VerifyAttentionConfig{})
-        require(plan.laneSplits[0] == 32 &&
+        require(plan.laneSplits[0] == kv::kQ8VerifyFloorSplits &&
                     (lanes < 4 || plan.laneSplits[3] == kv::kQ8VerifyMaximumSplits),
                 "default verify partition changed");
       require(plan.splitThreads.x == 256 && plan.splitThreads.y == 1 &&
@@ -237,6 +238,15 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
       require(int8 != registerPlan.sameExecutionAs(plan),
               "verify plan equality ignored the split tile");
     }
+  }
+  {
+    // The default history-aware floor: one split per 8 pages from the 8-split
+    // floor at 1K-4K, the configured 32 plus one per 16 pages from 16K on.
+    const std::array<uint32_t, 4> histories{1024, 4096, 16384, 131072};
+    const auto plan = ops::PagedAttention::verifyPlan(4, queryHeads, layout, histories);
+    require(plan.laneSplits == std::array<uint32_t, 4>{kv::kQ8VerifyFloorSplits, 17, 33,
+                                                       kv::kQ8VerifyMaximumSplits},
+            "default verify split floor changed");
   }
   rejects([&] { (void)ops::PagedAttention::prefillPlan(0, queryHeads, layout, 0); });
   rejects([&] { (void)ops::PagedAttention::prefillPlan(2049, queryHeads, layout, 0); });

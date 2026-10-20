@@ -21,6 +21,14 @@
 // per this many visible Page32 blocks, capped at the maximum that sizes the
 // partial workspace.
 #define SPLASH_VERIFY_ATTENTION_PAGES_PER_SPLIT 16u
+// At short history verify attention lowers the configured split count to one
+// split per SPLASH_VERIFY_ATTENTION_MINIMUM_PAGES_PER_SPLIT visible Page32
+// blocks, never below SPLASH_VERIFY_ATTENTION_FLOOR_SPLITS (nor above the
+// configured count). Chosen by the register-tile int8 attention sweep on an
+// M2 Pro: 8 and 8 cut verify attention about 6% at 1K-4K history; from about
+// 8K history the configured count binds again.
+#define SPLASH_VERIFY_ATTENTION_FLOOR_SPLITS 8u
+#define SPLASH_VERIFY_ATTENTION_MINIMUM_PAGES_PER_SPLIT 8u
 #define SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS 128u
 #define SPLASH_TARGET_SAMPLING_SHARDS 16u
 #define SPLASH_DRAFT_SAMPLING_SHARDS 8u

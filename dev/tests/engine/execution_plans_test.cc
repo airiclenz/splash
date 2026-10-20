@@ -4,6 +4,7 @@
 #include <array>
 #include <iostream>
 #include <limits>
+#include <span>
 #include <stdexcept>
 
 namespace {
@@ -49,6 +50,15 @@ constexpr std::array moeFields{
 
 kv::Layout layout(AttentionShape shape, uint32_t layers = 1) {
   return {layers, shape.kvHeads, shape.headDimension, shape.format};
+}
+// The default verify plan's split count: the widest of the first `lanes`
+// lanes' own counts under the default base and history-aware floor.
+uint32_t defaultVerifySplits(std::span<const uint32_t> histories, uint32_t lanes) {
+  uint32_t splits = 0;
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    splits = std::max(splits, kv::q8VerifyAttentionSplits(kv::kQ8VerifySplits,
+                                                          histories[lane], 8));
+  return splits;
 }
 DeviceCapabilities device(uint32_t family = 10) {
   DeviceCapabilities value;
@@ -123,7 +133,8 @@ void baselinePlans() {
         const std::array<uint32_t, 4> histories{0, 31, 2048, 8192};
         const auto selected = plans.verifyAttention(lanes, shape.queryHeads,
                                                     layout(shape), histories);
-        require(selected.splits == 32, "verify baseline changed");
+        require(selected.splits == defaultVerifySplits(histories, lanes),
+                "verify baseline changed");
         require(selected.configuration == VerifyAttentionConfig{},
                 "verify baseline changed with GPU family");
         covers(stride, selected.workspace, lanes, attentionFields);
@@ -453,9 +464,11 @@ void policyKeysAndBounds() {
   require(swapped.configuration.splitCount == VerifySplitCount::One &&
               swapped.splits == padded.splits,
           "verify policy did not apply to a mixed lane order");
-  require(plans.verifyAttention(2, 24, layout(attentionShapes[0]), histories).splits == 32,
+  require(plans.verifyAttention(2, 24, layout(attentionShapes[0]), histories).splits ==
+              defaultVerifySplits(histories, 2),
           "choice extrapolated to another packed width");
-  require(plans.verifyAttention(3, 16, layout(attentionShapes[1]), histories).splits == 32,
+  require(plans.verifyAttention(3, 16, layout(attentionShapes[1]), histories).splits ==
+              defaultVerifySplits(histories, 3),
           "choice extrapolated to another GQA shape");
   const auto verify = plans.verifyAttentionWorkspacePerLane(24, layout(attentionShapes[0]));
   require(verify.partialsBytes ==

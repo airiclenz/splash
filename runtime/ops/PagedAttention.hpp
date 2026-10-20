@@ -33,18 +33,26 @@ inline constexpr uint32_t kQ8VerifyMaximumSplits =
     SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS;
 inline constexpr uint32_t kQ8VerifyPagesPerSplit =
     SPLASH_VERIFY_ATTENTION_PAGES_PER_SPLIT;
+inline constexpr uint32_t kQ8VerifyFloorSplits =
+    SPLASH_VERIFY_ATTENTION_FLOOR_SPLITS;
+inline constexpr uint32_t kQ8VerifyMinimumPagesPerSplit =
+    SPLASH_VERIFY_ATTENTION_MINIMUM_PAGES_PER_SPLIT;
 static_assert(kQ8VerifySplits >= 1 && kQ8VerifySplits <= kQ8VerifyMaximumSplits);
 static_assert(kQ8VerifyPagesPerSplit >= 1);
+static_assert(kQ8VerifyFloorSplits >= 1 &&
+              kQ8VerifyFloorSplits <= kQ8VerifyMaximumSplits);
+static_assert(kQ8VerifyMinimumPagesPerSplit >= 1);
 
 // How far verify attention may lower its configured base split count at short
 // history: to no fewer than floorSplits, and to no fewer than one split per
-// minimumPagesPerSplit visible pages. The default floor is the maximum split
-// count, which no base exceeds, so the default policy never lowers a base.
+// minimumPagesPerSplit visible pages. A base at or below the floor is never
+// lowered. The default is the history-aware floor from ExecutionGeometry.h;
+// {kQ8VerifyMaximumSplits, kQ8VerifyPagesPerSplit} never lowers any base.
 // Valid policies have floorSplits in [1, kQ8VerifyMaximumSplits] and a nonzero
 // minimumPagesPerSplit; see q8VerifySplitPolicyIsValid.
 struct VerifySplitPolicy final {
-  uint32_t floorSplits = kQ8VerifyMaximumSplits;
-  uint32_t minimumPagesPerSplit = kQ8VerifyPagesPerSplit;
+  uint32_t floorSplits = kQ8VerifyFloorSplits;
+  uint32_t minimumPagesPerSplit = kQ8VerifyMinimumPagesPerSplit;
   bool operator==(const VerifySplitPolicy &) const = default;
 };
 
@@ -55,11 +63,12 @@ q8VerifySplitPolicyIsValid(VerifySplitPolicy policy) noexcept {
          policy.minimumPagesPerSplit >= 1;
 }
 
-// One lane's verify split count: the configured base, lowered no further than
-// the policy allows, one more split per kQ8VerifyPagesPerSplit visible pages,
-// never more than the maximum the partial workspace is sized for. It depends
-// only on the lane's own history, so batching never changes a lane's
-// arithmetic. The policy must be valid (q8VerifySplitPolicyIsValid).
+// One lane's verify split count: the configured base, lowered at short
+// history no further than the policy allows (so a lane may run fewer splits
+// than the base), raised to at least one split per kQ8VerifyPagesPerSplit
+// visible pages, never more than the maximum the partial workspace is sized
+// for. It depends only on the lane's own history, so batching never changes a
+// lane's arithmetic. The policy must be valid (q8VerifySplitPolicyIsValid).
 [[nodiscard]] constexpr uint32_t
 q8VerifyAttentionSplits(uint32_t baseSplits, uint32_t committedTokens,
                         uint32_t activeRows,

@@ -67,7 +67,7 @@ void testContract() {
   scaled.slot_splits = scaled.split_count - 1;
   require(q8VerifyAttentionValidationError(scaled) == "slot_splits_invalid",
           "slot stride below the lane's split count was accepted");
-  require(q8VerifyAttentionSplits(kQ8VerifySplits, 0, 8) == kQ8VerifySplits &&
+  require(q8VerifyAttentionSplits(kQ8VerifySplits, 0, 8) == kQ8VerifyFloorSplits &&
               q8VerifyAttentionSplits(kQ8VerifySplits, 16 * 1024, 8) ==
                   kQ8VerifySplits + 1 &&
               q8VerifyAttentionSplits(kQ8VerifySplits, 131072, 8) ==
