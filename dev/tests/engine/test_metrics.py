@@ -243,7 +243,9 @@ class DeniedReservationCauseMetricsTests(unittest.TestCase):
 
         self.assertIn(f"{DENIED_TOTAL_METRIC} 5", lines)
         start = lines.index(f"# TYPE {DENIED_BY_CAUSE_METRIC} counter")
-        self.assertTrue(lines[start - 1].startswith(f"# HELP {DENIED_BY_CAUSE_METRIC} "))
+        self.assertTrue(
+            lines[start - 1].startswith(f"# HELP {DENIED_BY_CAUSE_METRIC} ")
+        )
         self.assertEqual(
             lines[start + 1 : start + 3],
             [

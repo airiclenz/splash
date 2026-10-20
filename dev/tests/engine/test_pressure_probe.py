@@ -156,7 +156,6 @@ class CounterDeltaTests(unittest.TestCase):
             [0, 1, 2, 3, None],
         )
 
-
     def test_counterDelta_diffsEachDenialCause(self):
         before = snapshot(
             memory_governor__denied_reservations=2,
