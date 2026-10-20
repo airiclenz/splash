@@ -96,7 +96,8 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
         &ops::MoeWorkspace::routeRowsBytes,
         &ops::MoeWorkspace::groupedInputBytes,
         &ops::MoeWorkspace::expertIntermediateBytes,
-        &ops::MoeWorkspace::expertOutputBytes};
+        &ops::MoeWorkspace::expertOutputBytes,
+        &ops::MoeWorkspace::inputSumsBytes};
     const auto oldMoe = baseline.moeDecodeWorkspacePerLane(geometry.moe);
     const auto newMoe = selected.moeDecodeWorkspacePerLane(geometry.moe);
     for (auto field : fields)

@@ -505,7 +505,7 @@ private:
     buffers.logits = packed(DecodeTensor::Logits);
     // A dense target takes its MoE tensors too; they are empty views.
     for (uint32_t tensor = static_cast<uint32_t>(DecodeTensor::MoeSelectedExperts);
-         tensor <= static_cast<uint32_t>(DecodeTensor::MoeExpertOutput); ++tensor)
+         tensor <= static_cast<uint32_t>(DecodeTensor::MoeInputSums); ++tensor)
       static_cast<void>(packed(static_cast<DecodeTensor>(tensor)));
   }
 

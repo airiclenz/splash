@@ -86,6 +86,8 @@ struct MoeWorkspace final {
   uint64_t groupedInputBytes = 0;
   uint64_t expertIntermediateBytes = 0;
   uint64_t expertOutputBytes = 0;
+  // Register plans only: each grouped row's fp32 quant-group input sums.
+  uint64_t inputSumsBytes = 0;
 };
 
 // Both configurations consume affine Q4 expert slabs in StorageN=256 order.
@@ -125,9 +127,11 @@ moeDecodeSimdgroups(uint32_t appleGpuFamily) noexcept {
 // Expert tile implementation: a device policy the execution plans set, not a
 // tuned choice. Mpp is the shipped tensor-operation tile. Register is the
 // Apple7/8 tile (moe_mma.metal: exact half Q4 weights, fp32 inputs and
-// accumulation, in-kernel input sums), whose gate/up pass is fused at either
-// row count, so its prefill plans never split the experts. Its outputs match
-// the MPP tiles up to summation order, not bitwise.
+// accumulation), whose gate/up pass is fused at either row count, so its
+// prefill plans never split the experts. Its gather also writes each grouped
+// row's quant-group input sums, which the gate/up pass reads instead of
+// summing in the tile; the down pass sums its inputs in the tile. Its outputs
+// match the MPP tiles up to summation order, not bitwise.
 enum class MoeExpertKernel : uint8_t { Mpp = 0, Register = 1 };
 
 struct MoeConfig final {
@@ -187,6 +191,8 @@ struct MoeBuffers final {
   metal::MetalBuffer groupedInput;
   metal::MetalBuffer expertIntermediate;
   metal::MetalBuffer expertOutput;
+  // Register plans only: the gather's quant-group input sums for gate/up.
+  metal::MetalBuffer inputSums;
 };
 
 // Routes and executes grouped experts from immutable weight views.

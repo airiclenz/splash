@@ -449,7 +449,9 @@ kernel void moe_group_routes(
 }
 
 // Copies each grouped row's input so every expert tile is a dense matrix;
-// padding rows are zero and their outputs are never read.
+// padding rows are zero and their outputs are never read. The register expert
+// tiles' plans run moe_gather_rows_sums (moe_mma.metal), which also writes
+// the rows' quant-group input sums.
 kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                             device const uint *grouped_routes [[buffer(1)]],
                             device const uint *tile_count [[buffer(2)]],

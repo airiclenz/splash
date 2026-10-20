@@ -46,7 +46,7 @@ constexpr std::array moeFields{
     &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
     &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
     &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-    &MoeWorkspace::expertOutputBytes};
+    &MoeWorkspace::expertOutputBytes, &MoeWorkspace::inputSumsBytes};
 
 kv::Layout layout(AttentionShape shape, uint32_t layers = 1) {
   return {layers, shape.kvHeads, shape.headDimension, shape.format};

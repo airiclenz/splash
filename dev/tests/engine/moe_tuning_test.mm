@@ -98,7 +98,7 @@ void fixtureBounds() {
       &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
       &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
       &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-      &MoeWorkspace::expertOutputBytes};
+      &MoeWorkspace::expertOutputBytes, &MoeWorkspace::inputSumsBytes};
   for (const MoeShape shape : {MoeShape{256, 4, 2, 256},
                                MoeShape{2048, 256, 8, 512},
                                MoeShape{1024, 32, 4, 2048}}) {

@@ -1,7 +1,9 @@
 // Sparse MoE against a CPU reference with real Q4 expert weights: routing,
 // expert grouping (including partially filled tiles), the grouped gate/up and
 // down tiles, and the combine, for every operator-owned M8/M32 plan and the
-// Apple9 four-simdgroup decode tiles (bitwise against the shipped tile). Routing
+// Apple9 four-simdgroup decode tiles (bitwise against the shipped tile). The
+// Apple7/8 register gate/up pass, which reads the input sums its gather
+// writes, is checked bitwise against the tile that sums in-kernel. Routing
 // fixtures cover dispersed, concentrated and skewed expert utilization with
 // hidden width 1024 and intermediate width 512.
 #include "../../../runtime/metal/CommandGraph.hpp"
@@ -38,6 +40,7 @@ using splash::ops::kMoeRouteWideRows;
 using splash::ops::MoE;
 using splash::ops::MoeBuffers;
 using splash::ops::MoeConfig;
+using splash::ops::MoeExpertKernel;
 using splash::ops::MoeExpertSimdgroups;
 using splash::ops::MoeExpertTile;
 using splash::ops::MoePlan;
@@ -292,6 +295,9 @@ void allocateScratch(MetalBackend &backend, Fixture &fixture,
   b.expertIntermediate =
       shared(backend, w.expertIntermediateBytes, "intermediate");
   b.expertOutput = shared(backend, w.expertOutputBytes, "expert-output");
+  // MPP plans bind no input sums.
+  b.inputSums = w.inputSumsBytes ? shared(backend, w.inputSumsBytes, "input-sums")
+                                 : MetalBuffer{};
 }
 
 enum class Routing { Dispersed, Concentrated, Skewed };
@@ -506,7 +512,8 @@ bool sameWorkspace(const splash::ops::MoeWorkspace &a,
          a.routeRowsBytes == b.routeRowsBytes &&
          a.groupedInputBytes == b.groupedInputBytes &&
          a.expertIntermediateBytes == b.expertIntermediateBytes &&
-         a.expertOutputBytes == b.expertOutputBytes;
+         a.expertOutputBytes == b.expertOutputBytes &&
+         a.inputSumsBytes == b.inputSumsBytes;
 }
 
 void checkPlan(const MoePlan &plan) {
@@ -522,6 +529,11 @@ void checkPlan(const MoePlan &plan) {
       plan.splitExperts()
           ? std::max(shape.hiddenSize, shape.expertIntermediateSize)
           : shape.hiddenSize;
+  // One fp32 sum per grouped row and 64-input quant group, register plans only.
+  const uint64_t inputSums =
+      plan.config().kernel == MoeExpertKernel::Register
+          ? grouped * (shape.hiddenSize / 64) * 4
+          : 0;
   const auto &w = plan.workspace();
   require(plan.maximumTiles() == tiles &&
               w.selectedExpertsBytes == routes * 4 &&
@@ -531,7 +543,8 @@ void checkPlan(const MoePlan &plan) {
               w.groupedInputBytes == std::max<uint64_t>(
                   grouped * shape.hiddenSize * 2, rows * 256 * 2) &&
               w.expertIntermediateBytes == grouped * shape.expertIntermediateSize * 2 &&
-              w.expertOutputBytes == grouped * outputWidth * 2,
+              w.expertOutputBytes == grouped * outputWidth * 2 &&
+              w.inputSumsBytes == inputSums,
           "candidate workspace disagrees with independent geometry bound");
 }
 
@@ -560,6 +573,9 @@ void planBounds() {
         require(plan.rows() == rows, "prefill candidate changed actual rows");
         checkPlan(plan);
       }
+      for (const auto &plan : MoE::prefillCandidates(shape, rows, kMoeRouteWideRows,
+                                                     MoeExpertKernel::Register))
+        checkPlan(plan);
     }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const auto plans = MoE::decodeCandidates(shape, lanes, kMoeRouteWideRows);
@@ -571,6 +587,10 @@ void planBounds() {
         require(!plan.splitExperts(), "decode plans keep the fused expert tile");
         checkPlan(plan);
       }
+      for (const auto &plan : MoE::decodeCandidates(shape, lanes, kMoeRouteWideRows,
+                                                    MoeExpertSimdgroups::Eight,
+                                                    MoeExpertKernel::Register))
+        checkPlan(plan);
       // The Apple9 four-simdgroup tiles change only the down pass's column
       // grid: same rows, tiles and scratch as the shipped candidates.
       const auto narrow = MoE::decodeCandidates(shape, lanes, kMoeRouteWideRows,
@@ -622,8 +642,7 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
       splash::ops::moeRouteTile(plan.rows(), plan.config().routeWideRows);
   // The register router keeps the row tile but scores 8 x 16 on four
   // simdgroups or 32 x 16 on eight.
-  const bool registerRoute =
-      plan.config().kernel == splash::ops::MoeExpertKernel::Register;
+  const bool registerRoute = plan.config().kernel == MoeExpertKernel::Register;
   const uint32_t routeExperts = registerRoute ? 16 : route.experts;
   const uint32_t routeThreads = registerRoute && route.rows == 8 ? 128 : 256;
   const std::string scores =
@@ -635,7 +654,8 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   require(dispatches[0].pipelineName == scores &&
               dispatches[1].pipelineName == "moe_route_select_q8" &&
               dispatches[2].pipelineName == "moe_group_routes" &&
-              dispatches[3].pipelineName == "moe_gather_rows" &&
+              dispatches[3].pipelineName ==
+                  (registerRoute ? "moe_gather_rows_sums" : "moe_gather_rows") &&
               dispatches[combine].pipelineName == "moe_combine",
           "MoE plan chose inconsistent pipelines");
   if (split) {
@@ -654,13 +674,20 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
                 dispatches[experts + 1].threadgroups.x == kIntermediate / 256 &&
                 dispatches[experts + 2].threadgroups.x == kHidden / 256,
             "split MoE plan chose inconsistent gate scratch or column tiles");
-  } else if (plan.config().kernel == splash::ops::MoeExpertKernel::Register) {
+  } else if (plan.config().kernel == MoeExpertKernel::Register) {
     // Apple7/8 register tiles: four simdgroups, fused gate/up at both row
-    // counts, 16 gate/up and 32 down columns per simdgroup.
+    // counts, 16 gate/up and 32 down columns per simdgroup. Gate/up reads the
+    // input sums the gather wrote (its buffer 8, the gather's buffer 4).
     const std::string rows = m8 ? "m8" : "m32";
-    require(dispatches[experts].pipelineName == "moe_expert_gate_up_q4_mma_" + rows &&
+    require(dispatches[experts].pipelineName ==
+                    "moe_expert_gate_up_q4_mma_" + rows + "_sums" &&
                 dispatches[experts + 1].pipelineName == "moe_expert_down_q4_mma_" + rows,
             "register MoE plan chose inconsistent expert pipelines");
+    require(dispatches[3].buffers.size() == 5 &&
+                dispatches[experts].buffers.size() == 9 &&
+                dispatches[3].buffers[4].buffer.sameView(
+                    dispatches[experts].buffers[8].buffer),
+            "register MoE plan does not hand the gather's input sums to gate/up");
     require(dispatches[experts].threadgroups.x == kIntermediate / (m8 ? 64 : 32) &&
                 dispatches[experts + 1].threadgroups.x == kHidden / (m8 ? 128 : 64) &&
                 dispatches[experts].threadsPerThreadgroup.x == 128 &&
@@ -708,7 +735,12 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
 
 void bufferBounds(MetalBackend &backend, Fixture &fixture) {
   const uint64_t submissions = backend.submissionCount();
-  for (const auto &plan : MoE::prefillCandidates(fixture.shape, 33, kMoeRouteWideRows)) {
+  std::vector<MoePlan> plans;
+  for (const auto kernel : {MoeExpertKernel::Mpp, MoeExpertKernel::Register})
+    for (const auto &plan :
+         MoE::prefillCandidates(fixture.shape, 33, kMoeRouteWideRows, kernel))
+      plans.push_back(plan);
+  for (const auto &plan : plans) {
     allocateScratch(backend, fixture, plan);
     const auto rejectWeights = [&](const MoeWeights &weights, const char *label) {
       CommandGraph graph;
@@ -758,9 +790,12 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
                         &MoeBuffers::tileDescriptors, &MoeBuffers::tileCount,
                         &MoeBuffers::groupedRoutes, &MoeBuffers::routeRows,
                         &MoeBuffers::groupedInput, &MoeBuffers::expertIntermediate,
-                        &MoeBuffers::expertOutput}) {
+                        &MoeBuffers::expertOutput, &MoeBuffers::inputSums}) {
       MoeBuffers shortBuffers = fixture.buffers;
       const auto &buffer = fixture.buffers.*member;
+      // An MPP plan's input sums are empty: nothing to shorten.
+      if (!buffer.sizeBytes())
+        continue;
       shortBuffers.*member = backend.view(buffer, 0, buffer.sizeBytes() - 1);
       CommandGraph graph;
       rejects([&] { MoE::add(graph, shortBuffers, fixture.weights, plan); },
@@ -883,6 +918,57 @@ void routerTiles(MetalBackend &backend, const Fixture &fixture) {
   }
 }
 
+// The register gate/up pass reads the input sums its gather writes; the plain
+// register tile sums the same grouped inputs in-kernel. Both must write the
+// same bits on every live row of every tile, ragged ones too. The plan runs
+// on inputs spanning 2^-14..2^4, whose sums need more than fp32's 24 bits, so
+// a sum taken in any other order than the tile's changes the output bits; the
+// fixture's inputs are restored afterwards.
+void requireInTileSums(MetalBackend &backend, Fixture &fixture,
+                       const MoePlan &plan, const std::string &label) {
+  const MoeBuffers &b = fixture.buffers;
+  const MoeWeights &w = fixture.weights;
+  auto *input = static_cast<uint16_t *>(b.input.contents());
+  const uint64_t elements = uint64_t{plan.rows()} * kHidden;
+  const std::vector<uint16_t> saved(input, input + elements);
+  Random random(0x5a3);
+  for (uint64_t index = 0; index < elements; ++index) {
+    const uint32_t bits = random.next();
+    // Sign, a bf16 exponent in [113, 131] and seven mantissa bits.
+    input[index] = static_cast<uint16_t>(((bits & 1) << 15) |
+                                         ((113 + (bits >> 1) % 19) << 7) |
+                                         ((bits >> 8) & 0x7f));
+  }
+
+  const uint32_t tileRows = plan.tileRows();
+  const bool m8 = tileRows == 8;
+  MetalBuffer inTile = shared(backend, b.expertIntermediate.sizeBytes(), "in-tile-sums");
+  const MoeExpertParams params{kHidden, kIntermediate, kExperts, 0,
+                               w.expertGate.expertStrideBytes,
+                               w.expertUp.expertStrideBytes};
+  CommandGraph graph;
+  MoE::add(graph, b, w, plan);
+  graph.add(m8 ? "moe_expert_gate_up_q4_mma_m8" : "moe_expert_gate_up_q4_mma_m32",
+            {b.groupedInput, b.tileDescriptors, b.tileCount, w.expertGate.packed,
+             w.expertUp.packed, w.sharedGate.packed, w.sharedUp.packed, inTile},
+            params, {kIntermediate / (m8 ? 64 : 32), plan.maximumTiles(), 1},
+            {128, 1, 1});
+  (void)backend.submitCommand(graph.dispatches());
+  std::copy(saved.begin(), saved.end(), input);
+
+  const uint32_t tileCount = *static_cast<const uint32_t *>(b.tileCount.contents());
+  const auto *tiles = static_cast<const MoeTileDescriptor *>(b.tileDescriptors.contents());
+  const auto *gathered = static_cast<const uint8_t *>(b.expertIntermediate.contents());
+  const auto *expected = static_cast<const uint8_t *>(inTile.contents());
+  const uint64_t rowBytes = uint64_t{kIntermediate} * 2;
+  for (uint32_t tile = 0; tile < tileCount; ++tile) {
+    const uint64_t offset = uint64_t{tile} * tileRows * rowBytes;
+    if (std::memcmp(gathered + offset, expected + offset, tiles[tile].rows * rowBytes))
+      fail(label + " M" + std::to_string(tileRows) + " tile " + std::to_string(tile) +
+           ": gathered input sums change the register gate/up output");
+  }
+}
+
 void run(const std::string &metallibPath) {
   planBounds();
   MetalBackend backend(metallibPath);
@@ -991,8 +1077,10 @@ void run(const std::string &metallibPath) {
       // execute(); their summation order differs, so not bitwise.
       for (const auto &plan : MoE::decodeCandidates(fixture.shape, lanes, kMoeRouteWideRows,
                                                     MoeExpertSimdgroups::Eight,
-                                                    splash::ops::MoeExpertKernel::Register))
+                                                    MoeExpertKernel::Register)) {
         requireClose(execute(plan, label + " register"), baseline, label + " register");
+        requireInTileSums(backend, fixture, plan, label + " " + routingLabel);
+      }
     }
     // 12 and 48 rows leave 16-row ragged tiles in every routing fixture; 9,
     // 33 and 263 leave 8-row ones next to full tiles; 511/512 straddle the
@@ -1004,9 +1092,10 @@ void run(const std::string &metallibPath) {
       const auto baseline = execute(candidates[0], label);
       requireEqual(execute(candidates[1], label), baseline, label);
       for (const auto &plan : MoE::prefillCandidates(fixture.shape, rows, kMoeRouteWideRows,
-                                                     splash::ops::MoeExpertKernel::Register)) {
+                                                     MoeExpertKernel::Register)) {
         require(!plan.splitExperts(), label + ": register prefill plan split the experts");
         requireClose(execute(plan, label + " register"), baseline, label + " register");
+        requireInTileSums(backend, fixture, plan, label + " " + routingLabel);
       }
     }
     std::cout << "register vs shipped tile " << routingLabel << ": worst cosine "

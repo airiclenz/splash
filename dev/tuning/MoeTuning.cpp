@@ -20,13 +20,13 @@ constexpr std::array kScratchFields{
     &MoeBuffers::tileDescriptors, &MoeBuffers::tileCount,
     &MoeBuffers::groupedRoutes, &MoeBuffers::routeRows,
     &MoeBuffers::groupedInput, &MoeBuffers::expertIntermediate,
-    &MoeBuffers::expertOutput};
+    &MoeBuffers::expertOutput, &MoeBuffers::inputSums};
 constexpr std::array kWorkspaceFields{
     &MoeWorkspace::selectedExpertsBytes, &MoeWorkspace::routingWeightsBytes,
     &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
     &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
     &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-    &MoeWorkspace::expertOutputBytes};
+    &MoeWorkspace::expertOutputBytes, &MoeWorkspace::inputSumsBytes};
 
 uint64_t aligned(uint64_t value, uint64_t alignment) {
   if (value > std::numeric_limits<uint64_t>::max() - alignment + 1)
@@ -41,7 +41,7 @@ struct Fixture final {
 };
 
 struct FixtureLayout final {
-  std::array<uint64_t, 13> sizes;
+  std::array<uint64_t, 14> sizes;
   uint64_t bytes = 0;
 };
 

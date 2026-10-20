@@ -446,8 +446,8 @@ void profileMoeExpert(MetalBackend &backend, uint32_t tokens,
   const ComputeDispatch precomputed{
       tile.sumsPipeline,
       {{0, input}, {1, tiles}, {2, count}, {3, gate}, {4, up}, {5, gate},
-       {6, up}, {7, sumsOutput}, {9, sums}},
-      {{8, &params, sizeof(params)}},
+       {6, up}, {7, sumsOutput}, {8, sums}},
+      {{9, &params, sizeof(params)}},
       {kIntermediate / tile.columns, tileCount, 1},
       {kMmaThreads, 1, 1}};
   static_cast<void>(backend.submit(sum));

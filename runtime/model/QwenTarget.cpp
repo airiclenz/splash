@@ -361,7 +361,7 @@ void QwenTarget::addPrefillImpl(
           {buffers.normalized, residual, output, buffers.selectedExperts,
            buffers.routingWeights, buffers.tileDescriptors, buffers.tileCount,
            buffers.groupedRoutes, buffers.routeRows, buffers.groupedInput,
-           buffers.expertIntermediate, buffers.expertOutput},
+           buffers.expertIntermediate, buffers.expertOutput, buffers.inputSums},
           layer.ffn, *moePlan);
     }
 
@@ -525,7 +525,7 @@ void QwenTarget::addVerifyImpl(
           {buffers.normalized, residual, output, buffers.selectedExperts,
            buffers.routingWeights, buffers.tileDescriptors, buffers.tileCount,
            buffers.groupedRoutes, buffers.routeRows, buffers.groupedInput,
-           buffers.expertIntermediate, buffers.expertOutput},
+           buffers.expertIntermediate, buffers.expertOutput, buffers.inputSums},
           layer.ffn, *moePlan);
     }
 

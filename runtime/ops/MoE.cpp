@@ -5,11 +5,15 @@
 
 #include <cstddef>
 #include <stdexcept>
+#include <utility>
 
 namespace splash::ops {
 namespace {
 
 static_assert(offsetof(MoeExpertParams, expert_stride_bytes_0) == 16);
+
+// Inputs per Q4 quant group: one input sum per grouped row and group.
+constexpr uint32_t kQuantGroup = 64;
 
 bool matches(const Q8Projection &projection, uint32_t output,
              uint32_t input) noexcept {
@@ -56,7 +60,7 @@ void validate(const MoeWeights &weights, MoeShape shape) {
 }
 
 MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
-                          bool splitExperts) {
+                          bool splitExperts, bool inputSums) {
   if (!shape.valid())
     throw std::invalid_argument("invalid MoE workspace shape");
   const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
@@ -74,12 +78,15 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
           std::max(groupedRows * shape.hiddenSize * sizeof(uint16_t),
                    scoreBytes),
           groupedRows * shape.expertIntermediateSize * sizeof(uint16_t),
-          groupedRows * outputWidth * sizeof(uint16_t)};
+          groupedRows * outputWidth * sizeof(uint16_t),
+          inputSums ? groupedRows * (shape.hiddenSize / kQuantGroup) * sizeof(float)
+                    : 0};
 }
 
 // Pipelines, column tiles and threadgroup width of a plan's fused gate/up
 // and down passes. Only the 8-row tiles have a four-simdgroup form; see
-// MoeExpertSimdgroups for its geometry and measurements.
+// MoeExpertSimdgroups for its geometry and measurements. The register gate/up
+// tiles read the input sums the gather writes.
 struct ExpertPasses final {
   const char *gateUp;
   const char *down;
@@ -93,9 +100,9 @@ ExpertPasses fusedExpertPasses(const MoeConfig &config) noexcept {
   // over the 32-row tile and 4 x 1 over the 8-row tile.
   if (config.kernel == MoeExpertKernel::Register)
     return config.expertTile == MoeExpertTile::M32
-               ? ExpertPasses{"moe_expert_gate_up_q4_mma_m32",
+               ? ExpertPasses{"moe_expert_gate_up_q4_mma_m32_sums",
                               "moe_expert_down_q4_mma_m32", 32, 64, 128}
-               : ExpertPasses{"moe_expert_gate_up_q4_mma_m8",
+               : ExpertPasses{"moe_expert_gate_up_q4_mma_m8_sums",
                               "moe_expert_down_q4_mma_m8", 64, 128, 128};
   if (config.expertTile == MoeExpertTile::M32)
     return {"moe_expert_gate_up_q4_m32", "moe_expert_down_q4_m32", 128, 128,
@@ -143,7 +150,8 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
   if (config.kernel != MoeExpertKernel::Mpp &&
       config.kernel != MoeExpertKernel::Register)
     throw std::invalid_argument("invalid MoE expert kernel configuration");
-  workspace_ = workspaceFor(shape, rows, tileRows(), splitExperts_);
+  workspace_ = workspaceFor(shape, rows, tileRows(), splitExperts_,
+                            config.kernel == MoeExpertKernel::Register);
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
 }
 
@@ -168,7 +176,8 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
       buffers.routeRows.sizeBytes() < required.routeRowsBytes ||
       buffers.groupedInput.sizeBytes() < required.groupedInputBytes ||
       buffers.expertIntermediate.sizeBytes() < required.expertIntermediateBytes ||
-      buffers.expertOutput.sizeBytes() < required.expertOutputBytes) {
+      buffers.expertOutput.sizeBytes() < required.expertOutputBytes ||
+      buffers.inputSums.sizeBytes() < required.inputSumsBytes) {
     throw std::invalid_argument("MoE grouped scratch is smaller than its bound");
   }
   const RoutePass route = routePass(plan.config(), rows);
@@ -194,9 +203,15 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
             MoeGroupParams{rows, shape.expertsPerToken, tileRows,
                            shape.experts},
             {1, 1, 1});
-  graph.add("moe_gather_rows",
-            {buffers.input, buffers.groupedRoutes, buffers.tileCount,
-             buffers.groupedInput},
+  // The register gate/up tiles read the quant-group input sums that their
+  // gather writes beside the grouped rows.
+  const bool inputSums = plan.config().kernel == MoeExpertKernel::Register;
+  metal::BufferList gatherBuffers{buffers.input, buffers.groupedRoutes,
+                                  buffers.tileCount, buffers.groupedInput};
+  if (inputSums)
+    gatherBuffers.push_back(buffers.inputSums);
+  graph.add(inputSums ? "moe_gather_rows_sums" : "moe_gather_rows",
+            std::move(gatherBuffers),
             MoeGatherParams{tileRows, shape.hiddenSize, shape.routesPerToken()},
             {tiles, shape.hiddenSize / 256, 1});
 
@@ -240,12 +255,14 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
     // The workspace holds the same grouped rows whatever the column tile;
     // only the grid's column count and the threadgroup width follow it.
     const ExpertPasses passes = fusedExpertPasses(plan.config());
-    graph.add(passes.gateUp,
-              {buffers.groupedInput, buffers.tileDescriptors,
-               buffers.tileCount, weights.expertGate.packed,
-               weights.expertUp.packed, weights.sharedGate.packed,
-               weights.sharedUp.packed, buffers.expertIntermediate},
-              gateUp,
+    metal::BufferList gateUpBuffers{
+        buffers.groupedInput, buffers.tileDescriptors, buffers.tileCount,
+        weights.expertGate.packed, weights.expertUp.packed,
+        weights.sharedGate.packed, weights.sharedUp.packed,
+        buffers.expertIntermediate};
+    if (inputSums)
+      gateUpBuffers.push_back(buffers.inputSums);
+    graph.add(passes.gateUp, std::move(gateUpBuffers), gateUp,
               {shape.expertIntermediateSize / passes.gateUpColumns, tiles, 1},
               {passes.threads, 1, 1});
     graph.add(passes.down,

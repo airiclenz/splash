@@ -79,7 +79,7 @@ constexpr std::array moeFields{
     &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
     &MoeWorkspace::groupedRoutesBytes, &MoeWorkspace::routeRowsBytes,
     &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
-    &MoeWorkspace::expertOutputBytes};
+    &MoeWorkspace::expertOutputBytes, &MoeWorkspace::inputSumsBytes};
 
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,
@@ -280,30 +280,40 @@ DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
 MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape,
                                                uint32_t maximumRows) const {
   // Validate the bound before iterating; every row is included even if a
-  // future grouped layout's largest field is not monotone in row count.
-  auto bound = MoE::prefillPlan(shape, maximumRows).workspace();
+  // future grouped layout's largest field is not monotone in row count. Every
+  // plan carries the device's expert kernel, as moePrefill's does, so the
+  // register kernel's input sums are bounded.
+  MoeConfig baseline{MoeExpertTile::M32};
+  baseline.kernel = moeExpertKernel_;
+  auto bound = MoE::prefillPlan(shape, maximumRows, baseline).workspace();
   for (uint32_t rows = 1; rows < maximumRows; ++rows)
-    include(bound, MoE::prefillPlan(shape, rows).workspace(), moeFields);
+    include(bound, MoE::prefillPlan(shape, rows, baseline).workspace(), moeFields);
   for (const auto &choice : choices_.moe) {
     const auto &w = choice.workload;
     if (w.phase == MoePhase::Prefill && shapeKey(w.shape) == shapeKey(shape) &&
-        w.rows <= maximumRows)
-      include(bound, MoE::prefillPlan(shape, w.rows,
-                                     choice.configuration).workspace(), moeFields);
+        w.rows <= maximumRows) {
+      MoeConfig config = choice.configuration;
+      config.kernel = moeExpertKernel_;
+      include(bound, MoE::prefillPlan(shape, w.rows, config).workspace(), moeFields);
+    }
   }
   return bound;
 }
 
 MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape) const {
   MoeWorkspace bound;
+  MoeConfig baseline{MoeExpertTile::M8};
+  baseline.kernel = moeExpertKernel_;
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
-    include(bound, MoE::decodePlan(shape, lanes).workspace(), moeFields, lanes);
+    include(bound, MoE::decodePlan(shape, lanes, baseline).workspace(), moeFields,
+            lanes);
   for (const auto &choice : choices_.moe) {
     const auto &w = choice.workload;
     if (w.phase == MoePhase::Decode && shapeKey(w.shape) == shapeKey(shape)) {
       const uint32_t lanes = w.rows / kDecodeRows;
-      include(bound, MoE::decodePlan(shape, lanes,
-                                    choice.configuration).workspace(), moeFields,
+      MoeConfig config = choice.configuration;
+      config.kernel = moeExpertKernel_;
+      include(bound, MoE::decodePlan(shape, lanes, config).workspace(), moeFields,
               lanes);
     }
   }

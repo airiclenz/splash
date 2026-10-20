@@ -146,6 +146,7 @@ enum class PrefillTensor : uint32_t {
   MoeGroupedInput,
   MoeExpertIntermediate,
   MoeExpertOutput,
+  MoeInputSums,
   Count,
 };
 
@@ -284,6 +285,7 @@ enum class DecodeTensor : uint32_t {
   MoeGroupedInput,
   MoeExpertIntermediate,
   MoeExpertOutput,
+  MoeInputSums,
   Count,
 };
 

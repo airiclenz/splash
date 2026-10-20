@@ -1090,6 +1090,7 @@ struct Runtime::Impl {
     buffers.groupedInput = p(PrefillTensor::MoeGroupedInput);
     buffers.expertIntermediate = p(PrefillTensor::MoeExpertIntermediate);
     buffers.expertOutput = p(PrefillTensor::MoeExpertOutput);
+    buffers.inputSums = p(PrefillTensor::MoeInputSums);
     targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
@@ -1322,6 +1323,7 @@ struct Runtime::Impl {
     buffers.groupedInput = d(DecodeTensor::MoeGroupedInput);
     buffers.expertIntermediate = d(DecodeTensor::MoeExpertIntermediate);
     buffers.expertOutput = d(DecodeTensor::MoeExpertOutput);
+    buffers.inputSums = d(DecodeTensor::MoeInputSums);
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       const ModelBatchItem &item = paddedItem(lane);
       q8[lane] = q8Params(item.logicalPosition, kDecodeRows, kTileRows,
