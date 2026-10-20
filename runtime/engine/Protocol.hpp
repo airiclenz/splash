@@ -14,7 +14,7 @@
 
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 6;
+inline constexpr uint16_t kProtocolVersion = 7;
 inline constexpr size_t kFrameHeaderBytes = 24;
 inline constexpr uint32_t kStatusSchemaVersion = 5;
 // Image pixels travel inside the request frame; a multi-image agent turn can
@@ -29,6 +29,7 @@ enum class FrameType : uint16_t {
   Cancel = 0x0002,
   MaskResponse = 0x0003,
   StatusRequest = 0x0004,
+  Stop = 0x0005,
 
   Ready = 0x0100,
   Start = 0x0101,
@@ -214,6 +215,15 @@ struct StatusRequestFrame {
   bool operator==(const StatusRequestFrame &) const = default;
 };
 
+// The client matched a stop condition (a stop sequence or a reasoning-loop
+// trip): the engine finishes the request as stopped, a normal completion,
+// rather than cancelling it.  The Done frame still ends the request.
+struct StopFrame {
+  uint64_t requestId = 0;
+
+  bool operator==(const StopFrame &) const = default;
+};
+
 enum ReadyFeature : uint64_t {
   FeatureCancellation = 1ULL << 0,
   FeatureTokenMasks = 1ULL << 1,
@@ -331,7 +341,7 @@ struct StatusJsonEvent {
 
 using Message =
     std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
-                 StatusRequestFrame, ReadyEvent, StartEvent,
+                 StatusRequestFrame, StopFrame, ReadyEvent, StartEvent,
                  PromptProgressEvent, TokensEvent, MaskRequestEvent, DoneEvent,
                  ErrorEvent, CapacityExhaustedEvent, StatusJsonEvent>;
 

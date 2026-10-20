@@ -25,6 +25,7 @@ constexpr uint64_t kImageSpanBytes = 32;
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
+constexpr uint64_t kStopFixedBytes = 8;
 constexpr uint64_t kReadyFixedBytes = 24;
 constexpr uint64_t kStartFixedBytes = 21;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
@@ -104,6 +105,8 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
     return bounded(kMaskResponseFixedBytes, maximum);
   case FrameType::StatusRequest:
     return bounded(kStatusRequestFixedBytes, kStatusRequestFixedBytes);
+  case FrameType::Stop:
+    return bounded(kStopFixedBytes, kStopFixedBytes);
   case FrameType::Ready:
     return bounded(kReadyFixedBytes, kReadyFixedBytes);
   case FrameType::PromptProgress:
@@ -179,6 +182,7 @@ bool validFrameType(uint16_t raw, FrameType &type) {
   case FrameType::Cancel:
   case FrameType::MaskResponse:
   case FrameType::StatusRequest:
+  case FrameType::Stop:
   case FrameType::Ready:
   case FrameType::Start:
   case FrameType::PromptProgress:
@@ -476,6 +480,13 @@ std::optional<ProtocolIssue> validateCancel(const CancelFrame &cancel) {
                    "cancel request id must be non-zero");
 }
 
+std::optional<ProtocolIssue> validateStop(const StopFrame &stop) {
+  if (stop.requestId)
+    return std::nullopt;
+  return makeIssue(FailureClass::RequestError, IssueCode::InvalidRequestId, 0,
+                   "stop request id must be non-zero");
+}
+
 std::optional<ProtocolIssue>
 validateMaskResponse(const MaskResponseFrame &response,
                      const ProtocolLimits &limits) {
@@ -718,6 +729,15 @@ ProtocolResult<Frame> encodeCancel(const CancelFrame &cancel) {
   Writer writer(kCancelFixedBytes);
   writer.u64(cancel.requestId);
   return success(Frame{FrameType::Cancel, writer.take()});
+}
+
+ProtocolResult<Frame> encodeStop(const StopFrame &stop) {
+  if (auto issue = validateStop(stop)) {
+    return failure<Frame>(std::move(*issue));
+  }
+  Writer writer(kStopFixedBytes);
+  writer.u64(stop.requestId);
+  return success(Frame{FrameType::Stop, writer.take()});
 }
 
 ProtocolResult<Frame> encodeMaskResponse(const MaskResponseFrame &response,
@@ -978,6 +998,20 @@ ProtocolResult<Message> decodeCancel(const Frame &frame) {
     return failure<Message>(std::move(*issue));
   }
   return success(Message{cancel});
+}
+
+ProtocolResult<Message> decodeStop(const Frame &frame) {
+  Reader reader(frame.payload);
+  StopFrame stop;
+  if (!reader.u64(stop.requestId) || reader.remaining()) {
+    return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
+                                      IssueCode::InvalidPayloadLength, 0,
+                                      "stop payload has an invalid length"));
+  }
+  if (auto issue = validateStop(stop)) {
+    return failure<Message>(std::move(*issue));
+  }
+  return success(Message{stop});
 }
 
 ProtocolResult<Message> decodeMaskResponse(const Frame &frame,
@@ -1255,6 +1289,8 @@ std::string_view frameTypeName(FrameType type) {
     return "mask_response";
   case FrameType::StatusRequest:
     return "status_request";
+  case FrameType::Stop:
+    return "stop";
   case FrameType::Ready:
     return "ready";
   case FrameType::PromptProgress:
@@ -1372,6 +1408,8 @@ ProtocolResult<Frame> encodeMessage(const Message &message,
             return encodeMaskResponse(value, limits);
           } else if constexpr (std::is_same_v<T, StatusRequestFrame>) {
             return encodeStatusRequest(value);
+          } else if constexpr (std::is_same_v<T, StopFrame>) {
+            return encodeStop(value);
           } else if constexpr (std::is_same_v<T, ReadyEvent>) {
             return encodeReady(value);
           } else if constexpr (std::is_same_v<T, StartEvent>) {
@@ -1401,7 +1439,8 @@ ProtocolResult<Frame> encodeMessage(const Message &message,
           encoded.value->type == FrameType::Request ||
           encoded.value->type == FrameType::Cancel ||
           encoded.value->type == FrameType::MaskResponse ||
-          encoded.value->type == FrameType::StatusRequest;
+          encoded.value->type == FrameType::StatusRequest ||
+          encoded.value->type == FrameType::Stop;
       issue->failureClass = clientMessage ? FailureClass::RequestError
                                           : FailureClass::EngineUnhealthy;
       issue->requestId = std::visit(
@@ -1445,6 +1484,8 @@ ProtocolResult<Message> decodeFrame(const Frame &frame,
       return decodeMaskResponse(frame, limits);
     case FrameType::StatusRequest:
       return decodeStatusRequest(frame);
+    case FrameType::Stop:
+      return decodeStop(frame);
     case FrameType::Ready:
       return decodeReady(frame);
     case FrameType::Start:

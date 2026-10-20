@@ -100,6 +100,7 @@ private:
   bool handle(protocol::Message &message);
   bool handleRequest(protocol::RequestFrame &request);
   bool handleCancel(const protocol::CancelFrame &cancel);
+  bool handleStop(const protocol::StopFrame &stop);
   bool handleMask(const protocol::MaskResponseFrame &mask);
   bool handleStatus(const protocol::StatusRequestFrame &status);
   bool handleMaskIssue(protocol::ProtocolIssue issue);

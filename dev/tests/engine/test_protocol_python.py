@@ -15,22 +15,22 @@ ROOT = Path(__file__).parents[3]
 
 
 REQUEST_GOLDEN = (
-    "53504c480600180001000000540000000000000000000000efcdab8967452301"
+    "53504c480700180001000000540000000000000000000000efcdab8967452301"
     "000201008098281765060040a5ae0200000000008000000500000000000000cd"
     "cc4c3f3333733f200000001032547698badcfe00000000000000000001000000"
     "2a00000000000080ffffffff"
 )
 ERROR_GOLDEN = (
-    "53504c4806001800050100002700000000000000000000000200000000000000"
+    "53504c4807001800050100002700000000000000000000000200000000000000"
     "0000090000000c0000006770755f6661756c744d6574616c206661696c6564"
 )
 STATUS_GOLDEN = (
-    "53504c4806001800070100002d00000000000000000000002803000000000000"
+    "53504c4807001800070100002d00000000000000000000002803000000000000"
     "050000007b22736368656d615f76657273696f6e223a342c227265616479223a"
     "747275657d"
 )
 INITIAL_MASK_GOLDEN = (
-    "53504c4806001800030100001800000000000000000000005b00000000000000"
+    "53504c4807001800030100001800000000000000000000005b00000000000000"
     "06000000000000000400000000000000"
 )
 
@@ -86,6 +86,7 @@ int main() {
     score.scoreTokens = {101, 202, 303};
     show(score);
     show(CancelFrame{91});
+    show(StopFrame{91});
     show(MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}});
     show(StatusRequestFrame{808});
     show(ReadyEvent{1001, 4, 524288,
@@ -164,6 +165,7 @@ def all_messages():
         example_image_request(),
         example_score_request(),
         p.CancelFrame(91),
+        p.StopFrame(91),
         p.MaskResponseFrame(91, 7, (0xFFFFFFFF, 0, 0xA5A5A5A5)),
         p.StatusRequestFrame(808),
         p.ReadyEvent(
@@ -360,6 +362,31 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assertEqual(
             result.stdout.splitlines(),
             [p.serialize_message(message).hex() for message in all_messages()],
+        )
+
+    def test_stop_frame_wire_layout_beside_an_unchanged_cancel(self):
+        stop = p.serialize_message(p.StopFrame(91))
+        cancel = p.serialize_message(p.CancelFrame(91))
+
+        header = struct.unpack_from("<4sHHHHQI", stop)
+        self.assertEqual(
+            header,
+            (b"SPLH", p.PROTOCOL_VERSION, 24, 0x0005, 0, 8, 0),
+        )
+        self.assertEqual(stop[p.FRAME_HEADER_BYTES :], struct.pack("<Q", 91))
+        self.assertEqual(struct.unpack_from("<H", cancel, 8)[0], 0x0002)
+        self.assertEqual(cancel[p.FRAME_HEADER_BYTES :], struct.pack("<Q", 91))
+        self.assertEqual(p.decode_frame(parse_all(stop)[0]), p.StopFrame(91))
+        self.assert_protocol_error(
+            p.FailureClass.REQUEST_ERROR,
+            p.IssueCode.INVALID_REQUEST_ID,
+            lambda: p.serialize_message(p.StopFrame(0)),
+        )
+        zero = stop[: p.FRAME_HEADER_BYTES] + struct.pack("<Q", 0)
+        self.assert_protocol_error(
+            p.FailureClass.REQUEST_ERROR,
+            p.IssueCode.INVALID_REQUEST_ID,
+            lambda: p.decode_frame(parse_all(zero)[0]),
         )
 
     def test_progress_wire_validation(self):

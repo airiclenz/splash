@@ -359,11 +359,50 @@ void testScoreRequestAndDoneLogits() {
   }
 }
 
+// A Stop frame is a new client frame type carrying only the request id; the
+// Cancel frame beside it keeps its type and payload.
+void testStopFrameWireBesideCancel() {
+  constexpr std::string_view test = "stop frame wire beside cancel";
+  auto stop = serializeMessage(Message{StopFrame{91}});
+  auto cancel = serializeMessage(Message{CancelFrame{91}});
+  CHECK(test, stop && cancel);
+  if (!stop || !cancel)
+    return;
+
+  const auto &stopWire = *stop.value;
+  const auto &cancelWire = *cancel.value;
+  CHECK(test, stopWire.size() == kFrameHeaderBytes + 8);
+  CHECK(test, loadU16(stopWire, 4) == kProtocolVersion);
+  CHECK(test, loadU16(stopWire, 8) == 0x0005);
+  CHECK(test, loadU64(stopWire, 12) == 8);
+  CHECK(test, loadU64(stopWire, kFrameHeaderBytes) == 91);
+  CHECK(test, loadU16(cancelWire, 8) == 0x0002);
+  CHECK(test, cancelWire.size() == stopWire.size());
+  CHECK(test, loadU64(cancelWire, kFrameHeaderBytes) == 91);
+  CHECK(test, roundTrip(StopFrame{91}) == StopFrame{91});
+
+  auto zero = serializeMessage(Message{StopFrame{0}});
+  CHECK(test, !zero);
+  if (zero.issue) {
+    CHECK(test, zero.issue->failureClass == FailureClass::RequestError);
+    CHECK(test, zero.issue->code == IssueCode::InvalidRequestId);
+  }
+  auto zeroWire = stopWire;
+  storeU64(zeroWire, kFrameHeaderBytes, 0);
+  auto decodedZero = decodeFrame(decodeSingleFrame(zeroWire));
+  CHECK(test, !decodedZero);
+  if (decodedZero.issue) {
+    CHECK(test,
+          decodedZero.issue->failureClass == FailureClass::RequestError);
+    CHECK(test, decodedZero.issue->code == IssueCode::InvalidRequestId);
+  }
+}
 
 std::vector<Message> everyOtherMessage() {
   return {
       Message{exampleImageRequest()},
       CancelFrame{91},
+      StopFrame{91},
       MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}},
       StatusRequestFrame{808},
       ReadyEvent{1001, 4, 524'288,
@@ -930,6 +969,7 @@ int main() {
   try {
     testRequestWireAndRoundTrip();
     testScoreRequestAndDoneLogits();
+    testStopFrameWireBesideCancel();
     testEveryMessageAndMultiplexedStream();
     testOneByteIncrementalParsing();
     testLargeIncrementalFrameHasNoGeometricCapacitySlack();

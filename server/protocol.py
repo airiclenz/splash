@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 FRAME_HEADER_BYTES = 24
 STATUS_SCHEMA_VERSION = 5
 # Largest top-k the native sampler keeps as candidates.
@@ -34,6 +34,7 @@ _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _STATUS_REQUEST = struct.Struct("<Q")
+_STOP = struct.Struct("<Q")
 _READY = struct.Struct("<QIIQ")
 _START = struct.Struct("<QBiII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
@@ -65,6 +66,7 @@ class FrameType(IntEnum):
     CANCEL = 0x0002
     MASK_RESPONSE = 0x0003
     STATUS_REQUEST = 0x0004
+    STOP = 0x0005
 
     READY = 0x0100
     START = 0x0101
@@ -229,6 +231,14 @@ class CancelFrame:
 
 
 @dataclass(slots=True, frozen=True)
+class StopFrame:
+    """A client stop-condition match: the engine finishes the request as
+    stopped, a normal completion, and still ends it with a Done frame."""
+
+    request_id: int
+
+
+@dataclass(slots=True, frozen=True)
 class MaskResponseFrame:
     request_id: int
     mask_request_id: int
@@ -350,6 +360,7 @@ Message: TypeAlias = (
     | CancelFrame
     | MaskResponseFrame
     | StatusRequestFrame
+    | StopFrame
     | ReadyEvent
     | StartEvent
     | PromptProgressEvent
@@ -511,6 +522,8 @@ def _payload_bounds(frame_type: FrameType, limits: ProtocolLimits) -> tuple[int,
             )
         case FrameType.STATUS_REQUEST:
             bounds = (_STATUS_REQUEST.size, _STATUS_REQUEST.size)
+        case FrameType.STOP:
+            bounds = (_STOP.size, _STOP.size)
         case FrameType.READY:
             bounds = (_READY.size, _READY.size)
         case FrameType.PROMPT_PROGRESS:
@@ -789,9 +802,9 @@ def _request_issue(
     return None
 
 
-def _cancel_issue(cancel: CancelFrame) -> ProtocolIssue | None:
+def _client_request_id_issue(value: int, label: str) -> ProtocolIssue | None:
     try:
-        request_id = _u64(cancel.request_id, "cancel request id")
+        request_id = _u64(value, f"{label} request id")
     except ValueError as error:
         return _issue(
             FailureClass.REQUEST_ERROR,
@@ -803,8 +816,16 @@ def _cancel_issue(cancel: CancelFrame) -> ProtocolIssue | None:
     return _issue(
         FailureClass.REQUEST_ERROR,
         IssueCode.INVALID_REQUEST_ID,
-        "cancel request id must be non-zero",
+        f"{label} request id must be non-zero",
     )
+
+
+def _cancel_issue(cancel: CancelFrame) -> ProtocolIssue | None:
+    return _client_request_id_issue(cancel.request_id, "cancel")
+
+
+def _stop_issue(stop: StopFrame) -> ProtocolIssue | None:
+    return _client_request_id_issue(stop.request_id, "stop")
 
 
 def _mask_payload(values):
@@ -1150,6 +1171,10 @@ def _encode_message(
         _raise_issue(_cancel_issue(message))
         payload = _CANCEL.pack(message.request_id)
         frame_type = FrameType.CANCEL
+    elif isinstance(message, StopFrame):
+        _raise_issue(_stop_issue(message))
+        payload = _STOP.pack(message.request_id)
+        frame_type = FrameType.STOP
     elif isinstance(message, MaskResponseFrame):
         _raise_issue(_mask_response_issue(message, limits))
         mask = _mask_payload(message.mask_words)
@@ -1274,6 +1299,7 @@ def _encode_message(
             FrameType.CANCEL,
             FrameType.MASK_RESPONSE,
             FrameType.STATUS_REQUEST,
+            FrameType.STOP,
         }
         request_id = getattr(message, "request_id", 0)
         raise ProtocolError(
@@ -1531,6 +1557,10 @@ def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Me
         return message
     if frame_type is FrameType.STATUS_REQUEST:
         return StatusRequestFrame(_STATUS_REQUEST.unpack(payload)[0])
+    if frame_type is FrameType.STOP:
+        message = StopFrame(_STOP.unpack(payload)[0])
+        _raise_issue(_stop_issue(message))
+        return message
     if frame_type is FrameType.READY:
         message = ReadyEvent(*_READY.unpack(payload))
         _raise_issue(_ready_issue(message, FailureClass.PROTOCOL_FATAL))

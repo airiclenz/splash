@@ -884,6 +884,60 @@ void testCancelledScoreReturnsEmptyLogits() {
   require(doneCount == 1, "cancelled score did not emit Done");
 }
 
+// A client stop match arrives as a Stop frame while the request still has
+// output budget left; the request ends with one Done reporting Stop.
+void testStopFrameEndsTheRequestAsStopped() {
+  Backing backing(32);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  std::vector<uint8_t> output;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  engine::NativeRuntime loop(
+      config, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  loop.announceReady();
+  constexpr uint32_t kOutputBudget = 512;
+  auto encoded =
+      protocol::serializeMessage(protocol::Message{request(41, kOutputBudget)});
+  require(encoded && loop.receive(*encoded.value), "stop request wire failed");
+  auto emittedTokens = [&] {
+    uint32_t tokens = 0;
+    for (const protocol::Message &message : decodeMessages(output)) {
+      if (const auto *event = std::get_if<protocol::TokensEvent>(&message))
+        tokens += event->tokens.size();
+    }
+    return tokens;
+  };
+  for (uint32_t step = 0; step < 32 && emittedTokens() == 0; ++step)
+    static_cast<void>(loop.tick());
+  require(emittedTokens() > 0, "stop request emitted no token");
+
+  auto stopWire =
+      protocol::serializeMessage(protocol::Message{protocol::StopFrame{41}});
+  require(stopWire && loop.receive(*stopWire.value), "stop frame failed");
+  runUntilIdle(loop);
+
+  uint32_t doneCount = 0;
+  for (const protocol::Message &message : decodeMessages(output)) {
+    if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
+      ++doneCount;
+      require(done->requestId == 41, "stop ended the wrong request");
+      require(done->reason == protocol::FinishReason::Stop,
+              "stop frame did not finish the request as Stop");
+      require(done->completionTokens < kOutputBudget,
+              "stop frame did not end the request early");
+    }
+  }
+  require(doneCount == 1, "stopped request did not emit one Done");
+  require(!executor.holdsSlot(41), "stopped request kept its model slot");
+}
+
 struct ScoreBesideChat final {
   uint32_t publishedBlocks = 0;
   uint32_t failures = 0;
@@ -1010,6 +1064,7 @@ int main() {
     testStepTokensFitTheWire();
     testScoreRequestCompletesAfterFullPrompt();
     testCancelledScoreReturnsEmptyLogits();
+    testStopFrameEndsTheRequestAsStopped();
     testInvalidScoreFailsOneRequestAndKeepsTheBatch();
     std::cout << "native KV-first loop tests passed\n";
     return EXIT_SUCCESS;

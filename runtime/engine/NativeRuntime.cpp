@@ -218,6 +218,8 @@ bool NativeRuntime::handle(protocol::Message &message) {
           return handleMask(typed);
         } else if constexpr (std::is_same_v<T, protocol::StatusRequestFrame>) {
           return handleStatus(typed);
+        } else if constexpr (std::is_same_v<T, protocol::StopFrame>) {
+          return handleStop(typed);
         } else {
           protocol::ProtocolIssue issue;
           issue.failureClass = protocol::FailureClass::ProtocolFatal;
@@ -330,6 +332,25 @@ bool NativeRuntime::handleCancel(const protocol::CancelFrame &cancel) {
     return false;
   } catch (...) {
     engineError("cancel_failed", "unknown cancellation exception");
+    return false;
+  }
+  return true;
+}
+
+bool NativeRuntime::handleStop(const protocol::StopFrame &stop) {
+  if (!telemetry_.contains(stop.requestId)) {
+    // A client stop match can race the request's own terminal event.
+    return true;
+  }
+  try {
+    core_.stop(stop.requestId);
+  } catch (const std::exception &error) {
+    // As for cancel: a stop for live telemetry has no client-side failure
+    // left, so a core exception means engine ownership is inconsistent.
+    engineError("stop_failed", error.what());
+    return false;
+  } catch (...) {
+    engineError("stop_failed", "unknown stop exception");
     return false;
   }
   return true;
