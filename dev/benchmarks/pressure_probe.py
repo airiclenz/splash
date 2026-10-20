@@ -82,6 +82,14 @@ PHASE_COUNTERS = (
     ("decode_suspensions", ("cache", "resource_decode_suspensions")),
     ("decode_replay_tokens", ("cache", "resource_decode_replay_tokens")),
     ("denied_reservations", ("memory_governor", "denied_reservations")),
+    (
+        "denied_host_reservations",
+        ("memory_governor", "denied_host_reservations"),
+    ),
+    (
+        "denied_engine_reservations",
+        ("memory_governor", "denied_engine_reservations"),
+    ),
     ("state_evictions", ("state", "evictions")),
     ("checkpoint_evictions", ("state", "checkpoint_evictions")),
     ("checkpoint_retirements", ("state", "checkpoint_retirements")),

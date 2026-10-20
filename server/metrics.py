@@ -202,6 +202,17 @@ _STATUS_METRICS = {
         "memory_governor",
         "denied_reservations",
     ),
+    "splash_memory_denied_reservations_by_cause_total": LabelledCounter(
+        help_text=(
+            "Denied memory reservations by the bound that refused them: host "
+            "pressure or the engine budget."
+        ),
+        label="cause",
+        paths={
+            "host": ("memory_governor", "denied_host_reservations"),
+            "engine": ("memory_governor", "denied_engine_reservations"),
+        },
+    ),
     "splash_memory_limit_bytes": ("memory_governor", "limit_bytes"),
     "splash_memory_headroom_bytes": ("memory_governor", "headroom_bytes"),
     "splash_admission_waiting_memory": ("admission", "waiting_memory"),

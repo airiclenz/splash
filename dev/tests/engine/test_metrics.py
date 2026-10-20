@@ -227,6 +227,54 @@ class CheckpointFailureCauseMetricsTests(unittest.TestCase):
                 )
 
 
+DENIED_TOTAL_METRIC = "splash_memory_denied_reservations_total"
+DENIED_BY_CAUSE_METRIC = "splash_memory_denied_reservations_by_cause_total"
+
+
+class DeniedReservationCauseMetricsTests(unittest.TestCase):
+    def test_denial_causes_render_beside_the_unlabelled_total(self):
+        lines = prometheus_metrics(
+            governor_status(
+                denied_reservations=5,
+                denied_host_reservations=3,
+                denied_engine_reservations=2,
+            )
+        ).splitlines()
+
+        self.assertIn(f"{DENIED_TOTAL_METRIC} 5", lines)
+        start = lines.index(f"# TYPE {DENIED_BY_CAUSE_METRIC} counter")
+        self.assertTrue(lines[start - 1].startswith(f"# HELP {DENIED_BY_CAUSE_METRIC} "))
+        self.assertEqual(
+            lines[start + 1 : start + 3],
+            [
+                f'{DENIED_BY_CAUSE_METRIC}{{cause="host"}} 3',
+                f'{DENIED_BY_CAUSE_METRIC}{{cause="engine"}} 2',
+            ],
+        )
+
+    def test_unlabelled_total_keeps_its_own_family(self):
+        lines = prometheus_metrics(
+            governor_status(
+                denied_reservations=5,
+                denied_host_reservations=3,
+                denied_engine_reservations=2,
+            )
+        ).splitlines()
+
+        total_lines = [line for line in lines if DENIED_TOTAL_METRIC in line]
+        by_cause = [line for line in lines if DENIED_BY_CAUSE_METRIC in line]
+        self.assertEqual(total_lines, [f"{DENIED_TOTAL_METRIC} 5"])
+        self.assertEqual(len(by_cause), 4)
+        self.assertTrue(by_cause[0].startswith("# HELP "))
+        self.assertTrue(by_cause[1].startswith("# TYPE "))
+
+    def test_status_without_causes_renders_no_cause_lines(self):
+        text = prometheus_metrics(governor_status(denied_reservations=5))
+
+        self.assertNotIn(DENIED_BY_CAUSE_METRIC, text)
+        self.assertIn(f"{DENIED_TOTAL_METRIC} 5", text.splitlines())
+
+
 ACCEPTANCE_RATIO_METRIC = "splash_draft_acceptance_ratio"
 
 

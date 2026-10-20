@@ -162,6 +162,10 @@ std::string runtimeStatusJson(
       << ",\"headroom_bytes\":" << memoryGovernor.headroomBytes
       << ",\"growth_allowed\":" << boolean(memoryGovernor.growthAllowed)
       << ",\"denied_reservations\":" << memoryGovernor.deniedReservations
+      << ",\"denied_host_reservations\":"
+      << memoryGovernor.deniedHostReservations
+      << ",\"denied_engine_reservations\":"
+      << memoryGovernor.deniedEngineReservations
       << ",\"system_pressure\":"
       << json::quote(memoryPressureName(memoryGovernor.systemPressure))
       << ",\"host_measurement_valid\":"

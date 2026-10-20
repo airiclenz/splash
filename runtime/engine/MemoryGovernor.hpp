@@ -72,6 +72,10 @@ struct MemoryGovernorSnapshot {
   MemoryPressure pressure = MemoryPressure::Normal;
   // Failed reservation attempts, including retries of the same request.
   uint64_t deniedReservations = 0;
+  // The same denials split by the bound that refused them: host pressure or
+  // the engine budget. They sum to deniedReservations.
+  uint64_t deniedHostReservations = 0;
+  uint64_t deniedEngineReservations = 0;
   bool hostMeasurementValid = false;
   uint64_t hostAvailableBytes = 0;
   // The page breakdown of the same sample, zero while the measurement is
@@ -230,6 +234,8 @@ private:
   mutable std::mutex mutex_;
   uint64_t reservedBytes_ = 0;
   uint64_t deniedReservations_ = 0;
+  uint64_t deniedHostReservations_ = 0;
+  uint64_t deniedEngineReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
   std::optional<HostMemorySample> sampledHost_;
   bool hostConstrained_ = false;

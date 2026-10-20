@@ -131,6 +131,30 @@ class CounterDeltaTests(unittest.TestCase):
         )
 
 
+    def test_counterDelta_diffsEachDenialCause(self):
+        before = snapshot(
+            memory_governor__denied_reservations=2,
+            memory_governor__denied_host_reservations=1,
+            memory_governor__denied_engine_reservations=1,
+        )
+        after = snapshot(
+            memory_governor__denied_reservations=7,
+            memory_governor__denied_host_reservations=5,
+            memory_governor__denied_engine_reservations=2,
+        )
+
+        delta = probe.counter_delta(before, after)
+
+        self.assertEqual(
+            [
+                delta["denied_reservations"],
+                delta["denied_host_reservations"],
+                delta["denied_engine_reservations"],
+            ],
+            [5, 4, 1],
+        )
+
+
 class LaneRecordTests(unittest.TestCase):
     def test_laneRecord_readsCachedTokensFromUsage(self):
         reply = {

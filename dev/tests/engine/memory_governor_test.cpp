@@ -149,6 +149,39 @@ void testTryReserveAdvancesLatch() {
           "tryReserve() did not clear the latch at recovery");
 }
 
+// Each denial counts once under the bound that refused it and once in the
+// total; a grant counts nowhere.
+void testDenialsAreCountedByCause() {
+  FakeHost host;
+  MemoryGovernor governor = makeGovernor(host);
+
+  metal::AllocationFailure engineFailure = metal::AllocationFailure::None;
+  const bool grantedOverBudget =
+      governor.tryReserve(kLimitBytes, &engineFailure).has_value();
+  const MemoryGovernorSnapshot afterEngine = governor.snapshot();
+  host.availableBytes = kLowHostBytes;
+  metal::AllocationFailure hostFailure = metal::AllocationFailure::None;
+  const bool grantedUnderPressure =
+      governor.tryReserve(1, &hostFailure).has_value();
+  host.availableBytes = kAmpleHostBytes;
+  const bool grantedAtRecovery = governor.tryReserve(1).has_value();
+  const MemoryGovernorSnapshot counted = governor.snapshot();
+
+  require(!grantedOverBudget &&
+              engineFailure == metal::AllocationFailure::EngineBudget &&
+              afterEngine.deniedReservations == 1 &&
+              afterEngine.deniedEngineReservations == 1 &&
+              afterEngine.deniedHostReservations == 0,
+          "an engine-budget denial was not counted under its cause");
+  require(!grantedUnderPressure &&
+              hostFailure == metal::AllocationFailure::HostPressure,
+          "low host headroom admitted growth");
+  require(grantedAtRecovery && counted.deniedReservations == 2 &&
+              counted.deniedHostReservations == 1 &&
+              counted.deniedEngineReservations == 1,
+          "the denial causes do not sum to the total");
+}
+
 void testReservationThatFitsIsGrantedWhileWarningLatched() {
   FakeHost host;
   MemoryGovernor governor = makeGovernor(host);
@@ -330,6 +363,7 @@ int main() {
     testSnapshotNeitherSamplesNorLatches();
     testObserveLatchesWarningAndClearsAtRecovery();
     testTryReserveAdvancesLatch();
+    testDenialsAreCountedByCause();
     testReservationThatFitsIsGrantedWhileWarningLatched();
     testStartupAndServingShareOneFloor();
     testBootstrapPhaseAdmitsAgainstReserve();

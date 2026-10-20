@@ -13,6 +13,16 @@
 
 namespace splash::engine {
 
+namespace {
+
+// Denial counters saturate rather than wrap.
+void countDenial(uint64_t &counter) noexcept {
+  if (counter != std::numeric_limits<uint64_t>::max())
+    ++counter;
+}
+
+} // namespace
+
 uint64_t estimateHostAvailableMemory(const HostMemoryPages &statistics,
                                      uint64_t pageSize,
                                      uint64_t physicalMemoryBytes) noexcept {
@@ -236,9 +246,9 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
     if (failure)
       *failure = !engineFits ? metal::AllocationFailure::EngineBudget
                             : metal::AllocationFailure::HostPressure;
-    if (deniedReservations_ != std::numeric_limits<uint64_t>::max()) {
-      ++deniedReservations_;
-    }
+    countDenial(deniedReservations_);
+    countDenial(!engineFits ? deniedEngineReservations_
+                            : deniedHostReservations_);
     return std::nullopt;
   }
   reservedBytes_ = requested;
@@ -300,6 +310,8 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
       used < limitBytes_ ? limitBytes_ - used : 0,
       pressure,
       deniedReservations_,
+      deniedHostReservations_,
+      deniedEngineReservations_,
       sampledHost_.has_value(),
       host.availableBytes,
       host.inactiveBytes,
