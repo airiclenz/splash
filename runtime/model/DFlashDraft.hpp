@@ -69,6 +69,11 @@ struct DFlashDraftLayout final {
     return {layers, kvHeads, ExecutionLimits::draftContextTokens,
             attentionHeadDimension};
   }
+  // Width of the [K | V] columns that end each packed [Q | K | V] qkv row:
+  // the only columns the draft context K/V step reads.
+  [[nodiscard]] constexpr uint32_t contextKeyValueSize() const noexcept {
+    return 2 * kvHeads * attentionHeadDimension;
+  }
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
     return {hiddenSize, dynamicSize, qkvSize, attentionSize,
             attentionSize / attentionHeadDimension, kvHeads,
@@ -108,6 +113,7 @@ struct DFlashContextBuffers final {
   metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;
+  // [K | V] rows only, contextKeyValueSize() wide.
   metal::MetalBuffer qkv;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
@@ -130,6 +136,7 @@ struct DFlashPrefillBuffers final {
   metal::MetalBuffer projectionSums;
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;
+  // [K | V] rows only, contextKeyValueSize() wide.
   metal::MetalBuffer qkv;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
@@ -215,6 +222,9 @@ private:
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
   ops::Sampling selector_;
+  // Per layer, views of the qkv projection's [K | V] columns: the context
+  // steps project only these, never the query columns they would discard.
+  std::vector<ops::Q4Projection> contextKeyValueProjections_;
 };
 
 } // namespace splash::model

@@ -1274,6 +1274,107 @@ void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
   }
 }
 
+// ============================================================================
+// Views of whole 256-column storage blocks: in block-major packing each is one
+// contiguous range of the weight, scale and bias buffers (DFlashDraft
+// columnView).
+Q4Projection columnView(metal::MetalBackend &backend, const Q4Projection &p,
+                        uint32_t firstColumn, uint32_t columns) {
+  const uint64_t weightBytes = uint64_t{p.inputSize} / 2;
+  const uint64_t parameterBytes = uint64_t{p.inputSize} / 64 * 2;
+  return {backend.view(p.weights, firstColumn * weightBytes, columns * weightBytes),
+          backend.view(p.scales, firstColumn * parameterBytes, columns * parameterBytes),
+          backend.view(p.biases, firstColumn * parameterBytes, columns * parameterBytes),
+          columns, p.inputSize};
+}
+
+// ============================================================================
+// Runs one plain projection and returns its workload rows of output.
+std::vector<uint16_t> projectRows(metal::MetalBackend &backend, const Q4Linear &linear,
+                                  const Q4Projection &p, const LinearPlan &plan,
+                                  const metal::MetalBuffer &input) {
+  const LinearWorkload workload = plan.workload();
+  const auto output = allocate(backend, uint64_t{plan.storageRows()} * p.outputSize * 2);
+  LinearBuffers buffers{input, output, allocate(backend, plan.sumsBytes()), {}, {}, {}};
+  const auto scratch = plan.scratchSize();
+  buffers.scratch = {allocate(backend, scratch.input), allocate(backend, scratch.sums),
+                     allocate(backend, scratch.partials), allocate(backend, scratch.counters)};
+  metal::CommandGraph graph;
+  if (workload.phase == LinearPhase::Prefill)
+    linear.addPrefillSums(graph, input, buffers.sums, workload.matrix, workload.rows);
+  linear.add(graph, buffers, p, plan);
+  (void)backend.submitCommand(graph.dispatches());
+  const auto *values = static_cast<const uint16_t *>(output.contents());
+  return {values, values + uint64_t{workload.rows} * p.outputSize};
+}
+
+// ============================================================================
+// Every plan the draft qkv workload can select, pinned to the 2048 [K | V]
+// columns of a column view (Q4Linear::columnPlan), reproduces those columns of
+// the full projection bit for bit, for the prefill tiles and the decode lanes.
+void columnViewCase(metal::MetalBackend &backend, const Q4Linear &linear) {
+  constexpr LinearMatrix kQkv{6144, 5120};
+  constexpr uint32_t kKeyValueColumns = 2048;
+  constexpr uint32_t kFirstColumn = kQkv.outputSize - kKeyValueColumns;
+  const auto full = projection(backend, kQkv, 4099);
+  const auto view = columnView(backend, full, kFirstColumn, kKeyValueColumns);
+  std::vector<LinearWorkload> workloads;
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+    workloads.push_back({kQkv, lanes * 8, LinearPhase::Decode, LinearEpilogue::None});
+  for (const uint32_t rows : {33U, 2048U})
+    workloads.push_back({kQkv, rows, LinearPhase::Prefill, LinearEpilogue::None});
+  size_t compared = 0;
+  for (const LinearWorkload &workload : workloads) {
+    const auto input = allocate(backend,
+        uint64_t{linear.plan(workload).storageRows()} * kQkv.inputSize * 2);
+    auto *inputValues = static_cast<uint16_t *>(input.contents());
+    for (uint64_t i = 0; i < uint64_t{workload.rows} * kQkv.inputSize; ++i)
+      inputValues[i] = bf16(float(int(mix(uint32_t(i) + 2111) % 257) - 128) / 257.0f);
+    for (const LinearPlan &candidate : linear.candidates(workload)) {
+      const LinearPlan pinned = Q4Linear::columnPlan(candidate, kKeyValueColumns);
+      require(pinned.pipeline() == candidate.pipeline(),
+              "pinned column plan changed the Q4 kernel");
+      const auto expected = projectRows(backend, linear, full, candidate, input);
+      const auto actual = projectRows(backend, linear, view, pinned, input);
+      for (uint64_t row = 0; row < workload.rows; ++row)
+        require(std::memcmp(actual.data() + row * kKeyValueColumns,
+                            expected.data() + row * kQkv.outputSize + kFirstColumn,
+                            kKeyValueColumns * sizeof(uint16_t)) == 0,
+                "Q4 column view differs from the full projection's columns");
+      ++compared;
+    }
+  }
+  std::cout << "Linear K/V column view plans=" << compared << " bitwise PASS\n";
+}
+
+// ============================================================================
+// A column plan keeps the full plan's tile, scope and K partitions; only the
+// decode grid shrinks, and a range wider than the matrix or off the storage
+// blocks is refused.
+void columnPlans() {
+  const LinearMatrix qkv{6144, 5120};
+  const LinearWorkload decode{qkv, 16, LinearPhase::Decode, LinearEpilogue::None};
+  const LinearWorkload prefill{qkv, 33, LinearPhase::Prefill, LinearEpilogue::None};
+  for (const auto &[full, groups] : std::array{
+           std::pair{Q4Linear::plan(decode, {LinearTile::SimdgroupF32, 96, LinearSimdgroups::Four, 2}), 32U},
+           std::pair{Q4Linear::plan(decode, {LinearTile::N128, 10}), 10U},
+           std::pair{Q4Linear::plan(decode, {LinearTile::N256, 24}), 8U},
+           std::pair{Q4Linear::plan(prefill, {LinearTile::Mma64, 0, LinearSimdgroups::Four}), 0U}}) {
+    const LinearPlan narrow = Q4Linear::columnPlan(full, 2048);
+    require(narrow.workload().matrix == LinearMatrix{2048, qkv.inputSize} &&
+                narrow.workload().rows == full.workload().rows &&
+                narrow.configuration().tile == full.configuration().tile &&
+                narrow.configuration().simdgroups == full.configuration().simdgroups &&
+                narrow.configuration().splits == full.configuration().splits &&
+                narrow.configuration().groups == groups &&
+                narrow.pipeline() == full.pipeline(),
+            "column plan changed more than the decode grid");
+  }
+  const LinearPlan full = Q4Linear::plan(decode, {LinearTile::N128, 48});
+  rejects([&] { (void)Q4Linear::columnPlan(full, 8192); });
+  rejects([&] { (void)Q4Linear::columnPlan(full, 2000); });
+}
+
 void pipelineCapabilities(const char *metallib, const DeviceCapabilities &capabilities) {
   Q4Linear linear(capabilities);
   std::map<std::string, uint32_t> names{{"prefill_linear_q4_sums32", 256}};
@@ -1328,6 +1429,7 @@ int main(int argc, char **argv) {
     apple7Plans();
     narrowM24BoundaryPlans();
     scalingContracts();
+    columnPlans();
     // Apple9 at the assumed core count reaches the expanded split set;
     // Apple10 exercises the MPP-only candidate bound.
     size_t widestCandidates = 0;
@@ -1374,6 +1476,7 @@ int main(int argc, char **argv) {
       std::cout << "Linear N=" << matrix.outputSize << " K=" << matrix.inputSize
                 << " all epilogues/candidates/row cases PASS\n";
     }
+    columnViewCase(backend, linear);
     std::cout << "Linear plans and candidates: PASS\n";
   } catch (const std::exception &error) {
     std::cerr << "Linear plans: FAIL: " << error.what() << '\n';

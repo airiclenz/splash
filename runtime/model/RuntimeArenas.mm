@@ -98,7 +98,8 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::ContextHidden,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.hiddenSize));
   put(PrefillTensor::ContextQkv,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.qkvSize));
+      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+                         geometry.draft.contextKeyValueSize()));
   put(PrefillTensor::DraftRopeCos,
       bytesFor<float>(uint64_t{kPrefillRows} *
                       (geometry.draftState.headDimension / 2)));
@@ -218,7 +219,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::ContextHidden,
       bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
   put(DecodeTensor::ContextQkv,
-      bytesFor<uint16_t>(r * geometry.draft.qkvSize));
+      bytesFor<uint16_t>(r * geometry.draft.contextKeyValueSize()));
   put(DecodeTensor::CapturedTargetHidden,
       bytesFor<uint16_t>(r * geometry.draft.targetHiddenSize));
   put(DecodeTensor::DraftQueryKeys, draftWorkspace.queryKeysBytes);
@@ -351,6 +352,8 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
        {d.vocabularySize, d.hiddenSize}, {d.selectorRank, d.hiddenSize},
        {d.hiddenSize, d.targetHiddenSize}})
     include(matrix);
+  // The draft context's [K | V] projection runs the qkv plan's tile and K
+  // partitions over fewer columns, so the qkv entry above bounds its scratch.
   return result;
 }
 

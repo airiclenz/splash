@@ -491,6 +491,16 @@ LinearPlan Q4Linear::plan(LinearWorkload workload) const {
 LinearPlan Q4Linear::plan(LinearWorkload workload, LinearConfig config) {
   return LinearPlan(workload, config);
 }
+LinearPlan Q4Linear::columnPlan(const LinearPlan &full, uint32_t columns) {
+  LinearWorkload workload = full.workload();
+  if (columns > workload.matrix.outputSize)
+    throw std::invalid_argument("Q4 column plan exceeds its full matrix");
+  workload.matrix.outputSize = columns;
+  LinearConfig config = full.configuration();
+  if (workload.phase == LinearPhase::Decode)
+    config.groups = std::min(config.groups, columns / full.tileColumns());
+  return LinearPlan(workload, config);
+}
 void Q4Linear::setChoices(std::span<const LinearChoice> choices) {
   std::vector<LinearChoice> pending(choices.begin(), choices.end());
   for (const auto &choice : pending) (void)plan(choice.workload, choice.configuration);

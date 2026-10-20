@@ -184,6 +184,13 @@ public:
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   [[nodiscard]] LinearScratchSize decodeScratchSize(LinearWorkload workload) const;
   [[nodiscard]] static LinearPlan plan(LinearWorkload workload, LinearConfig config);
+  // The plan for a view of `columns` whole 256-column storage blocks of the
+  // full plan's matrix: the full plan's tile, cooperative scope and K
+  // partitions, so each column accumulates in the same order and rounds to the
+  // same bits as in the full projection. Only the decode grid shrinks to the
+  // narrower matrix (simdgroup and split tiles keep their full grid). Throws
+  // when the columns exceed the full matrix or do not fit the tile.
+  [[nodiscard]] static LinearPlan columnPlan(const LinearPlan &full, uint32_t columns);
   [[nodiscard]] std::vector<LinearPlan> candidates(LinearWorkload workload) const;
   // Installed only at startup; encoding does a read-only lookup, never tuning.
   void setChoices(std::span<const LinearChoice> choices);

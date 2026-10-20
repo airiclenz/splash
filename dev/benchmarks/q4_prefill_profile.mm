@@ -552,6 +552,10 @@ void run(const std::string &metallibPath) {
     profileShape(backend, rows, 5120, 6144, 32, 128, "prefill_linear_q4_sums32",
                  "prefill_linear_q4_n128", "draft_qkv_m32n128");
     profileMma(rows, 5120, 6144, "draft_qkv");
+    // The draft context projects only the qkv rows' 2048 [K | V] columns.
+    profileShape(backend, rows, 5120, 2048, 32, 128, "prefill_linear_q4_sums32",
+                 "prefill_linear_q4_n128", "draft_kv_m32n128");
+    profileMma(rows, 5120, 2048, "draft_kv");
   }
   // The residual FFN down projection with both tile widths: the executor
   // picks 128 columns when the 256-column grid would leave cores idle.

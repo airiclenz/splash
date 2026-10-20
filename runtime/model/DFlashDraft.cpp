@@ -29,6 +29,31 @@ void validateLayout(const DFlashDraftLayout &layout) {
   validateQ4Layout(layout.selectorRank, layout.hiddenSize);
 }
 
+// ============================================================================
+// Views of whole StorageN blocks of a projection's output columns. The packing
+// is block-major (parameter ((n / 256) * groups + g) * 256 + n % 256), so a
+// block-aligned column range is one contiguous range of each of the weight,
+// scale and bias buffers; no weight bytes are copied.
+ops::Q4Projection columnView(const metal::MetalBackend &backend,
+                             const ops::Q4Projection &projection,
+                             uint32_t firstColumn, uint32_t columns) {
+  if (!columns || firstColumn % kQ4StorageN || columns % kQ4StorageN ||
+      columns > projection.outputSize ||
+      firstColumn > projection.outputSize - columns) {
+    throw std::invalid_argument("Q4 column view is not whole storage blocks");
+  }
+  const uint64_t weightBytes = uint64_t{projection.inputSize} / 2;
+  const uint64_t parameterBytes =
+      uint64_t{projection.inputSize} / kQ4GroupElements * kBFloat16Bytes;
+  return {backend.view(projection.weights, firstColumn * weightBytes,
+                       columns * weightBytes),
+          backend.view(projection.scales, firstColumn * parameterBytes,
+                       columns * parameterBytes),
+          backend.view(projection.biases, firstColumn * parameterBytes,
+                       columns * parameterBytes),
+          columns, projection.inputSize};
+}
+
 } // namespace
 
 DFlashDraftRing::DFlashDraftRing(
@@ -75,6 +100,13 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
       !weights_.layout.stateLayout().valid()) {
     throw std::invalid_argument("draft weights do not match state geometry");
   }
+  const uint32_t keyValueSize = weights_.layout.contextKeyValueSize();
+  contextKeyValueProjections_.reserve(weights_.layers.size());
+  for (const DFlashDraftLayerWeights &layer : weights_.layers) {
+    contextKeyValueProjections_.push_back(
+        columnView(backend_, layer.qkvProjection,
+                   weights_.layout.qkvSize - keyValueSize, keyValueSize));
+  }
 }
 
 void DFlashDraft::addSelection(
@@ -113,20 +145,25 @@ void DFlashDraft::addContextPrefill(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden,
       buffers.projectionSums, layout.hiddenSize, rows);
 
-  const ops::LinearMatrix qkv{layout.qkvSize, layout.hiddenSize};
+  const uint32_t keyValueSize = layout.contextKeyValueSize();
+  const ops::LinearPlan keyValuePlan = ops::Q4Linear::columnPlan(
+      operators_.linear().plan({{layout.qkvSize, layout.hiddenSize}, rows,
+                                ops::LinearPhase::Prefill,
+                                ops::LinearEpilogue::None}),
+      keyValueSize);
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    operators_.linear().addPrefill(graph, buffers.hidden,
-                      weights_.layers[layer].qkvProjection, buffers.qkv,
-                      buffers.projectionSums, qkv, rows);
+    operators_.linear().add(
+        graph, {buffers.hidden, buffers.qkv, buffers.projectionSums, {}, {}, {}},
+        contextKeyValueProjections_[layer], keyValuePlan);
     for (const DFlashPrefillSpan &span : spans) {
       const uint64_t qkvOffset =
-          uint64_t{span.compactRow} * layout.qkvSize * sizeof(uint16_t);
+          uint64_t{span.compactRow} * keyValueSize * sizeof(uint16_t);
       const uint64_t ropeOffset =
           uint64_t{span.compactRow} * (layout.attentionHeadDimension / 2) * sizeof(float);
       ops::DraftAttention::addContextPrefill(
           graph,
           backend_.view(buffers.qkv, qkvOffset,
-                        uint64_t{span.rows} * layout.qkvSize *
+                        uint64_t{span.rows} * keyValueSize *
                             sizeof(uint16_t)),
           weights_.layers[layer].keyNorm,
           backend_.view(buffers.ropeCos, ropeOffset,
@@ -135,7 +172,7 @@ void DFlashDraft::addContextPrefill(
                         uint64_t{span.rows} * (layout.attentionHeadDimension / 2) * sizeof(float)),
           span.ring[layer].keys, span.ring[layer].values, span.rows,
           layout.stateLayout().tokens, span.startPosition,
-          layout.attentionShape());
+          layout.attentionShape(), ops::DraftContextLayout::KeyValue);
     }
   }
 }
@@ -257,17 +294,23 @@ void DFlashDraft::addContextCommit(
   ops::Normalization::addRms(graph, buffers.projected, weights_.hiddenNorm,
                              buffers.hidden, layout.hiddenSize, rows, buffers.linearScratch);
 
-  const ops::LinearMatrix qkv{layout.qkvSize, layout.hiddenSize};
+  const ops::LinearPlan keyValuePlan = ops::Q4Linear::columnPlan(
+      operators_.linear().plan({{layout.qkvSize, layout.hiddenSize}, rows,
+                                ops::LinearPhase::Decode,
+                                ops::LinearEpilogue::None}),
+      layout.contextKeyValueSize());
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    operators_.linear().addDecodeBatch(graph, buffers.hidden,
-                       weights_.layers[layer].qkvProjection, buffers.qkv, qkv,
-                       lanes, stats, buffers.linearScratch, true);
+    operators_.linear().add(
+        graph,
+        {buffers.hidden, buffers.qkv, {}, {}, {}, {}, buffers.linearScratch,
+         true},
+        contextKeyValueProjections_[layer], keyValuePlan, nullptr, &stats);
     ops::DraftAttention::addContextCommit(
         graph, buffers.qkv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],
         buffers.persistentValues[layer], buffers.retainedCounts,
         startPositions, layout.stateLayout().tokens, layout.attentionShape(),
-        lanes);
+        lanes, ops::DraftContextLayout::KeyValue);
   }
 }
 
