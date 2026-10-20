@@ -150,7 +150,9 @@ inline constexpr size_t kInlineBufferBindings = 22;
 inline constexpr size_t kInlineBytesBindings = 1;
 
 struct ComputeDispatch {
-  std::string pipelineName;
+  // Must view static storage, or storage that outlives the submit: the
+  // dispatch never owns its name.
+  std::string_view pipelineName;
   InlineVector<BufferBinding, kInlineBufferBindings> buffers;
   InlineVector<BytesBinding, kInlineBytesBindings> bytes;
   DispatchSize threadgroups;
@@ -164,6 +166,7 @@ struct CommandTiming {
 
 // GPU time of one dispatch replayed as its own command while profiling.
 struct DispatchTiming {
+  // Owned: a profile outlives the dispatches it timed.
   std::string pipelineName;
   double gpuSeconds = 0.0;
 };

@@ -325,8 +325,8 @@ void PagedAttention::addPrefillProjection(
   if (!tokens || !cacheStride || !rowStride)
     throw std::invalid_argument("invalid paged prefill projection geometry");
   const FullPrefillParams params{tokens, cacheStride, rowStride};
-  graph.add(std::string(pipeline(kernel, "prefill_attention_qkv",
-                                 "prefill_attention_qkv_kv2_g8")),
+  graph.add(pipeline(kernel, "prefill_attention_qkv",
+                     "prefill_attention_qkv_kv2_g8"),
             {std::move(packed), std::move(queryNorm), std::move(keyNorm),
              std::move(ropeCos), std::move(ropeSin), std::move(queries),
              std::move(chunkKeys), std::move(chunkValues)},
@@ -343,8 +343,8 @@ void PagedAttention::addPrefillGate(
   if (!tokens || !cacheStride || !rowStride)
     throw std::invalid_argument("invalid paged prefill gate geometry");
   const FullPrefillParams params{tokens, cacheStride, rowStride};
-  graph.add(std::string(pipeline(kernel, "prefill_attention_gate",
-                                 "prefill_attention_gate_kv2_g8")),
+  graph.add(pipeline(kernel, "prefill_attention_gate",
+                     "prefill_attention_gate_kv2_g8"),
             {std::move(packed), std::move(attention), std::move(hidden)}, params,
             {gateGroups(tokens, queryHeads, layout.headDimension), 1, 1});
 }
@@ -363,8 +363,8 @@ void PagedAttention::addVerifyProjection(
     throw std::invalid_argument("invalid paged verify projection geometry");
   const FullDecodeBatchParams params{rowsPerLane, cacheStride, rowStride,
                                      lanes};
-  graph.add(std::string(pipeline(kernel, "verify_attention_qkv",
-                                 "verify_attention_qkv_kv2_g8")),
+  graph.add(pipeline(kernel, "verify_attention_qkv",
+                     "verify_attention_qkv_kv2_g8"),
             {std::move(packed), std::move(queryNorm), std::move(keyNorm),
              std::move(ropeCos), std::move(ropeSin), std::move(queries),
              std::move(chunkKeys), std::move(chunkValues)},
@@ -387,13 +387,13 @@ void PagedAttention::addVerifyGate(
     const uint32_t width = queryHeads * layout.headDimension;
     if (scratch.input.sizeBytes() < uint64_t{width} * 16 * lanes || scratch.sums.sizeBytes() < uint64_t{width} / 2 * lanes)
       throw std::invalid_argument("Q4 attention gate scratch is below requirement");
-    graph.add(std::string(pipeline(kernel, "verify_attention_gate_q4", "verify_attention_gate_q4_kv2_g8")),
+    graph.add(pipeline(kernel, "verify_attention_gate_q4", "verify_attention_gate_q4_kv2_g8"),
               {packed, attention, hidden, scratch.input, scratch.sums}, params,
               {width / 64 * lanes, 1, 1}, {256, 1, 1});
     return;
   }
-  graph.add(std::string(pipeline(kernel, "verify_attention_gate",
-                                 "verify_attention_gate_kv2_g8")),
+  graph.add(pipeline(kernel, "verify_attention_gate",
+                     "verify_attention_gate_kv2_g8"),
             {std::move(packed), std::move(attention), std::move(hidden)}, params,
             {gateGroups(uint64_t{rowsPerLane} * lanes, queryHeads,
                         layout.headDimension),
@@ -427,7 +427,7 @@ void PagedAttention::addPrefillStore(
       : pipeline(kernel, "prefill_attention_q8_store", "prefill_attention_q8_store_kv2_g8");
   auto buffers = kvBuffers(layer, layout.format, {chunkKeys, chunkValues},
                            std::array{pageTable});
-  graph.add(std::string(store), std::move(buffers),
+  graph.add(store, std::move(buffers),
             params, {uint64_t{2} * params.chunk_tokens * layout.kvHeads, 1, 1},
             {layout.headDimension, 1, 1});
 }
@@ -455,15 +455,15 @@ void PagedAttention::addPrefill(
   if (!plan.hasReduce()) {
     auto buffers = kvBuffers(layer, plan.format, {queries},
                              std::array{std::move(output), pageTable});
-    graph.add(std::string(plan.splitPipeline), std::move(buffers),
+    graph.add(plan.splitPipeline, std::move(buffers),
               params, plan.splitGroups, plan.splitThreads);
     return;
   }
   auto buffers = kvBuffers(layer, plan.format, {queries},
                            std::array{partials, statistics, pageTable});
-  graph.add(std::string(plan.splitPipeline), std::move(buffers),
+  graph.add(plan.splitPipeline, std::move(buffers),
             params, plan.splitGroups, plan.splitThreads);
-  graph.add(std::string(plan.reducePipeline),
+  graph.add(plan.reducePipeline,
             {std::move(partials), std::move(statistics), std::move(output)},
             params, plan.reduceGroups);
 }
@@ -515,15 +515,15 @@ void PagedAttention::addVerify(
   }
   auto storeBuffers = kvBuffers(layer, plan.format,
       {buffers.chunkKeys, buffers.chunkValues}, buffers.pageTables);
-  graph.add(std::string(plan.storePipeline_), std::move(storeBuffers), stores,
+  graph.add(plan.storePipeline_, std::move(storeBuffers), stores,
             plan.storeGroups_, plan.storeThreads_);
 
   const std::array tail{buffers.partials, buffers.statistics,
       buffers.pageTables[0], buffers.pageTables[1], buffers.pageTables[2], buffers.pageTables[3]};
   auto attentionBuffers = kvBuffers(layer, plan.format, {buffers.queries}, tail);
-  graph.add(std::string(plan.splitPipeline), std::move(attentionBuffers),
+  graph.add(plan.splitPipeline, std::move(attentionBuffers),
             attention, plan.splitGroups, plan.splitThreads);
-  graph.add(std::string(plan.reducePipeline),
+  graph.add(plan.reducePipeline,
             {buffers.partials, buffers.statistics, buffers.output},
             attention, plan.reduceGroups);
 }

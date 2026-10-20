@@ -3,12 +3,14 @@
 #include "MetalBackend.hpp"
 
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -36,13 +38,15 @@ public:
   CommandGraph(CommandGraph &&) noexcept = default;
   CommandGraph &operator=(CommandGraph &&) noexcept = default;
 
-  void add(std::string pipeline, BufferList buffers, DispatchSize groups,
+  // The graph keeps the pipeline name as a view: it must name static storage
+  // (a literal or a constant name table), which outlives the submit.
+  void add(std::string_view pipeline, BufferList buffers, DispatchSize groups,
            DispatchSize threads = {kDefaultThreads, 1, 1}) {
-    push(std::move(pipeline), std::move(buffers), groups, threads);
+    push(pipeline, std::move(buffers), groups, threads);
   }
 
   template <class Params>
-  void add(std::string pipeline, BufferList buffers, const Params &params,
+  void add(std::string_view pipeline, BufferList buffers, const Params &params,
            DispatchSize groups, DispatchSize threads = {kDefaultThreads, 1, 1}) {
     static_assert(std::is_trivially_copyable_v<Params>,
                   "dispatch parameters must be plain data");
@@ -50,11 +54,21 @@ public:
                   "dispatch parameters exceed the payload chunk alignment");
     void *payload = storePayload(sizeof(Params), alignof(Params));
     std::memcpy(payload, &params, sizeof(Params));
-    ComputeDispatch &dispatch =
-        push(std::move(pipeline), std::move(buffers), groups, threads);
+    ComputeDispatch &dispatch = push(pipeline, std::move(buffers), groups, threads);
     dispatch.bytes.push_back({static_cast<uint32_t>(dispatch.buffers.size()),
                               payload, sizeof(Params)});
   }
+
+  // A std::string name would dangle once the caller's string dies; these
+  // overloads turn that into a compile error.
+  template <class Name>
+    requires std::same_as<std::remove_cvref_t<Name>, std::string>
+  void add(Name &&, BufferList, DispatchSize,
+           DispatchSize = {kDefaultThreads, 1, 1}) = delete;
+  template <class Name, class Params>
+    requires std::same_as<std::remove_cvref_t<Name>, std::string>
+  void add(Name &&, BufferList, const Params &, DispatchSize,
+           DispatchSize = {kDefaultThreads, 1, 1}) = delete;
 
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }
   [[nodiscard]] std::span<const ComputeDispatch> dispatches() const noexcept {
@@ -65,10 +79,10 @@ private:
   // One chunk holds the parameter payloads of a few hundred dispatches.
   static constexpr size_t kPayloadChunkBytes = 16 * 1024;
 
-  ComputeDispatch &push(std::string pipeline, BufferList buffers,
+  ComputeDispatch &push(std::string_view pipeline, BufferList buffers,
                         DispatchSize groups, DispatchSize threads) {
     ComputeDispatch &dispatch = dispatches_.emplace_back();
-    dispatch.pipelineName = std::move(pipeline);
+    dispatch.pipelineName = pipeline;
     dispatch.threadgroups = groups;
     dispatch.threadsPerThreadgroup = threads;
     dispatch.buffers.reserve(buffers.size());

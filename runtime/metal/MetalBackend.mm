@@ -1364,7 +1364,7 @@ CommandTicket MetalBackend::submitCommandAsync(
         for (const ComputeDispatch &dispatch : dispatches) {
             CommandTiming timing = submitAsync(dispatch).wait();
             impl_->dispatchProfile.push_back(
-                {dispatch.pipelineName, timing.gpuSeconds});
+                {std::string(dispatch.pipelineName), timing.gpuSeconds});
             total.gpuSeconds += timing.gpuSeconds;
             total.wallSeconds += timing.wallSeconds;
         }

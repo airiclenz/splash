@@ -608,7 +608,7 @@ void Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     // The bfloat tile runs a threadgroup per lane; the fp32 tile covers every
     // lane in one threadgroup.
     const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
-    graph.add(std::string(selected.pipeline()), std::move(bindings),
+    graph.add(selected.pipeline(), std::move(bindings),
         Q4Params{n, k, selected.configuration().splits},
         {selected.configuration().groups, selected.configuration().splits,
          selected.configuration().tile == LinearTile::SimdgroupF32 ? 1 : lanes}, {128, 1, 1});
@@ -618,13 +618,13 @@ void Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   const auto dispatch = [&](std::string_view name,
       std::initializer_list<metal::MetalBuffer> bindings) {
     if (w.phase == LinearPhase::Prefill)
-      graph.add(std::string(name), bindings,
+      graph.add(name, bindings,
           Q4PrefillParams{w.matrix.outputSize, w.matrix.inputSize},
           {selected.storageRows() / kPrefillRows, n / selected.tileColumns(), 1},
           {selected.threadsPerThreadgroup(), 1, 1});
     else {
       const uint32_t groups = selected.configuration().groups;
-      graph.add(std::string(name), bindings, Q4Params{n, k, groups}, {groups, 1, 1},
+      graph.add(name, bindings, Q4Params{n, k, groups}, {groups, 1, 1},
           {selected.threadsPerThreadgroup(), 1, 1});
     }
   };

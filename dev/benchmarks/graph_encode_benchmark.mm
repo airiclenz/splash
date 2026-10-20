@@ -306,7 +306,7 @@ private:
 
   void addNorm(CommandGraph &graph, const MetalBuffer &input,
                const MetalBuffer &weight, const MetalBuffer &output) {
-    graph.add(std::string(kPipeline),
+    graph.add(kPipeline,
               {input, weight, output, scratch_.input, scratch_.sums},
               geometry_.target.hiddenSize, kGroups);
   }
@@ -319,7 +319,7 @@ private:
                  bool isInputPrepared,
                  std::initializer_list<MetalBuffer> epilogue = {}) {
     if (!isInputPrepared) {
-      graph.add(std::string(kPipeline), {input, scratch_.input, scratch_.sums},
+      graph.add(kPipeline, {input, scratch_.input, scratch_.sums},
                 geometry_.target.hiddenSize, kGroups);
     }
     metal::BufferList bindings{
@@ -327,11 +327,11 @@ private:
         projection.biases, output,           scratch_.sums,
         scratch_.partials, scratch_.counters};
     bindings.insert(bindings.end(), epilogue);
-    graph.add(std::string(kPipeline), std::move(bindings), Q4Params{}, kGroups);
+    graph.add(kPipeline, std::move(bindings), Q4Params{}, kGroups);
   }
 
   void addRopeTables(CommandGraph &graph) {
-    graph.add(std::string(kPipeline),
+    graph.add(kPipeline,
               {packed(DecodeTensor::Positions), packed(DecodeTensor::DraftPositions),
                resources_.targetFrequencies, resources_.draftFrequencies,
                packed(DecodeTensor::RopeCos), packed(DecodeTensor::RopeSin),
@@ -341,7 +341,7 @@ private:
 
   void addEmbedding(CommandGraph &graph, DecodeTensor tokens, DecodeTensor output) {
     const Projection &table = resources_.embedding;
-    graph.add(std::string(kPipeline),
+    graph.add(kPipeline,
               {packed(tokens), table.weights, table.scales, table.biases,
                packed(output)},
               Q4EmbeddingParams{}, kGroups);
@@ -379,14 +379,14 @@ private:
   void addConvolution(CommandGraph &graph, const MetalBuffer &input,
                       const DraftBuffers &buffers, const MetalBuffer &weights,
                       const MetalBuffer &residual, const MetalBuffer &output) {
-    graph.add(std::string(kPipeline),
+    graph.add(kPipeline,
               {input, buffers.dynamic, weights, residual, output},
               DraftConvBatchParams{}, kGroups);
   }
 
   void addDraftAttention(CommandGraph &graph, const DraftBuffers &buffers,
                          const DraftLayer &layer, uint32_t index) {
-    graph.add(std::string(kPipeline),
+    graph.add(kPipeline,
               {buffers.proposalQkv, buffers.attention, layer.queryNorm,
                layer.keyNorm, buffers.ropeCos, buffers.ropeSin,
                buffers.queryKeys, buffers.queryValues},
@@ -396,11 +396,11 @@ private:
                 sameOnEveryLane(resources_.ringValues[index]));
     bindings.push_back(buffers.queryKeys);
     bindings.push_back(buffers.queryValues);
-    graph.add(std::string(kPipeline), std::move(bindings),
+    graph.add(kPipeline, std::move(bindings),
               DraftAttentionBatchParams{}, kGroups);
-    graph.add(std::string(kPipeline), {buffers.attention},
+    graph.add(kPipeline, {buffers.attention},
               DraftAttentionBatchParams{}, kGroups);
-    graph.add(std::string(kPipeline), {buffers.attention, buffers.proposalQkv},
+    graph.add(kPipeline, {buffers.attention, buffers.proposalQkv},
               DraftQkvBatchParams{}, kGroups);
   }
 
@@ -451,19 +451,19 @@ private:
     const MetalBuffer uniforms = packed(DecodeTensor::SamplingUniforms);
     const MetalBuffer proposed = packed(DecodeTensor::ProposedTokens);
     const MetalBuffer probabilities = packed(DecodeTensor::ProposalProbs);
-    graph.add(std::string(kPipeline), {logits, partialIds, partialValues},
+    graph.add(kPipeline, {logits, partialIds, partialValues},
               geometry_.target.vocabularySize, kGroups);
-    graph.add(std::string(kPipeline),
+    graph.add(kPipeline,
               {partialIds, partialValues, candidates, unary, selectorHidden,
                resources_.predecessorCodebook, resources_.successorCodebook},
               SelectorBatchParams{}, kGroups);
-    graph.add(std::string(kPipeline),
+    graph.add(kPipeline,
               {candidates, unary, partialValues, uniforms, proposed, probabilities},
               SelectorBatchParams{}, kGroups);
   }
 
   void addVerifyInput(CommandGraph &graph) {
-    graph.add(std::string(kPipeline),
+    graph.add(kPipeline,
               {packed(DecodeTensor::DraftInputTokens),
                packed(DecodeTensor::ProposedTokens), packed(DecodeTensor::InputTokens)},
               VerifyInputBatchParams{}, kGroups);
@@ -563,7 +563,7 @@ private:
                      buffers.recurrent, layer.mixerNorm, buffers.gdnHidden,
                      buffers.arrived, buffers.generation, scratch_.input,
                      scratch_.sums});
-    graph.add(std::string(kPipeline), std::move(bindings),
+    graph.add(kPipeline, std::move(bindings),
               GDNDecodeBatchParams{}, kGroups);
     addLinear(graph, buffers.gdnHidden, layer.mixerOutput, buffers.gdnOutput,
               true, {input});
@@ -578,13 +578,13 @@ private:
                                    pages.keyData, pages.keyScales,
                                    pages.valueData, pages.valueScales};
     store.insert(store.end(), buffers.pageTables.begin(), buffers.pageTables.end());
-    graph.add(std::string(kPipeline), std::move(store), stores, kGroups);
+    graph.add(kPipeline, std::move(store), stores, kGroups);
     metal::BufferList split{buffers.fullQueries, pages.keyData, pages.keyScales,
                                    pages.valueData, pages.valueScales,
                                    buffers.partials, buffers.statistics};
     split.insert(split.end(), buffers.pageTables.begin(), buffers.pageTables.end());
-    graph.add(std::string(kPipeline), std::move(split), attention, kGroups);
-    graph.add(std::string(kPipeline),
+    graph.add(kPipeline, std::move(split), attention, kGroups);
+    graph.add(kPipeline,
               {buffers.partials, buffers.statistics, buffers.fullAttention},
               attention, kGroups);
   }
@@ -593,13 +593,13 @@ private:
                          const TargetLayer &layer, const MetalBuffer &input,
                          uint32_t index) {
     addLinear(graph, buffers.normalized, layer.mixerInput, buffers.fullPacked, true);
-    graph.add(std::string(kPipeline),
+    graph.add(kPipeline,
               {buffers.fullPacked, layer.queryNorm, layer.keyNorm, buffers.ropeCos,
                buffers.ropeSin, buffers.fullQueries, buffers.chunkKeys[index],
                buffers.chunkValues[index]},
               FullDecodeBatchParams{}, kGroups);
     addPagedVerify(graph, buffers, index);
-    graph.add(std::string(kPipeline),
+    graph.add(kPipeline,
               {buffers.fullPacked, buffers.fullAttention, buffers.attentionHidden,
                scratch_.input, scratch_.sums},
               FullDecodeBatchParams{}, kGroups);
@@ -625,7 +625,7 @@ private:
     addLinear(graph, buffers.intermediate, layer.down, output, false, {residual});
     const auto captures = geometry_.target.captureLayers();
     if (std::find(captures.begin(), captures.end(), index) != captures.end()) {
-      graph.add(std::string(kPipeline), {output, buffers.captured},
+      graph.add(kPipeline, {output, buffers.captured},
                 CaptureParams{}, kGroups);
     }
   }
@@ -653,13 +653,13 @@ private:
     const MetalBuffer outputTokens = packed(DecodeTensor::OutputTokens);
     const MetalBuffer values = packed(DecodeTensor::ArgmaxValues);
     const MetalBuffer indices = packed(DecodeTensor::ArgmaxIndices);
-    graph.add(std::string(kPipeline), {logits, values, indices},
+    graph.add(kPipeline, {logits, values, indices},
               geometry_.target.vocabularySize, kGroups);
-    graph.add(std::string(kPipeline), {values, indices, outputTokens}, kGroups);
+    graph.add(kPipeline, {values, indices, outputTokens}, kGroups);
   }
 
   void addAcceptance(CommandGraph &graph) {
-    graph.add(std::string(kPipeline),
+    graph.add(kPipeline,
               {packed(DecodeTensor::ProposedTokens), packed(DecodeTensor::Candidates),
                packed(DecodeTensor::ProposalProbs), packed(DecodeTensor::TargetTopIds),
                packed(DecodeTensor::TargetTopProbs),
@@ -679,7 +679,7 @@ private:
     appendLanes(bindings, sameOnEveryLane(resources_.currentState),
                 sameOnEveryLane(resources_.nextState));
     bindings.push_back(packed(DecodeTensor::RetainedCount));
-    graph.add(std::string(kPipeline), std::move(bindings),
+    graph.add(kPipeline, std::move(bindings),
               GDNBatchCommitParams{}, kGroups);
   }
 
@@ -700,7 +700,7 @@ private:
       appendLanes(bindings, sameOnEveryLane(resources_.ringKeys[layer]),
                   sameOnEveryLane(resources_.ringValues[layer]));
       bindings.push_back(retained);
-      graph.add(std::string(kPipeline), std::move(bindings),
+      graph.add(kPipeline, std::move(bindings),
                 DraftContextBatchParams{}, kGroups);
     }
   }

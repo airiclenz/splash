@@ -13,6 +13,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -38,12 +39,12 @@ MetalBuffer shared(MetalBackend &backend, uint64_t bytes, const char *label) {
   return backend.allocateBuffer(bytes, BufferStorage::Shared, label);
 }
 
-ComputeDispatch affine(std::string pipeline, MetalBuffer input,
+ComputeDispatch affine(std::string_view pipeline, MetalBuffer input,
                        MetalBuffer weights, MetalBuffer scales,
                        MetalBuffer biases, MetalBuffer output,
                        const Q4Params &params) {
   ComputeDispatch result;
-  result.pipelineName = std::move(pipeline);
+  result.pipelineName = pipeline;
   result.buffers = {{0, std::move(input)},
                     {1, std::move(weights)},
                     {2, std::move(scales)},
@@ -55,12 +56,12 @@ ComputeDispatch affine(std::string pipeline, MetalBuffer input,
   return result;
 }
 
-ComputeDispatch gateUp(std::string pipeline, MetalBuffer input,
+ComputeDispatch gateUp(std::string_view pipeline, MetalBuffer input,
                        MetalBuffer weights, MetalBuffer scales,
                        MetalBuffer biases, MetalBuffer output,
                        const Q4Params &params) {
   ComputeDispatch result;
-  result.pipelineName = std::move(pipeline);
+  result.pipelineName = pipeline;
   result.buffers = {{0, std::move(input)},
                     {1, weights},
                     {2, scales},
@@ -75,12 +76,12 @@ ComputeDispatch gateUp(std::string pipeline, MetalBuffer input,
   return result;
 }
 
-ComputeDispatch residualDispatch(std::string pipeline, MetalBuffer input,
+ComputeDispatch residualDispatch(std::string_view pipeline, MetalBuffer input,
                                  MetalBuffer weights, MetalBuffer scales,
                                  MetalBuffer biases, MetalBuffer residual,
                                  MetalBuffer output, const Q4Params &params) {
   ComputeDispatch result;
-  result.pipelineName = std::move(pipeline);
+  result.pipelineName = pipeline;
   result.buffers = {{0, std::move(input)},
                     {1, std::move(weights)},
                     {2, std::move(scales)},
@@ -134,12 +135,12 @@ void requireSplitTolerance(const char *what, splash::ops::LinearEpilogue epilogu
             << " max_abs_ref=" << maxAbs << " slack=" << slack << '\n';
 }
 
-ComputeDispatch upSilu(std::string pipeline, MetalBuffer input,
+ComputeDispatch upSilu(std::string_view pipeline, MetalBuffer input,
                        MetalBuffer weights, MetalBuffer scales,
                        MetalBuffer biases, MetalBuffer gate,
                        MetalBuffer output, const Q4Params &params) {
   ComputeDispatch result;
-  result.pipelineName = std::move(pipeline);
+  result.pipelineName = pipeline;
   result.buffers = {{0, std::move(input)},
                     {1, std::move(weights)},
                     {2, std::move(scales)},
