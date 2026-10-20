@@ -1,9 +1,10 @@
 // Times Splash's vision encoder kernels on random bf16 inputs, with no model
 // loaded: each GEMM of one image's encode (vision_gemm_* at the patch
 // embedding, block QKV, projection, up and down, and merger up and down
-// shapes) and vision_attention, at 1024, 4096 and 16384 patches by default.
-// Shapes come from ops::Vision::kernelShapes with the GEMM tile family of the
-// device's GPU (Vision::gemmTile), so they match production dispatch. Each
+// shapes) and attention, at 1024, 4096 and 16384 patches by default.
+// Shapes and pipelines come from ops::Vision::kernelShapes with the tile
+// family of the device's GPU (Vision::gemmTile), so they match production
+// dispatch. Each
 // case reports the median GPU time of its one-dispatch command. These are
 // kernel timings, not a correctness oracle (vision-encoder is).
 //
@@ -13,10 +14,11 @@
 // every case of the production pipeline KERNEL, e.g. a register tile against
 // the MPP tile, and fails when its output strays beyond --tolerance from
 // variant 0: |a - b| / max(1, |a|) over the valid output rows. KERNEL may name
-// either tile family's pipeline: on Apple7/8 production runs vision_gemm_sgf_*,
-// so vision_gemm_sgf_m64n128=vision_gemm_m64n128 times the MPP tile against
-// it. --allow-diff turns either failure into a warning. Variants rotate order every round
-// (ABBA for two) on identical inputs.
+// either tile family's pipeline: on Apple7/8 production runs vision_gemm_sgf_*
+// and vision_attention_sgf, so vision_gemm_sgf_m64n128=vision_gemm_m64n128 or
+// vision_attention_sgf=vision_attention times the MPP kernel against it.
+// --allow-diff turns either failure into a warning. Variants rotate order
+// every round (ABBA for two) on identical inputs.
 //
 // usage: vision-profile METALLIB [--patches 1024,4096,16384] [--kernels LIST]
 //                       [--repeat N] [--compare-metallib PATH]
@@ -63,7 +65,6 @@ constexpr uint64_t kSeed = 0x5EED5EEDULL;
 // Bias magnitude relative to the unit-scale products.
 constexpr float kBiasScale = 0.1F;
 constexpr std::string_view kResidualSuffix = "_residual";
-constexpr std::string_view kAttentionPipeline = "vision_attention";
 
 // A case kernel: one GEMM of the encode, or attention when gemm is empty.
 struct Kernel final {
@@ -280,14 +281,15 @@ std::vector<std::string> splitList(const std::string &text) {
   return items;
 }
 
-// The production pipelines --alternate may replace, of either GEMM tile
-// family.
+// The production pipelines --alternate may replace, of either tile family.
 std::set<std::string, std::less<>> productionPipelines() {
-  std::set<std::string, std::less<>> names{std::string(kAttentionPipeline)};
-  for (const VisionGemmTile tile : {VisionGemmTile::Mpp, VisionGemmTile::Register})
-    for (const VisionGemmShape &shape :
-         Vision::kernelShapes(VisionLayout{}, ImageGrid{2, 2}, tile).gemms)
+  std::set<std::string, std::less<>> names;
+  for (const VisionGemmTile tile : {VisionGemmTile::Mpp, VisionGemmTile::Register}) {
+    const VisionKernelShapes shapes = Vision::kernelShapes(VisionLayout{}, ImageGrid{2, 2}, tile);
+    for (const VisionGemmShape &shape : shapes.gemms)
       names.insert(shape.pipeline);
+    names.insert(shapes.attention.pipeline);
+  }
   return names;
 }
 
@@ -322,7 +324,7 @@ void parseAlternate(const std::string &text, Options &options) {
   if (equals == std::string::npos || equals + 1 == text.size() ||
       !productionPipelines().contains(kernel))
     throw std::invalid_argument("--alternate takes KERNEL=PIPELINE with KERNEL a "
-                                "vision_gemm_* or vision_attention pipeline");
+                                "vision_gemm_* or vision_attention* pipeline");
   options.alternates[kernel] = text.substr(equals + 1);
 }
 
@@ -414,7 +416,7 @@ void run(const Options &options) {
       const VisionKernelShapes shapes =
           Vision::kernelShapes(VisionLayout{}, gridFor(patches), gemmTile);
       const std::string_view production =
-          kernel.gemm ? shapes.gemm(*kernel.gemm).pipeline : kAttentionPipeline;
+          kernel.gemm ? shapes.gemm(*kernel.gemm).pipeline : shapes.attention.pipeline;
       std::vector<Variant> variants{{&backend, 0, production}};
       if (comparison) variants.push_back({comparison.get(), 1, production});
       const auto alternate = options.alternates.find(production);

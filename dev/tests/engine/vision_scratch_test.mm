@@ -1,6 +1,6 @@
 // Checks of the vision scratch arena: the power-of-two patch capacity an
-// image admits and how the arena's bytes scale with it (CPU), the GEMM tile
-// family each GPU family runs (CPU), and the GPU zero fill the arena gets
+// image admits and how the arena's bytes scale with it (CPU), the GEMM and
+// attention tile family each GPU family runs (CPU), and the GPU zero fill the arena gets
 // before its first encode. No model weights load.
 
 #include "ops/Vision.hpp"
@@ -103,10 +103,12 @@ void testScratchBytesRejectsInvalidCapacity() {
   }
 }
 
-// Apple7/8 run every encode GEMM on a vision_gemm_sgf_* register tile;
-// Apple9 and later run the MPP tiles.
+// Apple7/8 run every encode GEMM on a vision_gemm_sgf_* register tile and
+// attention on vision_attention_sgf; Apple9 and later run the MPP kernels.
 void testGemmTileFollowsGpuFamily() {
   constexpr std::string_view registerPrefix = "vision_gemm_sgf_";
+  constexpr std::string_view registerAttention = "vision_attention_sgf";
+  constexpr std::string_view mppAttention = "vision_attention";
   constexpr std::array<std::pair<uint32_t, bool>, 4> families{{
       {7, true},
       {8, true},
@@ -125,6 +127,9 @@ void testGemmTileFollowsGpuFamily() {
                   isRegister,
               "vision GEMM pipeline does not follow the GPU family");
     }
+    require(shapes.attention.pipeline ==
+                (isRegister ? registerAttention : mppAttention),
+            "vision attention pipeline does not follow the GPU family");
   }
 }
 

@@ -1,13 +1,16 @@
-// Parity of the Apple7/8 register-tile vision GEMMs (vision_gemm_sgf_*) with
-// the MPP tiles they replace: every GEMM of one image's encode, at its real
-// input and output widths, on random bf16 inputs with a ragged last row tile.
-// The tiles accumulate K in different orders, so outputs agree within a
-// tolerance, not bitwise. No model weights load.
+// Parity of the Apple7/8 register-tile vision kernels with the MPP kernels
+// they replace: every GEMM of one image's encode (vision_gemm_sgf_*), at its
+// real input and output widths, on random bf16 inputs with a ragged last row
+// tile, and attention (vision_attention_sgf) over ragged query and key tiles.
+// The kernels accumulate in different orders, and MPP attention rounds its
+// probabilities to bf16, so outputs agree within a tolerance, not bitwise.
+// No model weights load.
 
 #include "metal/abi/Vision.h"
 #include "ops/Vision.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -30,6 +33,13 @@ constexpr float kBiasScale = 0.1F;
 // The outputs must reach unit scale, or a zero output would pass.
 constexpr float kMinimumOutputMagnitude = 0.5F;
 constexpr uint32_t kSeed = 0x5EED;
+// Query and key magnitude: scores spread several units apart, so each
+// softmax concentrates on a few keys and outputs reach unit scale.
+constexpr float kAttentionScoreScale = 4.0F;
+// Attention grids: 308 tokens leave the last query and key tiles ragged; 60
+// tokens fit one 64-key block, so half of the register kernel's simdgroups
+// own no keys.
+constexpr std::array<ops::ImageGrid, 2> kAttentionGrids{{{14, 22}, {6, 10}}};
 
 // Throws with message when condition is false.
 void require(bool condition, const std::string &message) {
@@ -131,6 +141,82 @@ void testRegisterTileMatchesMpp(metal::MetalBackend &backend,
           std::string(registerTile.pipeline) + " strays from " + mpp.pipeline);
 }
 
+// Fills dimensions [0, headDimension) of every valid token row of a
+// (heads, paddedTokens, width) buffer; padded tokens and dimensions stay zero,
+// as vision_qkv_prepare leaves them.
+void fillTokens(const metal::MetalBuffer &buffer,
+                const ops::VisionAttentionShape &shape, uint32_t width,
+                float scale, std::mt19937 &random) {
+  std::uniform_real_distribution<float> values(-scale, scale);
+  auto *data = static_cast<__bf16 *>(buffer.contents());
+  for (uint32_t head = 0; head < shape.heads; ++head)
+    for (uint32_t token = 0; token < shape.tokens; ++token) {
+      __bf16 *row =
+          data + (uint64_t{head} * shape.paddedTokens + token) * width;
+      for (uint32_t dimension = 0; dimension < shape.headDimension; ++dimension)
+        row[dimension] = __bf16(values(random));
+    }
+}
+
+// The register attention kernel matches MPP attention on random queries,
+// keys and values within kTolerance over every valid token of every head.
+void testRegisterAttentionMatchesMpp(metal::MetalBackend &backend,
+                                     const ops::VisionAttentionShape &mpp,
+                                     const ops::VisionAttentionShape &registerTile,
+                                     std::mt19937 &random) {
+  require(registerTile.queryTile == mpp.queryTile &&
+              registerTile.paddedTokens == mpp.paddedTokens,
+          std::string(registerTile.pipeline) + " grid differs from the MPP grid");
+  const uint64_t headTokens = uint64_t{mpp.heads} * mpp.paddedTokens;
+  const metal::MetalBuffer queries =
+      bf16Buffer(backend, headTokens * mpp.qkDimension, "queries");
+  const metal::MetalBuffer keys =
+      bf16Buffer(backend, headTokens * mpp.qkDimension, "keys");
+  const metal::MetalBuffer values =
+      bf16Buffer(backend, headTokens * mpp.headDimension, "values");
+  fillTokens(queries, mpp, mpp.qkDimension, kAttentionScoreScale, random);
+  fillTokens(keys, mpp, mpp.qkDimension, kAttentionScoreScale, random);
+  fillTokens(values, mpp, mpp.headDimension, 1.0F, random);
+
+  auto run = [&](std::string_view pipeline) {
+    metal::MetalBuffer output =
+        bf16Buffer(backend, headTokens * mpp.headDimension, "output");
+    metal::CommandGraph graph;
+    graph.add(pipeline, {queries, keys, values, output},
+              VisionAttentionParams{mpp.tokens, mpp.paddedTokens, mpp.scale},
+              {mpp.queryTiles(), mpp.heads, 1});
+    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    return output;
+  };
+  const metal::MetalBuffer expected = run(mpp.pipeline);
+  const metal::MetalBuffer actual = run(registerTile.pipeline);
+
+  const auto *reference = static_cast<const __bf16 *>(expected.contents());
+  const auto *candidate = static_cast<const __bf16 *>(actual.contents());
+  float maximumError = 0.0F;
+  float maximumMagnitude = 0.0F;
+  for (uint64_t row = 0; row < headTokens; ++row) {
+    if (row % mpp.paddedTokens >= mpp.tokens)
+      continue;
+    for (uint64_t index = row * mpp.headDimension;
+         index < (row + 1) * mpp.headDimension; ++index) {
+      const float value = static_cast<float>(reference[index]);
+      const float error =
+          std::fabs(static_cast<float>(candidate[index]) - value) /
+          std::max(1.0F, std::fabs(value));
+      maximumError =
+          std::max(maximumError, std::isnan(error) ? INFINITY : error);
+      maximumMagnitude = std::max(maximumMagnitude, std::fabs(value));
+    }
+  }
+  std::cout << registerTile.pipeline << " tokens=" << mpp.tokens
+            << " max_error=" << maximumError << '\n';
+  require(maximumMagnitude >= kMinimumOutputMagnitude,
+          std::string(mpp.pipeline) + " produced no unit-scale output");
+  require(maximumError <= kTolerance,
+          std::string(registerTile.pipeline) + " strays from " + mpp.pipeline);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -149,6 +235,16 @@ int main(int argc, char **argv) {
     for (size_t index = 0; index < mpp.gemms.size(); ++index)
       testRegisterTileMatchesMpp(backend, mpp.gemms[index],
                                  registerTiles.gemms[index], random);
+    for (const ops::ImageGrid attentionGrid : kAttentionGrids)
+      testRegisterAttentionMatchesMpp(
+          backend,
+          ops::Vision::kernelShapes(ops::VisionLayout{}, attentionGrid,
+                                    ops::VisionGemmTile::Mpp)
+              .attention,
+          ops::Vision::kernelShapes(ops::VisionLayout{}, attentionGrid,
+                                    ops::VisionGemmTile::Register)
+              .attention,
+          random);
     std::cout << "vision tile tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

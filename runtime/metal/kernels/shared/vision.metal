@@ -9,9 +9,11 @@
 // hand-written epilogues, grid {row_tile, output_tile}. On Apple7/8, which
 // have no bfloat arithmetic, the GEMMs run vision_gemm_sgf_* register tiles
 // instead: the same tiles, grid and epilogues on simdgroup_float8x8 matrices
-// with bf16 widened to fp32. Attention runs on the
-// native head dimension (72); token counts are padded to the 128-key tile so
-// K/V tiles read in full, with padded keys zeroed and masked by the softmax.
+// with bf16 widened to fp32; attention likewise runs vision_attention_sgf, a
+// register-matrix QK and PV with the same grid and layouts. Attention runs
+// on the native head dimension (72); token counts are padded to the 128-key
+// tile so K/V tiles read in full, with padded keys zeroed and masked by the
+// softmax.
 //
 // Token order everywhere is spatial-merge-block-major: each consecutive group
 // of four patches is one 2x2 spatial unit, so the merger reads contiguous
@@ -667,6 +669,247 @@ kernel void vision_attention(
         converted[i] = bfloat(running[i] / row_sum[index[1]]);
     }
     converted.store(ot.slice<D, M>(0, 0));
+}
+
+// Apple7/8 register attention: vision_attention's grid, layouts and output on
+// simdgroup_float8x8 matrices, for GPUs without bfloat arithmetic. bf16
+// operands widen exactly to fp32 and every product accumulates in fp32. A
+// lane holds two columns of one row of every 8 x 8 fragment, so the score
+// fragment of keys 8j..8j+7 is, after exponentiation, the probability operand
+// of PV depth step j as it stands, and a row reduction is two shuffles (the
+// row's four lanes differ in lane bits 0 and 3). Probabilities stay fp32 into
+// PV, where the MPP kernel rounds them to bf16.
+//
+// The eight simdgroups pair up on 16 query rows each: one runs an online
+// softmax over the even 64-key blocks, the other over the odd ones, so every
+// key and value fragment a lane loads feeds two row fragments. The odd half
+// hands its maximum, sum and output to the even half through threadgroup
+// memory once, after its last block. K and V load straight from device
+// memory into fragment registers.
+//
+// QK depth advances in 16-deep chunks of two 8-deep steps over a permuted
+// order: fragment depth d of step s is k = 2 d + s within the chunk, so a lane
+// reads four consecutive query values (depths fn and fn + 1 of both steps)
+// and two consecutive values of each of its two keys (depth fm).
+
+// A += left * right on 8 x 8 fragments given as each lane's two elements.
+inline void vision_fragment_multiply_accumulate(thread float2 &accumulated,
+                                                float2 left, float2 right) {
+    simdgroup_float8x8 left_matrix, right_matrix, sum, result;
+    reinterpret_cast<thread float2 &>(left_matrix.thread_elements()) = left;
+    reinterpret_cast<thread float2 &>(right_matrix.thread_elements()) = right;
+    reinterpret_cast<thread float2 &>(sum.thread_elements()) = accumulated;
+    simdgroup_multiply_accumulate(result, left_matrix, right_matrix, sum);
+    accumulated = reinterpret_cast<thread float2 &>(result.thread_elements());
+}
+
+kernel void vision_attention_sgf(
+    device const bfloat *queries [[buffer(0)]],
+    device const bfloat *keys [[buffer(1)]],
+    device const bfloat *values [[buffer(2)]],
+    device bfloat *output [[buffer(3)]],
+    constant VisionAttentionParams &params [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simd_group [[simdgroup_index_in_threadgroup]])
+{
+    constexpr ushort M = 64, D = kVisionHeadDim, DQ = kVisionQkDim;
+    constexpr ushort RowFragments = 2;  // 8-row fragments per simdgroup
+    constexpr ushort RowGroups = M / (8 * RowFragments);
+    constexpr ushort Halves = 2;        // simdgroups sharing one row group
+    constexpr ushort BlockKeys = 64;    // keys per online-softmax step
+    constexpr ushort KeyFragments = BlockKeys / 8;
+    constexpr ushort OutputFragments = D / 8;
+    constexpr ushort ChunkSteps = 2;
+    constexpr ushort ChunkDepth = 8 * ChunkSteps;
+    constexpr ushort Chunks = DQ / ChunkDepth;
+    static_assert(RowGroups * Halves == 8, "eight simdgroups cover the tile");
+    static_assert(DQ % ChunkDepth == 0 && D % 8 == 0,
+                  "QK depth and head dimension tile into whole fragments");
+    // The odd half's state, in lane order: 18 KiB + 2 KiB.
+    threadgroup float2 handed_output[RowGroups][RowFragments][OutputFragments]
+                                    [32];
+    threadgroup float handed_max[RowGroups][RowFragments][32];
+    threadgroup float handed_sum[RowGroups][RowFragments][32];
+
+    // simdgroup_matrix lane layout: thread_elements() are M[fm][fn], M[fm][fn + 1].
+    const ushort quad = simd_lane >> 2;
+    const ushort fm = (quad & 4) | ((simd_lane >> 1) & 3);
+    const ushort fn = ((quad & 2) << 1) | ((simd_lane & 1) << 1);
+    const ushort row_group = simd_group % RowGroups;
+    const ushort key_half = simd_group / RowGroups;
+    const uint head = group.y;
+    const uint first_row = group.x * M + row_group * 8 * RowFragments + fm;
+    const ulong qk_plane = ulong(head) * params.padded_tokens * DQ;
+    const ulong d_plane = ulong(head) * params.padded_tokens * D;
+    // Scores in log2 units, so the softmax runs on exp2.
+    const float scale = params.scale * M_LOG2E_F;
+    const uint context = params.tokens;
+    const uint blocks = (context + BlockKeys - 1) / BlockKeys;
+
+    uint2 query_words[RowFragments][Chunks];
+    #pragma unroll
+    for (ushort r = 0; r < RowFragments; ++r) {
+        device const bfloat *lane_query = queries + qk_plane +
+            ulong(first_row + r * 8) * DQ + 2 * fn;
+        #pragma unroll
+        for (ushort c = 0; c < Chunks; ++c) {
+            query_words[r][c] = *reinterpret_cast<device const uint2 *>(
+                lane_query + c * ChunkDepth);
+        }
+    }
+    device const bfloat *lane_keys = keys + qk_plane + ulong(fn) * DQ + 2 * fm;
+    device const bfloat *lane_values = values + d_plane + ulong(fm) * D + fn;
+
+    // running_sum is this lane's share of its row's sum; the row's lanes
+    // share the running maximum, so the shares add up at the end.
+    float running_max[RowFragments];
+    float running_sum[RowFragments];
+    float2 accumulated[RowFragments][OutputFragments];
+    #pragma unroll
+    for (ushort r = 0; r < RowFragments; ++r) {
+        running_max[r] = -INFINITY;
+        running_sum[r] = 0.0f;
+        #pragma unroll
+        for (ushort c = 0; c < OutputFragments; ++c) {
+            accumulated[r][c] = float2(0.0f);
+        }
+    }
+    for (uint block = key_half; block < blocks; block += Halves) {
+        device const bfloat *block_keys =
+            lane_keys + ulong(block) * BlockKeys * DQ;
+        float2 scores[RowFragments][KeyFragments];
+        #pragma unroll
+        for (ushort r = 0; r < RowFragments; ++r) {
+            #pragma unroll
+            for (ushort j = 0; j < KeyFragments; ++j) {
+                scores[r][j] = float2(0.0f);
+            }
+        }
+        #pragma unroll
+        for (ushort c = 0; c < Chunks; ++c) {
+            // key_words[j]: keys fn and fn + 1 of fragment j, depth fm.
+            uint2 key_words[KeyFragments];
+            #pragma unroll
+            for (ushort j = 0; j < KeyFragments; ++j) {
+                device const bfloat *key =
+                    block_keys + ulong(j) * 8 * DQ + c * ChunkDepth;
+                key_words[j] = uint2(
+                    *reinterpret_cast<device const uint *>(key),
+                    *reinterpret_cast<device const uint *>(key + DQ));
+            }
+            #pragma unroll
+            for (ushort step = 0; step < ChunkSteps; ++step) {
+                float2 query[RowFragments];
+                #pragma unroll
+                for (ushort r = 0; r < RowFragments; ++r) {
+                    query[r] = float2(vision_widen(query_words[r][c], step),
+                                      vision_widen(query_words[r][c],
+                                                   2 + step));
+                }
+                #pragma unroll
+                for (ushort j = 0; j < KeyFragments; ++j) {
+                    const float2 key =
+                        float2(vision_widen(key_words[j], step),
+                               vision_widen(key_words[j], 2 + step));
+                    #pragma unroll
+                    for (ushort r = 0; r < RowFragments; ++r) {
+                        vision_fragment_multiply_accumulate(scores[r][j],
+                                                            query[r], key);
+                    }
+                }
+            }
+        }
+
+        // Padded keys score -inf; every block holds at least one valid key,
+        // so the row maximum stays finite.
+        const uint first_key = block * BlockKeys + fn;
+        #pragma unroll
+        for (ushort r = 0; r < RowFragments; ++r) {
+            float block_max = -INFINITY;
+            #pragma unroll
+            for (ushort j = 0; j < KeyFragments; ++j) {
+                const uint key = first_key + j * 8;
+                scores[r][j] = float2(
+                    key < context ? scores[r][j].x * scale : -INFINITY,
+                    key + 1 < context ? scores[r][j].y * scale : -INFINITY);
+                block_max = max(block_max, max(scores[r][j].x, scores[r][j].y));
+            }
+            block_max = max(block_max, simd_shuffle_xor(block_max, 1));
+            block_max = max(block_max, simd_shuffle_xor(block_max, 8));
+            const float next_max = max(running_max[r], block_max);
+            const float correction = exp2(running_max[r] - next_max);
+            running_max[r] = next_max;
+            float block_sum = 0.0f;
+            #pragma unroll
+            for (ushort j = 0; j < KeyFragments; ++j) {
+                scores[r][j] = exp2(scores[r][j] - next_max);
+                block_sum += scores[r][j].x + scores[r][j].y;
+            }
+            running_sum[r] = running_sum[r] * correction + block_sum;
+            #pragma unroll
+            for (ushort c = 0; c < OutputFragments; ++c) {
+                accumulated[r][c] *= correction;
+            }
+        }
+
+        device const bfloat *block_values =
+            lane_values + ulong(block) * BlockKeys * D;
+        #pragma unroll
+        for (ushort j = 0; j < KeyFragments; ++j) {
+            #pragma unroll
+            for (ushort c = 0; c < OutputFragments; ++c) {
+                const uint2 value_word = uint2(
+                    *reinterpret_cast<device const uint *>(
+                        block_values + j * 8 * D + c * 8),
+                    0u);
+                const float2 value = float2(vision_widen(value_word, 0),
+                                            vision_widen(value_word, 1));
+                #pragma unroll
+                for (ushort r = 0; r < RowFragments; ++r) {
+                    vision_fragment_multiply_accumulate(accumulated[r][c],
+                                                        scores[r][j], value);
+                }
+            }
+        }
+    }
+
+    if (key_half == 1) {
+        #pragma unroll
+        for (ushort r = 0; r < RowFragments; ++r) {
+            handed_max[row_group][r][simd_lane] = running_max[r];
+            handed_sum[row_group][r][simd_lane] = running_sum[r];
+            #pragma unroll
+            for (ushort c = 0; c < OutputFragments; ++c) {
+                handed_output[row_group][r][c][simd_lane] = accumulated[r][c];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (key_half == 1) {
+        return;
+    }
+    // The odd half may own no block (-inf maximum): its scale is then zero.
+    #pragma unroll
+    for (ushort r = 0; r < RowFragments; ++r) {
+        const float other_max = handed_max[row_group][r][simd_lane];
+        const float row_max = max(running_max[r], other_max);
+        const float own_scale = exp2(running_max[r] - row_max);
+        const float other_scale = exp2(other_max - row_max);
+        float row_sum = running_sum[r] * own_scale +
+            handed_sum[row_group][r][simd_lane] * other_scale;
+        row_sum += simd_shuffle_xor(row_sum, 1);
+        row_sum += simd_shuffle_xor(row_sum, 8);
+        device bfloat *lane_output =
+            output + d_plane + ulong(first_row + r * 8) * D + fn;
+        #pragma unroll
+        for (ushort c = 0; c < OutputFragments; ++c) {
+            const float2 combined = accumulated[r][c] * own_scale +
+                handed_output[row_group][r][c][simd_lane] * other_scale;
+            *reinterpret_cast<device bfloat2 *>(lane_output + c * 8) =
+                bfloat2(combined / row_sum);
+        }
+    }
 }
 
 // Gather padded attention output back to (tokens, 1152) rows.

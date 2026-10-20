@@ -119,11 +119,12 @@ struct VisionGemmShape final {
   }
 };
 
-// The vision_attention dispatch: queries and keys are (heads, paddedTokens,
+// The vision attention dispatch: queries and keys are (heads, paddedTokens,
 // qkDimension), values and output (heads, paddedTokens, headDimension) bf16;
 // keys and values past tokens are zero. One threadgroup per queryTile queries
 // of each head.
 struct VisionAttentionShape final {
+  const char *pipeline = nullptr;
   uint32_t tokens = 0;
   uint32_t paddedTokens = 0;
   uint32_t heads = 0;
@@ -137,9 +138,10 @@ struct VisionAttentionShape final {
   }
 };
 
-// The family of kernels the vision GEMMs run: MPP cooperative-tensor tiles, or
-// the simdgroup_float8x8 register tiles of GPUs without bfloat arithmetic.
-// Both share tile sizes, grids and bindings; only pipeline names differ.
+// The family of kernels the vision GEMMs and attention run: MPP
+// cooperative-tensor tiles, or the simdgroup_float8x8 register tiles of GPUs
+// without bfloat arithmetic. Both share tile sizes, grids and bindings; only
+// pipeline names differ.
 enum class VisionGemmTile : uint8_t {
   Mpp,
   Register,
@@ -184,14 +186,15 @@ public:
   // Embedding buffers are written in whole merger tiles: the caller allocates
   // this many rows of layout.outputHiddenSize bf16 values per image.
   [[nodiscard]] static uint32_t embeddingRows(ImageGrid grid) noexcept;
-  // The GEMM tile family a GPU of appleGpuFamily runs: register tiles on
-  // Apple7/8, which have no bfloat arithmetic, MPP tiles on Apple9 and later.
+  // The GEMM and attention tile family a GPU of appleGpuFamily runs: register
+  // tiles on Apple7/8, which have no bfloat arithmetic, MPP tiles on Apple9
+  // and later.
   [[nodiscard]] static constexpr VisionGemmTile
   gemmTile(uint32_t appleGpuFamily) noexcept {
     return appleGpuFamily < 9 ? VisionGemmTile::Register : VisionGemmTile::Mpp;
   }
-  // The kernel dispatch shapes of one image with GEMMs of the given tile
-  // family, so tools can time the kernels alone. Throws
+  // The kernel dispatch shapes of one image with GEMMs and attention of the
+  // given tile family, so tools can time the kernels alone. Throws
   // std::invalid_argument for an unsupported layout or an invalid grid.
   [[nodiscard]] static VisionKernelShapes kernelShapes(const VisionLayout &layout,
                                                        ImageGrid grid,
@@ -255,7 +258,8 @@ private:
 
   const VisionWeights &model_;
   uint32_t maximumPatches_ = 0;
-  // The GEMM tile family of the backend's GPU, fixed at construction.
+  // The GEMM and attention tile family of the backend's GPU, fixed at
+  // construction.
   VisionGemmTile gemmTile_ = VisionGemmTile::Mpp;
   metal::MetalBuffer arena_;
   // Whether an encode() graph already carries the arena's zero fill.

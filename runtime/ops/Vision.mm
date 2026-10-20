@@ -44,6 +44,8 @@ constexpr GemmPipelines kRegisterGemms{
     "vision_gemm_sgf_m64n128", "vision_gemm_sgf_m64n128_residual",
     "vision_gemm_sgf_m64n128_gelu_tanh", "vision_gemm_sgf_m32n256",
     "vision_gemm_sgf_m32n256_gelu_erf"};
+constexpr const char *kMppAttention = "vision_attention";
+constexpr const char *kRegisterAttention = "vision_attention_sgf";
 
 uint32_t roundUp(uint32_t value, uint32_t multiple) noexcept {
   return (value + multiple - 1) / multiple * multiple;
@@ -131,8 +133,8 @@ VisionKernelShapes Vision::kernelShapes(const VisionLayout &layout,
   const uint32_t tokens = grid.patches();
   const uint32_t merged = grid.mergedTokens();
   const uint32_t hidden = layout.hiddenSize;
-  const GemmPipelines &pipelines =
-      tile == VisionGemmTile::Register ? kRegisterGemms : kMppGemms;
+  const bool isRegister = tile == VisionGemmTile::Register;
+  const GemmPipelines &pipelines = isRegister ? kRegisterGemms : kMppGemms;
   auto blockGemm = [&](const char *pipeline, uint32_t outputSize,
                        uint32_t inputSize) {
     return VisionGemmShape{pipeline, outputSize,   inputSize,
@@ -155,7 +157,8 @@ VisionKernelShapes Vision::kernelShapes(const VisionLayout &layout,
           mergerGemm(pipelines.mergerGeluErf, layout.mergedHiddenSize),
           mergerGemm(pipelines.merger, layout.outputHiddenSize),
       },
-      {tokens, roundUp(tokens, kKeyTile), layout.heads, kQueryTile,
+      {isRegister ? kRegisterAttention : kMppAttention, tokens,
+       roundUp(tokens, kKeyTile), layout.heads, kQueryTile,
        kQkDimension, layout.headDimension,
        1.0F / std::sqrt(static_cast<float>(layout.headDimension))},
   };
@@ -264,7 +267,7 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
                scratch(Scratch::Queries), scratch(Scratch::Keys),
                scratch(Scratch::Values)},
               qkvParams, {attention.paddedTokens, 1, 1});
-    graph.add("vision_attention",
+    graph.add(attention.pipeline,
               {scratch(Scratch::Queries), scratch(Scratch::Keys),
                scratch(Scratch::Values), scratch(Scratch::Attention)},
               attentionParams, {attention.queryTiles(), attention.heads, 1});
