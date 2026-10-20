@@ -4,7 +4,9 @@
 #include "metal/MetalBackend.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -97,6 +99,67 @@ struct ImageGrid final {
   }
 };
 
+// One vision GEMM dispatch: rows of inputSize bf16 values times the
+// transposed (outputSize, inputSize) weights, tiled tileRows x tileColumns.
+// Tiles read and write whole row tiles, so input, output and residual span
+// paddedRows() rows.
+struct VisionGemmShape final {
+  const char *pipeline = nullptr;
+  uint32_t outputSize = 0;
+  uint32_t inputSize = 0;
+  uint32_t rows = 0;
+  uint32_t tileRows = 0;
+  uint32_t tileColumns = 0;
+
+  [[nodiscard]] uint32_t rowTiles() const noexcept {
+    return (rows + tileRows - 1) / tileRows;
+  }
+  [[nodiscard]] uint32_t paddedRows() const noexcept {
+    return rowTiles() * tileRows;
+  }
+};
+
+// The vision_attention dispatch: queries and keys are (heads, paddedTokens,
+// qkDimension), values and output (heads, paddedTokens, headDimension) bf16;
+// keys and values past tokens are zero. One threadgroup per queryTile queries
+// of each head.
+struct VisionAttentionShape final {
+  uint32_t tokens = 0;
+  uint32_t paddedTokens = 0;
+  uint32_t heads = 0;
+  uint32_t queryTile = 0;
+  uint32_t qkDimension = 0;
+  uint32_t headDimension = 0;
+  float scale = 0.0F;
+
+  [[nodiscard]] uint32_t queryTiles() const noexcept {
+    return (tokens + queryTile - 1) / queryTile;
+  }
+};
+
+// The GEMMs of one image's encode, one per weight matrix (each block runs
+// Qkv, Projection, Up and Down).
+enum class VisionGemm : uint32_t {
+  PatchEmbedding,
+  Qkv,
+  Projection,
+  Up,
+  Down,
+  MergerUp,
+  MergerDown,
+  Count,
+};
+
+// The GEMM and attention dispatch shapes encode() issues for one image.
+struct VisionKernelShapes final {
+  std::array<VisionGemmShape, static_cast<size_t>(VisionGemm::Count)> gemms;
+  VisionAttentionShape attention;
+
+  [[nodiscard]] const VisionGemmShape &gemm(VisionGemm which) const noexcept {
+    return gemms[static_cast<size_t>(which)];
+  }
+};
+
 // GPU vision encoder with one reusable scratch arena sized for maximumPatches;
 // callers size it with imagePatchCapacity() for the largest image it encodes.
 // encode() appends one image's dispatches, from resized uint8 RGB pixels to
@@ -113,6 +176,11 @@ public:
   // Embedding buffers are written in whole merger tiles: the caller allocates
   // this many rows of layout.outputHiddenSize bf16 values per image.
   [[nodiscard]] static uint32_t embeddingRows(ImageGrid grid) noexcept;
+  // The kernel dispatch shapes of one image, so tools can time the kernels
+  // alone. Throws std::invalid_argument for an unsupported layout or an
+  // invalid grid.
+  [[nodiscard]] static VisionKernelShapes kernelShapes(const VisionLayout &layout,
+                                                       ImageGrid grid);
 
   Vision(metal::MetalBackend &backend, const VisionWeights &model,
          uint32_t maximumPatches);
@@ -160,13 +228,11 @@ private:
   [[nodiscard]] const metal::MetalBuffer &scratch(Scratch tensor) const noexcept {
     return scratch_[static_cast<uint32_t>(tensor)];
   }
-  void addGemm(metal::CommandGraph &graph, const char *pipeline,
+  void addGemm(metal::CommandGraph &graph, const VisionGemmShape &shape,
                const metal::MetalBuffer &input,
                const VisionAffine &weights,
                const metal::MetalBuffer &output,
-               const metal::MetalBuffer &residual, uint32_t outputSize,
-               uint32_t inputSize, uint32_t rows, uint32_t tileRows,
-               uint32_t tileColumns) const;
+               const metal::MetalBuffer &residual) const;
   void addNorm(metal::CommandGraph &graph, const metal::MetalBuffer &input,
                const VisionNorm &weights,
                const metal::MetalBuffer &output, uint32_t rows) const;

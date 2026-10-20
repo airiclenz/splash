@@ -105,6 +105,43 @@ uint32_t Vision::embeddingRows(ImageGrid grid) noexcept {
   return roundUp(grid.mergedTokens(), kMergerRowTile);
 }
 
+VisionKernelShapes Vision::kernelShapes(const VisionLayout &layout,
+                                        ImageGrid grid) {
+  requireLayout(layout);
+  if (!grid.valid())
+    throw std::invalid_argument("vision kernel shapes need a valid image grid");
+  const uint32_t tokens = grid.patches();
+  const uint32_t merged = grid.mergedTokens();
+  const uint32_t hidden = layout.hiddenSize;
+  auto blockGemm = [&](const char *pipeline, uint32_t outputSize,
+                       uint32_t inputSize) {
+    return VisionGemmShape{pipeline, outputSize,   inputSize,
+                           tokens,   kGemmRowTile, kGemmColumnTile};
+  };
+  auto mergerGemm = [&](const char *pipeline, uint32_t outputSize) {
+    return VisionGemmShape{pipeline, outputSize,     layout.mergedHiddenSize,
+                           merged,   kMergerRowTile, kMergerColumnTile};
+  };
+  // In VisionGemm order.
+  return {
+      {
+          blockGemm("vision_gemm_m64n128_residual", hidden,
+                    layout.patchDimension),
+          blockGemm("vision_gemm_m64n128", 3 * hidden, hidden),
+          blockGemm("vision_gemm_m64n128_residual", hidden, hidden),
+          blockGemm("vision_gemm_m64n128_gelu_tanh",
+                    layout.paddedIntermediateSize, hidden),
+          blockGemm("vision_gemm_m64n128_residual", hidden,
+                    layout.paddedIntermediateSize),
+          mergerGemm("vision_gemm_m32n256_gelu_erf", layout.mergedHiddenSize),
+          mergerGemm("vision_gemm_m32n256", layout.outputHiddenSize),
+      },
+      {tokens, roundUp(tokens, kKeyTile), layout.heads, kQueryTile,
+       kQkDimension, layout.headDimension,
+       1.0F / std::sqrt(static_cast<float>(layout.headDimension))},
+  };
+}
+
 Vision::Vision(metal::MetalBackend &backend, const VisionWeights &model,
                uint32_t maximumPatches)
     : model_(model), maximumPatches_(maximumPatches) {
@@ -123,14 +160,14 @@ Vision::Vision(metal::MetalBackend &backend, const VisionWeights &model,
     throw std::logic_error("vision scratch arena mismatch");
 }
 
-void Vision::addGemm(CommandGraph &graph, const char *pipeline,
+void Vision::addGemm(CommandGraph &graph, const VisionGemmShape &shape,
                      const MetalBuffer &input, const VisionAffine &weights,
-                     const MetalBuffer &output, const MetalBuffer &residual,
-                     uint32_t outputSize, uint32_t inputSize, uint32_t rows,
-                     uint32_t tileRows, uint32_t tileColumns) const {
-  graph.add(pipeline, {input, weights.weight, weights.bias, output, residual},
-            VisionGemmParams{outputSize, inputSize},
-            {(rows + tileRows - 1) / tileRows, outputSize / tileColumns, 1});
+                     const MetalBuffer &output,
+                     const MetalBuffer &residual) const {
+  graph.add(shape.pipeline,
+            {input, weights.weight, weights.bias, output, residual},
+            VisionGemmParams{shape.outputSize, shape.inputSize},
+            {shape.rowTiles(), shape.outputSize / shape.tileColumns, 1});
 }
 
 void Vision::addNorm(CommandGraph &graph, const MetalBuffer &input,
@@ -175,12 +212,12 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
     isArenaZeroQueued_ = true;
   }
 
-  const uint32_t padded = roundUp(tokens, kKeyTile);
-  const uint32_t merged = grid.mergedTokens();
+  const VisionKernelShapes shapes = kernelShapes(layout, grid);
+  const VisionAttentionShape &attention = shapes.attention;
   const VisionGridParams gridParams{grid.height, grid.width};
-  const VisionQkvParams qkvParams{tokens, padded};
-  const VisionAttentionParams attentionParams{
-      tokens, padded, 1.0F / std::sqrt(static_cast<float>(layout.headDimension))};
+  const VisionQkvParams qkvParams{tokens, attention.paddedTokens};
+  const VisionAttentionParams attentionParams{tokens, attention.paddedTokens,
+                                              attention.scale};
   const MetalBuffer &hidden = scratch(Scratch::Hidden);
   const MetalBuffer &normalized = scratch(Scratch::Normalized);
   const MetalBuffer &qkv = scratch(Scratch::Qkv);
@@ -192,55 +229,44 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
             {model_.positionTable, scratch(Scratch::Positions),
              scratch(Scratch::RopeCos), scratch(Scratch::RopeSin)},
             gridParams, {tokens, 1, 1});
-  addGemm(graph, "vision_gemm_m64n128_residual", scratch(Scratch::Patches),
-          model_.patchEmbedding, hidden, scratch(Scratch::Positions),
-          layout.hiddenSize, layout.patchDimension, tokens, kGemmRowTile,
-          kGemmColumnTile);
+  addGemm(graph, shapes.gemm(VisionGemm::PatchEmbedding),
+          scratch(Scratch::Patches), model_.patchEmbedding, hidden,
+          scratch(Scratch::Positions));
 
   for (const VisionBlock &block : model_.blocks) {
     addNorm(graph, hidden, block.norm1, normalized, tokens);
-    addGemm(graph, "vision_gemm_m64n128", normalized, block.qkv, qkv, hidden,
-            3 * layout.hiddenSize, layout.hiddenSize, tokens, kGemmRowTile,
-            kGemmColumnTile);
+    addGemm(graph, shapes.gemm(VisionGemm::Qkv), normalized, block.qkv, qkv,
+            hidden);
     // Padded key tokens are zeroed by the prepare pass so every 128-key tile
     // is finite under the softmax mask.
     graph.add("vision_qkv_prepare",
               {qkv, scratch(Scratch::RopeCos), scratch(Scratch::RopeSin),
                scratch(Scratch::Queries), scratch(Scratch::Keys),
                scratch(Scratch::Values)},
-              qkvParams, {padded, 1, 1});
+              qkvParams, {attention.paddedTokens, 1, 1});
     graph.add("vision_attention",
               {scratch(Scratch::Queries), scratch(Scratch::Keys),
                scratch(Scratch::Values), scratch(Scratch::Attention)},
-              attentionParams,
-              {(tokens + kQueryTile - 1) / kQueryTile, layout.heads, 1});
+              attentionParams, {attention.queryTiles(), attention.heads, 1});
     graph.add("vision_attention_pack", {scratch(Scratch::Attention), context},
               qkvParams, {tokens, 1, 1});
-    addGemm(graph, "vision_gemm_m64n128_residual", context, block.projection, hidden,
-            hidden, layout.hiddenSize, layout.hiddenSize, tokens, kGemmRowTile,
-            kGemmColumnTile);
+    addGemm(graph, shapes.gemm(VisionGemm::Projection), context,
+            block.projection, hidden, hidden);
     addNorm(graph, hidden, block.norm2, normalized, tokens);
-    addGemm(graph, "vision_gemm_m64n128_gelu_tanh", normalized, block.upProjection,
-            scratch(Scratch::Intermediate), hidden,
-            layout.paddedIntermediateSize, layout.hiddenSize, tokens,
-            kGemmRowTile, kGemmColumnTile);
-    addGemm(graph, "vision_gemm_m64n128_residual", scratch(Scratch::Intermediate),
-            block.downProjection, hidden, hidden, layout.hiddenSize,
-            layout.paddedIntermediateSize, tokens, kGemmRowTile,
-            kGemmColumnTile);
+    addGemm(graph, shapes.gemm(VisionGemm::Up), normalized, block.upProjection,
+            scratch(Scratch::Intermediate), hidden);
+    addGemm(graph, shapes.gemm(VisionGemm::Down),
+            scratch(Scratch::Intermediate), block.downProjection, hidden,
+            hidden);
   }
 
   // The merger reads the normalized rows as (merged, 4608): four consecutive
   // block-major patches form one merged token.
   addNorm(graph, hidden, model_.mergerNorm, normalized, tokens);
-  addGemm(graph, "vision_gemm_m32n256_gelu_erf", normalized,
-          model_.mergerUpProjection,
-          qkv, hidden, layout.mergedHiddenSize, layout.mergedHiddenSize, merged,
-          kMergerRowTile, kMergerColumnTile);
-  addGemm(graph, "vision_gemm_m32n256", qkv, model_.mergerDownProjection,
-          embeddings,
-          hidden, layout.outputHiddenSize, layout.mergedHiddenSize, merged,
-          kMergerRowTile, kMergerColumnTile);
+  addGemm(graph, shapes.gemm(VisionGemm::MergerUp), normalized,
+          model_.mergerUpProjection, qkv, hidden);
+  addGemm(graph, shapes.gemm(VisionGemm::MergerDown), qkv,
+          model_.mergerDownProjection, embeddings, hidden);
 }
 
 void Vision::inject(CommandGraph &graph, const MetalBuffer &embeddings,
