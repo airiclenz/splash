@@ -177,7 +177,8 @@ public:
   // 3 * 4 + 2 + 2 + 4 = 20. Other families have no simdgroup candidates
   // and at most one additional baseline (17). M24 replaces Paired128 with
   // N128/four-simdgroup candidates and adds up to four matrix K splits,
-  // with no one-lane tiles (at most 17).
+  // with no one-lane tiles (at most 17). Apple7/8 decode offers no MPP tile:
+  // only the fp32 register-matrix tile at its 4 K splits.
   static constexpr std::size_t kMaximumCandidates = 20;
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;

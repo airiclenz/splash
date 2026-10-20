@@ -512,6 +512,12 @@ std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
       if (existing.configuration() == config) return;
     result.push_back(LinearPlan(w, config));
   };
+  // Apple7/8 decode offers no MPP tile: the fp32 register-matrix tile
+  // measured 44-68% faster than every one of them on an M1 Max (see
+  // baseline), and on an M2 Pro the four- and eight-simdgroup M24 MPP tiles
+  // round apart (one element in 12288 a bf16 ulp off), so they never agree
+  // bitwise there.
+  const bool offersMppDecode = appleGpuFamily_ >= 9;
   for (const auto tile : {LinearTile::N128, LinearTile::N256, LinearTile::Paired128}) {
     const uint32_t columns = tile == LinearTile::N256 ? 256 : 128;
     if (w.matrix.outputSize % columns ||
@@ -526,7 +532,7 @@ std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
         append({tile, 0});
       if (supportsFourSimdgroups(w, tile))
         append({tile, 0, LinearSimdgroups::Four});
-    } else {
+    } else if (offersMppDecode) {
       const uint32_t tiles = w.matrix.outputSize / columns;
       // Sample two, three and four groups per core plus the full grid.
       // Always retain the measured baseline above, including its balanced
@@ -549,7 +555,7 @@ std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
   }
   // One-lane tiles: the split forms at their full grid and the paired N256
   // tile at one resident wave and at its full grid.
-  if (w.phase == LinearPhase::Decode && w.rows == SPLASH_TARGET_VERIFY_ROWS) {
+  if (offersMppDecode && w.phase == LinearPhase::Decode && w.rows == SPLASH_TARGET_VERIFY_ROWS) {
     const uint32_t n = w.matrix.outputSize;
     if (w.matrix.inputSize % kSplitInputBlock == 0) {
       append({LinearTile::Split32, n / 32, LinearSimdgroups::Four});

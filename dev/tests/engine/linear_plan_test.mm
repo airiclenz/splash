@@ -15,6 +15,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -47,6 +48,34 @@ uint16_t bf16(float value) {
 
 float fp32(uint16_t value) {
   return std::bit_cast<float>(uint32_t{value} << 16);
+}
+
+// ============================================================================
+// bf16 ulp distance: sign-magnitude bits mapped onto one ordered integer line.
+uint32_t bf16UlpDistance(uint16_t left, uint16_t right) {
+  const auto ordered = [](uint16_t value) {
+    return value & 0x8000 ? 0x8000 - int32_t(value & 0x7fff) : 0x8000 + int32_t(value);
+  };
+  return uint32_t(std::abs(ordered(left) - ordered(right)));
+}
+
+// ============================================================================
+// Describes how two bf16 outputs differ: differing element count, largest ulp
+// distance and the first differing index with both values.
+std::string describeMismatch(std::span<const uint16_t> expected,
+                             std::span<const uint16_t> actual) {
+  uint64_t differing = 0, first = expected.size();
+  uint32_t maxUlp = 0;
+  for (uint64_t i = 0; i < expected.size(); ++i) {
+    if (expected[i] == actual[i]) continue;
+    if (!differing++) first = i;
+    maxUlp = std::max(maxUlp, bf16UlpDistance(expected[i], actual[i]));
+  }
+  if (!differing) return "no differing elements";
+  return "differing=" + std::to_string(differing) + "/" + std::to_string(expected.size()) +
+      " max_ulp=" + std::to_string(maxUlp) + " first_index=" + std::to_string(first) +
+      " expected=" + std::to_string(fp32(expected[first])) +
+      " actual=" + std::to_string(fp32(actual[first]));
 }
 
 // Expected policy across GPU families, core counts and workload tile counts.
@@ -469,9 +498,11 @@ void apple7Plans() {
           require(apple9Config.tile != LinearTile::Simdgroup ||
                       config.splits == apple9Config.splits,
                   "Apple7 K partitions differ from Apple9");
-          for (const auto &candidate : linear.candidates(workload))
+          for (const auto &candidate : linear.candidates(workload)) {
             require(candidate.configuration().tile != LinearTile::Simdgroup,
                     "Apple7 candidate uses bfloat simdgroup operands");
+            require(candidate.registerMatrix(), "Apple7 decode candidate uses an MPP tile");
+          }
         }
     // Every prefill projection runs the register-matrix tile.
     for (const LinearMatrix matrix : {LinearMatrix{5120, 17408}, LinearMatrix{17408, 5120},
@@ -1009,12 +1040,27 @@ void bufferContracts(metal::MetalBackend &backend, Q4Linear &linear,
   }
 }
 
+// ============================================================================
+// The sequential MPP decode tile at its full grid: N256 for gate/up, which has
+// no N128 kernel, and N128 otherwise.
+LinearConfig sequentialReference(LinearWorkload workload) {
+  const uint32_t columns = workload.epilogue == LinearEpilogue::GateUp ? 256 : 128;
+  return {columns == 256 ? LinearTile::N256 : LinearTile::N128,
+          workload.matrix.outputSize / columns};
+}
+
 void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
                       const Q4Projection &p, const Q4Projection &gate,
                       LinearWorkload workload, bool inPlaceResidual = false) {
   require(!inPlaceResidual || workload.epilogue == LinearEpilogue::Residual,
           "in-place residual fixture requires residual epilogue");
-  const auto candidates = linear.candidates(workload);
+  auto candidates = linear.candidates(workload);
+  // Apple7/8 decode offers only reassociating register-matrix tiles. The
+  // pinned sequential MPP tile (N256 for gate/up) then runs beside them as
+  // the reference their derived bound is held to.
+  if (std::none_of(candidates.begin(), candidates.end(),
+                   [](const LinearPlan &plan) { return !plan.reassociates(); }))
+    candidates.push_back(Q4Linear::plan(workload, sequentialReference(workload)));
   const uint32_t storageRows = candidates[0].storageRows();
   auto input = allocate(backend, uint64_t{storageRows} * p.inputSize * 2);
   auto *inputValues = static_cast<uint16_t *>(input.contents());
@@ -1023,6 +1069,7 @@ void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
   // Sequential candidates share their output bytes; split-K candidates are
   // held to the derived bound against them once every candidate has run.
   std::vector<uint16_t> baseline;
+  std::string_view baselinePipeline;
   struct SplitOutput final {
     std::vector<uint16_t> output, residual;
     std::string_view pipeline;
@@ -1163,10 +1210,15 @@ void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
     if (plan.reassociates()) {
       splitOutputs.push_back({{output, output + elements}, immutableResidual, plan.pipeline(), plan.registerMatrix()});
     } else {
-      if (baseline.empty()) baseline.assign(output, output + elements);
+      if (baseline.empty()) {
+        baseline.assign(output, output + elements);
+        baselinePipeline = plan.pipeline();
+      }
       if (std::memcmp(baseline.data(), output, elements * 2) != 0)
         std::cerr << "matrix=" << p.outputSize << 'x' << p.inputSize << " rows=" << workload.rows
-                  << " epilogue=" << uint32_t(workload.epilogue) << " pipeline=" << plan.pipeline() << '\n';
+                  << " epilogue=" << uint32_t(workload.epilogue) << " pipeline=" << plan.pipeline()
+                  << " baseline_pipeline=" << baselinePipeline << ' '
+                  << describeMismatch(baseline, {output, elements}) << '\n';
       require(std::memcmp(baseline.data(), output, elements * 2) == 0,
               "Linear candidate differs from baseline output bytes");
     }
