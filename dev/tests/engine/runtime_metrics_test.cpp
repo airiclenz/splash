@@ -1,9 +1,12 @@
 #include "engine/Status.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <random>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -64,6 +67,70 @@ void testLatencyWindowAndThroughput() {
           "current prefill/decode batch samples are incomplete");
 }
 
+constexpr uint32_t kSelectionWindow = 4096;
+
+// The sort-based nearest-rank formula the selection must reproduce exactly.
+double sortedPercentile(std::vector<double> samples, double fraction) {
+  if (samples.empty())
+    return 0.0;
+  std::sort(samples.begin(), samples.end());
+  const size_t index =
+      static_cast<size_t>(std::ceil(fraction * samples.size())) - 1;
+  return samples[std::min(index, samples.size() - 1)];
+}
+
+// Records one TTFT and one ITL sample with the given latencies.
+void recordLatencies(RuntimeMetrics &metrics, double ttft, double itl) {
+  metrics.tokens(0.0, std::nullopt, 1, ttft);
+  metrics.tokens(0.0, 0.0, 1, itl);
+}
+
+// Quarter-millisecond steps over a narrow range, so windows carry ties.
+double randomLatency(std::mt19937 &generator) {
+  std::uniform_int_distribution<int> quarters(0, 400);
+  return double(quarters(generator)) / 4.0;
+}
+
+void testSelectionMatchesSortedPercentiles() {
+  std::mt19937 generator(20261019);
+  for (const size_t size : {size_t(1), size_t(2), size_t(3),
+                            size_t(kSelectionWindow)}) {
+    RuntimeMetrics metrics(kSelectionWindow);
+    std::vector<double> ttft;
+    std::vector<double> itl;
+    for (size_t sample = 0; sample < size; ++sample) {
+      ttft.push_back(randomLatency(generator));
+      itl.push_back(randomLatency(generator));
+      recordLatencies(metrics, ttft.back(), itl.back());
+    }
+
+    const RuntimeMetricsSnapshot snapshot = metrics.snapshot();
+
+    require(snapshot.ttftP50Milliseconds == sortedPercentile(ttft, 0.50) &&
+                snapshot.ttftP95Milliseconds == sortedPercentile(ttft, 0.95) &&
+                snapshot.itlP50Milliseconds == sortedPercentile(itl, 0.50) &&
+                snapshot.itlP95Milliseconds == sortedPercentile(itl, 0.95),
+            "selected percentiles differ from the sorted reference");
+  }
+}
+
+void testPollsNeverGrowScratch() {
+  std::mt19937 generator(7);
+  RuntimeMetrics metrics(kSelectionWindow);
+  const size_t reserved = metrics.percentileScratchCapacity();
+  require(reserved >= kSelectionWindow,
+          "percentile scratch is not reserved to the window");
+
+  for (size_t sample = 0; sample < kSelectionWindow + 64; ++sample) {
+    recordLatencies(metrics, randomLatency(generator),
+                    randomLatency(generator));
+    if (sample % 512 == 0 || sample >= kSelectionWindow - 1)
+      static_cast<void>(metrics.snapshot());
+    require(metrics.percentileScratchCapacity() == reserved,
+            "a percentile poll reallocated the scratch");
+  }
+}
+
 void testValidation() {
   bool threw = false;
   try {
@@ -89,6 +156,8 @@ void testValidation() {
 int main() {
   try {
     testLatencyWindowAndThroughput();
+    testSelectionMatchesSortedPercentiles();
+    testPollsNeverGrowScratch();
     testValidation();
     std::cout << "runtime metrics tests passed\n";
     return EXIT_SUCCESS;
