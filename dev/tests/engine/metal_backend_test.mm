@@ -121,9 +121,13 @@ std::shared_future<void> releaseMemoryQuery;
 std::atomic<unsigned> completionMemoryQueries{0};
 std::atomic<unsigned> memoryQueries{0};
 
+// The first binding index submit's per-dispatch index mask cannot hold.
+constexpr uint32_t kFirstUnmaskedBindingIndex = 64;
+
 // A command whose dispatch binds one index twice fails submit before commit,
 // whether the clash is two buffers or a buffer and a byte payload, even when
-// an earlier dispatch of the same command is valid.
+// an earlier dispatch of the same command is valid. So does a buffer or byte
+// binding at an index past the index mask.
 void duplicateBindingFailsSubmit(MetalBackend &backend, const MetalBuffer &buffer,
                                  const ComputeDispatch &valid) {
     require(!valid.buffers.empty() && !valid.bytes.empty(),
@@ -144,8 +148,20 @@ void duplicateBindingFailsSubmit(MetalBackend &backend, const MetalBuffer &buffe
             "a dispatch binding one index twice was submitted");
     }
 
+    ComputeDispatch bufferOutOfRange = valid;
+    bufferOutOfRange.buffers.front().index = kFirstUnmaskedBindingIndex;
+    ComputeDispatch bytesOutOfRange = valid;
+    bytesOutOfRange.bytes.front().index = kFirstUnmaskedBindingIndex;
+    for (const ComputeDispatch &outOfRange :
+         {bufferOutOfRange, bytesOutOfRange}) {
+        const std::vector<ComputeDispatch> command{valid, outOfRange};
+        requireBackendError(
+            [&] { (void)backend.submitCommandAsync(command); },
+            "a dispatch binding an index past the mask was submitted");
+    }
+
     require(backend.healthy() && backend.submissionCount() == submissions,
-            "a rejected duplicate binding was counted or poisoned the backend");
+            "a rejected binding was counted or poisoned the backend");
 }
 
 void observeCompletion(id command, SEL selector, MTLCommandBufferHandler handler) {

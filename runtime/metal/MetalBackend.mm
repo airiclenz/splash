@@ -19,7 +19,6 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
-#include <unordered_set>
 #include <utility>
 
 #include <unistd.h>
@@ -102,6 +101,26 @@ MTLSize metalSize(const DispatchSize &size, std::string_view field) {
 
 bool multiplyOverflows(uint64_t left, uint64_t right) {
     return right && left > std::numeric_limits<uint64_t>::max() / right;
+}
+
+// One bit per binding index lets submit validate a dispatch without
+// allocating; Metal's argument table has fewer slots than this.
+constexpr uint32_t kMaxBindingIndices = 64;
+
+// Marks index as bound in a dispatch's mask, rejecting an index the mask
+// cannot hold and one that the dispatch already bound.
+void claimBindingIndex(uint64_t &boundIndices, uint32_t index) {
+    if (index >= kMaxBindingIndices) {
+        std::ostringstream message;
+        message << "compute binding index " << index << " exceeds "
+                << (kMaxBindingIndices - 1);
+        throw MetalBackendError(message.str());
+    }
+    const uint64_t bit = uint64_t{1} << index;
+    if (boundIndices & bit) {
+        throw MetalBackendError("duplicate compute binding index");
+    }
+    boundIndices |= bit;
 }
 
 constexpr uint64_t kPlacementSparsePageBytes = MetalBackend::kPlacementSparsePageBytes;
@@ -450,6 +469,11 @@ struct MetalBackend::Impl {
     std::shared_ptr<BackendAsyncState> asyncState =
         std::make_shared<BackendAsyncState>();
     mutable std::mutex commandMutex;
+    // Guarded by commandMutex. Submit's scratch for deduplicating a command's
+    // buffer allocations; its capacity is kept so steady-state submits do not
+    // allocate. Entries point into the submitted dispatches and are dropped
+    // before submit returns.
+    std::vector<const std::shared_ptr<MetalAllocation> *> retainedScratch;
     uint64_t nextSparseEventValue = 0;
     uint64_t pendingSparseEventValue = 0;
 
@@ -481,6 +505,37 @@ struct MetalBackend::Impl {
                     (void)retainedEvent;
                 }];
         }
+    }
+
+    // Requires commandMutex. Appends each distinct allocation the command's
+    // buffer bindings reference to retained, once, so the ticket keeps them
+    // alive until release. Sorting pointers in the reused scratch costs
+    // O(B log B) for B bindings and allocates only when B outgrows every
+    // earlier command.
+    void retainCommandAllocationsLocked(
+        std::span<const ComputeDispatch> dispatches,
+        std::vector<std::shared_ptr<MetalAllocation>> &retained) {
+        retainedScratch.clear();
+        for (const ComputeDispatch &dispatch : dispatches) {
+            for (const BufferBinding &binding : dispatch.buffers) {
+                retainedScratch.push_back(&binding.buffer.impl_->allocation);
+            }
+        }
+        const auto byAllocation = [](const auto *left, const auto *right) {
+            return left->get() < right->get();
+        };
+        const auto sameAllocation = [](const auto *left, const auto *right) {
+            return left->get() == right->get();
+        };
+        std::sort(retainedScratch.begin(), retainedScratch.end(), byAllocation);
+        const auto distinctEnd = std::unique(
+            retainedScratch.begin(), retainedScratch.end(), sameAllocation);
+        retained.reserve(static_cast<size_t>(
+            distinctEnd - retainedScratch.begin()));
+        for (auto entry = retainedScratch.begin(); entry != distinctEnd; ++entry) {
+            retained.push_back(**entry);
+        }
+        retainedScratch.clear();
     }
 
     // Requires commandMutex. Releases the heap of a completed unmap.
@@ -1334,7 +1389,7 @@ CommandTicket MetalBackend::submitCommandAsync(
             dispatch.threadsPerThreadgroup.y *
             dispatch.threadsPerThreadgroup.z;
 
-        std::unordered_set<uint32_t> indices;
+        uint64_t boundIndices = 0;
         for (const BufferBinding &binding : dispatch.buffers) {
             if (!binding.buffer.impl_ || !binding.buffer.impl_->allocation) {
                 std::ostringstream message;
@@ -1348,18 +1403,14 @@ CommandTicket MetalBackend::submitCommandAsync(
                 throw MetalBackendError(
                     "compute dispatch buffer belongs to another backend");
             }
-            if (!indices.insert(binding.index).second) {
-                throw MetalBackendError("duplicate compute binding index");
-            }
+            claimBindingIndex(boundIndices, binding.index);
         }
         for (const BytesBinding &binding : dispatch.bytes) {
             if (!binding.data || !binding.sizeBytes) {
                 throw MetalBackendError("compute byte binding is empty");
             }
             checkedNSUInteger(binding.sizeBytes, "byte binding size");
-            if (!indices.insert(binding.index).second) {
-                throw MetalBackendError("duplicate compute binding index");
-            }
+            claimBindingIndex(boundIndices, binding.index);
         }
         prepared.push_back(item);
     }
@@ -1379,15 +1430,8 @@ CommandTicket MetalBackend::submitCommandAsync(
     auto ticketState = std::make_shared<CommandTicket::State>();
     ticketState->backend = impl_->asyncState;
     ticketState->completion = std::move(completion);
-    std::unordered_set<const MetalAllocation *> retained;
-    for (const ComputeDispatch &dispatch : dispatches) {
-        for (const BufferBinding &binding : dispatch.buffers) {
-            const auto &allocation = binding.buffer.impl_->allocation;
-            if (retained.insert(allocation.get()).second) {
-                ticketState->retainedAllocations.push_back(allocation);
-            }
-        }
-    }
+    impl_->retainCommandAllocationsLocked(
+        dispatches, ticketState->retainedAllocations);
     ticketState->sequence = impl_->asyncState->beginSubmission(dispatches.size());
 
     auto failBeforeCommit = [&](std::string message) {
