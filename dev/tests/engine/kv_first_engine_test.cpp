@@ -444,10 +444,11 @@ public:
     maskRequests.emplace_back(
         requestId, std::vector<uint32_t>(simulation.begin(), simulation.end()));
   }
-  void completed(uint64_t id, EngineFinishReason, uint32_t prompt,
+  void completed(uint64_t id, EngineFinishReason reason, uint32_t prompt,
                  uint32_t completion, std::span<const float>) override {
     ++completedCount;
     usage[id] = {prompt, completion};
+    reasons[id] = reason;
   }
   void failed(uint64_t, std::string code, std::string message,
               bool retryable) override {
@@ -464,6 +465,7 @@ public:
   std::vector<uint64_t> startIds;
   std::unordered_map<uint64_t, std::vector<uint32_t>> outputs;
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> usage;
+  std::unordered_map<uint64_t, EngineFinishReason> reasons;
   std::vector<std::string> failures;
   std::vector<std::pair<std::string, bool>> failureDetails;
   uint32_t emitted = 0;
@@ -5160,6 +5162,107 @@ void testDecodePublishesRollingCheckpoints() {
           "a capped decode step ended the reply early");
 }
 
+// A client stop between batches finishes the lane as a normal stop: counted
+// completed, not cancelled, with its rolling checkpoint retired.
+void testStopBetweenBatchesFinishesAsCompleted() {
+  RollingDecode fixture;
+  fixture.submit(530, 2 * defaultCheckpointTokens);
+  fixture.decodeUntil(530, RollingDecode::promptTokens +
+                               defaultCheckpointTokens + 40);
+  while (fixture.engine.commandInFlight())
+    static_cast<void>(fixture.engine.tick(fixture.now++));
+  require(fixture.engine.snapshot().checkpointPublications >= 1,
+          "stop fixture did not publish a decode checkpoint");
+  const uint64_t retiredBefore =
+      fixture.resources.snapshot().stateCache.checkpointRetirements;
+
+  fixture.engine.stop(530);
+
+  const auto stopped = fixture.engine.snapshot();
+  require(fixture.events.reasons.at(530) == EngineFinishReason::Stop &&
+              stopped.completed == 1 && stopped.cancelled == 0 &&
+              fixture.resources.snapshot().stateCache.checkpointRetirements >
+                  retiredBefore,
+          "a stop between batches did not finish as a completed request");
+  fixture.runToIdle();
+  require(fixture.resources.snapshot().activeRequests == 0 &&
+              fixture.executor.requests.empty(),
+          "a stopped request kept its lane");
+}
+
+// A stop of a lane inside the in-flight batch waits for the batch to drain,
+// then finishes as Stop without emitting that batch's output.
+void testStopInFlightFinishesAfterTheBatch() {
+  RollingDecode fixture;
+  fixture.submit(531, 1000);
+  fixture.decodeUntil(531, RollingDecode::promptTokens + 20);
+  if (!fixture.engine.commandInFlight())
+    static_cast<void>(fixture.engine.tick(fixture.now++));
+  require(fixture.engine.commandInFlight(),
+          "stop fixture did not launch a decode command");
+  const size_t emittedBefore = fixture.events.outputs.at(531).size();
+
+  fixture.engine.stop(531);
+  require(fixture.engine.commandInFlight() &&
+              fixture.events.completedCount == 0,
+          "an in-flight stop finished before its batch drained");
+  fixture.runToIdle();
+
+  const auto stopped = fixture.engine.snapshot();
+  require(fixture.events.reasons.at(531) == EngineFinishReason::Stop &&
+              stopped.completed == 1 && stopped.cancelled == 0 &&
+              fixture.events.outputs.at(531).size() == emittedBefore,
+          "an in-flight stop did not finish as Stop after its batch");
+}
+
+// A request stopped before it ever started finishes as Cancelled; an unknown
+// or already finished id is ignored.
+void testStopBeforeStartFinishesAsCancelled() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  engine.submit(request(532, std::vector<uint32_t>(64, 5)));
+
+  engine.stop(532);
+  runUntilIdle(engine);
+  engine.stop(532);
+  engine.stop(999);
+
+  const auto stopped = engine.snapshot();
+  require(events.startIds.empty() && events.completedCount == 1 &&
+              events.reasons.at(532) == EngineFinishReason::Cancelled &&
+              stopped.cancelled == 1 && stopped.completed == 0,
+          "an unstarted stop did not finish as a single cancellation");
+}
+
+// A lane suspended for resources has no cell but did start: a stop finishes
+// it as Stop, counted completed, and releases its suspension.
+void testStopOfASuspendedLaneFinishesAsCompleted() {
+  SoleDecodeLane fixture(100.0);
+  const double denied = fixture.decodeUntilBackedOff();
+  static_cast<void>(fixture.engine.tick(denied + 100.0));
+  require(fixture.executor.suspensions == 1 &&
+              !fixture.resident(SoleDecodeLane::laneId) &&
+              fixture.events.emitted > 0,
+          "stop fixture did not suspend a decoding lane");
+
+  fixture.engine.stop(SoleDecodeLane::laneId);
+  fixture.now = denied + 101.0;
+  require(fixture.tickUntil([&] { return fixture.engine.idle(); }),
+          "a stopped suspended lane did not leave the engine");
+
+  const auto stopped = fixture.engine.snapshot();
+  require(fixture.events.reasons.at(SoleDecodeLane::laneId) ==
+                  EngineFinishReason::Stop &&
+              stopped.completed == 1 && stopped.cancelled == 0 &&
+              fixture.events.failedCount == 0 &&
+              fixture.resources.snapshot().activeRequests == 0,
+          "a suspended lane's stop did not finish as a completed request");
+}
+
 void testDecodeSuspensionOnTheBoundaryResumesFromThePreviousCheckpoint() {
   const uint32_t interval = 2048;
   RollingDecode fixture(interval);
@@ -5303,6 +5406,10 @@ int main() {
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testCheckpointIntervalValidationAndDisable();
     testDecodePublishesRollingCheckpoints();
+    testStopBetweenBatchesFinishesAsCompleted();
+    testStopInFlightFinishesAfterTheBatch();
+    testStopBeforeStartFinishesAsCancelled();
+    testStopOfASuspendedLaneFinishesAsCompleted();
     testDecodeSuspensionOnTheBoundaryResumesFromThePreviousCheckpoint();
     testDecodeBoundaryStateIsReusedNotPublishedTwice();
     testUncappedCommitPastTheBoundaryCountsOneFailure();

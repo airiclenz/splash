@@ -14,6 +14,10 @@ constexpr double kResourceRetryBackoffMilliseconds = 100.0;
 // during which a queued request no longer keeps its found state for a peer.
 constexpr double kColdFallbackWaitFraction = 0.5;
 constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
+// Failure codes an in-flight lane carries until its batch drains, then
+// finishes as Cancelled or Stop rather than as a failure.
+constexpr char kCancelledFailureCode[] = "cancelled";
+constexpr char kStoppedFailureCode[] = "stopped";
 
 // ============================================================================
 // True while a resource wait has more than kColdFallbackWaitFraction of its
@@ -127,19 +131,46 @@ void Engine::cancel(uint64_t id) {
   auto found = requests_.find(id);
   if (found == requests_.end() || found->second.finalized)
     return;
-  if (pending_) {
-    for (const BatchItem &item : pending_->plan.items) {
-      if (item.requestId == id) {
-        // An earlier deadline failure of the same in-flight lane stands.
-        if (!found->second.failure) {
-          found->second.failure = Failure{"cancelled", "request cancelled"};
-        }
-        pending_->ticket->abandonMask(id);
-        return;
-      }
-    }
-  }
+  if (endAfterInFlightBatch(found->second,
+                            {kCancelledFailureCode, "request cancelled"}))
+    return;
   finish(found->second, EngineFinishReason::Cancelled, {});
+}
+
+void Engine::stop(uint64_t id) {
+  auto found = requests_.find(id);
+  if (found == requests_.end() || found->second.finalized)
+    return;
+  Request &active = found->second;
+  // Never started: no lane and no output yet, so nothing was generated to
+  // stop on. A resource-suspended lane has no cell but did start.
+  if (!active.stateCell && !active.suspended) {
+    finish(active, EngineFinishReason::Cancelled, {});
+    return;
+  }
+  if (endAfterInFlightBatch(active, {kStoppedFailureCode, "request stopped"}))
+    return;
+  finish(active, EngineFinishReason::Stop, {});
+}
+
+// ============================================================================
+// When the lane rides the in-flight batch, records `failure` for the batch's
+// completion to act on and abandons its mask wait, returning true; an
+// in-flight command cannot be revoked, so the lane ends once it drains.
+bool Engine::endAfterInFlightBatch(Request &active, Failure failure) {
+  if (!pending_)
+    return false;
+  const uint64_t id = active.request.id;
+  for (const BatchItem &item : pending_->plan.items) {
+    if (item.requestId != id)
+      continue;
+    // An earlier deadline failure of the same in-flight lane stands.
+    if (!active.failure)
+      active.failure = std::move(failure);
+    pending_->ticket->abandonMask(id);
+    return true;
+  }
+  return false;
 }
 
 void Engine::failRequest(uint64_t id, std::string code, std::string message) {
@@ -1627,8 +1658,10 @@ void Engine::apply(const BatchPlan &plan,
     if (active.failure) {
       Failure failure = std::move(*active.failure);
       active.failure.reset();
-      if (failure.code == "cancelled") {
+      if (failure.code == kCancelledFailureCode) {
         finish(active, EngineFinishReason::Cancelled, {});
+      } else if (failure.code == kStoppedFailureCode) {
+        finish(active, EngineFinishReason::Stop, {});
       } else {
         finishFailure(active, std::move(failure));
       }
@@ -1644,8 +1677,12 @@ void Engine::finish(Request &active, EngineFinishReason reason,
                     std::span<const float> optionLogits) {
   if (active.finalized)
     return;
+  // A batch completion has already ended a finishing lane's scheduler phase;
+  // a client stop between batches has not.
   if (reason == EngineFinishReason::Cancelled) {
     scheduler_.cancel(active.request.id);
+  } else if (reason == EngineFinishReason::Stop) {
+    scheduler_.stop(active.request.id);
   }
   active.finalized = true;
   const uint32_t completionTokens =

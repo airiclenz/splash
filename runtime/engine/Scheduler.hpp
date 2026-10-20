@@ -87,6 +87,9 @@ public:
                            uint32_t replayTokens);
   void maskReady(uint64_t requestId);
   void cancel(uint64_t requestId);
+  // Ends a request as Completed outside a batch completion, for a client
+  // stop; a request already terminal keeps its phase.
+  void stop(uint64_t requestId);
   void fail(uint64_t requestId);
   void remove(uint64_t requestId);
 

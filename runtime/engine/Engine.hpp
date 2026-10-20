@@ -114,6 +114,12 @@ public:
     scheduler_.observePrefill(rows, wallMilliseconds);
   }
   void cancel(uint64_t requestId);
+  // Finishes a started request as EngineFinishReason::Stop: counted
+  // completed, its checkpoints retired as a normal finish retires them. A
+  // lane inside the in-flight batch finishes once that batch completes,
+  // emitting none of its output; a request that never started finishes as
+  // Cancelled; an unknown or finished id is ignored.
+  void stop(uint64_t requestId);
   void failRequest(uint64_t requestId, std::string code, std::string message);
   void provideMask(uint64_t requestId, std::span<const uint32_t> words);
   void setCompletionNotifier(std::function<void()> notifier);
@@ -324,6 +330,7 @@ private:
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
              double wallMilliseconds, bool representativePrefillTiming);
+  [[nodiscard]] bool endAfterInFlightBatch(Request &request, Failure failure);
   void finish(Request &request, EngineFinishReason reason,
               std::span<const float> optionLogits);
   void finishFailure(Request &request, Failure failure);

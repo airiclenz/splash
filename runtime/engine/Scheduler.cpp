@@ -140,6 +140,12 @@ void Scheduler::cancel(uint64_t id) {
     request.phase = Phase::Cancelled;
 }
 
+void Scheduler::stop(uint64_t id) {
+  Request &request = get(id);
+  if (!terminal(request.phase))
+    request.phase = Phase::Completed;
+}
+
 void Scheduler::fail(uint64_t id) {
   Request &request = get(id);
   if (terminal(request.phase))
