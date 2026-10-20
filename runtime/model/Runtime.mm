@@ -257,6 +257,10 @@ struct Runtime::Impl {
   QwenStateStorage &states;
   std::unique_ptr<PrefillArena> prefillArena;
   std::unique_ptr<DecodeArena> decodeArena;
+  // PageStorage allocates each layer's buffers once and maps pages into them
+  // in place, so one copy taken at construction serves every graph.
+  std::unique_ptr<kv::LayerStorage[]> kvLayerStorage;
+  std::span<const kv::LayerStorage> kvLayers;
   std::unordered_map<uint64_t, Request> requests;
   // Allocated for image cache misses and reclaimable once pending encodes
   // finish. Injecting already encoded rows needs no vision arena.
@@ -333,6 +337,12 @@ struct Runtime::Impl {
       throw std::invalid_argument(
           "model runtime resources do not match the loaded package");
     }
+    const uint32_t attentionLayers = geometry.target.kvLayout.attentionLayers;
+    kvLayerStorage = std::make_unique<kv::LayerStorage[]>(attentionLayers);
+    for (uint32_t layer = 0; layer < attentionLayers; ++layer)
+      kvLayerStorage[layer] = kvPages.layer(layer);
+    kvLayers = std::span<const kv::LayerStorage>(kvLayerStorage.get(),
+                                                 attentionLayers);
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
   }
@@ -1080,10 +1090,6 @@ struct Runtime::Impl {
     buffers.groupedInput = p(PrefillTensor::MoeGroupedInput);
     buffers.expertIntermediate = p(PrefillTensor::MoeExpertIntermediate);
     buffers.expertOutput = p(PrefillTensor::MoeExpertOutput);
-    std::vector<kv::LayerStorage> kvLayers(
-        geometry.target.kvLayout.attentionLayers);
-    for (uint32_t layer = 0; layer < kvLayers.size(); ++layer)
-      kvLayers[layer] = kvPages.layer(layer);
     targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
@@ -1345,13 +1351,11 @@ struct Runtime::Impl {
       gdnBeta[layer] = decodeArena->gdnBatchSlice(
           DecodeTensor::VerifyBetaBase, layer, lanes);
     }
-    std::vector<kv::LayerStorage> kvLayers(attentionLayers);
     for (uint32_t layer = 0; layer < attentionLayers; ++layer) {
       chunkKeys[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkKeysBase, layer, lanes);
       chunkValues[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkValuesBase, layer, lanes);
-      kvLayers[layer] = kvPages.layer(layer);
     }
     targetModel.addVerify(graph, std::move(buffers), kvLayers, q8, verify,
                           lanes, stats);

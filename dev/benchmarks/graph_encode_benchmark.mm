@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -281,7 +282,7 @@ public:
       : geometry_(geometry), arena_(arena), resources_(resources),
         scratch_(arena.linearScratch()) {}
 
-  // Encodes the whole cycle into graph; returns the arena views it created.
+  // Encodes the whole cycle into graph; returns the arena views it looked up.
   uint32_t encode(CommandGraph &graph) {
     views_ = 0;
     addRopeTables(graph);
@@ -478,7 +479,7 @@ private:
     LaneBuffers pageTables, currentStates, nextStates;
     std::vector<MetalBuffer> gdnPacked, gdnMixed, gdnDecay, gdnBeta;
     std::vector<MetalBuffer> chunkKeys, chunkValues;
-    std::vector<kv::LayerStorage> kvLayers;
+    std::span<const kv::LayerStorage> kvLayers;
   };
 
   void takeTargetActivations(TargetBuffers &buffers) {
@@ -522,14 +523,13 @@ private:
     }
     buffers.chunkKeys.resize(attentionLayers);
     buffers.chunkValues.resize(attentionLayers);
-    buffers.kvLayers.resize(attentionLayers);
+    buffers.kvLayers = resources_.kvLayers;
     for (uint32_t layer = 0; layer < attentionLayers; ++layer) {
       views_ += 2;
       buffers.chunkKeys[layer] =
           arena_.attentionBatchSlice(DecodeTensor::ChunkKeysBase, layer, kWidth);
       buffers.chunkValues[layer] =
           arena_.attentionBatchSlice(DecodeTensor::ChunkValuesBase, layer, kWidth);
-      buffers.kvLayers[layer] = resources_.kvLayers[layer];
     }
   }
 

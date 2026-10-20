@@ -18,6 +18,9 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace splash::model {
 
@@ -303,6 +306,17 @@ constexpr bool isLayerMajorTensor(DecodeTensor tensor) noexcept {
   return isGdnLayerTensor(tensor) || isAttentionLayerTensor(tensor);
 }
 
+// The layer-major tensors are consecutive enumerators, so each family indexes
+// its precomputed views by distance from its first member.
+static_assert(static_cast<uint32_t>(DecodeTensor::VerifyBetaBase) -
+                      static_cast<uint32_t>(DecodeTensor::VerifyPackedBase) ==
+                  3,
+              "GDN layer tensors must be consecutive");
+static_assert(static_cast<uint32_t>(DecodeTensor::ChunkValuesBase) -
+                      static_cast<uint32_t>(DecodeTensor::ChunkKeysBase) ==
+                  1,
+              "attention layer tensors must be consecutive");
+
 [[nodiscard]] uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept;
 [[nodiscard]] std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
@@ -333,12 +347,18 @@ public:
           tensors_[lane][tensor] = backend_.view(
               base_, cursor + uint64_t{lane} * stride, sizes[tensor]);
         }
+        for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes) {
+          packed_[lanes - 1][tensor] =
+              backend_.view(base_, cursor, uint64_t{lanes} * sizes[tensor]);
+        }
       }
       cursor +=
           alignArena(checkedMultiply(stride, kLaneCount, "decode tensor"));
     }
     if (cursor != baseBytes)
       throw std::logic_error("decode arena mismatch");
+    buildGdnViews();
+    buildAttentionViews();
 
     const uint64_t denseScratchBytes = gateScratchBytes(geometry_, operators);
     if (denseScratchBytes) {
@@ -371,21 +391,18 @@ public:
     return tensors_[lane][static_cast<uint32_t>(tensor)];
   }
 
-  [[nodiscard]] metal::MetalBuffer packed(DecodeTensor tensor, uint32_t lanes) const {
+  [[nodiscard]] const metal::MetalBuffer &packed(DecodeTensor tensor,
+                                                 uint32_t lanes) const {
     if (!lanes || lanes > kLaneCount)
       throw std::out_of_range("invalid packed decode width");
     if (isLayerMajorTensor(tensor)) {
       throw std::logic_error(
           "layer-major decode scratch requires a layer view");
     }
-    const uint32_t index = static_cast<uint32_t>(tensor);
     // Model-specific scratch is represented by an empty buffer.  The
     // selected target graph consumes either dense-FFN or MoE tensors, never
     // both, so no dummy allocation is needed for the inactive operator.
-    if (!sizes_[index])
-      return {};
-    return backend_.view(base_, offsets_[index],
-                         uint64_t{lanes} * sizes_[index]);
+    return packed_[lanes - 1][static_cast<uint32_t>(tensor)];
   }
 
   [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }
@@ -408,62 +425,139 @@ public:
     return std::max(target, draft);
   }
 
-  [[nodiscard]] metal::MetalBuffer gdnBatchSlice(DecodeTensor base, uint32_t gdnLayer,
-                                          uint32_t lanes) const {
+  [[nodiscard]] const metal::MetalBuffer &
+  gdnBatchSlice(DecodeTensor base, uint32_t gdnLayer, uint32_t lanes) const {
     const uint32_t layers = geometry_.target.stateLayout.layers;
     if (!lanes || lanes > kLaneCount || gdnLayer >= layers ||
         !isGdnLayerTensor(base))
       throw std::out_of_range("invalid batched GDN layer");
-    const uint32_t index = static_cast<uint32_t>(base);
-    // Each GDN tensor holds one stride per layer per lane; the planner sized
-    // it as layers x stride, so the stride is recovered here, not supplied.
-    const uint64_t stride = sizes_[index] / layers;
-    const uint64_t relative = uint64_t{gdnLayer} * kLaneCount * stride;
-    const uint64_t bytes = uint64_t{lanes} * stride;
-    if (relative + bytes > sizes_[index] * kLaneCount)
-      throw std::logic_error("batched GDN layer exceeds decode arena");
-    return backend_.view(base_, offsets_[index] + relative, bytes);
+    const metal::MetalBuffer &view = gdnSlices_[layerViewIndex(
+        gdnFamilyIndex(base), gdnLayer, layers, lanes)];
+    if (!view)
+      throw std::logic_error("batched GDN layer is empty");
+    return view;
   }
 
-  [[nodiscard]] metal::MetalBuffer gdnStorage(DecodeTensor base) const {
+  [[nodiscard]] const metal::MetalBuffer &gdnStorage(DecodeTensor base) const {
     if (!isGdnLayerTensor(base))
       throw std::invalid_argument("tensor is not GDN replay scratch");
-    const uint32_t index = static_cast<uint32_t>(base);
-    return backend_.view(base_, offsets_[index], sizes_[index] * kLaneCount);
+    const metal::MetalBuffer &view = gdnStorage_[gdnFamilyIndex(base)];
+    if (!view)
+      throw std::logic_error("GDN replay scratch is empty");
+    return view;
   }
 
-  [[nodiscard]] metal::MetalBuffer attentionBatchSlice(DecodeTensor base,
-                                                uint32_t attentionLayer,
-                                                uint32_t lanes) const {
-    if (!lanes || lanes > kLaneCount ||
-        attentionLayer >= geometry_.target.kvLayout.attentionLayers ||
+  [[nodiscard]] const metal::MetalBuffer &
+  attentionBatchSlice(DecodeTensor base, uint32_t attentionLayer,
+                      uint32_t lanes) const {
+    const uint32_t layers = geometry_.target.kvLayout.attentionLayers;
+    if (!lanes || lanes > kLaneCount || attentionLayer >= layers ||
         !isAttentionLayerTensor(base)) {
       throw std::out_of_range("invalid batched attention layer");
     }
-    const uint32_t index = static_cast<uint32_t>(base);
-    const uint64_t relative =
-        uint64_t{attentionLayer} * kLaneCount *
-        decodeChunkLayerBytes(geometry_);
-    const uint64_t bytes =
-        uint64_t{lanes} * decodeChunkLayerBytes(geometry_);
-    if (relative + bytes > sizes_[index] * kLaneCount)
-      throw std::logic_error("batched attention layer exceeds decode arena");
-    return backend_.view(base_, offsets_[index] + relative, bytes);
+    const metal::MetalBuffer &view = attentionSlices_[layerViewIndex(
+        attentionFamilyIndex(base), attentionLayer, layers, lanes)];
+    if (!view)
+      throw std::logic_error("batched attention layer is empty");
+    return view;
   }
 
   [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
 
 private:
+  static constexpr uint32_t kGdnTensors = 4;
+  static constexpr uint32_t kAttentionTensors = 2;
+
+  static constexpr uint32_t gdnFamilyIndex(DecodeTensor tensor) noexcept {
+    return static_cast<uint32_t>(tensor) -
+           static_cast<uint32_t>(DecodeTensor::VerifyPackedBase);
+  }
+  static constexpr uint32_t attentionFamilyIndex(DecodeTensor tensor) noexcept {
+    return static_cast<uint32_t>(tensor) -
+           static_cast<uint32_t>(DecodeTensor::ChunkKeysBase);
+  }
+  // Layer views are stored family-major, then layer, then batch width 1-4.
+  static size_t layerViewIndex(uint32_t family, uint32_t layer,
+                               uint32_t layers, uint32_t lanes) noexcept {
+    return (size_t{family} * layers + layer) * kLaneCount + (lanes - 1);
+  }
+
+  // A layer-major tensor holds kLaneCount strides per layer, laid out layer
+  // by layer; a width-N slice is the first N strides of one layer.
+  void buildLayerViews(std::vector<metal::MetalBuffer> &views, uint32_t index,
+                       uint32_t family, uint32_t layers, uint64_t stride) {
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+      const uint64_t relative = uint64_t{layer} * kLaneCount * stride;
+      for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes) {
+        const uint64_t bytes = uint64_t{lanes} * stride;
+        if (relative + bytes > sizes_[index] * kLaneCount)
+          throw std::logic_error("batched layer exceeds decode arena");
+        views[layerViewIndex(family, layer, layers, lanes)] =
+            backend_.view(base_, offsets_[index] + relative, bytes);
+      }
+    }
+  }
+
+  void buildGdnViews() {
+    const uint32_t layers = geometry_.target.stateLayout.layers;
+    gdnSlices_.resize(size_t{kGdnTensors} * layers * kLaneCount);
+    for (uint32_t family = 0; family < kGdnTensors; ++family) {
+      const uint32_t index =
+          static_cast<uint32_t>(DecodeTensor::VerifyPackedBase) + family;
+      if (!sizes_[index])
+        continue;
+      gdnStorage_[family] =
+          backend_.view(base_, offsets_[index], sizes_[index] * kLaneCount);
+      // The planner sized each GDN tensor as layers x stride, so the stride
+      // is recovered here, not supplied.
+      const uint64_t stride = sizes_[index] / layers;
+      if (stride)
+        buildLayerViews(gdnSlices_, index, family, layers, stride);
+    }
+  }
+
+  void buildAttentionViews() {
+    const uint32_t layers = geometry_.target.kvLayout.attentionLayers;
+    const uint64_t stride = decodeChunkLayerBytes(geometry_);
+    attentionSlices_.resize(size_t{kAttentionTensors} * layers * kLaneCount);
+    for (uint32_t family = 0; family < kAttentionTensors; ++family) {
+      const uint32_t index =
+          static_cast<uint32_t>(DecodeTensor::ChunkKeysBase) + family;
+      if (sizes_[index] && stride)
+        buildLayerViews(attentionSlices_, index, family, layers, stride);
+    }
+  }
+
   metal::MetalBackend &backend_;
   RuntimeGeometry geometry_;
   metal::MetalBuffer base_;
   std::array<std::array<metal::MetalBuffer, decodeTensorCount>, kLaneCount> tensors_{};
+  // Every batch view a decode step binds, taken once at construction so a
+  // step only looks them up. packed_ is indexed [width - 1][tensor].
+  std::array<std::array<metal::MetalBuffer, decodeTensorCount>, kLaneCount> packed_{};
+  std::array<metal::MetalBuffer, kGdnTensors> gdnStorage_{};
+  std::vector<metal::MetalBuffer> gdnSlices_;
+  std::vector<metal::MetalBuffer> attentionSlices_;
   std::array<uint64_t, decodeTensorCount> offsets_{};
   std::array<uint64_t, decodeTensorCount> sizes_{};
   metal::MetalBuffer gateScratch_;
   ops::LinearScratch linearScratch_;
   uint64_t bytes_ = 0;
 };
+
+// A decode step binds these views without taking a new one.
+static_assert(std::is_same_v<decltype(std::declval<const DecodeArena &>().packed(
+                                 DecodeTensor::Hidden0, 1)),
+                             const metal::MetalBuffer &>);
+static_assert(std::is_same_v<decltype(std::declval<const DecodeArena &>().gdnBatchSlice(
+                                 DecodeTensor::VerifyPackedBase, 0, 1)),
+                             const metal::MetalBuffer &>);
+static_assert(std::is_same_v<decltype(std::declval<const DecodeArena &>().gdnStorage(
+                                 DecodeTensor::VerifyPackedBase)),
+                             const metal::MetalBuffer &>);
+static_assert(std::is_same_v<decltype(std::declval<const DecodeArena &>().attentionBatchSlice(
+                                 DecodeTensor::ChunkKeysBase, 0, 1)),
+                             const metal::MetalBuffer &>);
 
 [[nodiscard]] uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
                                           const ops::ExecutionPlans &operators);
