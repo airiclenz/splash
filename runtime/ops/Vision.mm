@@ -27,6 +27,24 @@ constexpr uint64_t kBf16Bytes = 2;
 constexpr uint64_t kZeroWordBytes = 16;
 constexpr uint64_t kZeroGroupLimit = 1024;
 
+// The GEMM pipelines of one tile family, one per tile shape and epilogue.
+struct GemmPipelines final {
+  const char *block;
+  const char *blockResidual;
+  const char *blockGeluTanh;
+  const char *merger;
+  const char *mergerGeluErf;
+};
+
+constexpr GemmPipelines kMppGemms{
+    "vision_gemm_m64n128", "vision_gemm_m64n128_residual",
+    "vision_gemm_m64n128_gelu_tanh", "vision_gemm_m32n256",
+    "vision_gemm_m32n256_gelu_erf"};
+constexpr GemmPipelines kRegisterGemms{
+    "vision_gemm_sgf_m64n128", "vision_gemm_sgf_m64n128_residual",
+    "vision_gemm_sgf_m64n128_gelu_tanh", "vision_gemm_sgf_m32n256",
+    "vision_gemm_sgf_m32n256_gelu_erf"};
+
 uint32_t roundUp(uint32_t value, uint32_t multiple) noexcept {
   return (value + multiple - 1) / multiple * multiple;
 }
@@ -106,13 +124,15 @@ uint32_t Vision::embeddingRows(ImageGrid grid) noexcept {
 }
 
 VisionKernelShapes Vision::kernelShapes(const VisionLayout &layout,
-                                        ImageGrid grid) {
+                                        ImageGrid grid, VisionGemmTile tile) {
   requireLayout(layout);
   if (!grid.valid())
     throw std::invalid_argument("vision kernel shapes need a valid image grid");
   const uint32_t tokens = grid.patches();
   const uint32_t merged = grid.mergedTokens();
   const uint32_t hidden = layout.hiddenSize;
+  const GemmPipelines &pipelines =
+      tile == VisionGemmTile::Register ? kRegisterGemms : kMppGemms;
   auto blockGemm = [&](const char *pipeline, uint32_t outputSize,
                        uint32_t inputSize) {
     return VisionGemmShape{pipeline, outputSize,   inputSize,
@@ -125,16 +145,15 @@ VisionKernelShapes Vision::kernelShapes(const VisionLayout &layout,
   // In VisionGemm order.
   return {
       {
-          blockGemm("vision_gemm_m64n128_residual", hidden,
-                    layout.patchDimension),
-          blockGemm("vision_gemm_m64n128", 3 * hidden, hidden),
-          blockGemm("vision_gemm_m64n128_residual", hidden, hidden),
-          blockGemm("vision_gemm_m64n128_gelu_tanh",
-                    layout.paddedIntermediateSize, hidden),
-          blockGemm("vision_gemm_m64n128_residual", hidden,
+          blockGemm(pipelines.blockResidual, hidden, layout.patchDimension),
+          blockGemm(pipelines.block, 3 * hidden, hidden),
+          blockGemm(pipelines.blockResidual, hidden, hidden),
+          blockGemm(pipelines.blockGeluTanh, layout.paddedIntermediateSize,
+                    hidden),
+          blockGemm(pipelines.blockResidual, hidden,
                     layout.paddedIntermediateSize),
-          mergerGemm("vision_gemm_m32n256_gelu_erf", layout.mergedHiddenSize),
-          mergerGemm("vision_gemm_m32n256", layout.outputHiddenSize),
+          mergerGemm(pipelines.mergerGeluErf, layout.mergedHiddenSize),
+          mergerGemm(pipelines.merger, layout.outputHiddenSize),
       },
       {tokens, roundUp(tokens, kKeyTile), layout.heads, kQueryTile,
        kQkDimension, layout.headDimension,
@@ -144,7 +163,8 @@ VisionKernelShapes Vision::kernelShapes(const VisionLayout &layout,
 
 Vision::Vision(metal::MetalBackend &backend, const VisionWeights &model,
                uint32_t maximumPatches)
-    : model_(model), maximumPatches_(maximumPatches) {
+    : model_(model), maximumPatches_(maximumPatches),
+      gemmTile_(gemmTile(backend.capabilities().appleGpuFamily)) {
   const uint64_t total = scratchBytes(model.layout, maximumPatches);
   // Only kernels touch the arena, so it lives in private storage; the first
   // encode() zeroes it on the GPU (addArenaZero).
@@ -212,7 +232,7 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
     isArenaZeroQueued_ = true;
   }
 
-  const VisionKernelShapes shapes = kernelShapes(layout, grid);
+  const VisionKernelShapes shapes = kernelShapes(layout, grid, gemmTile_);
   const VisionAttentionShape &attention = shapes.attention;
   const VisionGridParams gridParams{grid.height, grid.width};
   const VisionQkvParams qkvParams{tokens, attention.paddedTokens};

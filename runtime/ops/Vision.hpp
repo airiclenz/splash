@@ -137,6 +137,14 @@ struct VisionAttentionShape final {
   }
 };
 
+// The family of kernels the vision GEMMs run: MPP cooperative-tensor tiles, or
+// the simdgroup_float8x8 register tiles of GPUs without bfloat arithmetic.
+// Both share tile sizes, grids and bindings; only pipeline names differ.
+enum class VisionGemmTile : uint8_t {
+  Mpp,
+  Register,
+};
+
 // The GEMMs of one image's encode, one per weight matrix (each block runs
 // Qkv, Projection, Up and Down).
 enum class VisionGemm : uint32_t {
@@ -176,11 +184,18 @@ public:
   // Embedding buffers are written in whole merger tiles: the caller allocates
   // this many rows of layout.outputHiddenSize bf16 values per image.
   [[nodiscard]] static uint32_t embeddingRows(ImageGrid grid) noexcept;
-  // The kernel dispatch shapes of one image, so tools can time the kernels
-  // alone. Throws std::invalid_argument for an unsupported layout or an
-  // invalid grid.
+  // The GEMM tile family a GPU of appleGpuFamily runs: register tiles on
+  // Apple7/8, which have no bfloat arithmetic, MPP tiles on Apple9 and later.
+  [[nodiscard]] static constexpr VisionGemmTile
+  gemmTile(uint32_t appleGpuFamily) noexcept {
+    return appleGpuFamily < 9 ? VisionGemmTile::Register : VisionGemmTile::Mpp;
+  }
+  // The kernel dispatch shapes of one image with GEMMs of the given tile
+  // family, so tools can time the kernels alone. Throws
+  // std::invalid_argument for an unsupported layout or an invalid grid.
   [[nodiscard]] static VisionKernelShapes kernelShapes(const VisionLayout &layout,
-                                                       ImageGrid grid);
+                                                       ImageGrid grid,
+                                                       VisionGemmTile tile);
 
   Vision(metal::MetalBackend &backend, const VisionWeights &model,
          uint32_t maximumPatches);
@@ -240,6 +255,8 @@ private:
 
   const VisionWeights &model_;
   uint32_t maximumPatches_ = 0;
+  // The GEMM tile family of the backend's GPU, fixed at construction.
+  VisionGemmTile gemmTile_ = VisionGemmTile::Mpp;
   metal::MetalBuffer arena_;
   // Whether an encode() graph already carries the arena's zero fill.
   bool isArenaZeroQueued_ = false;

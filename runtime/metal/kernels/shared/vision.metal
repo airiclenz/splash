@@ -6,7 +6,10 @@
 //
 // Conventions match the text-model kernels: 256 threads (8 simdgroups) per
 // threadgroup, MPP cooperative-tensor matmuls with fp32 accumulation and
-// hand-written epilogues, grid {row_tile, output_tile}. Attention runs on the
+// hand-written epilogues, grid {row_tile, output_tile}. On Apple7/8, which
+// have no bfloat arithmetic, the GEMMs run vision_gemm_sgf_* register tiles
+// instead: the same tiles, grid and epilogues on simdgroup_float8x8 matrices
+// with bf16 widened to fp32. Attention runs on the
 // native head dimension (72); token counts are padded to the 128-key tile so
 // K/V tiles read in full, with padded keys zeroed and masked by the softmax.
 //
@@ -142,6 +145,21 @@ inline float vision_erf(float x) {
     return sign * (1.0f - polynomial * precise::exp(-x * x));
 }
 
+// The GEMM epilogue's activation on one fp32 output value.
+template <VisionActivation Activation>
+inline float vision_activate(float value) {
+    if constexpr (Activation == VisionGeluTanh) {
+        return 0.5f * value *
+            (1.0f + precise::tanh(
+                0.7978845608028654f *
+                (value + 0.044715f * value * value * value)));
+    } else if constexpr (Activation == VisionGeluErf) {
+        return 0.5f * value *
+            (1.0f + vision_erf(value * 0.7071067811865476f));
+    }
+    return value;
+}
+
 template <ushort TileM, ushort TileN, VisionActivation Activation,
           bool AddResidual>
 inline void vision_gemm_tile(
@@ -195,17 +213,8 @@ inline void vision_gemm_tile(
     #pragma unroll
     for (ushort i = 0; i < accumulated.get_capacity(); ++i) {
         auto index = accumulated.get_multidimensional_index(i);
-        float value = accumulated[i] +
-            float(bias[output_origin + index[0]]);
-        if constexpr (Activation == VisionGeluTanh) {
-            value = 0.5f * value *
-                (1.0f + precise::tanh(
-                    0.7978845608028654f *
-                    (value + 0.044715f * value * value * value)));
-        } else if constexpr (Activation == VisionGeluErf) {
-            value = 0.5f * value *
-                (1.0f + vision_erf(value * 0.7071067811865476f));
-        }
+        float value = vision_activate<Activation>(
+            accumulated[i] + float(bias[output_origin + index[0]]));
         if constexpr (AddResidual) {
             value += float(residual[
                 ulong(row_origin + index[1]) * output_size +
@@ -239,6 +248,174 @@ VISION_GEMM_KERNEL(vision_gemm_m64n128_gelu_tanh, 64, 128, VisionGeluTanh, false
 VISION_GEMM_KERNEL(vision_gemm_m32n256, 32, 256, VisionNone, false)
 VISION_GEMM_KERNEL(vision_gemm_m32n256_gelu_erf, 32, 256, VisionGeluErf,
                    false)
+
+// Apple7/8 register tile: vision_gemm_tile's output, grid and epilogue on
+// simdgroup_float8x8 matrices, for GPUs without bfloat arithmetic. bf16
+// operands widen exactly to fp32 (a 16-bit shift) and accumulate in fp32.
+// The eight simdgroups each own a 32 x 32 output block, 4 x 4 fragments of
+// 8 x 8, laid out (TileM / 32) x (TileN / 32) over the tile. Operands load
+// straight from device memory into each lane's fragment registers: no
+// threadgroup memory and no barriers.
+//
+// K advances in 32-deep chunks of four 8-deep steps over a permuted K order:
+// fragment depth d of step s is k = 4 d + s within the chunk, so each lane
+// reads whole 8-byte runs: 8 consecutive input values of its row (depths fn
+// and fn + 1 of every step) and 4 consecutive weight values of each of its two
+// columns (depth fm of every step). Fragments are rebuilt from float2 lane
+// values for every multiply: holding accumulators or operands in arrays of
+// simdgroup matrices measured several times slower on Apple8.
+constant ushort kVisionRegisterFragments = 4;  // 8x8 fragments per side
+constant ushort kVisionRegisterSteps = 4;      // 8-deep steps per chunk
+constant ushort kVisionRegisterDepth = 8 * kVisionRegisterSteps;
+
+// Value `step` of four packed bf16, widened to fp32.
+inline float vision_widen(uint2 packed, ushort step) {
+    const uint word = packed[step >> 1];
+    return as_type<float>((step & 1) ? (word & 0xFFFF0000u) : (word << 16));
+}
+
+template <ushort TileM, ushort TileN, VisionActivation Activation,
+          bool AddResidual>
+inline void vision_gemm_register_tile(
+    device bfloat *input,
+    device bfloat *weights,
+    device bfloat *bias,
+    device bfloat *output,
+    device bfloat *residual,
+    uint output_size,
+    uint input_size,
+    uint output_origin,
+    uint row_origin,
+    ushort simd_group,
+    ushort simd_lane)
+{
+    constexpr ushort F = kVisionRegisterFragments;
+    constexpr ushort SimdgroupsN = TileN / (8 * F);
+    static_assert((TileM / (8 * F)) * SimdgroupsN == 8,
+                  "eight 32 x 32 simdgroup blocks cover the tile");
+    // simdgroup_matrix lane layout: thread_elements() are M[fm][fn], M[fm][fn + 1].
+    const ushort quad = simd_lane >> 2;
+    const ushort fm = (quad & 4) | ((simd_lane >> 1) & 3);
+    const ushort fn = ((quad & 2) << 1) | ((simd_lane & 1) << 1);
+    const uint first_row = row_origin + (simd_group / SimdgroupsN) * 8 * F;
+    const uint first_column =
+        output_origin + (simd_group % SimdgroupsN) * 8 * F;
+
+    device const bfloat *lane_input[F];
+    device const bfloat *lane_weights[F];
+    #pragma unroll
+    for (ushort i = 0; i < F; ++i) {
+        lane_input[i] = input + ulong(first_row + i * 8 + fm) * input_size +
+            kVisionRegisterSteps * fn;
+        lane_weights[i] = weights +
+            ulong(first_column + i * 8 + fn) * input_size +
+            kVisionRegisterSteps * fm;
+    }
+
+    float2 accumulated[F][F];
+    #pragma unroll
+    for (ushort i = 0; i < F; ++i) {
+        #pragma unroll
+        for (ushort j = 0; j < F; ++j) {
+            accumulated[i][j] = float2(0.0f);
+        }
+    }
+    for (uint k = 0; k < input_size; k += kVisionRegisterDepth) {
+        // rows[i][h]: input row fragment i, depth fn + h of every step.
+        // columns[j][h]: weight column fn + h of fragment j, depth fm.
+        uint2 rows[F][2];
+        uint2 columns[F][2];
+        #pragma unroll
+        for (ushort i = 0; i < F; ++i) {
+            #pragma unroll
+            for (ushort h = 0; h < 2; ++h) {
+                rows[i][h] = *reinterpret_cast<device const uint2 *>(
+                    lane_input[i] + k + kVisionRegisterSteps * h);
+                columns[i][h] = *reinterpret_cast<device const uint2 *>(
+                    lane_weights[i] + ulong(h) * input_size + k);
+            }
+        }
+        #pragma unroll
+        for (ushort step = 0; step < kVisionRegisterSteps; ++step) {
+            float2 a[F];
+            float2 b[F];
+            #pragma unroll
+            for (ushort i = 0; i < F; ++i) {
+                a[i] = float2(vision_widen(rows[i][0], step),
+                              vision_widen(rows[i][1], step));
+                b[i] = float2(vision_widen(columns[i][0], step),
+                              vision_widen(columns[i][1], step));
+            }
+            #pragma unroll
+            for (ushort i = 0; i < F; ++i) {
+                #pragma unroll
+                for (ushort j = 0; j < F; ++j) {
+                    simdgroup_float8x8 left, right, sum, result;
+                    reinterpret_cast<thread float2 &>(
+                        left.thread_elements()) = a[i];
+                    reinterpret_cast<thread float2 &>(
+                        right.thread_elements()) = b[j];
+                    reinterpret_cast<thread float2 &>(
+                        sum.thread_elements()) = accumulated[i][j];
+                    simdgroup_multiply_accumulate(result, left, right, sum);
+                    accumulated[i][j] = reinterpret_cast<thread float2 &>(
+                        result.thread_elements());
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (ushort j = 0; j < F; ++j) {
+        const uint column = first_column + j * 8 + fn;
+        const float2 column_bias = float2(
+            float(bias[column]), float(bias[column + 1]));
+        #pragma unroll
+        for (ushort i = 0; i < F; ++i) {
+            const ulong offset =
+                ulong(first_row + i * 8 + fm) * output_size + column;
+            const float2 sum = accumulated[i][j] + column_bias;
+            float2 value = float2(vision_activate<Activation>(sum.x),
+                                  vision_activate<Activation>(sum.y));
+            if constexpr (AddResidual) {
+                value += float2(*reinterpret_cast<device const bfloat2 *>(
+                    residual + offset));
+            }
+            *reinterpret_cast<device bfloat2 *>(output + offset) =
+                bfloat2(value);
+        }
+    }
+}
+
+#define VISION_GEMM_REGISTER_KERNEL(name, tile_m, tile_n, activation,        \
+                                    add_residual)                             \
+kernel void name(                                                             \
+    device bfloat *input [[buffer(0)]],                                       \
+    device bfloat *weights [[buffer(1)]],                                     \
+    device bfloat *bias [[buffer(2)]],                                        \
+    device bfloat *output [[buffer(3)]],                                      \
+    device bfloat *residual [[buffer(4)]],                                    \
+    constant VisionGemmParams &params [[buffer(5)]],                          \
+    uint2 group [[threadgroup_position_in_grid]],                             \
+    ushort simd_lane [[thread_index_in_simdgroup]],                           \
+    ushort simd_group [[simdgroup_index_in_threadgroup]])                     \
+{                                                                             \
+    vision_gemm_register_tile<tile_m, tile_n, activation, add_residual>(      \
+        input, weights, bias, output, residual,                               \
+        params.output_size, params.input_size,                                \
+        group.y * tile_n, group.x * tile_m, simd_group, simd_lane);           \
+}
+
+VISION_GEMM_REGISTER_KERNEL(vision_gemm_sgf_m64n128, 64, 128, VisionNone,
+                            false)
+VISION_GEMM_REGISTER_KERNEL(vision_gemm_sgf_m64n128_residual, 64, 128,
+                            VisionNone, true)
+VISION_GEMM_REGISTER_KERNEL(vision_gemm_sgf_m64n128_gelu_tanh, 64, 128,
+                            VisionGeluTanh, false)
+VISION_GEMM_REGISTER_KERNEL(vision_gemm_sgf_m32n256, 32, 256, VisionNone,
+                            false)
+VISION_GEMM_REGISTER_KERNEL(vision_gemm_sgf_m32n256_gelu_erf, 32, 256,
+                            VisionGeluErf, false)
 
 // LayerNorm with bias (fp32 statistics), one threadgroup per row.
 

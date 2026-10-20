@@ -2,18 +2,20 @@
 // loaded: each GEMM of one image's encode (vision_gemm_* at the patch
 // embedding, block QKV, projection, up and down, and merger up and down
 // shapes) and vision_attention, at 1024, 4096 and 16384 patches by default.
-// Shapes come from ops::Vision::kernelShapes, so they match production
-// dispatch. Each case reports the median GPU time of its one-dispatch
-// command. These are kernel timings, not a correctness oracle (vision-encoder
-// is).
+// Shapes come from ops::Vision::kernelShapes with the GEMM tile family of the
+// device's GPU (Vision::gemmTile), so they match production dispatch. Each
+// case reports the median GPU time of its one-dispatch command. These are
+// kernel timings, not a correctness oracle (vision-encoder is).
 //
 // Variant 0 runs METALLIB's production pipeline. --compare-metallib adds the
 // same pipeline from a second metallib and fails when its output bits differ.
 // --alternate KERNEL=PIPELINE (repeatable) adds PIPELINE from METALLIB for
 // every case of the production pipeline KERNEL, e.g. a register tile against
 // the MPP tile, and fails when its output strays beyond --tolerance from
-// variant 0: |a - b| / max(1, |a|) over the valid output rows. --allow-diff
-// turns either failure into a warning. Variants rotate order every round
+// variant 0: |a - b| / max(1, |a|) over the valid output rows. KERNEL may name
+// either tile family's pipeline: on Apple7/8 production runs vision_gemm_sgf_*,
+// so vision_gemm_sgf_m64n128=vision_gemm_m64n128 times the MPP tile against
+// it. --allow-diff turns either failure into a warning. Variants rotate order every round
 // (ABBA for two) on identical inputs.
 //
 // usage: vision-profile METALLIB [--patches 1024,4096,16384] [--kernels LIST]
@@ -278,12 +280,14 @@ std::vector<std::string> splitList(const std::string &text) {
   return items;
 }
 
-// The production pipelines --alternate may replace.
+// The production pipelines --alternate may replace, of either GEMM tile
+// family.
 std::set<std::string, std::less<>> productionPipelines() {
-  const VisionKernelShapes shapes = Vision::kernelShapes(VisionLayout{}, ImageGrid{2, 2});
   std::set<std::string, std::less<>> names{std::string(kAttentionPipeline)};
-  for (const VisionGemmShape &shape : shapes.gemms)
-    names.insert(shape.pipeline);
+  for (const VisionGemmTile tile : {VisionGemmTile::Mpp, VisionGemmTile::Register})
+    for (const VisionGemmShape &shape :
+         Vision::kernelShapes(VisionLayout{}, ImageGrid{2, 2}, tile).gemms)
+      names.insert(shape.pipeline);
   return names;
 }
 
@@ -399,6 +403,7 @@ void run(const Options &options) {
   std::unique_ptr<MetalBackend> comparison;
   if (!options.comparisonLibrary.empty())
     comparison = std::make_unique<MetalBackend>(options.comparisonLibrary);
+  const VisionGemmTile gemmTile = Vision::gemmTile(backend.capabilities().appleGpuFamily);
   std::cerr << "device " << backend.capabilities().deviceName
             << ", one vision kernel per command, median GPU time of " << options.repeat
             << " commands (ms)\n";
@@ -406,7 +411,8 @@ void run(const Options &options) {
   bool isFirst = true;
   for (const Kernel &kernel : options.kernels)
     for (uint32_t patches : options.patches) {
-      const VisionKernelShapes shapes = Vision::kernelShapes(VisionLayout{}, gridFor(patches));
+      const VisionKernelShapes shapes =
+          Vision::kernelShapes(VisionLayout{}, gridFor(patches), gemmTile);
       const std::string_view production =
           kernel.gemm ? shapes.gemm(*kernel.gemm).pipeline : kAttentionPipeline;
       std::vector<Variant> variants{{&backend, 0, production}};

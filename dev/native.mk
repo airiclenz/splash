@@ -118,6 +118,7 @@ TEST_GRAPH_ENCODE_BENCHMARK := $(ENGINE_TEST_BUILD)/graph-encode-benchmark
 TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 TEST_VISION_ENCODER_TEST := $(ENGINE_TEST_BUILD)/vision-encoder
 TEST_VISION_SCRATCH_TEST := $(ENGINE_TEST_BUILD)/vision-scratch
+TEST_VISION_TILE_METAL := $(ENGINE_TEST_BUILD)/vision-tile-metal
 TEST_Q8_AIR := $(ENGINE_TEST_BUILD)/q8-paged-kv.air
 TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
 # Both Q8 tests share the attention and store kernels of both phases.
@@ -186,6 +187,7 @@ TEST_METAL_TARGETS := $(TEST_Q4_SGMATRIX_TEST) $(TEST_TUNING_WORKLOADS) \
 	$(TEST_DRAFT_SELECTOR_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
 	$(TEST_VISION_SCRATCH_TEST) \
+	$(TEST_VISION_TILE_METAL) \
 	$(LIB) $(TEST_METAL_BACKEND_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB)
 
 TEST_UNIT_TEST_TARGETS := $(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))
@@ -545,6 +547,14 @@ $(TEST_VISION_SCRATCH_TEST): runtime/metal/DeviceCapabilities.cpp \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
+# Register-tile vision GEMMs against the MPP tiles; no weights load.
+$(TEST_VISION_TILE_METAL): runtime/metal/DeviceCapabilities.cpp \
+		runtime/metal/MetalBackend.mm \
+		runtime/ops/Vision.mm \
+		dev/tests/engine/vision_tile_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+		$(ENGINE_LINKFLAGS) -o $@
+
 $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
@@ -669,6 +679,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_DRAFT_SELECTOR_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_SCRATCH_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_VISION_TILE_METAL) $(LIB)
 
 .PHONY: test-real
 VISION_FIXTURE_incoai/Qwen3.8-27B-Splash := qwen3.8-27b
