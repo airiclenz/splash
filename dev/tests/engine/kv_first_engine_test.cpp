@@ -5098,8 +5098,9 @@ EngineRequest replyRequest(uint64_t id, const std::vector<uint32_t> &prompt,
 }
 
 // A completed request keeps its deepest prefill checkpoint beside its
-// prompt-end state, even after a reply that rolled a decode checkpoint; a
-// prompt diverging between the two resumes from the checkpoint.
+// prompt-end state, and its reply's decode checkpoint too; a prompt diverging
+// between the prefill checkpoint and the prompt end resumes from the
+// prefill checkpoint.
 void testDivergentPromptResumesFromTheKeptCheckpoint() {
   Backing backing(2048);
   KvPool pool(backing);
@@ -5114,9 +5115,10 @@ void testDivergentPromptResumesFromTheKeptCheckpoint() {
   engine.submit(replyRequest(700, prompt, defaultCheckpointTokens));
   runReplyUntilIdle(engine);
   require(engine.snapshot().checkpointPublications == 4 &&
-              resources.snapshot().stateCache.entries == 2 &&
-              resources.snapshot().stateCache.checkpointEntries == 1,
-          "completed request did not keep only its deepest prefill checkpoint");
+              resources.snapshot().stateCache.entries == 3 &&
+              resources.snapshot().stateCache.checkpointEntries == 2,
+          "completed request did not keep its deepest prefill and decode "
+          "checkpoints");
 
   std::vector<uint32_t> divergent(prompt.begin(),
                                   prompt.begin() + deepest + 40);
@@ -5795,8 +5797,109 @@ void testDeniedDecodeCaptureRecyclesTheLanesOwnCheckpoint() {
   fixture.runToIdle();
 }
 
+// The conversation history a follow-up turn sends: the lane's prompt, its
+// reply, and toolTokens tokens of a tool result.
+std::vector<uint32_t> followUpTurn(const std::vector<uint32_t> &prompt,
+                                   const std::vector<uint32_t> &reply,
+                                   uint32_t toolTokens) {
+  std::vector<uint32_t> turn(prompt);
+  turn.insert(turn.end(), reply.begin(), reply.end());
+  turn.insert(turn.end(), toolTokens, 61);
+  return turn;
+}
+
+// A reply that crosses a checkpoint boundary keeps its decode checkpoint
+// through a Warning pass, and the follow-up that extends the reply resumes
+// from it instead of re-prefilling the reply.
+void testFollowUpResumesFromTheRepliesDecodeCheckpoint() {
+  RollingDecode fixture;
+  const uint32_t interval = defaultCheckpointTokens;
+  const std::vector<uint32_t> prompt(RollingDecode::promptTokens, 51);
+  fixture.submit(560, interval + 200);
+  fixture.runToIdle();
+  require(fixture.resources.snapshot().stateCache.checkpointEntries == 1,
+          "a finished reply did not keep its decode checkpoint");
+
+  static_cast<void>(fixture.engine.reclaimMemory(
+      warningReclaim(std::numeric_limits<uint64_t>::max())));
+  const std::vector<uint32_t> turn =
+      followUpTurn(prompt, fixture.events.outputs.at(560), 50);
+  fixture.engine.submit(replyRequest(561, turn, 100));
+  fixture.runToIdle();
+
+  const std::pair<EngineCacheStatus, uint32_t> decodeHit{
+      EngineCacheStatus::PrefixHit, interval};
+  require(fixture.events.starts.back() == decodeHit &&
+              fixture.resources.snapshot().stateCache.checkpointEntries <= 2,
+          "the follow-up did not resume from the reply's decode checkpoint");
+}
+
+// A reply that crosses no checkpoint boundary keeps no decode checkpoint.
+void testShortReplyKeepsNoDecodeCheckpoint() {
+  RollingDecode fixture;
+  fixture.submit(565, 200);
+  fixture.runToIdle();
+
+  const StateCacheSnapshot cached = fixture.resources.snapshot().stateCache;
+  require(cached.entries == 1 && cached.checkpointEntries == 0,
+          "a short reply kept a checkpoint");
+}
+
+// Back-to-back turns hold at most one decode checkpoint: the turn that
+// resumes from the previous reply's decode checkpoint retires it once it
+// publishes deeper states, carries the kept prefill checkpoint forward, and
+// keeps its own reply's decode checkpoint.
+void testFollowUpTurnRetiresThePreviousRepliesCheckpoint() {
+  RollingDecode fixture;
+  const uint32_t interval = defaultCheckpointTokens;
+  const std::vector<uint32_t> prompt(interval + 100, 51);
+  fixture.engine.submit(replyRequest(570, prompt, interval + 200));
+  fixture.runToIdle();
+  require(fixture.resources.snapshot().stateCache.checkpointEntries == 2,
+          "the first turn did not keep its prefill and decode checkpoints");
+  const std::vector<uint32_t> second =
+      followUpTurn(prompt, fixture.events.outputs.at(570), 50);
+
+  fixture.engine.submit(replyRequest(571, second, interval));
+  fixture.runToIdle();
+
+  require(fixture.events.starts.back().second == 2 * interval &&
+              fixture.resources.snapshot().stateCache.checkpointEntries == 2 &&
+              fixture.resources.lookup(std::span(second).first(interval + 1))
+                      .resumeBoundary() == interval &&
+              fixture.resources
+                      .lookup(std::span(second).first(2 * interval + 1))
+                      .resumeBoundary() < 2 * interval,
+          "the second turn kept more than one decode checkpoint");
+}
+
+// A turn diverging inside the previous reply, before its decode checkpoint,
+// retires that checkpoint once its own reply keeps one.
+void testDivergentTurnRetiresTheInheritedDecodeCheckpoint() {
+  RollingDecode fixture;
+  const uint32_t interval = defaultCheckpointTokens;
+  const std::vector<uint32_t> prompt(RollingDecode::promptTokens, 51);
+  fixture.submit(575, interval + 200);
+  fixture.runToIdle();
+  const std::vector<uint32_t> first =
+      followUpTurn(prompt, fixture.events.outputs.at(575), 0);
+  const std::vector<uint32_t> reply(fixture.events.outputs.at(575).begin(),
+                                    fixture.events.outputs.at(575).begin() +
+                                        500);
+  const std::vector<uint32_t> divergent = followUpTurn(prompt, reply, 100);
+
+  fixture.engine.submit(replyRequest(576, divergent, interval));
+  fixture.runToIdle();
+
+  require(fixture.events.starts.back().second < interval &&
+              fixture.resources.snapshot().stateCache.checkpointEntries == 1 &&
+              fixture.resources.lookup(std::span(first).first(interval + 1))
+                      .resumeBoundary() < interval,
+          "a divergent turn kept the reply checkpoint it inherited");
+}
+
 // A client stop between batches finishes the lane as a normal stop: counted
-// completed, not cancelled, with its rolling checkpoint retired.
+// completed, not cancelled, with its rolling checkpoint kept for the reply.
 void testStopBetweenBatchesFinishesAsCompleted() {
   RollingDecode fixture;
   fixture.submit(530, 2 * defaultCheckpointTokens);
@@ -5812,10 +5915,11 @@ void testStopBetweenBatchesFinishesAsCompleted() {
   fixture.engine.stop(530);
 
   const auto stopped = fixture.engine.snapshot();
+  const StateCacheSnapshot cached = fixture.resources.snapshot().stateCache;
   require(fixture.events.reasons.at(530) == EngineFinishReason::Stop &&
               stopped.completed == 1 && stopped.cancelled == 0 &&
-              fixture.resources.snapshot().stateCache.checkpointRetirements >
-                  retiredBefore,
+              cached.checkpointRetirements == retiredBefore &&
+              cached.checkpointEntries == 1,
           "a stop between batches did not finish as a completed request");
   fixture.runToIdle();
   require(fixture.resources.snapshot().activeRequests == 0 &&
@@ -6051,6 +6155,10 @@ int main() {
     testCheckpointIntervalValidationAndDisable();
     testDecodePublishesRollingCheckpoints();
     testDeniedDecodeCaptureRecyclesTheLanesOwnCheckpoint();
+    testFollowUpResumesFromTheRepliesDecodeCheckpoint();
+    testShortReplyKeepsNoDecodeCheckpoint();
+    testFollowUpTurnRetiresThePreviousRepliesCheckpoint();
+    testDivergentTurnRetiresTheInheritedDecodeCheckpoint();
     testStopBetweenBatchesFinishesAsCompleted();
     testStopInFlightFinishesAfterTheBatch();
     testStopBeforeStartFinishesAsCancelled();

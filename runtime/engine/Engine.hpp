@@ -115,7 +115,7 @@ public:
   }
   void cancel(uint64_t requestId);
   // Finishes a started request as EngineFinishReason::Stop: counted
-  // completed, its checkpoints retired as a normal finish retires them. A
+  // completed, its checkpoints kept or retired as a normal finish does. A
   // lane inside the in-flight batch finishes once that batch completes,
   // emitting none of its output; a request that never started finishes as
   // Cancelled; an unknown or finished id is ignored.
@@ -166,20 +166,23 @@ private:
   };
 
   // The resume states a conversation's next turn restores: the prompt-end
-  // state and the prefill checkpoint kept beside it. Taken at the prompt-end
-  // publication, held through suspension, and moved into conversationEnds_
-  // at a Stop or Length finish.
+  // state and the prefill checkpoint kept beside it, taken at the prompt-end
+  // publication and held through suspension, and the reply's decode
+  // checkpoint, taken at a Stop or Length finish, which moves the end into
+  // conversationEnds_.
   struct ConversationEnd final {
     StateProtection promptEnd;
     StateProtection keptCheckpoint;
+    StateProtection decodeCheckpoint;
 
     [[nodiscard]] explicit operator bool() const noexcept {
-      return promptEnd || keptCheckpoint;
+      return promptEnd || keptCheckpoint || decodeCheckpoint;
     }
-    // Whether either resume state sits on kvBlock; never for block 0.
+    // Whether any resume state sits on kvBlock; never for block 0.
     [[nodiscard]] bool holds(uint64_t kvBlock) const noexcept {
       return kvBlock && (promptEnd.kvBlock == kvBlock ||
-                         keptCheckpoint.kvBlock == kvBlock);
+                         keptCheckpoint.kvBlock == kvBlock ||
+                         decodeCheckpoint.kvBlock == kvBlock);
     }
   };
 
@@ -217,7 +220,8 @@ private:
     // A resident lane's latestCheckpoint, spared by Warning reclaim and taken
     // by growth reclaim and another lane's publication recycling only after
     // every unprotected state; the lane's own denied capture recycles it
-    // first. Dropped when the lane suspends or ends.
+    // first. Dropped when the lane suspends or ends; a Stop or Length finish
+    // moves a decode checkpoint into conversationEnd instead.
     StateProtection checkpointProtection;
     // A decoding lane's checkpoint replaced at its last decode boundary B,
     // kept until a later commit passes B: a suspension at exactly B cannot
@@ -242,6 +246,10 @@ private:
     // carried forward onto its prompt-end state, so a conversation holds at
     // most one kept checkpoint.
     StateCheckpoint inheritedCheckpoint;
+    // The kept decode checkpoint recorded on the state this request restored
+    // at its first admission: retired once this request's finish keeps its
+    // own, otherwise carried forward, so a conversation holds at most one.
+    StateCheckpoint inheritedDecodeCheckpoint;
     // The prompt-end publication was attempted; a resumed replay passing the
     // prompt end again keeps nothing further.
     bool promptEndPublished = false;
@@ -316,6 +324,11 @@ private:
   void setLatestCheckpoint(Request &request, StateCheckpoint checkpoint);
   void keepDeepestCheckpoint(Request &request, uint64_t promptEndBlock);
   void recordKeptCheckpoint(Request &request, uint64_t promptEndBlock);
+  [[nodiscard]] bool
+  isDecodeCheckpoint(const Request &request,
+                     StateCheckpoint checkpoint) const noexcept;
+  void keepDecodeCheckpoint(Request &request);
+  void recordDecodeCheckpoint(Request &request, StateCheckpoint decode);
   void protectConversationEnd(Request &request, uint64_t promptEndBlock);
   void keepConversationEnd(Request &request);
   void releaseConversationEnd(ConversationEnd &end) noexcept;

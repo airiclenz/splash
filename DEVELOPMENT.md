@@ -257,7 +257,10 @@ path. Constrained requests use a separate batch for the host mask exchange.
 
 Long prefill uses disposable rolling checkpoints every 4096 tokens. A completed
 request keeps its deepest one beside its prompt-end state, one per conversation,
-so a prompt edited within its last interval re-prefills at most 4096 tokens.
+so a prompt edited within its last interval re-prefills at most 4096 tokens. A reply
+that crossed a 4096-token boundary also keeps its deepest decode checkpoint, one per
+conversation, so a follow-up turn that extends prompt + reply resumes from it instead
+of re-prefilling the reply.
 Contended prefill adapts toward a 500 ms slice, keeping 2048-token chunks for long
 unopposed work. These policies do not extend client deadlines. Memory recovery waits are
 bounded, but readiness does not guarantee that a request-sized allocation fits.

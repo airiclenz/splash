@@ -138,8 +138,9 @@ public:
   [[nodiscard]] bool carriesState(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
-  // Records the checkpoints kept beside the prompt-end state at kvBlock, so
-  // a later request that resumes from that state can find and retire them.
+  // Records the checkpoints kept beside the prompt-end state, or kept decode
+  // checkpoint, at kvBlock, so a later request that resumes from that state
+  // can find and retire them.
   // No-op when no state is published at kvBlock.
   void recordKeptCheckpoint(uint64_t kvBlock, KeptCheckpoints kept) noexcept;
   // The checkpoints recorded beside the state at kvBlock, or empty handles;
@@ -149,7 +150,7 @@ public:
   // One cache reclaimer for memory growth and pressure warnings. After empty
   // backing, disposable checkpoints are reclaimed first, except protected
   // ones such as a resident lane's latest checkpoint or a conversation end's
-  // kept checkpoint. Ordinary states and
+  // kept checkpoints. Ordinary states and
   // state-free KV leaves retain their shared oldest-first access order.
   // Active requests and pinned restores are never selected. Physical release
   // is paced by the backing: while an earlier release is still being torn
@@ -168,7 +169,7 @@ public:
   // A pass without evictAll (Warning pressure) spares every protected state
   // (a suspended request's resume state, a queued request's prefix, a
   // resident lane's latest checkpoint, a conversation end's prompt-end state
-  // and kept checkpoint) and evicts the next publication instead; evictAll
+  // and kept checkpoints) and evicts the next publication instead; evictAll
   // (Critical pressure) takes protected states too.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
                                       bool keepResumePoint = false,
@@ -210,7 +211,7 @@ public:
                                                     uint32_t resumeTokens);
   // Protects the state published at kvBlock: the prefix a queued request
   // found and will restore, a resident lane's latest checkpoint, or a
-  // conversation end's prompt-end state or kept checkpoint.
+  // conversation end's prompt-end state or kept checkpoints.
   // Returns an empty handle when no state is published there.
   [[nodiscard]] StateProtection protectState(uint64_t kvBlock);
   // Ends one protection. No-op once its publication is gone.

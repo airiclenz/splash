@@ -611,8 +611,10 @@ bool Engine::admit(Request &active, double now) {
       model_.restore(active.request.id, resumeBoundary, lookup.state->state(),
                      !draft.draftStateRestoreSkipped);
       if (!resuming) {
-        active.inheritedCheckpoint =
-            cache_.keptCheckpoint(lookup.state->kvBlock()).prefill;
+        const KeptCheckpoints inherited =
+            cache_.keptCheckpoint(lookup.state->kvBlock());
+        active.inheritedCheckpoint = inherited.prefill;
+        active.inheritedDecodeCheckpoint = inherited.decode;
         active.restoredStateBlock = lookup.state->kvBlock();
       }
       setLatestCheckpoint(active,
@@ -938,6 +940,67 @@ void Engine::recordKeptCheckpoint(Request &active, uint64_t promptEndBlock) {
 }
 
 // ============================================================================
+// Whether checkpoint is a cached decode checkpoint of the lane's reply: one
+// held past the prompt-end publication that is neither the conversation's
+// kept prefill checkpoint nor the one the lane inherited. O(1).
+bool Engine::isDecodeCheckpoint(const Request &active,
+                                StateCheckpoint checkpoint) const noexcept {
+  return checkpoint && active.promptEndPublished &&
+         checkpoint.kvBlock != active.keptCheckpoint.kvBlock &&
+         checkpoint.kvBlock != active.inheritedCheckpoint.kvBlock &&
+         cache_.checkpointState(checkpoint.kvBlock).publication ==
+             checkpoint.publication;
+}
+
+// ============================================================================
+// At a Stop or Length finish, keeps the lane's latest decode checkpoint, its
+// deepest, as the conversation's kept decode checkpoint instead of retiring
+// it, so a follow-up prompt extending the reply resumes from it rather than
+// re-prefilling the reply. Keeping its own retires the decode checkpoint the
+// lane inherited, unless a peer holds it as a recovery point; a lane without
+// its own retires its latest checkpoint as before and carries the inherited
+// one forward, so a conversation keeps at most one. Runs once per finish:
+// O(1), plus one walk of the request table when retiring.
+void Engine::keepDecodeCheckpoint(Request &active) {
+  const StateCheckpoint own = active.latestCheckpoint;
+  const StateCheckpoint inherited = active.inheritedDecodeCheckpoint;
+  if (!isDecodeCheckpoint(active, own)) {
+    static_cast<void>(retireCheckpoint(active));
+    recordDecodeCheckpoint(active, inherited);
+    return;
+  }
+  if (inherited && inherited.kvBlock != own.kvBlock &&
+      !peerHoldsCheckpoint(active, inherited))
+    static_cast<void>(cache_.retireCheckpointState(inherited));
+  recordDecodeCheckpoint(active, own);
+  // The conversation end now protects it; the lane's own hold ends here.
+  setLatestCheckpoint(active, {});
+}
+
+// ============================================================================
+// Records decode as the conversation's kept decode checkpoint beside its
+// prompt-end state and protects it with the conversation end. Its own state
+// records the conversation's kept prefill checkpoint (the lane's own while
+// cached, else the inherited one), so a follow-up that resumes from decode
+// inherits that one and retires it once it keeps its own. No-op for an empty
+// or evicted handle. O(1).
+void Engine::recordDecodeCheckpoint(Request &active, StateCheckpoint decode) {
+  if (!decode ||
+      cache_.checkpointState(decode.kvBlock).publication != decode.publication)
+    return;
+  const StateCheckpoint own = active.keptCheckpoint;
+  const bool ownCached =
+      own && cache_.checkpointState(own.kvBlock).publication == own.publication;
+  const StateCheckpoint prefill = ownCached ? own : active.inheritedCheckpoint;
+  cache_.recordKeptCheckpoint(active.conversationEnd.promptEnd.kvBlock,
+                              {.prefill = prefill, .decode = decode});
+  cache_.recordKeptCheckpoint(decode.kvBlock, {.prefill = prefill});
+  cache_.unprotectState(active.conversationEnd.decodeCheckpoint);
+  active.conversationEnd.decodeCheckpoint =
+      cache_.protectState(decode.kvBlock);
+}
+
+// ============================================================================
 // Protects the conversation's resume states once its prompt-end state at
 // promptEndBlock is published: that state and the checkpoint recorded beside
 // it, while it is still that checkpoint publication. O(1).
@@ -977,10 +1040,11 @@ void Engine::keepConversationEnd(Request &active) {
 }
 
 // ============================================================================
-// Drops both protections of end and empties it. Stale handles are no-ops.
+// Drops every protection of end and empties it. Stale handles are no-ops.
 void Engine::releaseConversationEnd(ConversationEnd &end) noexcept {
   cache_.unprotectState(std::exchange(end.promptEnd, {}));
   cache_.unprotectState(std::exchange(end.keptCheckpoint, {}));
+  cache_.unprotectState(std::exchange(end.decodeCheckpoint, {}));
 }
 
 // Counts one checkpoint publication failure in the total and under its cause,
@@ -993,9 +1057,10 @@ void Engine::countCheckpointFailure(PublicationFailure cause) noexcept {
 
 // ============================================================================
 // The protections active's own conversation holds on checkpoint's
-// publication: the lane's latest, previous and kept handles, and the
-// conversation end it continues, the entry its finish will replace. A stale
-// handle matches nothing. O(maximumBatchWidth).
+// publication: the lane's latest, previous and kept handles, and the kept
+// prefill and decode checkpoints of the conversation end it continues, the
+// entry its finish will replace. A stale handle matches nothing.
+// O(maximumBatchWidth).
 uint32_t Engine::ownProtections(const Request &active,
                                 StateCheckpoint checkpoint) const {
   const auto same = [&](StateProtection protection) {
@@ -1010,8 +1075,9 @@ uint32_t Engine::ownProtections(const Request &active,
   const auto continued = std::find_if(first, last, [&](const auto &entry) {
     return entry.holds(active.restoredStateBlock);
   });
-  if (continued != last && same(continued->keptCheckpoint))
-    ++count;
+  if (continued != last)
+    count += same(continued->keptCheckpoint) +
+             same(continued->decodeCheckpoint);
   return count;
 }
 
@@ -1797,7 +1863,7 @@ void Engine::finish(Request &active, EngineFinishReason reason,
   if (reason == EngineFinishReason::Cancelled) {
     ++counters_.cancelled;
   } else {
-    static_cast<void>(retireCheckpoint(active));
+    keepDecodeCheckpoint(active);
     retirePreviousCheckpoint(active);
     keepConversationEnd(active);
     ++counters_.completed;

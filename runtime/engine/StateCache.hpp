@@ -21,8 +21,9 @@ struct StateCheckpoint final {
 };
 
 // The checkpoints a conversation keeps beside its prompt-end state: its
-// deepest prefill checkpoint and its deepest decode checkpoint. Either handle
-// may be empty, or stale once its publication is gone.
+// deepest prefill checkpoint and its finished reply's deepest decode
+// checkpoint. The kept decode checkpoint's own state records only the prefill
+// handle. Either handle may be empty, or stale once its publication is gone.
 struct KeptCheckpoints final {
   StateCheckpoint prefill;
   StateCheckpoint decode;
@@ -30,7 +31,7 @@ struct KeptCheckpoints final {
 
 // Names one publication a request needs: a suspended request's resume state,
 // a queued request's cached prefix, a resident lane's latest checkpoint, or a
-// conversation end's prompt-end state or kept checkpoint.
+// conversation end's prompt-end state or kept checkpoints.
 // A handle outlives neither the publication's eviction nor its replacement:
 // releasing a stale handle is a no-op.
 struct StateProtection final {
@@ -120,8 +121,9 @@ public:
   // Refreshes recency within the state's class. No-op when absent or pinned.
   void touch(uint64_t kvBlock) noexcept;
   // Records on the state published at kvBlock the checkpoints kept beside
-  // it by the conversation whose prompt ended there. Replaces any earlier
-  // record; no-op when no state is published.
+  // it by the conversation whose prompt ended there, or whose kept decode
+  // checkpoint it is. Replaces any earlier record; no-op when no state is
+  // published.
   void recordKeptCheckpoint(uint64_t kvBlock, KeptCheckpoints kept) noexcept;
   // The checkpoints recorded beside the state at kvBlock, or empty handles.
   // A handle may be stale: retiring a stale handle is a no-op.
@@ -174,8 +176,8 @@ private:
     bool evictable = false;
     bool checkpoint = false;
     uint64_t publication = 0;
-    // The checkpoints kept beside this prompt-end state; see
-    // recordKeptCheckpoint.
+    // The checkpoints kept beside this prompt-end state or kept decode
+    // checkpoint; see recordKeptCheckpoint.
     KeptCheckpoints kept;
   };
 
