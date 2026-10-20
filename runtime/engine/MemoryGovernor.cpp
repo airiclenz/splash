@@ -205,8 +205,12 @@ uint64_t MemoryGovernor::hostHeadroomBytes(
 
 bool MemoryGovernor::hostAdmits(uint64_t hostHeadroom,
                                 MemoryPressure pressure) const noexcept {
-  return pressure != MemoryPressure::Critical &&
-      hostHeadroom >= hostCushion_.warningMarginBytes;
+  if (pressure == MemoryPressure::Critical)
+    return false;
+  // The headroom is already net of the reserve: while bootstrapping any of
+  // it left after the growth keeps the host above the load guard's floor.
+  return isBootstrapping_ ? hostHeadroom > 0
+                          : hostHeadroom >= hostCushion_.warningMarginBytes;
 }
 
 std::optional<MemoryGovernor::Reservation>
@@ -262,6 +266,11 @@ metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
 void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
   std::lock_guard lock(mutex_);
   systemPressure_ = pressure;
+}
+
+void MemoryGovernor::setBootstrapping(bool bootstrapping) noexcept {
+  std::lock_guard lock(mutex_);
+  isBootstrapping_ = bootstrapping;
 }
 
 void MemoryGovernor::observe() noexcept {

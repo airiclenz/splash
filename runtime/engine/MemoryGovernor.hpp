@@ -80,8 +80,8 @@ struct MemoryGovernorSnapshot {
   uint64_t hostWiredBytes = 0;
   uint64_t hostCompressorBytes = 0;
   uint64_t hostReserveBytes = 0;
-  // The cushion's margins over the reserve: growth needs the warning margin
-  // left after it; a Warning reclaim episode ends at the recovery margin.
+  // The cushion's margins over the reserve: serving growth needs the warning
+  // margin left after it; a Warning reclaim episode ends at the recovery margin.
   uint64_t hostWarningMarginBytes = 0;
   uint64_t hostRecoveryMarginBytes = 0;
   uint64_t hostHeadroomBytes = 0;
@@ -178,8 +178,9 @@ public:
                  HostAvailableMemoryProvider hostAvailableMemory);
 
   // Grants while the engine budget fits, the host keeps at least the warning
-  // margin above the reserve after the growth, and pressure is not Critical.
-  // The Warning latch never denies on its own.
+  // margin above the reserve after the growth (while bootstrapping: stays
+  // above the reserve), and pressure is not Critical. The Warning latch never
+  // denies on its own.
   [[nodiscard]] std::optional<Reservation> tryReserve(
       uint64_t bytes, metal::AllocationFailure *failure = nullptr);
   // Low-level storage/model components receive only this transactional
@@ -187,6 +188,12 @@ public:
   // reverse dependency on engine policy.
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
   void setPressure(MemoryPressure pressure) noexcept;
+  // While set, host admission applies the load guard's floor (the reserve)
+  // instead of the serving floor, so load and warmup allocate as far as the
+  // guard lets them. A new governor applies the serving rule; startup sets
+  // the flag and clears it where serving begins, after which growth stays
+  // paused until headroom reaches the serving floor.
+  void setBootstrapping(bool bootstrapping) noexcept;
   // Samples host memory, stores the sample and advances the Warning latch,
   // which drives reported pressure and paced reclaim, never admission. Only
   // this and tryReserve() move the latch, so reported pressure never depends
@@ -226,6 +233,7 @@ private:
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
   std::optional<HostMemorySample> sampledHost_;
   bool hostConstrained_ = false;
+  bool isBootstrapping_ = false;
 };
 
 } // namespace splash::engine

@@ -897,6 +897,8 @@ int main(int argc, char **argv) {
     engine::EngineConfig engineConfig;
     engineConfig.maxContext = resources->memoryPlan().maximumContextTokens();
     engineConfig.vocabularySize = capabilities.vocabularySize;
+    // The benchmark Engine grows under the serving rule, as a server does.
+    resources->memoryGovernor().setBootstrapping(false);
     // No pressure tick runs here, so each check samples the host itself.
     engineConfig.growthPaused = [resources] {
       engine::MemoryGovernor &governor = resources->memoryGovernor();

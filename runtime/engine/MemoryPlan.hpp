@@ -44,20 +44,31 @@ struct ModelMemoryProfile final {
 
 [[nodiscard]] std::string modelStatusJson(const ModelMemoryProfile &model);
 
-// The host memory kept free of the engine. Growth is admitted while
-// reclaimable memory stays at or above reserve + warning margin after the
-// growth; the recovery margin only ends a Warning reclaim episode.
+// The host memory kept free of the engine. While serving, growth is admitted
+// while reclaimable memory stays at or above reserve + warning margin after
+// the growth; during load and warmup it only has to stay above the reserve.
+// The recovery margin only ends a Warning reclaim episode.
 struct HostCushion {
   uint64_t reserveBytes = 0;
   uint64_t warningMarginBytes = 0;
   uint64_t recoveryMarginBytes = 0;
 
-  // The least reclaimable host memory that may remain after growth, and the
-  // floor startup must stand strictly above.
+  // The least reclaimable host memory that may remain after serving growth,
+  // and the floor the pre-load check must stand strictly above.
   [[nodiscard]] constexpr uint64_t admissionFloorBytes() const noexcept {
     return reserveBytes + warningMarginBytes;
   }
 };
+
+// The startup floor rule: reclaimable host memory must stand strictly above
+// the floor. The pre-load check applies admissionFloorBytes(); the guard on
+// every load and warmup operation applies reserveBytes, so a start inside the
+// warning margin finishes and serves with growth paused until headroom
+// recovers.
+[[nodiscard]] constexpr bool
+hostStandsAboveFloor(uint64_t availableBytes, uint64_t floorBytes) noexcept {
+  return availableBytes > floorBytes;
+}
 
 struct EngineMemoryPolicy {
   // recommendedMaxWorkingSetSize already describes Metal's performance-safe

@@ -104,33 +104,48 @@ uint64_t packedModelFileBytes(const std::filesystem::path &root) {
 
 uint64_t mebibytes(uint64_t bytes) noexcept { return bytes / kMiB; }
 
+// Which floor a startup check applies; both come from the one HostCushion.
+enum class StartupFloor : uint8_t {
+  // Before the package opens: the serving governor's floor, reserve plus
+  // warning margin.
+  Admission,
+  // At every Metal operation during load and warmup: the reserve alone.
+  // Stricter here refused starts that would serve with growth paused.
+  Reserve,
+};
+
 // The startup admission rule. Deliberately independent of the model size:
 // weights are mapped, not copied, so the package never has to fit in
 // reclaimable memory at once. Residency is what must fit, and it is checked
 // here again at every Metal operation as loading and warmup build it up.
-// The floor is the serving governor's: reserve plus warning margin.
+// Throws a HostPressure MetalAllocationError naming the floor it applied.
 void requireStartupHeadroom(
     const MemoryGovernor::HostAvailableMemoryProvider &hostAvailableMemory,
-    const HostCushion &cushion, MemoryPressure pressure) {
+    const HostCushion &cushion, StartupFloor floor, MemoryPressure pressure) {
+  const bool withWarningMargin = floor == StartupFloor::Admission;
+  const uint64_t floorBytes = withWarningMargin
+      ? cushion.admissionFloorBytes()
+      : cushion.reserveBytes;
   const std::optional<HostMemorySample> sample = hostAvailableMemory();
-  if (!sample || sample->availableBytes <= cushion.admissionFloorBytes() ||
-      pressure == MemoryPressure::Critical) {
-    std::ostringstream message;
-    message << "not enough free memory to start: ";
-    if (!sample)
-      message << "reclaimable host memory cannot be measured";
-    else
-      message << mebibytes(sample->availableBytes) << " MiB reclaimable, "
-              << mebibytes(cushion.admissionFloorBytes())
-              << " MiB required (" << mebibytes(cushion.reserveBytes)
-              << " MiB protected for macOS + "
-              << mebibytes(cushion.warningMarginBytes)
-              << " MiB warning margin), system pressure "
-              << memoryPressureName(pressure);
-    message << "; close memory-heavy applications and retry";
-    throw metal::MetalAllocationError(message.str(),
-                                      metal::AllocationFailure::HostPressure);
+  if (sample && hostStandsAboveFloor(sample->availableBytes, floorBytes) &&
+      pressure != MemoryPressure::Critical)
+    return;
+  std::ostringstream message;
+  message << "not enough free memory to start: ";
+  if (!sample) {
+    message << "reclaimable host memory cannot be measured";
+  } else {
+    message << mebibytes(sample->availableBytes) << " MiB reclaimable, "
+            << mebibytes(floorBytes) << " MiB required ("
+            << mebibytes(cushion.reserveBytes) << " MiB protected for macOS";
+    if (withWarningMargin)
+      message << " + " << mebibytes(cushion.warningMarginBytes)
+              << " MiB warning margin";
+    message << "), system pressure " << memoryPressureName(pressure);
   }
+  message << "; close memory-heavy applications and retry";
+  throw metal::MetalAllocationError(message.str(),
+                                    metal::AllocationFailure::HostPressure);
 }
 
 std::array<uint8_t, 32> parseSha256(std::string_view value) {
@@ -321,6 +336,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         if (cancelled && cancelled())
           throw metal::MetalBackendError("Metal operation cancelled");
         requireStartupHeadroom(hostAvailableMemory, hostCushion,
+            StartupFloor::Reserve,
             pressure ? pressure() : MemoryPressure::Normal);
       });
   try {
@@ -337,9 +353,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
               std::to_string(hardBudgetBytes) + " bytes",
           deviceStatusJson(device), {}, RuntimeResourceFailure::EngineCapacity);
     }
-    // Fail before opening the package when the machine has no headroom at
-    // all; the guard installed above keeps checking as residency grows.
+    // Fail before opening the package below the serving floor; the guard
+    // installed above keeps checking against the reserve as residency grows.
     requireStartupHeadroom(hostAvailableMemory, hostCushion,
+        StartupFloor::Admission,
         config.memoryPressure ? config.memoryPressure() : MemoryPressure::Normal);
   } catch (const RuntimeResourcesError &) {
     throw;
@@ -439,6 +456,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         baselineBudget.hardBudgetBytes - runtimeReserve;
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
         *backend, elasticGrowthCeiling, hostCushion, hostAvailableMemory);
+    // Warmup's lazy state cells and KV meet the load guard's floor, not the
+    // serving one; whoever starts serving ends the phase.
+    memoryGovernor->setBootstrapping(true);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     std::string rejected;

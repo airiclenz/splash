@@ -168,28 +168,74 @@ void testReservationThatFitsIsGrantedWhileWarningLatched() {
           "the Warning latch denied a reservation that fits");
 }
 
-// requireStartupHeadroom refuses at or below admissionFloorBytes(); a one-byte
-// reservation must meet the same floor, and the snapshot must agree with it.
+// The pre-load check refuses at or below admissionFloorBytes() and a one-byte
+// serving reservation meets the same floor, the snapshot agreeing with it;
+// the load guard passes inside the warning margin and refuses at the reserve.
 void testStartupAndServingShareOneFloor() {
   FakeHost host;
   MemoryGovernor governor = makeGovernor(host);
+  const uint64_t floorBytes = kCushion.admissionFloorBytes();
 
-  host.availableBytes = kCushion.admissionFloorBytes();
+  const bool preLoadAtFloor = hostStandsAboveFloor(floorBytes, floorBytes);
+  const bool preLoadAboveFloor =
+      hostStandsAboveFloor(floorBytes + 1, floorBytes);
+  const bool guardInBand =
+      hostStandsAboveFloor(kLowHostBytes, kCushion.reserveBytes);
+  const bool guardAtReserve =
+      hostStandsAboveFloor(kCushion.reserveBytes, kCushion.reserveBytes);
+  host.availableBytes = floorBytes;
   metal::AllocationFailure failure = metal::AllocationFailure::None;
   const bool grantedAtFloor = governor.tryReserve(1, &failure).has_value();
   const bool reportedAtFloor = governor.snapshot().hostGrowthAllowed;
-  host.availableBytes = kCushion.admissionFloorBytes() + 1;
+  host.availableBytes = floorBytes + 1;
   const bool grantedAboveFloor = governor.tryReserve(1).has_value();
-  host.availableBytes = kCushion.admissionFloorBytes() - 1;
+  host.availableBytes = floorBytes - 1;
   governor.observe();
   const bool reportedBelowFloor = governor.snapshot().hostGrowthAllowed;
 
+  require(!preLoadAtFloor && preLoadAboveFloor,
+          "the pre-load check did not stand on the admission floor");
+  require(guardInBand && !guardAtReserve,
+          "the load guard did not stand on the reserve");
   require(!grantedAtFloor &&
               failure == metal::AllocationFailure::HostPressure,
-          "serving admitted growth at the startup floor");
-  require(grantedAboveFloor, "serving refused growth above the startup floor");
+          "serving admitted growth at the admission floor");
+  require(grantedAboveFloor,
+          "serving refused growth above the admission floor");
   require(reportedAtFloor && !reportedBelowFloor,
           "the snapshot's host test differs from the reservation's");
+}
+
+// While bootstrapping, a governor inside the warning margin admits growth
+// that keeps the host above the reserve and denies growth that reaches it;
+// once serving begins the serving floor applies and growth reports paused.
+void testBootstrapPhaseAdmitsAgainstReserve() {
+  FakeHost host;
+  MemoryGovernor governor = makeGovernor(host);
+  governor.setBootstrapping(true);
+
+  host.availableBytes = kLowHostBytes;
+  const bool grantedInBand = governor.tryReserve(1).has_value();
+  const bool reportedInBand = governor.snapshot().hostGrowthAllowed;
+  host.availableBytes = kCushion.reserveBytes + 1;
+  metal::AllocationFailure atReserve = metal::AllocationFailure::None;
+  const bool grantedAtReserve = governor.tryReserve(1, &atReserve).has_value();
+  governor.setBootstrapping(false);
+  host.availableBytes = kLowHostBytes;
+  metal::AllocationFailure serving = metal::AllocationFailure::None;
+  const bool grantedServing = governor.tryReserve(1, &serving).has_value();
+  const MemoryGovernorSnapshot servingSnapshot = governor.snapshot();
+
+  require(grantedInBand && reportedInBand,
+          "bootstrap denied growth that keeps the host above the reserve");
+  require(!grantedAtReserve &&
+              atReserve == metal::AllocationFailure::HostPressure,
+          "bootstrap admitted growth that reaches the reserve");
+  require(!grantedServing &&
+              serving == metal::AllocationFailure::HostPressure &&
+              !servingSnapshot.hostGrowthAllowed &&
+              !servingSnapshot.growthAllowed,
+          "serving inside the warning margin did not pause growth");
 }
 
 void testCushionScalesWithPhysicalMemory() {
@@ -286,6 +332,7 @@ int main() {
     testTryReserveAdvancesLatch();
     testReservationThatFitsIsGrantedWhileWarningLatched();
     testStartupAndServingShareOneFloor();
+    testBootstrapPhaseAdmitsAgainstReserve();
     testCushionScalesWithPhysicalMemory();
     testInvalidCushionRejected();
     testSystemPressureReadsWithoutSampling();

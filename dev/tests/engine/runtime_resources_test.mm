@@ -165,14 +165,19 @@ void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
   }
 }
 
-// Startup stands on the serving governor's floor, reserve plus warning
-// margin, and the refusal names that floor rather than the bare reserve.
+// The pre-load check stands on the serving governor's floor, reserve plus
+// warning margin, and its refusal names that floor rather than the bare
+// reserve. The load guard behind it stands on the reserve alone, so the
+// same reading would pass every load and warmup operation.
 void testStartupRefusalNamesServingFloor(const char *metallibPath) {
   TemporaryModelRoot root;
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root);
   const HostCushion cushion = EngineMemoryPolicy::hostCushion(
       NSProcessInfo.processInfo.physicalMemory);
   const uint64_t floorBytes = cushion.admissionFloorBytes();
+  require(!hostStandsAboveFloor(floorBytes, floorBytes) &&
+              hostStandsAboveFloor(floorBytes, cushion.reserveBytes),
+          "the pre-load and load-guard floors do not differ by the margin");
   const std::string expected =
       std::to_string(floorBytes / kMiB) + " MiB required (" +
       std::to_string(cushion.reserveBytes / kMiB) +
