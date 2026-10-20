@@ -449,6 +449,127 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   require(invalid.empty(), "invalid draft request partially encoded a graph");
 }
 
+// The K/V-only context layout reads the same K and V columns from 2048-wide
+// rows that the packed layout reads from 6144-wide [Q | K | V] rows, so both
+// must leave byte-identical rings, for the prefill step and the batched commit.
+void contextLayouts(MetalBackend &backend, DraftAttentionShape shape) {
+  constexpr uint32_t kPacked = 6144;
+  constexpr uint32_t kKeyValue = 2 * kKvHeads * kHeadDim;
+  constexpr uint32_t kQueryWidth = kPacked - kKeyValue;
+  const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
+  Random random(0x6b760000ULL + shape.hiddenSize);
+  const auto keyNorm = randomBfloat(backend, kHeadDim, random, "key norm");
+  auto keyValueOnly = [&](const MetalBuffer &packed, uint64_t rows) {
+    MetalBuffer result = backend.allocateBuffer(
+        rows * kKeyValue * 2, BufferStorage::Shared, "draft context kv");
+    const auto *source = static_cast<const uint16_t *>(packed.contents());
+    auto *target = static_cast<uint16_t *>(result.contents());
+    for (uint64_t row = 0; row < rows; ++row)
+      std::memcpy(target + row * kKeyValue,
+                  source + row * kPacked + kQueryWidth, kKeyValue * 2);
+    return result;
+  };
+  auto rope = [&](uint64_t rows, float step) {
+    MetalBuffer result = backend.allocateBuffer(
+        rows * kHeadDim / 2 * sizeof(float), BufferStorage::Shared, "rope");
+    for (uint64_t i = 0; i < rows * kHeadDim / 2; ++i)
+      static_cast<float *>(result.contents())[i] = std::cos(float(i) * step);
+    return result;
+  };
+  struct Rings {
+    std::vector<MetalBuffer> keys;
+    std::vector<MetalBuffer> values;
+  };
+  // Both layouts start from the same ring contents, so slots neither writes
+  // compare equal too and a stray write shows up as a difference.
+  auto rings = [&](uint64_t seed) {
+    Rings result;
+    Random fill(seed);
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      result.keys.push_back(randomBfloat(backend, ringElements, fill, "keys"));
+      result.values.push_back(
+          randomBfloat(backend, ringElements, fill, "values"));
+    }
+    return result;
+  };
+  auto requireEqual = [&](const Rings &packed, const Rings &keyValue,
+                          const Rings &initial, const char *message) {
+    bool written = false;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const std::array pairs{
+          std::array{packed.keys[lane], keyValue.keys[lane], initial.keys[lane]},
+          std::array{packed.values[lane], keyValue.values[lane],
+                     initial.values[lane]}};
+      for (const auto &pair : pairs) {
+        require(std::memcmp(pair[0].contents(), pair[1].contents(),
+                            pair[0].sizeBytes()) == 0,
+                message);
+        written = written || std::memcmp(pair[0].contents(), pair[2].contents(),
+                                         pair[0].sizeBytes()) != 0;
+      }
+    }
+    require(written, "draft context layout case wrote no ring slot");
+  };
+
+  // Prefill: one span whose positions wrap the ring end.
+  constexpr uint32_t kTokens = 37;
+  constexpr uint32_t kStart = kWindow - 11;
+  const auto packedPrefill =
+      randomBfloat(backend, uint64_t{kTokens} * kPacked, random, "context qkv");
+  const auto keyValuePrefill = keyValueOnly(packedPrefill, kTokens);
+  const auto prefillCos = rope(kTokens, 0.01F);
+  const auto prefillSin = rope(kTokens, 0.013F);
+  const Rings prefillInitial = rings(0x1111);
+  const Rings prefillPacked = rings(0x1111);
+  const Rings prefillKeyValue = rings(0x1111);
+  CommandGraph prefill;
+  DraftAttention::addContextPrefill(
+      prefill, packedPrefill, keyNorm, prefillCos, prefillSin,
+      prefillPacked.keys[0], prefillPacked.values[0], kTokens, kWindow, kStart,
+      shape);
+  DraftAttention::addContextPrefill(
+      prefill, keyValuePrefill, keyNorm, prefillCos, prefillSin,
+      prefillKeyValue.keys[0], prefillKeyValue.values[0], kTokens, kWindow,
+      kStart, shape, DraftContextLayout::KeyValue);
+  require(prefill.dispatches()[0].pipelineName == "prefill_draft_context_kv" &&
+              prefill.dispatches()[1].pipelineName ==
+                  "prefill_draft_context_kv_only",
+          "draft context prefill layout picked the wrong kernel");
+  static_cast<void>(backend.submitCommand(prefill.dispatches()));
+  requireEqual(prefillPacked, prefillKeyValue, prefillInitial,
+               "K/V-only draft context prefill ring differed from packed");
+
+  // Commit: every lane, with a partly retained, an empty and a wrapping lane.
+  const uint64_t commitRows = uint64_t{kLanes} * kRows;
+  const auto packedCommit =
+      randomBfloat(backend, commitRows * kPacked, random, "context qkv");
+  const auto keyValueCommit = keyValueOnly(packedCommit, commitRows);
+  const auto commitCos = rope(commitRows, 0.02F);
+  const auto commitSin = rope(commitRows, 0.017F);
+  MetalBuffer retained = backend.allocateBuffer(
+      kLanes * sizeof(uint32_t), BufferStorage::Shared, "retained");
+  const std::array<uint32_t, kLanes> retainedCounts{8, 5, 0, 8};
+  std::memcpy(retained.contents(), retainedCounts.data(), sizeof(retainedCounts));
+  const std::array<uint32_t, kLanes> starts{0, 2045, 17, 262140};
+  const Rings commitInitial = rings(0x2222);
+  const Rings commitPacked = rings(0x2222);
+  const Rings commitKeyValue = rings(0x2222);
+  CommandGraph commit;
+  DraftAttention::addContextCommit(
+      commit, packedCommit, keyNorm, commitCos, commitSin, commitPacked.keys,
+      commitPacked.values, retained, starts, kWindow, shape, kLanes);
+  DraftAttention::addContextCommit(
+      commit, keyValueCommit, keyNorm, commitCos, commitSin,
+      commitKeyValue.keys, commitKeyValue.values, retained, starts, kWindow,
+      shape, kLanes, DraftContextLayout::KeyValue);
+  require(commit.dispatches()[0].pipelineName == "draft_context_kv_commit" &&
+              commit.dispatches()[1].pipelineName == "draft_context_kv_only_commit",
+          "draft context commit layout picked the wrong kernel");
+  static_cast<void>(backend.submitCommand(commit.dispatches()));
+  requireEqual(commitPacked, commitKeyValue, commitInitial,
+               "K/V-only draft context commit ring differed from packed");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -460,6 +581,7 @@ int main(int argc, char **argv) {
     for (const auto shape : kShapes) {
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
         surroundingPhases(backend, shape, lanes);
+      contextLayouts(backend, shape);
       runCase(backend, 1, shape, {0, 0, 0, 0});
       runCase(backend, 2, shape, {2048, 2047, 0, 0});
       runCase(backend, 3, shape, {2100, 4094, 6143, 0});

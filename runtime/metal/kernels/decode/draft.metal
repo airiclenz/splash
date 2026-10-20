@@ -110,6 +110,43 @@ inline void draft_qkv_prepare_phase(
   }
 }
 
+// One (lane, row, KV head) task of the batched draft context commit; each
+// lane's Rows input rows are QWidth + 2048 wide (see draft_context_kv_phase).
+template <uint QWidth>
+inline void draft_context_kv_commit_phase(
+    device const bfloat *context_qkv, device const bfloat *k_norm,
+    device const float *rope_cos, device const float *rope_sin,
+    device bfloat *keys0, device bfloat *keys1, device bfloat *keys2,
+    device bfloat *keys3, device bfloat *values0, device bfloat *values1,
+    device bfloat *values2, device bfloat *values3,
+    device const uint *retained, constant DraftContextBatchParams &params,
+    uint group, uint thread_index, uint lane, uint simd_group,
+    threadgroup float *reductions, threadgroup bfloat *normalized) {
+  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint KVHeads = 8;
+  constexpr uint PackedWidth = QWidth + 2048;
+  constexpr uint RopeLaneStride = Rows * 64;
+  uint batch = group / (Rows * KVHeads);
+  uint task = group % (Rows * KVHeads);
+  if (batch >= params.lanes)
+    return;
+  device bfloat *keys =
+      batch == 0 ? keys0 : (batch == 1 ? keys1 : (batch == 2 ? keys2 : keys3));
+  device bfloat *values = batch == 0
+                              ? values0
+                              : (batch == 1 ? values1
+                                            : (batch == 2 ? values2 : values3));
+  DraftContextParams lane_params{Rows, params.cache_stride,
+                                  params.start_position[batch]};
+  draft_context_kv_phase<QWidth>(
+      context_qkv + ulong(batch) * Rows * PackedWidth, k_norm,
+      rope_cos + ulong(batch) * RopeLaneStride,
+      rope_sin + ulong(batch) * RopeLaneStride, keys, values, lane_params,
+      min(retained[batch], Rows), task, thread_index, lane, simd_group,
+      reductions, normalized);
+}
+
+// Reads the 6144-wide packed [Q | K | V] projection rows.
 kernel void draft_context_kv_commit(
     device const bfloat *context_qkv [[buffer(0)]],
     device const bfloat *k_norm [[buffer(1)]],
@@ -127,30 +164,38 @@ kernel void draft_context_kv_commit(
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
-  constexpr uint KVHeads = 8;
-  constexpr uint PackedWidth = 6144;
-  constexpr uint RopeLaneStride = Rows * 64;
-  uint batch = group / (Rows * KVHeads);
-  uint task = group % (Rows * KVHeads);
-  if (batch >= params.lanes)
-    return;
-  device bfloat *keys =
-      batch == 0 ? keys0 : (batch == 1 ? keys1 : (batch == 2 ? keys2 : keys3));
-  device bfloat *values = batch == 0
-                              ? values0
-                              : (batch == 1 ? values1
-                                            : (batch == 2 ? values2 : values3));
-  DraftContextParams lane_params{Rows, params.cache_stride,
-                                  params.start_position[batch]};
   threadgroup float reductions[8];
   threadgroup bfloat normalized[128];
-  draft_context_kv_phase(
-      context_qkv + ulong(batch) * Rows * PackedWidth, k_norm,
-      rope_cos + ulong(batch) * RopeLaneStride,
-      rope_sin + ulong(batch) * RopeLaneStride, keys, values, lane_params,
-      min(retained[batch], Rows), task, thread_index, lane, simd_group,
-      reductions, normalized);
+  draft_context_kv_commit_phase<4096>(
+      context_qkv, k_norm, rope_cos, rope_sin, keys0, keys1, keys2, keys3,
+      values0, values1, values2, values3, retained, params, group,
+      thread_index, lane, simd_group, reductions, normalized);
+}
+
+// Reads 2048-wide K/V-only [K | V] projection rows.
+kernel void draft_context_kv_only_commit(
+    device const bfloat *context_kv [[buffer(0)]],
+    device const bfloat *k_norm [[buffer(1)]],
+    device const float *rope_cos [[buffer(2)]],
+    device const float *rope_sin [[buffer(3)]],
+    device bfloat *keys0 [[buffer(4)]], device bfloat *keys1 [[buffer(5)]],
+    device bfloat *keys2 [[buffer(6)]], device bfloat *keys3 [[buffer(7)]],
+    device bfloat *values0 [[buffer(8)]],
+    device bfloat *values1 [[buffer(9)]],
+    device bfloat *values2 [[buffer(10)]],
+    device bfloat *values3 [[buffer(11)]],
+    device const uint *retained [[buffer(12)]],
+    constant DraftContextBatchParams &params [[buffer(13)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float reductions[8];
+  threadgroup bfloat normalized[128];
+  draft_context_kv_commit_phase<0>(
+      context_kv, k_norm, rope_cos, rope_sin, keys0, keys1, keys2, keys3,
+      values0, values1, values2, values3, retained, params, group,
+      thread_index, lane, simd_group, reductions, normalized);
 }
 
 // One split of the attention of one KV head over the 32 query rows of one

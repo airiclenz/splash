@@ -21,6 +21,12 @@ struct DraftAttentionShape final {
   bool operator==(const DraftAttentionShape &) const = default;
 };
 
+// Row layout of the projection the draft context K/V step reads: Packed rows
+// are the full 6144-wide [Q | K | V] projection, KeyValue rows only the
+// 2048-wide [K | V] part. Both write the same ring contents for the same K/V
+// columns.
+enum class DraftContextLayout : uint8_t { Packed, KeyValue };
+
 // These configurations vary the surrounding convolution, QKV preparation and
 // reorder phases. The compiled attention core stays M32/N128/D128 with eight
 // query rows, 256 threads, a fixed number of ring splits per KV head and the
@@ -131,7 +137,8 @@ public:
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
       metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
       metal::MetalBuffer values, uint32_t tokens, uint32_t cacheStride,
-      uint32_t startPosition, DraftAttentionShape shape);
+      uint32_t startPosition, DraftAttentionShape shape,
+      DraftContextLayout layout = DraftContextLayout::Packed);
   static void addContextCommit(
       metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
@@ -140,7 +147,8 @@ public:
       std::span<const metal::MetalBuffer> persistentValues,
       metal::MetalBuffer retainedCounts,
       std::span<const uint32_t> startPositions, uint32_t cacheStride,
-      DraftAttentionShape shape, uint32_t lanes);
+      DraftAttentionShape shape, uint32_t lanes,
+      DraftContextLayout layout = DraftContextLayout::Packed);
 };
 
 } // namespace splash::ops

@@ -2,6 +2,12 @@
 
 #include "metal/abi/KernelABI.h"
 
+// One (row, KV head) task of the draft context K/V step. The input rows are
+// packed [Q | K | V] with QWidth query columns ahead of the 1024 K and 1024 V
+// columns: QWidth 4096 reads the full 6144-wide projection, QWidth 0 a
+// 2048-wide K/V-only projection. The arithmetic is the same either way, so the
+// ring contents match for the same K/V columns.
+template <uint QWidth>
 inline void draft_context_kv_phase(
     device const bfloat *context_qkv, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
@@ -10,7 +16,7 @@ inline void draft_context_kv_phase(
     uint thread_index, uint lane, uint simd_group,
     threadgroup float *reductions, threadgroup bfloat *normalized) {
   constexpr uint KVHeads = 8, HeadDim = 128, Window = SPLASH_DRAFT_SLIDING_WINDOW;
-  constexpr uint QWidth = 4096, KWidth = 1024, PackedWidth = 6144;
+  constexpr uint KWidth = 1024, PackedWidth = QWidth + 2 * KWidth;
   uint row = task / KVHeads;
   if (row >= active_tokens)
     return;

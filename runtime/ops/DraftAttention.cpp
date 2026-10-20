@@ -232,12 +232,15 @@ void DraftAttention::addContextPrefill(
     metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
     metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
     metal::MetalBuffer values, uint32_t tokens, uint32_t cacheStride,
-    uint32_t startPosition, DraftAttentionShape shape) {
+    uint32_t startPosition, DraftAttentionShape shape,
+    DraftContextLayout layout) {
   static_cast<void>(kernelShape(shape));
   if (!tokens || !cacheStride)
     throw std::invalid_argument("invalid draft context prefill geometry");
   const DraftContextParams params{tokens, cacheStride, startPosition};
-  graph.add("prefill_draft_context_kv",
+  graph.add(layout == DraftContextLayout::KeyValue
+                ? "prefill_draft_context_kv_only"
+                : "prefill_draft_context_kv",
             {std::move(contextQkv), std::move(keyNorm), std::move(ropeCos),
              std::move(ropeSin), std::move(keys), std::move(values)},
             params, {uint64_t{tokens} * shape.kvHeads, 1, 1});
@@ -251,7 +254,7 @@ void DraftAttention::addContextCommit(
     std::span<const metal::MetalBuffer> persistentValues,
     metal::MetalBuffer retainedCounts,
     std::span<const uint32_t> startPositions, uint32_t cacheStride,
-    DraftAttentionShape shape, uint32_t lanes) {
+    DraftAttentionShape shape, uint32_t lanes, DraftContextLayout layout) {
   requireLanes(lanes);
   static_cast<void>(kernelShape(shape));
   if (startPositions.size() != kMaximumLanes || !cacheStride)
@@ -264,7 +267,10 @@ void DraftAttention::addContextCommit(
       std::move(ropeSin)};
   appendLaneBindings(bindings, persistentKeys, persistentValues);
   bindings.push_back(std::move(retainedCounts));
-  graph.add("draft_context_kv_commit", std::move(bindings), params,
+  graph.add(layout == DraftContextLayout::KeyValue
+                ? "draft_context_kv_only_commit"
+                : "draft_context_kv_commit",
+            std::move(bindings), params,
             {uint64_t{lanes} * SPLASH_DRAFT_QUERY_ROWS * shape.kvHeads, 1,
              1});
 }
