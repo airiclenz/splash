@@ -1,4 +1,5 @@
 #include "model/Runtime.hpp"
+#include "model/PolicyMasks.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -699,25 +700,29 @@ struct Runtime::Impl {
     return next;
   }
 
-  void loadPolicyBuffers(Request &entry, uint32_t lane,
-                         std::span<const uint32_t> masks) const {
+  void loadSamplingUniforms(const Request &entry, uint32_t lane) const {
     auto uniforms = decodeArena->get(lane, DecodeTensor::SamplingUniforms);
     auto *uniformData = contents<float>(uniforms, "sampling uniforms");
     std::copy(entry.cycleUniforms.begin(), entry.cycleUniforms.end(),
               uniformData);
+  }
+
+  // Unconstrained lanes write no mask words: the sampling kernels read the
+  // masks only for constrained lanes. A constrained lane rewrites all of its
+  // rows, so stale rows of an earlier step never reach the kernels.
+  void loadPolicyBuffers(Request &entry, uint32_t lane,
+                         std::span<const uint32_t> masks) const {
+    loadSamplingUniforms(entry, lane);
+    const bool isConstrained = entry.constraint == ConstraintMode::TokenMask;
+    if (!isConstrained && masks.empty())
+      return;
 
     auto constraint = decodeArena->get(lane, DecodeTensor::ConstraintMasks);
     auto *maskData = contents<uint32_t>(constraint, "constraint masks");
     const uint64_t capacity =
         uint64_t{ExecutionLimits::maximumStepTokens} * geometry.maskWords();
-    std::fill(maskData, maskData + capacity,
-              std::numeric_limits<uint32_t>::max());
-    if (!masks.empty()) {
-      if (masks.size() > capacity) {
-        throw std::invalid_argument("constraint mask exceeds decode arena");
-      }
-      std::copy(masks.begin(), masks.end(), maskData);
-    }
+    writeConstraintMasks({maskData, capacity}, isConstrained, masks,
+                         geometry.maskWords());
   }
 
   static ops::SamplingPolicy samplingPolicy(const Request &entry) noexcept {
@@ -1088,7 +1093,7 @@ struct Runtime::Impl {
         if (samplingEnabled(entry)) {
           entry.cycleUniforms.fill(0.0F);
           entry.cycleUniforms[0] = nextUniform(entry);
-          loadPolicyBuffers(entry, sequence.lane, {});
+          loadSamplingUniforms(entry, sequence.lane);
         }
         addPrefillPolicy(graph, entry, sequence.lane, lastRows - 1);
       }
@@ -2257,7 +2262,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->prepareDecodeLane(entry, item, lane);
       if (Impl::samplingEnabled(entry))
         Impl::stageSamplingCycle(entry);
-      impl_->loadPolicyBuffers(entry, lane, {});
+      // Nothing binds ConstraintMasks before the mask arrives; the WaitingMask
+      // stage writes them.
+      impl_->loadSamplingUniforms(entry, lane);
       laneResult.draftComputed = true;
       continue;
     }
