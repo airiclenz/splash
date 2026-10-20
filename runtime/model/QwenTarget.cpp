@@ -393,11 +393,12 @@ void QwenTarget::addVerify(
     std::span<const kv::LayerStorage> kvLayers,
     std::span<const kv::Q8ChunkedPrefillParams> q8,
     std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-    ops::GdnStoredRow storedRow, ops::Q4DispatchStats &stats) const {
+    ops::GdnStoredRow storedRow, bool isTargetHiddenCaptured,
+      ops::Q4DispatchStats &stats) const {
   std::visit(
       [&](const auto *weights) {
         addVerifyImpl(*weights, graph, std::move(buffers), kvLayers, q8,
-                      verify, lanes, storedRow, stats);
+                      verify, lanes, storedRow, isTargetHiddenCaptured, stats);
       },
       weights_);
 }
@@ -409,7 +410,8 @@ void QwenTarget::addVerifyImpl(
     std::span<const kv::LayerStorage> kvLayers,
     std::span<const kv::Q8ChunkedPrefillParams> q8,
     std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-    ops::GdnStoredRow storedRow, ops::Q4DispatchStats &stats) const {
+    ops::GdnStoredRow storedRow, bool isTargetHiddenCaptured,
+      ops::Q4DispatchStats &stats) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
       q8.size() != ExecutionLimits::maximumBatchWidth ||
       verify.size() != ExecutionLimits::maximumBatchWidth ||
@@ -532,7 +534,7 @@ void QwenTarget::addVerifyImpl(
     const auto captureLayers = geometry_.captureLayers();
     const auto captured =
         std::find(captureLayers.begin(), captureLayers.end(), layerIndex);
-    if (captured != captureLayers.end()) {
+    if (isTargetHiddenCaptured && captured != captureLayers.end()) {
       ops::DraftAttention::captureTargetHidden(
           graph, output, buffers.capturedTargetHidden, rows,
           static_cast<uint32_t>(captured - captureLayers.begin()), 0, 0,

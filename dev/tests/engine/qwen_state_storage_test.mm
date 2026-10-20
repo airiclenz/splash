@@ -150,6 +150,86 @@ void testTargetOnlyStates(metal::MetalBackend &backend,
   storage.releaseSlot(0, 504);
 }
 
+// A runtime without speculation snapshots target-only: the copy takes the
+// lane's reserve cell and no draft ring, from the reserve or the pool, and
+// stores no draft window, so a full lane's lengths do not make it composite.
+// The default snapshot keeps its draft-window rule; both refuse a target
+// length that is zero or not page-aligned before taking any buffer.
+void testTargetOnlySnapshot(metal::MetalBackend &backend,
+                            const metal::AllocationAdmission &admitState,
+                            bool &admitNewAllocations) {
+  using model::QwenLogicalLengths;
+  using model::QwenSnapshotContent;
+  using model::QwenStateStorage;
+
+  QwenStateStorage storage(backend, admitState, kStateLayout);
+  require(storage.tryActivateSlot(0, 701) && storage.tryActivateSlot(1, 702),
+          "target-only snapshot fixture lanes were not activated");
+  const QwenLogicalLengths partial{4'096, 0, 0, 0};
+  storage.updateLengths(0, partial);
+  const auto &source = storage.buffers(0);
+  const uint32_t active = storage.metadata(0).activeParity;
+  word(source.gdn[active].convolutionBase) = 0x81818181;
+  word(source.gdn[active].recurrentBase) = 0x82828282;
+  requireThrows<std::invalid_argument>(
+      [&] { static_cast<void>(storage.snapshot(0)); },
+      "default snapshot accepted a lane without a draft window");
+
+  const uint64_t storageBefore = storage.actualAllocatedBytes();
+  const uint32_t idleCellsBefore = storage.idleCells();
+  const uint32_t idleRingsBefore = storage.idleRings();
+  admitNewAllocations = false;
+  auto targetOnly = storage.snapshot(0, QwenSnapshotContent::TargetOnly);
+  admitNewAllocations = true;
+  require(targetOnly && !targetOnly->carriesDraft() &&
+              targetOnly->bytes() == kTargetState.cellBytes(),
+          "target-only snapshot carried a draft ring");
+  require(storage.actualAllocatedBytes() == storageBefore &&
+              storage.idleCells() == idleCellsBefore &&
+              storage.idleRings() == idleRingsBefore,
+          "target-only snapshot allocated or took a pooled buffer");
+  require(word(source.gdn[active].convolutionBase) == 0x81818181,
+          "target-only snapshot disturbed the live lane");
+
+  requireThrows<std::invalid_argument>(
+      [&] { storage.restore(1, *targetOnly, true); },
+      "target-only snapshot restored a draft it does not carry");
+  storage.restore(1, *targetOnly, false);
+  const auto &destination = storage.buffers(1);
+  const uint32_t restored = storage.metadata(1).activeParity;
+  require(word(destination.gdn[restored].convolutionBase) == 0x81818181 &&
+              word(destination.gdn[restored].recurrentBase) == 0x82828282 &&
+              storage.metadata(1).lengths ==
+                  QwenLogicalLengths{4'096, 4'096, 0, 0},
+          "target-only snapshot did not restore its GDN state at its length");
+  targetOnly.reset();
+  require(storage.idleCells() == idleCellsBefore + 1 &&
+              storage.idleRings() == idleRingsBefore,
+          "a dropped target-only snapshot returned a draft ring");
+
+  const QwenLogicalLengths complete{2'048, 0, 2'048, 0};
+  storage.updateLengths(0, complete);
+  const auto fromFull = storage.snapshot(0, QwenSnapshotContent::TargetOnly);
+  require(fromFull && !fromFull->carriesDraft(),
+          "target-only snapshot of a full lane carried its draft ring");
+
+  for (const QwenLogicalLengths lengths :
+       {QwenLogicalLengths{100, 0, 50, 50}, QwenLogicalLengths{0, 0, 0, 0}}) {
+    storage.updateLengths(0, lengths);
+    const uint32_t idleCells = storage.idleCells();
+    requireThrows<std::invalid_argument>(
+        [&] {
+          static_cast<void>(
+              storage.snapshot(0, QwenSnapshotContent::TargetOnly));
+        },
+        "target-only snapshot accepted zero or unaligned target tokens");
+    require(storage.idleCells() == idleCells,
+            "a refused target-only snapshot took a cell");
+  }
+  storage.releaseSlot(0, 701);
+  storage.releaseSlot(1, 702);
+}
+
 // Runtime::suspendWithState's sequence: the live state moves out, then the
 // slot and the idle pool are released. The moved cell survives both without
 // a copy or an admitted allocation, restores at the lane's length, and parks
@@ -563,6 +643,7 @@ void run(const std::string &metallib) {
   }
   testTargetOnlyStates(backend, admitState, admitNewAllocations);
   testSuspensionKeepsTheMovedCell(backend, admitState, admitNewAllocations);
+  testTargetOnlySnapshot(backend, admitState, admitNewAllocations);
   require(backend.memoryStats().allocatedBytes == beforeStorage,
           "destroyed state slots remained in actual allocation count");
 

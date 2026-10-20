@@ -303,6 +303,9 @@ struct Runtime::Impl {
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
   const bool isSpeculationEnabled = true;
+  // The draft work each graph kind encodes; none without speculation.
+  const DraftEncoders prefillDraft;
+  const DraftEncoders decodeDraft;
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
   // Each place that builds a command graph; graphs from one site share a shape.
@@ -342,6 +345,10 @@ struct Runtime::Impl {
         pipelineReserveBytes(value.pipelineReserveBytes),
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
         isSpeculationEnabled(value.isSpeculationEnabled),
+        prefillDraft(
+            draftEncoders(WorkKind::Prefill, value.isSpeculationEnabled)),
+        decodeDraft(
+            draftEncoders(WorkKind::Decode, value.isSpeculationEnabled)),
         sampling(value.backend, geometry.target.vocabularySize, kDecodeRows),
         targetModel(std::visit(
                         [&](const auto &weights) {
@@ -373,6 +380,15 @@ struct Runtime::Impl {
     if (found == requests.end())
       throw std::out_of_range("unknown request");
     return found->second;
+  }
+
+  // ==========================================================================
+  // Whether a lane's lengths carry the draft window its state needs: a
+  // complete one when decode commits draft context, none without speculation.
+  bool
+  hasRequiredDraftWindow(const QwenLogicalLengths &lengths) const noexcept {
+    return !decodeDraft.isDraftContextCommitted ||
+           lengths.hasCompleteDraftWindow(kDraftCacheStride);
   }
 
   static bool samplingEnabled(const Request &entry) noexcept {
@@ -739,8 +755,12 @@ struct Runtime::Impl {
         source + uint64_t{row + 1} * geometry.target.hiddenSize);
   }
 
-  static DispatchDraftCapturePlan
-  activeDraftCaptures(const Request &entry, const ModelBatchItem &item) {
+  // The draft-context spans one prefill dispatch captures; none without
+  // speculation, whatever the request's plan.
+  DispatchDraftCapturePlan
+  activeDraftCaptures(const Request &entry, const ModelBatchItem &item) const {
+    if (!prefillDraft.isTargetHiddenCaptured)
+      return {};
     if (!entry.draftContextPlan) {
       throw std::logic_error("prefill request has no draft context plan");
     }
@@ -1189,7 +1209,7 @@ struct Runtime::Impl {
     }
     const QwenSlotMetadata &metadata = states.metadata(entry.slot);
     if (metadata.lengths.targetTokens != item.logicalPosition ||
-        !metadata.lengths.hasCompleteDraftWindow(kDraftCacheStride)) {
+        !hasRequiredDraftWindow(metadata.lengths)) {
       throw std::logic_error("decode state length is not exact");
     }
     static_cast<void>(synchronizedPageTable(entry, item));
@@ -1410,12 +1430,13 @@ struct Runtime::Impl {
           DecodeTensor::ChunkValuesBase, layer, lanes);
     }
     // Without speculation only row 0 is ever retained: the decode stores its
-    // GDN state and encodeBatchGdnCommit adds no commit.
+    // GDN state and encodeBatchGdnCommit adds no commit. Nor does it capture
+    // target hidden rows, which only the draft context commit reads.
     targetModel.addVerify(graph, std::move(buffers), kvLayers, q8, verify,
                           lanes,
                           isSpeculationEnabled ? ops::GdnStoredRow::Last
                                                : ops::GdnStoredRow::First,
-                          stats);
+                          decodeDraft.isTargetHiddenCaptured, stats);
   }
 
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,
@@ -1455,6 +1476,10 @@ struct Runtime::Impl {
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid draft state commit batch");
     }
+    // Without speculation the draft ring keeps no context: states stay
+    // target-only.
+    if (!decodeDraft.isDraftContextCommitted)
+      return;
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->packed(tensor, lanes);
@@ -1639,11 +1664,17 @@ struct Runtime::Impl {
       const uint64_t nextLength =
           items[lane].logicalPosition + laneResult.retained;
       const QwenLogicalLengths previous = states.metadata(entry.slot).lengths;
-      states.updateLengths(
-          entry.slot, advanceDraftContext(
-                          previous, nextLength,
-                          {static_cast<uint32_t>(items[lane].logicalPosition),
-                           static_cast<uint32_t>(nextLength), 0, false}));
+      QwenLogicalLengths next = previous;
+      next.targetTokens = nextLength;
+      // Without speculation the draft ring commits nothing, so only the
+      // target length advances.
+      if (decodeDraft.isDraftContextCommitted) {
+        next = advanceDraftContext(
+            previous, nextLength,
+            {static_cast<uint32_t>(items[lane].logicalPosition),
+             static_cast<uint32_t>(nextLength), 0, false});
+      }
+      states.updateLengths(entry.slot, next);
       entry.generatedTokens += laneResult.retained;
       entry.pendingToken = laneResult.nextAnchor;
       entry.maskWords.clear();
@@ -2182,7 +2213,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       Impl::Request &entry = *entries[lane];
       const ModelBatchItem &item = items[lane];
-      const auto captures = Impl::activeDraftCaptures(entry, item);
+      const auto captures = impl->activeDraftCaptures(entry, item);
       const uint32_t capturedRows = Impl::captureRows(captures);
       uint32_t activeRows = 0;
       uint32_t materializationRows = 0;
@@ -2394,20 +2425,27 @@ Runtime::decodeAsync(const BatchPlan &plan,
   if (draftComputed && draftComputed != lanes.size()) {
     throw std::logic_error("decode batch mixed draft execution phases");
   }
+  const DraftEncoders &decodeDraft = impl_->decodeDraft;
   if (draftComputed || verified) {
     const uint32_t ropeRows = width * kDecodeRows;
+    // Only the draft proposal and context commit read the draft tables.
+    const uint32_t draftRopeRows =
+        decodeDraft.isDraftProposed || decodeDraft.isDraftContextCommitted
+            ? ropeRows
+            : 0;
     impl_->addRopeTables(
         commandGraph,
         impl_->decodeArena->packed(DecodeTensor::Positions, width), ropeRows,
         impl_->decodeArena->packed(DecodeTensor::DraftPositions, width),
-        ropeRows, impl_->decodeArena->packed(DecodeTensor::RopeCos, width),
+        draftRopeRows,
+        impl_->decodeArena->packed(DecodeTensor::RopeCos, width),
         impl_->decodeArena->packed(DecodeTensor::RopeSin, width),
         impl_->decodeArena->packed(DecodeTensor::DraftRopeCos, width),
         impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width));
   }
-  // Without speculation the draft proposes nothing; its context commit still
-  // runs so states stay composite.
-  if (draftComputed && impl_->isSpeculationEnabled) {
+  // Without speculation the draft proposes nothing and commits no context, so
+  // states stay target-only.
+  if (draftComputed && decodeDraft.isDraftProposed) {
     std::array<Impl::Request *, kLaneCount> requests{};
     std::array<uint64_t, kLaneCount> logicalPositions{};
     for (uint32_t lane = 0; lane < lanes.size(); ++lane) {
@@ -2483,11 +2521,15 @@ std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
   if (!entry.resident)
     throw std::logic_error("request is not resident");
   const QwenSlotMetadata &metadata = impl_->states.metadata(entry.slot);
-  if (!metadata.lengths.hasCompleteDraftWindow(kDraftCacheStride) ||
+  if (!impl_->hasRequiredDraftWindow(metadata.lengths) ||
       metadata.lengths.targetTokens % kv::kPageTokens) {
     throw std::logic_error("cannot snapshot uncommitted draft state");
   }
-  return impl_->states.snapshot(entry.slot);
+  // Without speculation no lane keeps a draft window to copy.
+  return impl_->states.snapshot(entry.slot,
+                                impl_->decodeDraft.isDraftContextCommitted
+                                    ? QwenSnapshotContent::Composite
+                                    : QwenSnapshotContent::TargetOnly);
 }
 
 uint64_t Runtime::reclaimIdleState() noexcept {
@@ -2696,7 +2738,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
                            lengths.targetTokens ==
                                1 + decoded[lane].outputTokens.size() -
                                    decoded[lane].outputTokensWithoutKv &&
-                           lengths.hasCompleteDraftWindow(kDraftCacheStride);
+                           impl_->hasRequiredDraftWindow(lengths);
     }
     const bool fusedWidth =
         width == 1 ||
@@ -2767,7 +2809,7 @@ WarmupStepResult Runtime::warmupDraftVerifyCommit() {
         decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));
     const auto &lengths = impl_->states.metadata(0).lengths;
     if (result.size() != 1 || result[0].outputTokens.empty() ||
-        !lengths.hasCompleteDraftWindow(kDraftCacheStride) ||
+        !impl_->hasRequiredDraftWindow(lengths) ||
         lengths.targetTokens <= 1 ||
         lengths.targetTokens != 1 + result[0].outputTokens.size() -
                                     result[0].outputTokensWithoutKv) {
@@ -2822,12 +2864,12 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     estimatedPeakBytes = impl_->estimatedWarmupPeak();
     end(id);
     beginColdRequest(request, 1);
-    restore(id, prefixTokens, cachedState, true);
+    restore(id, prefixTokens, cachedState, cachedState->carriesDraft());
     setDraftContextPlan(
         id, planDraftContext(prefixTokens, promptTokens, prefixTokens, {}));
     const auto &restored = impl_->states.metadata(1).lengths;
     if (restored.targetTokens != prefixTokens ||
-        !restored.hasCompleteDraftWindow(kDraftCacheStride)) {
+        !impl_->hasRequiredDraftWindow(restored)) {
       throw std::runtime_error("prefix restore length mismatch");
     }
 
@@ -2858,7 +2900,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     wallSeconds += historicalDecodeWallSeconds;
     const auto &continued = impl_->states.metadata(1).lengths;
     if (decoded.size() != 1 || decoded[0].outputTokens.empty() ||
-        !continued.hasCompleteDraftWindow(kDraftCacheStride) ||
+        !impl_->hasRequiredDraftWindow(continued) ||
         continued.targetTokens <= promptTokens ||
         continued.targetTokens !=
             promptTokens + decoded[0].outputTokens.size() -

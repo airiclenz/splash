@@ -3,6 +3,7 @@
 #include "engine/Cache.hpp"
 #include "engine/Bootstrap.hpp"
 #include "TestModel.hpp"
+#include "model/Runtime.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -835,6 +836,26 @@ void testNativeConfigCarriesSpeculationToResources() {
           "the process identity did not reach the bootstrap configuration");
 }
 
+// Speculation alone decides the draft work a graph encodes: none without it,
+// so a --no-speculation prefill captures no context rows and its decode
+// neither captures target hidden rows nor commits the draft ring.
+void testDraftEncodersFollowSpeculation() {
+  using model::DraftEncoders;
+  using model::draftEncoders;
+
+  const DraftEncoders prefillOff = draftEncoders(WorkKind::Prefill, false);
+  const DraftEncoders decodeOff = draftEncoders(WorkKind::Decode, false);
+  const DraftEncoders prefillOn = draftEncoders(WorkKind::Prefill, true);
+  const DraftEncoders decodeOn = draftEncoders(WorkKind::Decode, true);
+
+  require(prefillOff == DraftEncoders{} && decodeOff == DraftEncoders{},
+          "a graph encodes draft work without speculation");
+  require(prefillOn == DraftEncoders{true, false, true},
+          "speculative prefill does not capture and commit context alone");
+  require(decodeOn == DraftEncoders{true, true, true},
+          "speculative decode skips a draft encoder");
+}
+
 void testContendedPrefillRowsReachConfigInAnyOrder() {
   const std::vector<std::vector<std::string_view>> orders = {
       {"--contended-prefill-rows", "256", "--kv-format", "bf16",
@@ -902,6 +923,7 @@ int main() {
     testNativeOptionsAcceptEitherOrder();
     testNativeOptionsRejectMalformedTails();
     testNativeConfigCarriesSpeculationToResources();
+    testDraftEncodersFollowSpeculation();
     testContendedPrefillRowsReachConfigInAnyOrder();
     testContendedPrefillRowsRejectInvalidValues();
     std::cout << "native bootstrap tests passed\n";

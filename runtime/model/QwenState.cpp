@@ -40,6 +40,26 @@ constexpr uint32_t kSlotRings = 2;
 constexpr uint32_t kReserveCell = 2;
 constexpr uint32_t kReserveRing = 1;
 
+// ============================================================================
+// A target-only state is resumable only at a whole KV page past the start.
+void requireTargetOnlyLengths(const QwenLogicalLengths &lengths) {
+  if (!lengths.targetTokens || lengths.targetTokens % kv::kPageTokens) {
+    throw std::invalid_argument(
+        "target-only composite state requires page-aligned target tokens");
+  }
+}
+
+// ============================================================================
+// The lengths with an empty draft window ending at the target length.
+QwenLogicalLengths withoutDraftWindow(QwenLogicalLengths lengths,
+                                      uint32_t draftCapacity) {
+  lengths.draftBase = lengths.targetTokens;
+  lengths.draftLength = 0;
+  lengths.draftCommitCursor =
+      static_cast<uint32_t>(lengths.targetTokens % draftCapacity);
+  return lengths;
+}
+
 // Takes up to taken.size() buffers from the back of the pool, in pop order.
 template <class Buffer, std::size_t Count>
 uint32_t takePooled(std::vector<std::shared_ptr<Buffer>> &pool,
@@ -260,13 +280,20 @@ void QwenStateStorage::swapParity(uint32_t index) {
 }
 
 std::shared_ptr<const QwenCompositeState>
-QwenStateStorage::snapshot(uint32_t index) {
+QwenStateStorage::snapshot(uint32_t index, QwenSnapshotContent content) {
   Slot &source = slot(index);
   requireAssigned(source);
-  validateLengths(source.metadata.lengths, true);
+  const bool isTargetOnly = content == QwenSnapshotContent::TargetOnly;
+  QwenLogicalLengths lengths = source.metadata.lengths;
+  validateLengths(lengths, !isTargetOnly);
+  if (isTargetOnly) {
+    requireTargetOnlyLengths(lengths);
+    lengths = withoutDraftWindow(lengths, layout_.draft.tokens);
+  }
   // The lane's reserve first, then pooled buffers, then the governor. A
   // denied admission puts a taken cell back where it came from and drops a
-  // fresh one, leaving no trace.
+  // fresh one, leaving no trace. A target-only snapshot leaves the reserve's
+  // ring and the pooled rings untouched.
   QwenCacheSlot &reserve = (*reserves_)[index].buffers;
   QwenCacheSlot cacheSlot;
   const bool reservedCell = static_cast<bool>(reserve.gdn);
@@ -275,19 +302,23 @@ QwenStateStorage::snapshot(uint32_t index) {
                                : acquireCell("qwen-state-cache-gdn");
   if (!cacheSlot.gdn)
     return nullptr;
-  cacheSlot.draft = reserve.draft ? std::move(reserve.draft)
-                                  : acquireRing("qwen-state-cache-draft");
-  if (!cacheSlot.draft) {
-    if (reservedCell)
-      reserve.gdn = std::move(cacheSlot.gdn);
-    else if (pooledCell)
-      pool_->cells.push_back(std::move(cacheSlot.gdn));
-    return nullptr;
+  if (!isTargetOnly) {
+    cacheSlot.draft = reserve.draft ? std::move(reserve.draft)
+                                    : acquireRing("qwen-state-cache-draft");
+    if (!cacheSlot.draft) {
+      if (reservedCell)
+        reserve.gdn = std::move(cacheSlot.gdn);
+      else if (pooledCell)
+        pool_->cells.push_back(std::move(cacheSlot.gdn));
+      return nullptr;
+    }
   }
   const uint32_t active = source.metadata.activeParity;
   copyExact(cacheSlot.gdn->buffers().stateBase,
             source.gdn[active]->buffers().stateBase, "cached GDN state");
-  for (uint32_t layer = 0; layer < source.buffers.draft.size(); ++layer) {
+  const uint32_t draftLayers =
+      cacheSlot.draft ? static_cast<uint32_t>(source.buffers.draft.size()) : 0;
+  for (uint32_t layer = 0; layer < draftLayers; ++layer) {
     copyExact(cacheSlot.draft->layers()[layer].keys,
               source.buffers.draft[layer].keys, "cached draft keys");
     copyExact(cacheSlot.draft->layers()[layer].values,
@@ -295,7 +326,7 @@ QwenStateStorage::snapshot(uint32_t index) {
   }
   return std::shared_ptr<const QwenCompositeState>(new QwenCompositeState(
       pool_, reserves_, {index, source.metadata.requestId},
-      std::move(cacheSlot), layout_, source.metadata.lengths));
+      std::move(cacheSlot), layout_, lengths));
 }
 
 std::shared_ptr<const QwenCompositeState>
@@ -348,9 +379,8 @@ void QwenStateStorage::restore(uint32_t index, const CompositeState &state,
     validateLengths(stored, true);
   } else if (restoreDraftState) {
     throw std::invalid_argument("target-only composite state has no draft");
-  } else if (!stored.targetTokens || stored.targetTokens % kv::kPageTokens) {
-    throw std::invalid_argument(
-        "target-only composite state requires page-aligned target tokens");
+  } else {
+    requireTargetOnlyLengths(stored);
   }
   Slot &destination = slot(index);
   requireAssigned(destination);
@@ -373,13 +403,9 @@ void QwenStateStorage::restore(uint32_t index, const CompositeState &state,
     }
   }
   uint64_t requestId = destination.metadata.requestId;
-  QwenLogicalLengths lengths = stored;
-  if (!restoreDraftState) {
-    lengths.draftBase = lengths.targetTokens;
-    lengths.draftLength = 0;
-    lengths.draftCommitCursor =
-        lengths.targetTokens % layout_.draft.tokens;
-  }
+  const QwenLogicalLengths lengths =
+      restoreDraftState ? stored
+                        : withoutDraftWindow(stored, layout_.draft.tokens);
   destination.metadata = {true, requestId, active, lengths};
 }
 

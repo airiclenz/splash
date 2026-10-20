@@ -1,11 +1,37 @@
 #pragma once
 
+#include "model/Model.hpp"
 #include "model/ModelFactory.hpp"
 
 #include <cstdint>
 #include <memory>
 
 namespace splash::model {
+
+// ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+// The draft-model work a prefill or decode graph encodes. Without speculation
+// no graph encodes any of it, so states stay target-only: no draft ring is
+// written and no draft window is kept.
+struct DraftEncoders final {
+  // Target hidden rows captured as draft context: prefill spans, decode verify.
+  bool isTargetHiddenCaptured = false;
+  // The draft forward that proposes tokens (decode only).
+  bool isDraftProposed = false;
+  // The draft context written into the slot's draft ring: the packed context
+  // prefill, or the decode's context commit.
+  bool isDraftContextCommitted = false;
+
+  bool operator==(const DraftEncoders &) const = default;
+};
+
+// ============================================================================
+// The draft encoders a graph of the given kind encodes, given speculation.
+[[nodiscard]] constexpr DraftEncoders
+draftEncoders(WorkKind kind, bool isSpeculationEnabled) noexcept {
+  if (!isSpeculationEnabled)
+    return {};
+  return {true, kind == WorkKind::Decode, true};
+}
 
 class Runtime final : public RuntimeModel {
 public:

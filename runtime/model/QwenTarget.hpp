@@ -339,12 +339,16 @@ public:
       std::span<const kv::LayerStorage> kvLayers) const;
   // storedRow is the verify row whose GDN state the decode stores; First
   // replaces the state commit when only row 0 can be retained.
+  // isTargetHiddenCaptured adds the capture-layer copies into
+  // capturedTargetHidden that the draft context commit reads; without
+  // speculation nothing reads them.
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const kv::LayerStorage> kvLayers,
       std::span<const kv::Q8ChunkedPrefillParams> q8,
       std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-      ops::GdnStoredRow storedRow, ops::Q4DispatchStats &stats) const;
+      ops::GdnStoredRow storedRow, bool isTargetHiddenCaptured,
+      ops::Q4DispatchStats &stats) const;
   void addHead(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
                uint32_t normalizedRows, ops::LinearScratch scratch = {}) const;
@@ -370,7 +374,8 @@ private:
       std::span<const kv::LayerStorage> kvLayers,
       std::span<const kv::Q8ChunkedPrefillParams> q8,
       std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
-      ops::GdnStoredRow storedRow, ops::Q4DispatchStats &stats) const;
+      ops::GdnStoredRow storedRow, bool isTargetHiddenCaptured,
+      ops::Q4DispatchStats &stats) const;
 
   WeightView weights_;
   QwenTargetGeometry geometry_;

@@ -125,8 +125,10 @@ that a long uncached prompt will reach its first token quickly.
 - `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
 - `--kv-format`: target KV cache storage, `int8` (default) or `bf16`.
 - `--no-speculation`: decode one token per step without draft proposals. The
-  draft model stays loaded; `/status` reports `speculative_decoding: false` and
-  no draft acceptance rate. Default: speculative decoding on.
+  draft model stays loaded but prefill and decode run none of its work;
+  `/status` reports `speculative_decoding: false`, no draft acceptance rate and
+  zero active or materialization draft context rows. Default: speculative
+  decoding on.
 - `--contended-prefill-rows`: smallest prefill command, in rows, while other
   requests are decoding: a power of two from `64` to `2048`. A larger floor
   finishes a long prompt sooner but stalls their tokens longer per command

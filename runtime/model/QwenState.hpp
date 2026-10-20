@@ -158,6 +158,11 @@ private:
   friend class QwenStateStorage;
 };
 
+// ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+// What a snapshot copies: the GDN cell and the draft ring, or the GDN cell
+// alone for a runtime without speculation, whose lanes keep no draft window.
+enum class QwenSnapshotContent : uint8_t { Composite, TargetOnly };
+
 // Live cells retain stable backing; only idle buffers may be reclaimed.
 class QwenStateStorage final : public model::StateStorage {
 public:
@@ -195,9 +200,13 @@ public:
   // Copies committed state into the lane's reserve, else a pooled or newly
   // admitted cache slot, while the lane retains its own cells. Returns nullptr
   // on capacity pressure; dropping a cached state makes its slot available
-  // for retry.
+  // for retry. A Composite snapshot needs equal page-aligned target and draft
+  // lengths; a TargetOnly one needs nonzero page-aligned target tokens, takes
+  // no draft ring and stores no draft window. Violations throw
+  // std::invalid_argument before any buffer is taken.
   [[nodiscard]] std::shared_ptr<const QwenCompositeState>
-  snapshot(uint32_t slot);
+  snapshot(uint32_t slot,
+           QwenSnapshotContent content = QwenSnapshotContent::Composite);
   // Moves the lane's active-parity GDN cell, and its draft ring only when
   // the draft window is complete, into a composite state: no copy, no
   // allocation admission. Without the ring the state is target-only. The
