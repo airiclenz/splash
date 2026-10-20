@@ -15,10 +15,14 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include <unistd.h>
@@ -171,6 +175,15 @@ NSString *checkedNSString(std::string_view value, std::string_view field) {
     }
     return result;
 }
+
+// Hashes std::string keys and std::string_view probes alike, so a lookup by
+// view neither allocates nor copies the name.
+struct PipelineNameHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view name) const noexcept {
+        return std::hash<std::string_view>{}(name);
+    }
+};
 
 }  // namespace
 
@@ -459,8 +472,11 @@ struct MetalBackend::Impl {
     __strong id<MTL4CommandQueue> sparseQueue = nil;
     __strong id<MTLSharedEvent> sparseEvent = nil;
     __strong id<MTLLibrary> library = nil;
-    __strong NSMutableDictionary<NSString *, id<MTLComputePipelineState>>
-        *pipelines = nil;
+    // Guarded by commandMutex. Holds only successfully created pipelines; a
+    // name that failed to resolve is never inserted, so it fails again.
+    std::unordered_map<std::string, id<MTLComputePipelineState>,
+                       PipelineNameHash, std::equal_to<>>
+        pipelines;
 
     DeviceCapabilities capabilities;
     std::array<uint8_t, 32> metallibSha256{};
@@ -611,10 +627,11 @@ struct MetalBackend::Impl {
         if (name.empty()) {
             throw MetalBackendError("Metal pipeline name must not be empty");
         }
-        NSString *key = checkedNSString(name, "pipeline name");
-        id<MTLComputePipelineState> cached = [pipelines objectForKey:key];
-        if (cached) return cached;
+        if (auto cached = pipelines.find(name); cached != pipelines.end()) {
+            return cached->second;
+        }
 
+        NSString *key = checkedNSString(name, "pipeline name");
         id<MTLFunction> function = [library newFunctionWithName:key];
         if (!function) {
             throw MetalBackendError(
@@ -628,7 +645,7 @@ struct MetalBackend::Impl {
                 "unable to create Metal pipeline " + std::string(name) +
                 ": " + errorDescription(error));
         }
-        [pipelines setObject:result forKey:key];
+        pipelines.emplace(name, result);
         sampleDeviceMemory();
         return result;
     }
@@ -810,10 +827,6 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
             throw MetalBackendError(
                 "unable to load metallib " + metallibPath + ": " +
                 errorDescription(error));
-        }
-        impl_->pipelines = [NSMutableDictionary dictionary];
-        if (!impl_->pipelines) {
-            throw MetalBackendError("unable to create Metal pipeline cache");
         }
         impl_->sampleDeviceMemory();
 
@@ -1603,7 +1616,7 @@ uint64_t MetalBackend::submissionCount() const noexcept {
 
 size_t MetalBackend::pipelineCount() const noexcept {
     std::lock_guard lock(impl_->commandMutex);
-    return impl_->pipelines.count;
+    return impl_->pipelines.size();
 }
 
 void MetalBackend::checkHealth() {
