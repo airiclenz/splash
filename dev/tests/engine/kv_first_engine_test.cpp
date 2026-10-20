@@ -5206,6 +5206,52 @@ void testWarningReclaimKeepsAResidentLanesConversationEnd() {
   runUntilIdle(engine);
 }
 
+// While macOS reports warn, every pressure pass sheds cache whatever the
+// governor's own headroom: beside two decoding lanes it takes an idle
+// conversation's state and keeps both lanes' prompt-end states and kept
+// checkpoints. The directive is the policy's OS-warn pass with nothing
+// waiting; an unbounded target shows what the pass may take, not how much.
+void testOsWarningPassKeepsTwoDecodingLanesConversationEnds() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  const std::vector<uint32_t> idlePrompt(129, 870);
+  cancelAfterPromptEnd(engine, resources, 870, idlePrompt);
+  const uint64_t idlePublications =
+      engine.snapshot().replayStatePublications;
+  const std::vector<uint32_t> firstPrompt(defaultCheckpointTokens + 100, 871);
+  const std::vector<uint32_t> secondPrompt(defaultCheckpointTokens + 100, 872);
+  engine.submit(replyRequest(871, firstPrompt, 1000));
+  engine.submit(replyRequest(872, secondPrompt, 1000));
+  for (uint32_t step = 0;
+       step < 256 &&
+       engine.snapshot().replayStatePublications < idlePublications + 2;
+       ++step)
+    static_cast<void>(engine.tick(step + 1));
+  require(!engine.idle() && resources.cachedTokens(idlePrompt) != 0 &&
+              resources.snapshot().stateCache.entries == 5 &&
+              resources.snapshot().stateCache.checkpointEntries == 2,
+          "fixture did not keep two decoding lanes beside an idle state");
+
+  static_cast<void>(engine.reclaimMemory(
+      {.reclaimEmptyKvExtents = true,
+       .evictAllUnpinnedPrefixes = false,
+       .targetBytes = std::numeric_limits<uint64_t>::max(),
+       .keepResumePoint = true}));
+
+  require(resources.cachedTokens(idlePrompt) == 0,
+          "an OS-warn pass kept an idle conversation's cache");
+  require(resources.snapshot().stateCache.entries == 4 &&
+              resources.snapshot().stateCache.checkpointEntries == 2,
+          "an OS-warn pass took a decoding lane's conversation end");
+  engine.cancel(871);
+  engine.cancel(872);
+  runUntilIdle(engine);
+}
+
 // A cancelled or failed request releases the end protection it took at its
 // prompt-end publication: a Warning pass then takes the state.
 void testCancelledOrFailedRequestReleasesItsConversationEnd() {
@@ -5673,6 +5719,7 @@ int main() {
     testResumedRequestKeepsItsConversationEnd();
     testGrowthReclaimTakesAConversationEndRatherThanStall();
     testWarningReclaimKeepsAResidentLanesConversationEnd();
+    testOsWarningPassKeepsTwoDecodingLanesConversationEnds();
     testCancelledOrFailedRequestReleasesItsConversationEnd();
     testShortSuffixContinuesCheckpointDraftState();
     testDefaultCheckpointRestoresLatestCommittedPrefix();

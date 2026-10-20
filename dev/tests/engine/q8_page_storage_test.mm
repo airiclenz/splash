@@ -214,7 +214,9 @@ void run(const std::string &metallib) {
     require(!bounded.tryReserve(1).has_value() &&
                 !bounded.snapshot().hostMeasurementValid,
             "missing host memory telemetry did not fail closed");
-    MemoryPressurePolicy missingPolicy;
+    // A KV extent's worth: the least an OS-warn pass reclaims.
+    const uint64_t osWarningPassBytes = 64ULL * 1024 * 1024;
+    MemoryPressurePolicy missingPolicy(osWarningPassBytes);
     auto missing = bounded.snapshot();
     auto missingDirective = missingPolicy.update(missing, 0.0, false);
     require(missing.pressure == MemoryPressure::Warning &&
@@ -237,7 +239,7 @@ void run(const std::string &metallib) {
     fakeHostAvailable = estimateHostAvailableMemory(
         pressurePages, 1, hostReserve + 24 * giB);
     bounded.observe();
-    MemoryPressurePolicy hostPolicy;
+    MemoryPressurePolicy hostPolicy(osWarningPassBytes);
     auto hostDirective = hostPolicy.update(bounded.snapshot(), 0.0, false);
     require(!bounded.tryReserve(1).has_value() &&
                 bounded.snapshot().pressure == MemoryPressure::Warning &&
@@ -264,7 +266,7 @@ void run(const std::string &metallib) {
     fakeHostAvailable = hostReserve + 3 * giB;
     bounded.setPressure(MemoryPressure::Normal);
 
-    MemoryPressurePolicy policy;
+    MemoryPressurePolicy policy(osWarningPassBytes);
     MemoryGovernorSnapshot policySnapshot;
     policySnapshot.pressure = MemoryPressure::Warning;
     policySnapshot.hostMeasurementValid = true;
@@ -295,21 +297,36 @@ void run(const std::string &metallib) {
     policySnapshot.pressure = MemoryPressure::Warning;
     require(policy.update(policySnapshot, 2101.0, false).targetBytes == giB / 4,
             "a new pressure episode inherited an old cooldown");
-    policySnapshot.systemPressure = MemoryPressure::Warning;
+    // With OS pressure normal, a host Warning episode that has regained the
+    // recovery margin keeps live cache.
+    policySnapshot.systemPressure = MemoryPressure::Normal;
     policySnapshot.hostHeadroomBytes = 3 * giB;
     const auto advisory = policy.update(policySnapshot, 3101.0, false);
     require(advisory.reclaimEmptyKvExtents && !advisory.evictAllUnpinnedPrefixes &&
                 advisory.targetBytes == 0,
-            "system warning discarded live cache despite sufficient headroom");
+            "host warning discarded live cache despite sufficient headroom");
+    // OS warn means the kernel is compressing and swapping whatever the
+    // governor's own headroom reads: each pass sheds at least one extent.
+    policySnapshot.systemPressure = MemoryPressure::Warning;
+    const auto osWarning = policy.update(policySnapshot, 4101.0, false);
+    require(osWarning.reclaimEmptyKvExtents &&
+                !osWarning.evictAllUnpinnedPrefixes &&
+                osWarning.targetBytes == osWarningPassBytes &&
+                osWarning.keepResumePoint,
+            "OS warn above the recovery margin kept idle cache resident");
+    policySnapshot.hostHeadroomBytes = 2 * giB - osWarningPassBytes / 2;
+    require(policy.update(policySnapshot, 5101.0, false).targetBytes ==
+                osWarningPassBytes,
+            "OS warn reclaimed less than one extent per pass");
     // The newest publication is what a follow-up resumes from; rebuilding it
     // costs a whole prefill, so a shrink nothing is waiting for leaves it and
     // takes the rest. A waiting request outranks it, and Critical takes all.
     policySnapshot.systemPressure = MemoryPressure::Warning;
     policySnapshot.hostHeadroomBytes = giB / 4;
-    const auto speculative = policy.update(policySnapshot, 4101.0, false);
+    const auto speculative = policy.update(policySnapshot, 6101.0, false);
     require(speculative.targetBytes == giB && speculative.keepResumePoint,
             "a speculative shrink discarded the resume point");
-    const auto demanded = policy.update(policySnapshot, 5101.0, true);
+    const auto demanded = policy.update(policySnapshot, 7101.0, true);
     require(demanded.targetBytes == giB && !demanded.keepResumePoint,
             "a waiting request could not reach the resume point");
     policySnapshot.pressure = MemoryPressure::Critical;

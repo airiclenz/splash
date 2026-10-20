@@ -328,8 +328,11 @@ int runNative(const engine::NativeArguments &arguments) {
 
   transport.setControlHandler([&pressureMonitor, published,
                                memoryReporter = engine::MemoryStatusReporter{},
-                               pressurePolicy =
-                                   engine::MemoryPressurePolicy{}]() mutable {
+                               pressurePolicy = engine::MemoryPressurePolicy{
+                                   published->resources()
+                                       .memoryPlan()
+                                       .breakdown()
+                                       .kvExtentBytes}]() mutable {
     engine::MemoryPressure pressure = pressureMonitor.pressure();
     engine::RuntimeResources &resources = published->resources();
     engine::MemoryGovernor &governor = resources.memoryGovernor();

@@ -107,6 +107,11 @@ struct MemoryReclaimDirective {
 // pressure is never offset by bytes reclaimed earlier in the same episode.
 class MemoryPressurePolicy final {
 public:
+  // osWarningPassBytes is the least a pass takes while the OS itself reports
+  // warn: one KV extent, the unit cache backing returns to the host in.
+  explicit MemoryPressurePolicy(uint64_t osWarningPassBytes) noexcept
+      : osWarningPassBytes_(osWarningPassBytes ? osWarningPassBytes : 1) {}
+
   // requestWaiting reports whether a request cannot proceed for want of
   // memory. Without one the pass is speculative and keeps the resume point.
   [[nodiscard]] MemoryReclaimDirective
@@ -114,6 +119,7 @@ public:
          bool requestWaiting) noexcept;
 
 private:
+  uint64_t osWarningPassBytes_;
   double nextReclaimMilliseconds_ = 0.0;
 };
 
