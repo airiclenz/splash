@@ -138,14 +138,13 @@ public:
   [[nodiscard]] bool carriesState(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
-  // Records the checkpoint kept beside the prompt-end state at kvBlock, so a
-  // later request that resumes from that state can find and retire it.
+  // Records the checkpoints kept beside the prompt-end state at kvBlock, so
+  // a later request that resumes from that state can find and retire them.
   // No-op when no state is published at kvBlock.
-  void recordKeptCheckpoint(uint64_t kvBlock,
-                            StateCheckpoint checkpoint) noexcept;
-  // The checkpoint recorded beside the state at kvBlock, or an empty handle;
+  void recordKeptCheckpoint(uint64_t kvBlock, KeptCheckpoints kept) noexcept;
+  // The checkpoints recorded beside the state at kvBlock, or empty handles;
   // possibly stale.
-  [[nodiscard]] StateCheckpoint keptCheckpoint(uint64_t kvBlock) const noexcept;
+  [[nodiscard]] KeptCheckpoints keptCheckpoint(uint64_t kvBlock) const noexcept;
 
   // One cache reclaimer for memory growth and pressure warnings. After empty
   // backing, disposable checkpoints are reclaimed first, except protected
@@ -194,6 +193,13 @@ public:
   // only an unprotected checkpoint qualifies, so a protected checkpoint is
   // recycled rather than none.
   [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
+  // Recycles exactly this checkpoint publication for a required state
+  // publication, through the eviction path, while no more than
+  // heldProtections protections hold it: the caller passes the ones its own
+  // conversation holds, so a state another request needs is never taken.
+  // False when it is gone, pinned or held by anyone else. O(1).
+  [[nodiscard]] bool recycleCheckpointState(StateCheckpoint checkpoint,
+                                            uint32_t heldProtections) noexcept;
   // Protects the deepest composite state on the request's published prefix
   // that a resume of resumeTokens tokens can restore, from Warning reclaim:
   // like lookup, it leaves one token to recompute, so a state on the block

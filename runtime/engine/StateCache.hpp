@@ -20,6 +20,14 @@ struct StateCheckpoint final {
   [[nodiscard]] explicit operator bool() const noexcept { return kvBlock != 0; }
 };
 
+// The checkpoints a conversation keeps beside its prompt-end state: its
+// deepest prefill checkpoint and its deepest decode checkpoint. Either handle
+// may be empty, or stale once its publication is gone.
+struct KeptCheckpoints final {
+  StateCheckpoint prefill;
+  StateCheckpoint decode;
+};
+
 // Names one publication a request needs: a suspended request's resume state,
 // a queued request's cached prefix, a resident lane's latest checkpoint, or a
 // conversation end's prompt-end state or kept checkpoint.
@@ -111,14 +119,13 @@ public:
   bool retireCheckpoint(StateCheckpoint checkpoint) noexcept;
   // Refreshes recency within the state's class. No-op when absent or pinned.
   void touch(uint64_t kvBlock) noexcept;
-  // Records on the state published at kvBlock the checkpoint kept beside it:
-  // the deepest prefill checkpoint of the conversation whose prompt ended
-  // there. Replaces any earlier record; no-op when no state is published.
-  void recordKeptCheckpoint(uint64_t kvBlock,
-                            StateCheckpoint checkpoint) noexcept;
-  // The checkpoint recorded beside the state at kvBlock, or an empty handle.
-  // The handle may be stale: retiring a stale handle is a no-op.
-  [[nodiscard]] StateCheckpoint keptCheckpoint(uint64_t kvBlock) const noexcept;
+  // Records on the state published at kvBlock the checkpoints kept beside
+  // it by the conversation whose prompt ended there. Replaces any earlier
+  // record; no-op when no state is published.
+  void recordKeptCheckpoint(uint64_t kvBlock, KeptCheckpoints kept) noexcept;
+  // The checkpoints recorded beside the state at kvBlock, or empty handles.
+  // A handle may be stale: retiring a stale handle is a no-op.
+  [[nodiscard]] KeptCheckpoints keptCheckpoint(uint64_t kvBlock) const noexcept;
 
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
   // Marks the resident publication as one a request needs.
@@ -143,6 +150,12 @@ public:
   evictionCandidate(bool keepResumePoint = false,
                     bool spareProtected = false) const noexcept;
   [[nodiscard]] StateEviction evict(uint64_t kvBlock) noexcept;
+  // Evicts exactly this checkpoint publication, counted as a checkpoint
+  // eviction, while no more than allowedProtections protections hold it.
+  // False when it is absent, replaced, upgraded to an ordinary state, pinned
+  // or held by more protections. O(1).
+  [[nodiscard]] bool evictCheckpoint(StateCheckpoint checkpoint,
+                                     uint32_t allowedProtections) noexcept;
   [[nodiscard]] StateCacheSnapshot snapshot() const noexcept;
 
 private:
@@ -161,9 +174,9 @@ private:
     bool evictable = false;
     bool checkpoint = false;
     uint64_t publication = 0;
-    // The checkpoint kept beside this prompt-end state; see
+    // The checkpoints kept beside this prompt-end state; see
     // recordKeptCheckpoint.
-    StateCheckpoint keptCheckpoint;
+    KeptCheckpoints kept;
   };
 
   struct EvictionQueue {

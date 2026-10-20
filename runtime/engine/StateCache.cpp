@@ -153,16 +153,15 @@ bool StateCache::retireCheckpoint(StateCheckpoint checkpoint) noexcept {
 }
 
 void StateCache::recordKeptCheckpoint(uint64_t kvBlock,
-                                      StateCheckpoint checkpoint) noexcept {
+                                      KeptCheckpoints kept) noexcept {
   const auto found = entries_.find(kvBlock);
   if (found != entries_.end())
-    found->second.keptCheckpoint = checkpoint;
+    found->second.kept = kept;
 }
 
-StateCheckpoint StateCache::keptCheckpoint(uint64_t kvBlock) const noexcept {
+KeptCheckpoints StateCache::keptCheckpoint(uint64_t kvBlock) const noexcept {
   const auto found = entries_.find(kvBlock);
-  return found == entries_.end() ? StateCheckpoint{}
-                                 : found->second.keptCheckpoint;
+  return found == entries_.end() ? KeptCheckpoints{} : found->second.kept;
 }
 
 bool StateCache::contains(uint64_t kvBlock) const noexcept {
@@ -216,6 +215,19 @@ StateCache::evictionCandidate(bool keepResumePoint,
 
 StateEviction StateCache::evict(uint64_t kvBlock) noexcept {
   return erase(kvBlock, false);
+}
+
+// ============================================================================
+// Evicts the checkpoint publication named by checkpoint when at most
+// allowedProtections protections hold it; erase refuses a pinned entry.
+bool StateCache::evictCheckpoint(StateCheckpoint checkpoint,
+                                 uint32_t allowedProtections) noexcept {
+  const auto found = entries_.find(checkpoint.kvBlock);
+  if (found == entries_.end() || !found->second.checkpoint ||
+      found->second.publication != checkpoint.publication ||
+      found->second.protections > allowedProtections)
+    return false;
+  return erase(checkpoint.kvBlock, false).evicted;
 }
 
 StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {

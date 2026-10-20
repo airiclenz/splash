@@ -5087,6 +5087,125 @@ void testKeptCheckpointIsReclaimedBeforeOrdinaryStates() {
           "reclaim took an ordinary state before the kept checkpoint");
 }
 
+// Ticks until request id finishes while a peer lane keeps running.
+void runUntilFinished(engine::Engine &engine, const Events &events,
+                      uint64_t id) {
+  for (uint32_t step = 0; step < 128 && !events.reasons.contains(id); ++step)
+    static_cast<void>(engine.tick(step + 1));
+  require(events.reasons.contains(id),
+          "request did not finish beside its peer");
+}
+
+// Ticks until the engine has published one more replay state: a newly
+// submitted request's prompt-end state.
+void runUntilPromptEnd(engine::Engine &engine) {
+  const uint64_t published = engine.snapshot().replayStatePublications;
+  for (uint32_t step = 0;
+       step < 128 && engine.snapshot().replayStatePublications == published;
+       ++step)
+    static_cast<void>(engine.tick(step + 1));
+  require(engine.snapshot().replayStatePublications > published,
+          "request did not publish its prompt-end state");
+}
+
+// Two conversations warmed and extended in turn, every state protected by a
+// conversation end: while the first's extension stays resident, a
+// governor-denied prompt-end capture of the second's recycles the checkpoint
+// the second conversation inherited, never the first's older kept
+// checkpoint.
+void testDeniedCaptureRecyclesItsOwnConversationsCheckpoint() {
+  Backing backing(2048);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  const uint32_t deepest = 2 * defaultCheckpointTokens;
+  std::vector<uint32_t> first(deepest + 200, 880);
+  std::vector<uint32_t> second(deepest + 200, 881);
+  engine.submit(request(880, first));
+  runUntilIdle(engine);
+  engine.submit(request(881, second));
+  runUntilIdle(engine);
+  first.insert(first.end(), 40, 882);
+  engine.submit(replyRequest(882, first, 1000));
+  runUntilPromptEnd(engine);
+  require(!engine.idle() &&
+              resources.snapshot().stateCache.checkpointEntries == 2,
+          "fixture did not keep both conversations' checkpoints");
+  const EngineSnapshot before = engine.snapshot();
+
+  second.insert(second.end(), 40, 883);
+  executor.deniedSnapshots = 1;
+  engine.submit(request(883, second));
+  runUntilFinished(engine, events, 883);
+
+  const EngineSnapshot after = engine.snapshot();
+  require(executor.deniedSnapshots == 0 &&
+              after.recycledStatePublications ==
+                  before.recycledStatePublications + 1 &&
+              after.resources.stateCache.checkpointEvictions ==
+                  before.resources.stateCache.checkpointEvictions + 1 &&
+              after.replayStatePublicationFailures == 0 &&
+              after.checkpointPublicationFailures == 0,
+          "denied prompt-end capture did not land on a recycled checkpoint");
+  require(resources.lookup(std::span(first).first(deepest + 1))
+                      .resumeBoundary() == deepest &&
+              resources.lookup(std::span(second).first(deepest + 1))
+                      .resumeBoundary() == 0,
+          "denied capture took the resident conversation's kept checkpoint");
+  engine.cancel(882);
+  runUntilIdle(engine);
+}
+
+// A checkpoint of the lane's conversation that a peer also holds is not the
+// lane's to recycle: a peer resumed from the conversation's kept checkpoint
+// keeps it beside its own prompt end, so a denied capture of the
+// conversation's next turn recycles an idle state instead.
+void testDeniedCaptureSkipsACheckpointAPeerHolds() {
+  Backing backing(2048);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  const std::vector<uint32_t> idle(129, 890);
+  cancelAfterPromptEnd(engine, resources, 890, idle);
+  const uint32_t deepest = 2 * defaultCheckpointTokens;
+  std::vector<uint32_t> prompt(deepest + 200, 891);
+  engine.submit(request(891, prompt));
+  runUntilIdle(engine);
+  std::vector<uint32_t> divergent(prompt.begin(),
+                                  prompt.begin() + deepest + 40);
+  std::fill(divergent.begin() + deepest + 12, divergent.end(), 892);
+  engine.submit(replyRequest(892, divergent, 1000));
+  runUntilPromptEnd(engine);
+  require(!engine.idle() && events.starts.back().second == deepest &&
+              resources.lookup(idle).resumeBoundary() == 128,
+          "peer did not resume from the kept checkpoint beside an idle state");
+  const EngineSnapshot before = engine.snapshot();
+
+  prompt.insert(prompt.end(), 40, 893);
+  executor.deniedSnapshots = 1;
+  engine.submit(request(893, prompt));
+  runUntilFinished(engine, events, 893);
+
+  const EngineSnapshot after = engine.snapshot();
+  require(executor.deniedSnapshots == 0 &&
+              after.recycledStatePublications ==
+                  before.recycledStatePublications + 1 &&
+              after.resources.stateCache.checkpointEvictions ==
+                  before.resources.stateCache.checkpointEvictions &&
+              after.replayStatePublicationFailures == 0,
+          "denied prompt-end capture did not land on a recycled state");
+  require(resources.lookup(std::span(prompt).first(deepest + 1))
+                      .resumeBoundary() == deepest &&
+              resources.lookup(idle).resumeBoundary() == 0,
+          "denied capture recycled a checkpoint its peer holds");
+  engine.cancel(892);
+  runUntilIdle(engine);
+}
+
 // A one-lane engine over a 64-page backing, for conversation-end tests.
 struct ConversationEndFixture final {
   // Runs request id over prompt to its Length finish.
@@ -5532,6 +5651,35 @@ void testDecodePublishesRollingCheckpoints() {
           "a capped decode step ended the reply early");
 }
 
+// A decode lane whose capture is denied recycles its own rolling checkpoint,
+// never the older checkpoint another conversation keeps.
+void testDeniedDecodeCaptureRecyclesTheLanesOwnCheckpoint() {
+  RollingDecode fixture;
+  const uint32_t interval = defaultCheckpointTokens;
+  const std::vector<uint32_t> other(interval + 100, 545);
+  fixture.engine.submit(request(545, other));
+  fixture.runToIdle();
+  fixture.submit(546, 2 * interval + 600);
+  fixture.decodeUntil(546, interval + 40);
+  const EngineSnapshot before = fixture.engine.snapshot();
+
+  fixture.executor.deniedSnapshots = 1;
+  fixture.decodeUntil(546, 2 * interval + 40);
+
+  const EngineSnapshot after = fixture.engine.snapshot();
+  require(fixture.executor.deniedSnapshots == 0 &&
+              after.checkpointPublicationFailures == 0 &&
+              after.checkpointPublications ==
+                  before.checkpointPublications + 1 &&
+              after.recycledStatePublications ==
+                  before.recycledStatePublications + 1,
+          "denied decode capture did not land on a recycled checkpoint");
+  require(fixture.resources.lookup(std::span(other).first(interval + 1))
+                  .resumeBoundary() == interval,
+          "denied decode capture took another conversation's checkpoint");
+  fixture.runToIdle();
+}
+
 // A client stop between batches finishes the lane as a normal stop: counted
 // completed, not cancelled, with its rolling checkpoint retired.
 void testStopBetweenBatchesFinishesAsCompleted() {
@@ -5772,6 +5920,8 @@ int main() {
     testDivergentPromptResumesFromTheKeptCheckpoint();
     testConversationKeepsOneCheckpoint();
     testKeptCheckpointIsReclaimedBeforeOrdinaryStates();
+    testDeniedCaptureRecyclesItsOwnConversationsCheckpoint();
+    testDeniedCaptureSkipsACheckpointAPeerHolds();
     testWarningReclaimKeepsTheNewestConversationEnds();
     testFollowUpTurnsReplaceTheirConversationsEnd();
     testAnotherConversationReleasesTheOldestEnd();
@@ -5785,6 +5935,7 @@ int main() {
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testCheckpointIntervalValidationAndDisable();
     testDecodePublishesRollingCheckpoints();
+    testDeniedDecodeCaptureRecyclesTheLanesOwnCheckpoint();
     testStopBetweenBatchesFinishesAsCompleted();
     testStopInFlightFinishesAfterTheBatch();
     testStopBeforeStartFinishesAsCancelled();

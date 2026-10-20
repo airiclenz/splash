@@ -612,7 +612,7 @@ bool Engine::admit(Request &active, double now) {
                      !draft.draftStateRestoreSkipped);
       if (!resuming) {
         active.inheritedCheckpoint =
-            cache_.keptCheckpoint(lookup.state->kvBlock());
+            cache_.keptCheckpoint(lookup.state->kvBlock()).prefill;
         active.restoredStateBlock = lookup.state->kvBlock();
       }
       setLatestCheckpoint(active,
@@ -925,7 +925,8 @@ void Engine::recordKeptCheckpoint(Request &active, uint64_t promptEndBlock) {
   const StateCheckpoint cached = cache_.checkpointState(own.kvBlock);
   const bool keepsOwn = own && cached.publication == own.publication;
   if (!keepsOwn) {
-    cache_.recordKeptCheckpoint(promptEndBlock, active.inheritedCheckpoint);
+    cache_.recordKeptCheckpoint(promptEndBlock,
+                                {.prefill = active.inheritedCheckpoint});
     return;
   }
   const StateCheckpoint inherited = active.inheritedCheckpoint;
@@ -933,7 +934,7 @@ void Engine::recordKeptCheckpoint(Request &active, uint64_t promptEndBlock) {
                          inherited.publication == own.publication;
   if (inherited && !sameAsOwn && !peerHoldsCheckpoint(active, inherited))
     static_cast<void>(cache_.retireCheckpointState(inherited));
-  cache_.recordKeptCheckpoint(promptEndBlock, own);
+  cache_.recordKeptCheckpoint(promptEndBlock, {.prefill = own});
 }
 
 // ============================================================================
@@ -943,7 +944,7 @@ void Engine::recordKeptCheckpoint(Request &active, uint64_t promptEndBlock) {
 void Engine::protectConversationEnd(Request &active, uint64_t promptEndBlock) {
   releaseConversationEnd(active.conversationEnd);
   active.conversationEnd.promptEnd = cache_.protectState(promptEndBlock);
-  const StateCheckpoint kept = cache_.keptCheckpoint(promptEndBlock);
+  const StateCheckpoint kept = cache_.keptCheckpoint(promptEndBlock).prefill;
   if (kept &&
       cache_.checkpointState(kept.kvBlock).publication == kept.publication)
     active.conversationEnd.keptCheckpoint = cache_.protectState(kept.kvBlock);
@@ -990,13 +991,62 @@ void Engine::countCheckpointFailure(PublicationFailure cause) noexcept {
       cause)];
 }
 
+// ============================================================================
+// The protections active's own conversation holds on checkpoint's
+// publication: the lane's latest, previous and kept handles, and the
+// conversation end it continues, the entry its finish will replace. A stale
+// handle matches nothing. O(maximumBatchWidth).
+uint32_t Engine::ownProtections(const Request &active,
+                                StateCheckpoint checkpoint) const {
+  const auto same = [&](StateProtection protection) {
+    return protection.kvBlock == checkpoint.kvBlock &&
+           protection.publication == checkpoint.publication;
+  };
+  uint32_t count = same(active.checkpointProtection) +
+                   same(active.previousCheckpointProtection) +
+                   same(active.conversationEnd.keptCheckpoint);
+  const auto first = conversationEnds_.begin();
+  const auto last = first + static_cast<std::ptrdiff_t>(conversationEndCount_);
+  const auto continued = std::find_if(first, last, [&](const auto &entry) {
+    return entry.holds(active.restoredStateBlock);
+  });
+  if (continued != last && same(continued->keptCheckpoint))
+    ++count;
+  return count;
+}
+
+// ============================================================================
+// Recycles one checkpoint of the lane's own conversation for its denied
+// capture: its latest checkpoint, which a decode publication replaces anyway,
+// then its kept checkpoint, then the one it inherited. One that a peer lane,
+// a suspended or queued request, or another conversation's end protects is
+// skipped. True when one was evicted. Runs only on a denied capture: at most
+// three O(maximumBatchWidth) counts.
+bool Engine::recycleOwnCheckpoint(Request &active) {
+  for (const StateCheckpoint candidate :
+       {active.latestCheckpoint, active.keptCheckpoint,
+        active.inheritedCheckpoint}) {
+    if (!candidate ||
+        !cache_.recycleCheckpointState(candidate,
+                                       ownProtections(active, candidate)))
+      continue;
+    if (candidate.kvBlock == active.latestCheckpoint.kvBlock)
+      setLatestCheckpoint(active, {});
+    return true;
+  }
+  return false;
+}
+
+// ============================================================================
 // Copies the lane's live state for a publication. When no slot is free it
-// recycles one cached state, a checkpoint for a checkpoint, and retries once;
-// nullptr when that fails too.
-std::shared_ptr<const CompositeState> Engine::captureState(uint64_t requestId,
+// recycles one of the lane's own checkpoints, or else one cached state, a
+// checkpoint for a checkpoint, and retries once; nullptr when that fails too.
+std::shared_ptr<const CompositeState> Engine::captureState(Request &active,
                                                            bool checkpoint) {
+  const uint64_t requestId = active.request.id;
   std::shared_ptr<const CompositeState> state = model_.snapshot(requestId);
-  if (!state && cache_.reclaimOneState(checkpoint)) {
+  if (!state &&
+      (recycleOwnCheckpoint(active) || cache_.reclaimOneState(checkpoint))) {
     state = model_.snapshot(requestId);
     if (state)
       ++counters_.recycledStatePublications;
@@ -1056,7 +1106,7 @@ void Engine::publishReachedStateBoundaries(Request &active,
           continue;
         }
         std::shared_ptr<const CompositeState> state =
-            captureState(active.request.id, checkpoint);
+            captureState(active, checkpoint);
         if (!state) {
           countFailure(PublicationFailure::SnapshotDenied);
           continue;
@@ -1134,7 +1184,7 @@ void Engine::publishDecodeCheckpoint(Request &active, uint32_t previousTokens,
       ++counters_.deduplicatedStatePublications;
     } else {
       std::shared_ptr<const CompositeState> state =
-          captureState(active.request.id, true);
+          captureState(active, true);
       if (!state) {
         countCheckpointFailure(PublicationFailure::SnapshotDenied);
         return;

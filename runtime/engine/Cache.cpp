@@ -298,11 +298,11 @@ bool Cache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
 }
 
 void Cache::recordKeptCheckpoint(uint64_t kvBlock,
-                                 StateCheckpoint checkpoint) noexcept {
-  states_.recordKeptCheckpoint(kvBlock, checkpoint);
+                                 KeptCheckpoints kept) noexcept {
+  states_.recordKeptCheckpoint(kvBlock, kept);
 }
 
-StateCheckpoint Cache::keptCheckpoint(uint64_t kvBlock) const noexcept {
+KeptCheckpoints Cache::keptCheckpoint(uint64_t kvBlock) const noexcept {
   return states_.keptCheckpoint(kvBlock);
 }
 
@@ -377,6 +377,11 @@ bool Cache::reclaimOneState(bool checkpointsOnly) {
     state = states_.evictionCandidate();
   return state && (!checkpointsOnly || states_.checkpoint(state->id)) &&
          states_.evict(state->id).evicted;
+}
+
+bool Cache::recycleCheckpointState(StateCheckpoint checkpoint,
+                                   uint32_t heldProtections) noexcept {
+  return states_.evictCheckpoint(checkpoint, heldProtections);
 }
 
 StateProtection Cache::protectDeepestState(uint64_t requestId,

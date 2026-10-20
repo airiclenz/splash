@@ -215,8 +215,9 @@ private:
     // checkpointProtection with it.
     StateCheckpoint latestCheckpoint;
     // A resident lane's latestCheckpoint, spared by Warning reclaim and taken
-    // by growth reclaim and publication recycling only after every
-    // unprotected state. Dropped when the lane suspends or ends.
+    // by growth reclaim and another lane's publication recycling only after
+    // every unprotected state; the lane's own denied capture recycles it
+    // first. Dropped when the lane suspends or ends.
     StateProtection checkpointProtection;
     // A decoding lane's checkpoint replaced at its last decode boundary B,
     // kept until a later commit passes B: a suspension at exactly B cannot
@@ -231,8 +232,10 @@ private:
     // it stays cached beside the prompt-end state: a later prompt diverging
     // between the two resumes from it. Protected with the prompt-end state
     // as part of conversationEnd; once its end leaves conversationEnds_,
-    // reclaim takes it before any ordinary state. Written at most once per
-    // request; decode checkpoint rolling and finish never touch it.
+    // reclaim takes it before any ordinary state. A denied capture of this
+    // lane recycles it before any other conversation's checkpoint. Written at
+    // most once per request; decode checkpoint rolling and finish never touch
+    // it.
     StateCheckpoint keptCheckpoint;
     // The kept checkpoint recorded on the state this request restored at its
     // first admission: retired once this request keeps its own, otherwise
@@ -316,8 +319,11 @@ private:
   void protectConversationEnd(Request &request, uint64_t promptEndBlock);
   void keepConversationEnd(Request &request);
   void releaseConversationEnd(ConversationEnd &end) noexcept;
+  [[nodiscard]] uint32_t ownProtections(const Request &request,
+                                        StateCheckpoint checkpoint) const;
+  [[nodiscard]] bool recycleOwnCheckpoint(Request &request);
   [[nodiscard]] std::shared_ptr<const CompositeState>
-  captureState(uint64_t requestId, bool checkpoint);
+  captureState(Request &request, bool checkpoint);
   void countCheckpointFailure(PublicationFailure cause) noexcept;
   void publishReachedStateBoundaries(Request &request,
                                      uint32_t promptProcessed);
