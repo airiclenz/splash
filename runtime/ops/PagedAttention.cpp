@@ -6,7 +6,6 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <vector>
 
 namespace splash::ops {
 namespace {
@@ -15,14 +14,13 @@ enum class KernelLayout : uint8_t { Kv4Group6, Kv2Group8 };
 
 // BF16 has no scale buffers or bindings. Keep the existing INT8 argument
 // order; each format has a precompiled entry with its corresponding ABI.
-std::vector<metal::MetalBuffer> kvBuffers(
+metal::BufferList kvBuffers(
     const kv::LayerStorage &layer, kv::Format format,
     std::initializer_list<metal::MetalBuffer> before,
     std::span<const metal::MetalBuffer> after) {
   if (layer.format != format)
     throw std::invalid_argument("attention plan and KV storage formats differ");
-  std::vector<metal::MetalBuffer> buffers;
-  buffers.reserve(before.size() + after.size() + (format == kv::Format::Int8 ? 4 : 2));
+  metal::BufferList buffers;
   buffers.insert(buffers.end(), before.begin(), before.end());
   buffers.push_back(layer.keyData);
   if (format == kv::Format::Int8) buffers.push_back(layer.keyScales);

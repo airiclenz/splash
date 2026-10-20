@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/DeviceCapabilities.hpp"
+#include "metal/InlineVector.hpp"
 
 #include <array>
 #include <cstddef>
@@ -141,10 +142,17 @@ struct BytesBinding {
   uint64_t sizeBytes = 0;
 };
 
+// The most buffers a production dispatch binds: the fused Q4 GDN decode binds
+// two inputs, a current and a next state per lane, ten tensors and two
+// scratch buffers. Dispatches up to these counts keep their bindings inline.
+inline constexpr size_t kInlineBufferBindings = 22;
+// Production dispatches bind at most one parameter struct.
+inline constexpr size_t kInlineBytesBindings = 1;
+
 struct ComputeDispatch {
   std::string pipelineName;
-  std::vector<BufferBinding> buffers;
-  std::vector<BytesBinding> bytes;
+  InlineVector<BufferBinding, kInlineBufferBindings> buffers;
+  InlineVector<BytesBinding, kInlineBytesBindings> bytes;
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
 };

@@ -7,7 +7,6 @@
 #include <cstddef>
 #include <stdexcept>
 #include <utility>
-#include <vector>
 
 namespace splash::ops {
 namespace {
@@ -72,15 +71,18 @@ void GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                     GdnStateStrides state) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid())
     throw std::invalid_argument("invalid GDN decode geometry");
+  // The fused Q4 decode is the widest production dispatch: two inputs, two
+  // states per lane, ten tensors and two scratch buffers.
+  static_assert(2 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH + 10 + 2 <=
+                    metal::kInlineBufferBindings,
+                "GDN decode bindings outgrow the inline binding capacity");
   const KernelLayout kernel = kernelShape(shape);
-  std::vector<metal::MetalBuffer> bindings{buffers.packed,
-                                           buffers.convolutionWeights};
+  metal::BufferList bindings{buffers.packed, buffers.convolutionWeights};
   const bool prepare = bool(buffers.linearScratch.input);
   const uint64_t outputWidth = uint64_t{shape.valueHeads} * shape.headDimension;
   if (prepare && (buffers.linearScratch.input.sizeBytes() < outputWidth * 16 * lanes ||
                   buffers.linearScratch.sums.sizeBytes() < outputWidth / 2 * lanes))
     throw std::invalid_argument("Q4 GDN preparation scratch is below requirement");
-  bindings.reserve(prepare ? 22 : 20);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
                   {buffers.mixed, buffers.decayWeights, buffers.timeBias,
@@ -108,9 +110,8 @@ void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
       !state.valid())
     throw std::invalid_argument("invalid GDN commit geometry");
   const KernelLayout kernel = kernelShape(shape);
-  std::vector<metal::MetalBuffer> bindings{
-      buffers.packed, buffers.mixed, buffers.decay, buffers.beta};
-  bindings.reserve(13);
+  metal::BufferList bindings{buffers.packed, buffers.mixed, buffers.decay,
+                             buffers.beta};
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   bindings.push_back(buffers.retainedCounts);
   constexpr uint32_t rows = SPLASH_TARGET_VERIFY_ROWS;

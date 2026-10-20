@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -279,6 +280,28 @@ struct Runtime::Impl {
   const bool isSpeculationEnabled = true;
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
+  // Each place that builds a command graph; graphs from one site share a shape.
+  enum class GraphSite : uint8_t {
+    RestoredHead,
+    Prefill,
+    Decode,
+    VerifyForward,
+    VerifyCommit,
+    Count,
+  };
+  // The dispatch count of the last graph each site built. The next graph at a
+  // site reserves that many, so a steady shape never regrows its dispatch list.
+  std::array<std::atomic<uint32_t>, static_cast<size_t>(GraphSite::Count)>
+      graphSizes{};
+  [[nodiscard]] CommandGraph newGraph(GraphSite site) const {
+    return CommandGraph{graphSizes[static_cast<size_t>(site)].load(
+        std::memory_order_relaxed)};
+  }
+  void recordGraph(GraphSite site, const CommandGraph &graph) {
+    graphSizes[static_cast<size_t>(site)].store(
+        static_cast<uint32_t>(graph.dispatches().size()),
+        std::memory_order_relaxed);
+  }
   ops::Sampling sampling;
   QwenTarget targetModel;
   DFlashDraft draftModel;
@@ -783,11 +806,12 @@ struct Runtime::Impl {
     }
     loadPolicyBuffers(entry, lane, masks);
 
-    CommandGraph graph;
+    CommandGraph graph = newGraph(GraphSite::RestoredHead);
     targetModel.addHead(graph, d(DecodeTensor::Hidden0),
                         d(DecodeTensor::FinalHidden), d(DecodeTensor::Logits),
                         kDecodeRows, decodeArena->linearScratch());
     addInitialPolicySelection(graph, entry, lane, 0);
+    recordGraph(GraphSite::RestoredHead, graph);
     CommandTiming timing = backend.submitCommand(graph.dispatches());
     entry.pendingToken = *contents<uint32_t>(d(DecodeTensor::OutputTokens),
                                              "restored prefix next token");
@@ -1644,11 +1668,12 @@ struct Runtime::Impl {
           }
         }
 
-        CommandGraph target;
+        CommandGraph target = impl_.newGraph(GraphSite::VerifyForward);
         const uint32_t width = static_cast<uint32_t>(lanes_.size());
         impl_.encodeBatchVerifyEmbedding(target, width);
         impl_.encodeTargetVerifyBatchForward(
             target, {entries.data(), lanes_.size()}, items_, stats_);
+        impl_.recordGraph(GraphSite::VerifyForward, target);
         submit(target);
         stage_ = Stage::TargetForward;
       }
@@ -1686,7 +1711,7 @@ struct Runtime::Impl {
                                  : std::span<const uint32_t>{entry.maskWords});
           }
 
-          CommandGraph commit;
+          CommandGraph commit = impl_.newGraph(GraphSite::VerifyCommit);
           impl_.encodeTargetVerifyBatchPolicy(commit,
                                               {entries.data(), lanes_.size()});
           impl_.encodeBatchAcceptance(commit, {entries.data(), lanes_.size()},
@@ -1694,6 +1719,7 @@ struct Runtime::Impl {
           impl_.encodeBatchGdnCommit(commit, {entries.data(), lanes_.size()});
           impl_.encodeDraftStateCommitBatch(
               commit, {entries.data(), lanes_.size()}, items_, stats_);
+          impl_.recordGraph(GraphSite::VerifyCommit, commit);
           submit(commit);
           stage_ = Stage::Commit;
         }
@@ -2052,8 +2078,9 @@ Runtime::prefillAsync(const BatchPlan &plan,
   }
 
   std::array<Impl::Request *, kLaneCount> entries{};
-  CommandGraph graph;
+  CommandGraph graph = impl_->newGraph(Impl::GraphSite::Prefill);
   impl_->encodePackedPrefillGraph(graph, items, entries);
+  impl_->recordGraph(Impl::GraphSite::Prefill, graph);
   const bool encodesImages = std::any_of(
       entries.begin(), entries.begin() + items.size(), [](const auto *entry) {
         return std::any_of(entry->images.begin(), entry->images.end(),
@@ -2284,7 +2311,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     laneResult.verify = true;
   }
 
-  CommandGraph commandGraph;
+  CommandGraph commandGraph = impl_->newGraph(Impl::GraphSite::Decode);
   uint32_t verified = 0;
   uint32_t draftComputed = 0;
   for (const Impl::DecodeLaneResult &lane : lanes)
@@ -2342,6 +2369,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     impl_->encodeDraftStateCommitBatch(
         commandGraph, {requests.data(), lanes.size()}, items, batchStats);
   }
+  impl_->recordGraph(Impl::GraphSite::Decode, commandGraph);
 
   const bool overlapConstraintMask =
       constrained && !lanes.empty() &&

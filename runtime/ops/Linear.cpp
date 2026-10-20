@@ -600,7 +600,7 @@ void Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
       graph.add("decode_linear_q4_prepare", {b.input, b.scratch.input, b.scratch.sums},
                 k, {k / 32, w.rows / SPLASH_TARGET_VERIFY_ROWS, 1}, {128, 1, 1});
     const auto &first = gate ? *gate : p;
-    std::vector<metal::MetalBuffer> bindings{b.scratch.input, first.weights,
+    metal::BufferList bindings{b.scratch.input, first.weights,
         first.scales, first.biases, b.output, b.scratch.sums,
         b.scratch.partials, b.scratch.counters};
     if (gate) bindings.insert(bindings.end(), {p.weights, p.scales, p.biases});

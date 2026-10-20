@@ -266,7 +266,7 @@ LaneBuffers sameOnEveryLane(const MetalBuffer &buffer) {
   return lanes;
 }
 
-void appendLanes(std::vector<MetalBuffer> &bindings, const LaneBuffers &first,
+void appendLanes(metal::BufferList &bindings, const LaneBuffers &first,
                  const LaneBuffers &second) {
   bindings.insert(bindings.end(), first.begin(), first.end());
   bindings.insert(bindings.end(), second.begin(), second.end());
@@ -322,7 +322,7 @@ private:
       graph.add(std::string(kPipeline), {input, scratch_.input, scratch_.sums},
                 geometry_.target.hiddenSize, kGroups);
     }
-    std::vector<MetalBuffer> bindings{
+    metal::BufferList bindings{
         scratch_.input,  projection.weights, projection.scales,
         projection.biases, output,           scratch_.sums,
         scratch_.partials, scratch_.counters};
@@ -391,8 +391,7 @@ private:
                layer.keyNorm, buffers.ropeCos, buffers.ropeSin,
                buffers.queryKeys, buffers.queryValues},
               DraftQkvBatchParams{}, kGroups);
-    std::vector<MetalBuffer> bindings{buffers.attention};
-    bindings.reserve(2 * kLanes + 3);
+    metal::BufferList bindings{buffers.attention};
     appendLanes(bindings, sameOnEveryLane(resources_.ringKeys[index]),
                 sameOnEveryLane(resources_.ringValues[index]));
     bindings.push_back(buffers.queryKeys);
@@ -556,8 +555,7 @@ private:
                    uint32_t index) {
     addLinear(graph, buffers.normalized, layer.mixerInput,
               buffers.gdnPacked[index], true);
-    std::vector<MetalBuffer> bindings{buffers.gdnPacked[index], layer.convolution};
-    bindings.reserve(22);
+    metal::BufferList bindings{buffers.gdnPacked[index], layer.convolution};
     appendLanes(bindings, buffers.currentStates, buffers.nextStates);
     bindings.insert(bindings.end(),
                     {buffers.gdnMixed[index], layer.decay, layer.timeBias,
@@ -576,12 +574,12 @@ private:
     const kv::LayerStorage &pages = buffers.kvLayers[index];
     const std::array<SplashChunkedPrefillParams, kLanes> stores{};
     const std::array<SplashQ8VerifyAttentionParams, kLanes> attention{};
-    std::vector<MetalBuffer> store{buffers.chunkKeys[index], buffers.chunkValues[index],
+    metal::BufferList store{buffers.chunkKeys[index], buffers.chunkValues[index],
                                    pages.keyData, pages.keyScales,
                                    pages.valueData, pages.valueScales};
     store.insert(store.end(), buffers.pageTables.begin(), buffers.pageTables.end());
     graph.add(std::string(kPipeline), std::move(store), stores, kGroups);
-    std::vector<MetalBuffer> split{buffers.fullQueries, pages.keyData, pages.keyScales,
+    metal::BufferList split{buffers.fullQueries, pages.keyData, pages.keyScales,
                                    pages.valueData, pages.valueScales,
                                    buffers.partials, buffers.statistics};
     split.insert(split.end(), buffers.pageTables.begin(), buffers.pageTables.end());
@@ -673,12 +671,11 @@ private:
 
   void addGdnCommit(CommandGraph &graph) {
     views_ += 4;
-    std::vector<MetalBuffer> bindings{
+    metal::BufferList bindings{
         arena_.gdnStorage(DecodeTensor::VerifyPackedBase),
         arena_.gdnStorage(DecodeTensor::VerifyMixedBase),
         arena_.gdnStorage(DecodeTensor::VerifyDecayBase),
         arena_.gdnStorage(DecodeTensor::VerifyBetaBase)};
-    bindings.reserve(13);
     appendLanes(bindings, sameOnEveryLane(resources_.currentState),
                 sameOnEveryLane(resources_.nextState));
     bindings.push_back(packed(DecodeTensor::RetainedCount));
@@ -699,8 +696,7 @@ private:
     for (uint32_t layer = 0; layer < resources_.draft.size(); ++layer) {
       const DraftLayer &weights = resources_.draft[layer];
       addLinear(graph, hidden, weights.qkv, qkv, true);
-      std::vector<MetalBuffer> bindings{qkv, weights.keyNorm, ropeCos, ropeSin};
-      bindings.reserve(2 * kLanes + 5);
+      metal::BufferList bindings{qkv, weights.keyNorm, ropeCos, ropeSin};
       appendLanes(bindings, sameOnEveryLane(resources_.ringKeys[layer]),
                   sameOnEveryLane(resources_.ringValues[layer]));
       bindings.push_back(retained);
@@ -723,10 +719,12 @@ struct Cycle final {
 };
 
 // The timer covers graph build, arena views, validation and encoding up to
-// commit; the GPU completion wait and graph teardown fall outside it.
-Cycle runCycle(metal::MetalBackend &backend, DecodeCycle &cycle) {
-  CommandGraph graph;
+// commit; the GPU completion wait and graph teardown fall outside it. The graph
+// reserves expectedDispatches, as Runtime reserves the last decode graph's size.
+Cycle runCycle(metal::MetalBackend &backend, DecodeCycle &cycle,
+               size_t expectedDispatches) {
   const auto started = std::chrono::steady_clock::now();
+  CommandGraph graph{expectedDispatches};
   const uint32_t views = cycle.encode(graph);
   metal::CommandTicket ticket = backend.submitCommandAsync(graph.dispatches());
   const auto committed = std::chrono::steady_clock::now();
@@ -819,12 +817,13 @@ int main(int argc, const char *argv[]) {
     const model::DecodeArena arena(backend, geometry, operators);
     const Resources resources = makeResources(backend, geometry);
     DecodeCycle cycle(geometry, arena, resources);
+    size_t dispatches = 0;
     for (uint32_t warmup = 0; warmup < kWarmupCycles; ++warmup)
-      static_cast<void>(runCycle(backend, cycle));
+      dispatches = runCycle(backend, cycle, dispatches).dispatches;
     std::vector<Cycle> cycles;
     cycles.reserve(options.repeat);
     for (uint32_t repeat = 0; repeat < options.repeat; ++repeat)
-      cycles.push_back(runCycle(backend, cycle));
+      cycles.push_back(runCycle(backend, cycle, dispatches));
     report(options, backend.capabilities().deviceName, cycles);
     return 0;
   } catch (const std::exception &error) {

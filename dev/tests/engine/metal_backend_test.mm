@@ -1,3 +1,4 @@
+#include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/metal/DeviceQueries.hpp"
 #include "../../../runtime/ops/PagedKv.hpp"
@@ -18,6 +19,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <future>
@@ -34,8 +36,10 @@ namespace {
 using splash::metal::AllocationFailure;
 using splash::metal::MetalAllocationError;
 using splash::metal::BufferBinding;
+using splash::metal::BufferList;
 using splash::metal::BufferStorage;
 using splash::metal::BytesBinding;
+using splash::metal::CommandGraph;
 using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
@@ -162,6 +166,53 @@ void duplicateBindingFailsSubmit(MetalBackend &backend, const MetalBuffer &buffe
 
     require(backend.healthy() && backend.submissionCount() == submissions,
             "a rejected binding was counted or poisoned the backend");
+}
+
+// A graph dispatch with the production maximum of buffers and one parameter
+// struct keeps every binding inside the dispatch, each payload keeps its
+// address as the graph grows, and a list past the inline capacity moves to
+// the heap with its bindings intact.
+void dispatchBindingsStayInline(const MetalBuffer &buffer) {
+    constexpr size_t kBindings = splash::metal::kInlineBufferBindings;
+    constexpr uint32_t kFirstValue = 7;
+    constexpr uint32_t kLaterDispatches = 2048;
+    BufferList buffers;
+    for (size_t index = 0; index < kBindings; ++index) buffers.push_back(buffer);
+    require(buffers.isInline() && buffers.size() == kBindings,
+            "a production-sized buffer list left its inline storage");
+
+    CommandGraph graph(1);
+    graph.add("test_add_u32", buffers, kFirstValue, {1, 1, 1});
+    const ComputeDispatch &first = graph.dispatches().front();
+    require(first.buffers.isInline() && first.buffers.size() == kBindings &&
+                first.bytes.isInline() && first.bytes.size() == 1 &&
+                first.bytes[0].index == kBindings,
+            "a production-sized dispatch did not keep its bindings inline");
+    for (uint32_t index = 0; index < kBindings; ++index) {
+        require(first.buffers[index].index == index &&
+                    first.buffers[index].buffer.sameView(buffer),
+                "an inline buffer binding lost its index or buffer");
+    }
+    const void *payload = first.bytes[0].data;
+    for (uint32_t value = 0; value < kLaterDispatches; ++value)
+        graph.add("test_add_u32", {buffer}, value, {1, 1, 1});
+    uint32_t stored = 0;
+    std::memcpy(&stored, graph.dispatches().front().bytes[0].data, sizeof(stored));
+    require(graph.dispatches().front().bytes[0].data == payload &&
+                stored == kFirstValue,
+            "a parameter payload moved as the graph grew");
+    std::memcpy(&stored, graph.dispatches().back().bytes[0].data, sizeof(stored));
+    require(stored == kLaterDispatches - 1,
+            "the last parameter payload was not stored");
+
+    buffers.push_back(buffer);
+    require(!buffers.isInline() && buffers.size() == kBindings + 1 &&
+                buffers.back().sameView(buffer),
+            "a buffer list past its inline capacity lost a binding");
+    const BufferList moved = std::move(buffers);
+    require(!moved.isInline() && moved.size() == kBindings + 1 &&
+                buffers.empty() && buffers.isInline(),
+            "moving a heap buffer list did not hand over its storage");
 }
 
 void observeCompletion(id command, SEL selector, MTLCommandBufferHandler handler) {
@@ -1173,6 +1224,7 @@ void run(const std::string &metallibPath) {
         std::vector<ComputeDispatch> command{first, first};
         (void)backend.submitCommand(command);
         duplicateBindingFailsSubmit(backend, view, first);
+        dispatchBindingsStayInline(view);
     }
     require(backend.submissionCount() == 3,
             "explicit operation list did not use one command buffer");
