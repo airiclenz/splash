@@ -161,7 +161,8 @@ class CallbackStreamer:
     When the incremental decoder rejects a token, a fresh one is rebuilt from
     a bounded window of recent ids so streaming, stops and the guard continue
     (`decode_fallbacks` counts these); if that fails too, `end()` reconciles
-    the rest of the reply from a whole-sequence decode.
+    the rest of the reply from a whole-sequence decode. While the decoder is
+    alive, `end()` decodes only the ids it still holds, behind a bounded window.
     """
 
     def __init__(
@@ -342,8 +343,42 @@ class CallbackStreamer:
         self.decoded_through = through
         return "".join(parts)
 
+    def _decode_held_tail(self):
+        """Return the text of the ids the live decoder still holds, or None.
+
+        Decodes the held ids behind at most `DECODE_RECOVERY_WINDOW` ids of
+        context and the context alone, and takes the suffix, as the decoder's
+        own steps do, so the cost is O(window + held), never O(reply). Returns
+        None when the context's text is not a prefix of the tail's, for the
+        whole-reply reconciliation to settle.
+        """
+        start = self.decoded_through
+        if start == len(self.token_ids):
+            return ""
+        window = max(0, start - DECODE_RECOVERY_WINDOW)
+        tail = self.tokenizer.decode(
+            self.token_ids[window:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        context = self.tokenizer.decode(
+            self.token_ids[window:start],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        if not tail.startswith(context):
+            return None
+        return tail[len(context) :]
+
     def end(self):
         if self.stop_sequence is not None:
+            return
+        held = self._decode_held_tail() if self.decode_stream is not None else None
+        if held is not None:
+            self._emit(held)
+            if self.stop_sequence is None:
+                self._send(self.pending_text)
+                self.pending_text = ""
             return
         decoded = self.tokenizer.decode(
             self.token_ids,

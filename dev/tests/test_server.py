@@ -55,7 +55,8 @@ def _byte_backend(fragments):
     vocabulary = {}
     for token_id in range(max(fragments) + 1):
         value = fragments.get(token_id, f"<unused_{token_id}>")
-        token = "".join(alphabet[byte] for byte in value.encode())
+        raw = value if isinstance(value, bytes) else value.encode()
+        token = "".join(alphabet[byte] for byte in raw)
         vocabulary[token] = token_id
     vocabulary["[UNK]"] = len(vocabulary)
     backend = Tokenizer(models.WordLevel(vocabulary, unk_token="[UNK]"))
@@ -133,10 +134,12 @@ class FakeTokenizer:
 
 
 class EndFailTokenizer(FakeTokenizer):
+    """The decoder holds token 6 as a partial character, so `end()` decodes it."""
+
     def __init__(self):
         super().__init__()
         self.fragments[6] = "tail"
-        self.backend_tokenizer = _byte_backend(self.fragments)
+        self.backend_tokenizer = _byte_backend({**self.fragments, 6: b"\xe4"})
         self.tail_decodes = 0
 
     def decode(self, token_ids, **kwargs):
@@ -909,6 +912,38 @@ class ServerTest(unittest.TestCase):
                 offset += size
             streamer.end()
             self.assertEqual("".join(chunks), tokenizer.decode(token_ids), seed)
+
+    def test_callback_streamer_end_decodes_only_the_held_tail(self):
+        class RecordingTokenizer(ByteLevelTestTokenizer):
+            def __init__(self, raw_tokens):
+                super().__init__(raw_tokens)
+                self.decode_lengths = []
+
+            def decode(self, token_ids, **kwargs):
+                self.decode_lengths.append(len(token_ids))
+                return super().decode(token_ids, **kwargs)
+
+        words = [f"word{index} ".encode() for index in range(64)]
+        partial = [bytes([value]) for value in "中".encode()[:2]]
+        tokenizer = RecordingTokenizer([*words, *partial])
+        window = backend_api.DECODE_RECOVERY_WINDOW
+        for token_ids, held in (
+            (tokenizer.token_ids[: len(words)] * 4, 0),
+            (tokenizer.token_ids[: len(words)] * 4 + tokenizer.token_ids[-2:], 2),
+        ):
+            expected = ByteLevelTestTokenizer.decode(tokenizer, token_ids)
+            chunks = []
+            streamer = backend_api.CallbackStreamer(tokenizer, chunks.append)
+            for offset in range(0, len(token_ids), 7):
+                streamer.put_tokens(token_ids[offset : offset + 7])
+            tokenizer.decode_lengths.clear()
+            streamer.end()
+
+            self.assertEqual("".join(chunks), expected, held)
+            self.assertEqual(len(tokenizer.decode_lengths), 2 if held else 0)
+            self.assertLessEqual(
+                max(tokenizer.decode_lengths, default=0), window + held
+            )
 
     def test_callback_streamer_reconciles_an_invalid_decoder_prefix(self):
         tokenizer = ByteLevelTestTokenizer([b'{"', b"value", b'":', b"123", b"}"])
