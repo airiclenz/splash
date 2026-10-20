@@ -320,6 +320,168 @@ void profileRouter(MetalBackend &backend, uint32_t rows,
               << " router_ms=" << median(samples[index]) << '\n';
 }
 
+// An Apple7/8 MoE gate/up register tile, its precomputed-sums variant and
+// its column tile.
+struct ExpertTile final {
+  const char *pipeline;
+  const char *sumsPipeline;
+  uint32_t rows;
+  uint32_t columns;
+};
+
+constexpr std::array<ExpertTile, 2> kExpertTiles{{
+    {"moe_expert_gate_up_q4_mma_m8", "moe_expert_gate_up_q4_mma_m8_sums", 8, 64},
+    {"moe_expert_gate_up_q4_mma_m32", "moe_expert_gate_up_q4_mma_m32_sums", 32,
+     32},
+}};
+constexpr uint32_t kExpertPairs = 6;
+constexpr uint32_t kExpertSubmits = 9;
+
+uint32_t mixBits(uint64_t value) {
+  value ^= value >> 33;
+  value *= 0xff51afd7ed558ccdULL;
+  value ^= value >> 33;
+  value *= 0xc4ceb9fe1a85ec53ULL;
+  value ^= value >> 33;
+  return static_cast<uint32_t>(value);
+}
+
+double medianSubmit(MetalBackend &backend, const ComputeDispatch &dispatch) {
+  std::vector<double> samples;
+  for (uint32_t submit = 0; submit < kExpertSubmits; ++submit)
+    samples.push_back(backend.submit(dispatch).gpuSeconds * 1000.0);
+  return median(samples);
+}
+
+// The 35B-A3B fused gate/up expert pass (hidden 2048, intermediate 512, 256
+// experts, top 8) on the Apple7/8 register tiles, against the variant reading
+// per-row, per-group input sums that moe_expert_input_sums_mma precomputes in
+// the tile's order. Tokens route to hashed experts, so the tiles carry
+// ragged row counts. The grouped input holds varied bf16 of mixed exponents,
+// and both outputs start zeroed, so the variant's output must match the
+// tile's bit for bit before it is timed. Each of kExpertPairs pairs times the
+// tile (A) and the variant (B) in ABBA order, each sample a median of
+// kExpertSubmits submits; the variant's sums kernel is reported apart.
+void profileMoeExpert(MetalBackend &backend, uint32_t tokens,
+                      const ExpertTile &tile, bool sumsVariant) {
+  constexpr uint32_t kHidden = 2048;
+  constexpr uint32_t kIntermediate = 512;
+  constexpr uint32_t kExperts = 256;
+  constexpr uint32_t kTopK = 8;
+  constexpr uint32_t kGroups = kHidden / kQuantGroup;
+  std::vector<uint32_t> routes(kExperts, 0);
+  for (uint32_t token = 0; token < tokens; ++token)
+    for (uint32_t k = 0; k < kTopK; ++k)
+      ++routes[mixBits(uint64_t{token} * kTopK + k) % kExperts];
+  std::vector<MoeTileDescriptor> descriptors;
+  for (uint32_t expert = 0; expert < kExperts; ++expert)
+    for (uint32_t row = 0; row < routes[expert]; row += tile.rows)
+      descriptors.push_back(
+          {expert, std::min(tile.rows, routes[expert] - row)});
+  const auto tileCount = static_cast<uint32_t>(descriptors.size());
+  const uint64_t groupedRows = uint64_t{tileCount} * tile.rows;
+
+  const uint64_t elements = uint64_t{kIntermediate} * kHidden;
+  const uint64_t weightBytes = elements / 2;
+  const uint64_t parameterBytes = elements / 32;
+  const uint64_t stride = weightBytes + 2 * parameterBytes;
+  const auto packedExperts = [&](const std::string &name) {
+    MetalBuffer packed = shared(backend, stride * kExperts, "moe " + name);
+    auto *bytes = static_cast<uint8_t *>(packed.contents());
+    std::memset(bytes, 0x5a, packed.sizeBytes());
+    for (uint32_t expert = 0; expert < kExperts; ++expert)
+      std::memset(bytes + expert * stride + weightBytes, 0x3c,
+                  2 * parameterBytes);
+    return packed;
+  };
+  MetalBuffer gate = packedExperts("gate");
+  MetalBuffer up = packedExperts("up");
+  MetalBuffer input = shared(backend, groupedRows * kHidden * sizeof(__bf16),
+                             "moe grouped input");
+  auto *inputBits = static_cast<uint16_t *>(input.contents());
+  for (uint64_t index = 0; index < groupedRows * kHidden; ++index) {
+    const uint32_t bits = mixBits(index);
+    // Sign, an exponent in [2^-4, 2^3] and seven mantissa bits.
+    inputBits[index] = static_cast<uint16_t>(
+        ((bits & 1) << 15) | ((123 + (bits >> 1) % 8) << 7) | ((bits >> 4) & 0x7f));
+  }
+  MetalBuffer tiles = shared(backend, descriptors.size() * sizeof(MoeTileDescriptor),
+                             "moe tiles");
+  std::memcpy(tiles.contents(), descriptors.data(), tiles.sizeBytes());
+  MetalBuffer count = shared(backend, sizeof(uint32_t), "moe tile count");
+  std::memcpy(count.contents(), &tileCount, sizeof(tileCount));
+  MetalBuffer sums = shared(backend, groupedRows * kGroups * sizeof(float),
+                            "moe input sums");
+  const uint64_t outputBytes = groupedRows * kIntermediate * sizeof(__bf16);
+  MetalBuffer output = shared(backend, outputBytes, "moe output");
+  MetalBuffer sumsOutput = shared(backend, outputBytes, "moe sums output");
+  std::memset(output.contents(), 0, outputBytes);
+  std::memset(sumsOutput.contents(), 0, outputBytes);
+  const MoeExpertParams params{kHidden, kIntermediate, kExperts, 0, stride,
+                               stride};
+  const uint32_t inputSize = kHidden;
+
+  // The shared-expert slabs are never read: no descriptor names expert 256.
+  const ComputeDispatch inTile{
+      tile.pipeline,
+      {{0, input}, {1, tiles}, {2, count}, {3, gate}, {4, up}, {5, gate},
+       {6, up}, {7, output}},
+      {{8, &params, sizeof(params)}},
+      {kIntermediate / tile.columns, tileCount, 1},
+      {kMmaThreads, 1, 1}};
+  const std::string label = std::string(tile.pipeline) + " tokens=" +
+                            std::to_string(tokens) +
+                            " tiles=" + std::to_string(tileCount);
+  if (!sumsVariant) {
+    static_cast<void>(backend.submit(inTile));
+    std::cout << label << " tile_ms=" << medianSubmit(backend, inTile) << '\n';
+    return;
+  }
+  const ComputeDispatch sum{
+      "moe_expert_input_sums_mma",
+      {{0, input}, {1, sums}},
+      {{2, &inputSize, sizeof(inputSize)}},
+      {kGroups / 4, static_cast<uint32_t>(groupedRows / 8), 1},
+      {kMmaThreads, 1, 1}};
+  const ComputeDispatch precomputed{
+      tile.sumsPipeline,
+      {{0, input}, {1, tiles}, {2, count}, {3, gate}, {4, up}, {5, gate},
+       {6, up}, {7, sumsOutput}, {9, sums}},
+      {{8, &params, sizeof(params)}},
+      {kIntermediate / tile.columns, tileCount, 1},
+      {kMmaThreads, 1, 1}};
+  static_cast<void>(backend.submit(sum));
+  static_cast<void>(backend.submit(inTile));
+  static_cast<void>(backend.submit(precomputed));
+  if (std::memcmp(output.contents(), sumsOutput.contents(), outputBytes) != 0)
+    throw std::runtime_error(label + ": precomputed sums change the output");
+
+  std::vector<double> tileSamples;
+  std::vector<double> sumsSamples;
+  uint32_t wins = 0;
+  for (uint32_t pair = 0; pair < kExpertPairs; ++pair) {
+    double a = 0;
+    double b = 0;
+    if (pair % 2 == 0) {
+      a = medianSubmit(backend, inTile);
+      b = medianSubmit(backend, precomputed);
+    } else {
+      b = medianSubmit(backend, precomputed);
+      a = medianSubmit(backend, inTile);
+    }
+    tileSamples.push_back(a);
+    sumsSamples.push_back(b);
+    wins += b < a ? 1 : 0;
+  }
+  const double tileMs = median(tileSamples);
+  const double sumsMs = median(sumsSamples);
+  std::cout << label << " tile_ms=" << tileMs << " sums_variant_ms=" << sumsMs
+            << " change_pct=" << (sumsMs / tileMs - 1.0) * 100.0
+            << " variant_wins=" << wins << '/' << kExpertPairs
+            << " sums_kernel_ms=" << medianSubmit(backend, sum)
+            << " bitwise=equal\n";
+}
+
 void run(const std::string &metallibPath) {
   MetalBackend backend(metallibPath);
   constexpr std::array<uint32_t, 13> kProfileRows{
@@ -420,6 +582,11 @@ void run(const std::string &metallibPath) {
   profileRouter(backend, 8, registerRouter);
   for (uint32_t rows : kProfileRows)
     profileRouter(backend, rows, registerRouter);
+  // The register expert tiles run on any GPU; only Apple7/8 select them.
+  const bool sumsVariant = hasFunction(metallibPath, kExpertTiles[0].sumsPipeline);
+  for (uint32_t tokens : {8u, 32u, 128u, 512u, 2'048u})
+    for (const ExpertTile &tile : kExpertTiles)
+      profileMoeExpert(backend, tokens, tile, sumsVariant);
 }
 
 } // namespace

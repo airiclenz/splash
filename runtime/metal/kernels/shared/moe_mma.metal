@@ -13,7 +13,9 @@ using namespace metal;
 //
 // Unlike the dense tile, the input sums are not precomputed: each lane already
 // holds eight inputs of each of its rows per group, and three xor shuffles over
-// the lanes that share a row finish the group sum.
+// the lanes that share a row finish the group sum. The _sums gate/up variants
+// read those sums from a buffer instead, written by moe_expert_input_sums_mma
+// with the same arithmetic; q4-prefill-profile times them against these tiles.
 //
 // A threadgroup is four simdgroups. The 32-row tile arranges them 2 x 2
 // (columns x rows), each simdgroup owning 16 rows as two 8-row fragments; the
@@ -32,12 +34,34 @@ constexpr constant uint kSimdgroups = 4;
 
 enum class Pass { GateUp, Down };
 
-template <uint Rows, Pass P>
+// The quant-group sums of rows fn and fn + 1 from a lane's eight bf16 of each
+// (x[0], x[1]): pairs in order within the lane, then lane bits 1, 2 and 4
+// (fm, the other 56 inputs of these rows) in a tree of xor shuffles.
+inline float2 groupSum(thread const uint4 *x) {
+  float2 sum;
+#pragma unroll
+  for (uint e = 0; e < 2; ++e) {
+    float s = 0;
+#pragma unroll
+    for (uint v = 0; v < 4; ++v)
+      s += as_type<float>(x[e][v] << 16) + as_type<float>(x[e][v] & 0xFFFF0000u);
+    sum[e] = s;
+  }
+  sum += simd_shuffle_xor(sum, 2);
+  sum += simd_shuffle_xor(sum, 4);
+  sum += simd_shuffle_xor(sum, 16);
+  return sum;
+}
+
+// Sums: read each row's group sums from input_sums (grouped row x group,
+// fp32) instead of reducing the inputs in the tile.
+template <uint Rows, Pass P, bool Sums = false>
 inline void expert(device const bfloat *grouped_input,
                    device const MoeTileDescriptor *tiles,
                    device const uint *tile_count, device uchar *packed_0,
                    device uchar *packed_1, device uchar *shared_0,
                    device uchar *shared_1, device bfloat *output,
+                   device const float *input_sums,
                    constant MoeExpertParams &params, uint2 tg, uint sg,
                    uint lane) {
   static_assert(Rows == 8 || Rows == 32, "8- and 32-row expert tiles");
@@ -89,6 +113,7 @@ inline void expert(device const bfloat *grouped_input,
   const uint rowBase = firstRow + fn;
   device const bfloat *input =
       grouped_input + (ulong(tg.y) * Rows + rowBase) * K + 8 * fm;
+  device const float *rowSums = input_sums + (ulong(tg.y) * Rows + rowBase) * groups;
   bool live[FM];
 #pragma unroll
   for (uint j = 0; j < FM; ++j) live[j] = firstRow + j * 8 < descriptor.rows;
@@ -110,20 +135,16 @@ inline void expert(device const bfloat *grouped_input,
 #pragma unroll
     for (uint j = 0; j < FM; ++j) {
 #pragma unroll
-      for (uint e = 0; e < 2; ++e) {
+      for (uint e = 0; e < 2; ++e)
         x[j][e] = live[j] ? *reinterpret_cast<device const uint4 *>(
                                 input + ulong(j * 8 + e) * K + g * kGroup)
                           : uint4(0);
-        float s = 0;
-#pragma unroll
-        for (uint v = 0; v < 4; ++v)
-          s += as_type<float>(x[j][e][v] << 16) + as_type<float>(x[j][e][v] & 0xFFFF0000u);
-        sum[j][e] = s;
-      }
-      // Lane bits 1, 2 and 4 select fm: the other 56 inputs of these rows.
-      sum[j] += simd_shuffle_xor(sum[j], 2);
-      sum[j] += simd_shuffle_xor(sum[j], 4);
-      sum[j] += simd_shuffle_xor(sum[j], 16);
+      if constexpr (Sums)
+        sum[j] = live[j] ? float2(rowSums[ulong(j * 8) * groups + g],
+                                  rowSums[ulong(j * 8 + 1) * groups + g])
+                         : float2(0);
+      else
+        sum[j] = groupSum(x[j]);
     }
     // Nibble j of words x and y, 16 bits apart: low halves serve j < 4.
     uint2 pairs[FN];
@@ -414,7 +435,7 @@ inline void route(device const bfloat *input, device const uchar *weights,
       constant MoeExpertParams &params [[buffer(8)]], MOE_MMA_THREADS) {       \
     moemma::expert<Rows, moemma::Pass::GateUp>(                                \
         grouped_input, tiles, tile_count, gate_packed, up_packed, shared_gate, \
-        shared_up, output, params, group, simd_group, simd_lane);              \
+        shared_up, output, nullptr, params, group, simd_group, simd_lane);     \
   }                                                                            \
   kernel void moe_expert_down_q4_mma_m##Rows(                                  \
       device bfloat *grouped_input [[buffer(0)]],                              \
@@ -426,13 +447,64 @@ inline void route(device const bfloat *input, device const uchar *weights,
       constant MoeExpertParams &params [[buffer(6)]], MOE_MMA_THREADS) {       \
     moemma::expert<Rows, moemma::Pass::Down>(                                  \
         grouped_input, tiles, tile_count, down_packed, down_packed,            \
-        shared_down, shared_down, output, params, group, simd_group,           \
+        shared_down, shared_down, output, nullptr, params, group, simd_group,  \
         simd_lane);                                                            \
   }
 
 MOE_MMA_KERNELS(8)
 MOE_MMA_KERNELS(32)
 #undef MOE_MMA_KERNELS
+
+// The gate/up tiles reading precomputed input sums (buffer 9), for
+// q4-prefill-profile's comparison against the in-tile sums.
+#define MOE_MMA_SUMS_KERNEL(Rows)                                              \
+  kernel void moe_expert_gate_up_q4_mma_m##Rows##_sums(                        \
+      device bfloat *grouped_input [[buffer(0)]],                              \
+      device const MoeTileDescriptor *tiles [[buffer(1)]],                     \
+      device const uint *tile_count [[buffer(2)]],                             \
+      device uchar *gate_packed [[buffer(3)]],                                 \
+      device uchar *up_packed [[buffer(4)]],                                   \
+      device uchar *shared_gate [[buffer(5)]],                                 \
+      device uchar *shared_up [[buffer(6)]],                                   \
+      device bfloat *output [[buffer(7)]],                                     \
+      constant MoeExpertParams &params [[buffer(8)]],                          \
+      device const float *input_sums [[buffer(9)]], MOE_MMA_THREADS) {         \
+    moemma::expert<Rows, moemma::Pass::GateUp, true>(                          \
+        grouped_input, tiles, tile_count, gate_packed, up_packed, shared_gate, \
+        shared_up, output, input_sums, params, group, simd_group, simd_lane);  \
+  }
+
+MOE_MMA_SUMS_KERNEL(8)
+MOE_MMA_SUMS_KERNEL(32)
+#undef MOE_MMA_SUMS_KERNEL
+
+// Every grouped row's quant-group input sums (row x group, fp32) as the
+// expert tiles compute them: one simdgroup per 8 rows and group, in the
+// tiles' lane layout, so the sums agree with theirs bit for bit. Grid:
+// (groups / 4, grouped rows / 8) threadgroups of four simdgroups.
+kernel void moe_expert_input_sums_mma(
+    device const bfloat *grouped_input [[buffer(0)]],
+    device float *input_sums [[buffer(1)]],
+    constant uint &input_size [[buffer(2)]], MOE_MMA_THREADS) {
+  const uint groups = input_size / moemma::kGroup;
+  const uint g = group.x * moemma::kSimdgroups + simd_group;
+  if (g >= groups)
+    return;
+  const uint qid = simd_lane >> 2;
+  const uint fm = (qid & 4) | ((simd_lane >> 1) & 3);
+  const uint fn = ((qid & 2) << 1) | ((simd_lane & 1) << 1);
+  const ulong row = ulong(group.y) * 8 + fn;
+  uint4 x[2];
+#pragma unroll
+  for (uint e = 0; e < 2; ++e)
+    x[e] = *reinterpret_cast<device const uint4 *>(
+        grouped_input + (row + e) * input_size + g * moemma::kGroup + 8 * fm);
+  const float2 sum = moemma::groupSum(x);
+  if (fm == 0) {
+    input_sums[row * groups + g] = sum[0];
+    input_sums[(row + 1) * groups + g] = sum[1];
+  }
+}
 
 // Router scores: 8 rows x 16 experts on four simdgroups, and 32 rows x 16
 // experts on two row groups of four (256 threads). On an M2 Pro both beat
