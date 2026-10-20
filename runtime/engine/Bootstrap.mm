@@ -293,6 +293,8 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
       config.nativeLoop.engine.maxContext;
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;
+  config.nativeLoop.engine.isSpeculationEnabled =
+      config.resources.isSpeculationEnabled;
 
   std::unique_ptr<model::RuntimeModel> modelRuntime;
   try {

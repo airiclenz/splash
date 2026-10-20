@@ -873,6 +873,66 @@ void testQueuedPeerJunctionWalksPastTargetOnlyState() {
           "a queued peer's junction did not reject the target-only state");
 }
 
+// What one engine planned and restored for a prompt run twice whose replay
+// state, the deepest boundary, sits at 8128 and is cached target-only by the
+// first run: the prompt ends one page past it.
+struct RepeatOverTargetOnlyEnd final {
+  DraftContextPlan firstPlan;
+  uint32_t restoredLength = 0;
+  bool restoredDraft = false;
+  uint32_t failedCount = 0;
+};
+
+RepeatOverTargetOnlyEnd repeatOverTargetOnlyEnd(bool isSpeculationEnabled) {
+  Backing backing(256);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({.isSpeculationEnabled = isSpeculationEnabled},
+                        resources, executor, events);
+  constexpr uint32_t deepestBoundary = 8128;
+  executor.targetOnlyAtBoundary = deepestBoundary;
+  const std::vector<uint32_t> prompt(deepestBoundary + KvCache::pageTokens, 13);
+
+  engine.submit(request(1, prompt));
+  runUntilIdle(engine);
+  RepeatOverTargetOnlyEnd result;
+  result.firstPlan = executor.plans.at(1);
+  engine.submit(request(2, prompt));
+  runUntilIdle(engine);
+
+  result.restoredLength = executor.restoredLengths.at(2);
+  result.restoredDraft = executor.restoredDraft;
+  result.failedCount = events.failedCount;
+  return result;
+}
+
+// Without speculation nothing is captured for the draft, and a repeat
+// resumes from the target-only state at the deepest boundary, without draft.
+void testUnspeculatedRepeatResumesAtTargetOnlyEnd() {
+  const RepeatOverTargetOnlyEnd run = repeatOverTargetOnlyEnd(false);
+
+  require(run.firstPlan.captureSpans.empty() &&
+              run.firstPlan.boundaries.empty() &&
+              run.firstPlan.replayEnd == 8128 + KvCache::pageTokens &&
+              run.failedCount == 0,
+          "an unspeculated prefill planned draft captures");
+  require(run.restoredLength == 8128 && !run.restoredDraft,
+          "an unspeculated repeat did not resume at its target-only end");
+}
+
+// With speculation the same target-only end is a short remainder from the
+// prompt: the plan captures draft rows and the repeat walks past it.
+void testSpeculatedRepeatWalksPastTargetOnlyEnd() {
+  const RepeatOverTargetOnlyEnd run = repeatOverTargetOnlyEnd(true);
+
+  require(!run.firstPlan.captureSpans.empty() && run.failedCount == 0,
+          "a speculated prefill planned no draft captures");
+  require(run.restoredLength < 8128,
+          "a speculated repeat restored a short target-only remainder");
+}
+
 // A lane cancelled while the command that ends at its armed boundary is in
 // flight publishes nothing when that command drains: no snapshot is taken,
 // no failure is counted, and the blocks committed earlier stay cached.
@@ -5724,6 +5784,8 @@ int main() {
     testTargetOnlyStateRestoresWithoutDraft();
     testShortRemainderWalksPastTargetOnlyState();
     testQueuedPeerJunctionWalksPastTargetOnlyState();
+    testUnspeculatedRepeatResumesAtTargetOnlyEnd();
+    testSpeculatedRepeatWalksPastTargetOnlyEnd();
     testCancellationInFlightAtBoundaryPublishesNoState();
     testActiveCellGrowthReclaimsCachedStateAndRetries();
     testKvGrowthReclaimsIdleStateBeforeCache();

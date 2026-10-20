@@ -37,6 +37,23 @@ uint32_t replayStateBoundary(uint32_t tokens) noexcept {
                     : 0;
 }
 
+// The plan of a model that does not draft: planDraftContext's replay range
+// and restore boundary with no capture or boundary, so no draft row is
+// replayed, and a restored state never brings its draft window.
+DraftContextPlan undraftedPlan(uint32_t replayBegin, uint32_t replayEnd,
+                               std::optional<uint32_t> restoredBoundary,
+                               bool targetOnlyRestore) {
+  DraftContextPlan result;
+  result.replayBegin = replayBegin;
+  result.replayEnd = replayEnd;
+  result.restoredDraftBoundary = restoredBoundary;
+  result.targetOnlyRestore = targetOnlyRestore;
+  result.targetPrefillRows = replayEnd - replayBegin;
+  result.draftContextRowsAvoided = result.targetPrefillRows;
+  result.draftStateRestoreSkipped = restoredBoundary ? 1 : 0;
+  return result;
+}
+
 } // namespace
 
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
@@ -793,7 +810,9 @@ bool Engine::rebuildsDraftWindow(const Request &active, uint32_t stateBoundary,
 
 bool Engine::restorable(const Request &active,
                         const CacheLookup &lookup) const {
-  if (!lookup.state || lookup.state->state()->carriesDraft())
+  // Without speculation no draft window is ever continued or rebuilt.
+  if (!config_.isSpeculationEnabled || !lookup.state ||
+      lookup.state->state()->carriesDraft())
     return true;
   return rebuildsDraftWindow(active, lookup.resumeBoundary(),
                              lookup.junctionBoundary());
@@ -822,14 +841,17 @@ bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
 DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
                                                uint32_t stateBoundary,
                                                bool targetOnlyRestore) const {
+  const std::optional<uint32_t> restoredBoundary =
+      stateBoundary ? std::optional<uint32_t>(stateBoundary) : std::nullopt;
+  if (!config_.isSpeculationEnabled)
+    return undraftedPlan(stateBoundary, active.replayTokens, restoredBoundary,
+                         targetOnlyRestore);
   std::vector<uint32_t> boundaries;
   boundaries.reserve(active.stateBoundaries.size() - active.stateBoundaryCursor);
   for (size_t i = active.stateBoundaryCursor; i < active.stateBoundaries.size(); ++i)
     boundaries.push_back(active.stateBoundaries[i].tokens);
-  return planDraftContext(
-      stateBoundary, active.replayTokens,
-      stateBoundary ? std::optional<uint32_t>(stateBoundary) : std::nullopt,
-      boundaries, targetOnlyRestore);
+  return planDraftContext(stateBoundary, active.replayTokens, restoredBoundary,
+                          boundaries, targetOnlyRestore);
 }
 
 void Engine::armNextStateBoundary(Request &active) {
@@ -1540,8 +1562,8 @@ void Engine::suspendModel(Request &active, uint32_t position) {
     return;
   // A hint: admit's restorable check is authoritative. A KV junction past
   // position, unknown here, only lowers the first boundary admit checks.
-  const bool usable =
-      state->carriesDraft() || rebuildsDraftWindow(active, position, 0);
+  const bool usable = !config_.isSpeculationEnabled || state->carriesDraft() ||
+                      rebuildsDraftWindow(active, position, 0);
   const bool retiring = usable && active.latestCheckpoint;
   if (usable) {
     static_cast<void>(retireCheckpoint(active));

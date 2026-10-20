@@ -34,6 +34,10 @@ struct EngineConfig final {
   // two in [64, model::ExecutionLimits::prefillTokenBudget].
   uint32_t contendedPrefillRows = Scheduler::kDefaultContendedPrefillRows;
   double resourceWaitTimeoutMilliseconds = 30000.0;
+  // Whether the model drafts. Off, the engine plans no draft captures,
+  // restores every state without its draft window and accepts target-only
+  // states at any boundary: the model runs no draft work to continue.
+  bool isSpeculationEnabled = true;
   // Host growth admission, supplied by the runtime governor. Queried only on
   // failed allocation, never on the successful decode path.
   std::function<bool()> growthPaused;
