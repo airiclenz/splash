@@ -252,9 +252,10 @@ private:
     // The state a suspended request resumes from, spared by Warning reclaim
     // until the resume succeeds or the request ends.
     StateProtection resumeProtection;
-    // The cached prefix an unstarted request found before waiting for
-    // resources, spared by Warning reclaim until admission or the request
-    // ends. Never held with resumeProtection.
+    // The cached prefix an unstarted request found, protected from its
+    // first denied admission attempt, before that attempt's reclaim: growth
+    // reclaim takes it last and Warning reclaim spares it, until admission
+    // or the request ends. Never held with resumeProtection.
     StateProtection queuedProtection;
     // The scheduler owns the terminal phase; this flag records that the
     // corresponding event was emitted and model/resource ownership ended.

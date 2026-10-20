@@ -3880,6 +3880,66 @@ void testGrowthReclaimTakesAQueuedPrefixRatherThanStall() {
           "the queued request did not complete after growth reclaim");
 }
 
+// A sole request is denied by the engine budget while its lookup pins the
+// state it found at 64. Cached KV of another prompt, held by a cache-only
+// request, turns evictable during the first reclaim after the lease drop,
+// newer than the unpinned state; one eviction then lifts the denial. Growth
+// reclaim must take that KV, not the found state, and admit cold.
+void testGrowthReclaimSparesAFoundStateForCachedKv() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  const std::vector<uint32_t> prompt(65, 310);
+  cachePrefix(resources, 999, std::span(prompt).first(64), 64);
+  constexpr uint64_t kHolderId = 998;
+  const std::vector<uint32_t> other(64, 998);
+  resources.beginRequest(kHolderId);
+  require(resources.ensureTokens(kHolderId, other.size()).granted(),
+          "the KV holder's pages were not acquired");
+  static_cast<void>(resources.publishCommittedBlocks(
+      kHolderId, other, static_cast<uint32_t>(other.size())));
+  // The model's idle-state reclaim opens every growth reclaim: the first one
+  // after the lease drop ends the holder, leaving its KV the only other
+  // candidate.
+  bool holding = true;
+  executor.reclaimableIdleStateBytes = 1;
+  executor.idleStateReclaimable = [&] {
+    if (holding && executor.beginAttempts &&
+        resources.snapshot().stateCache.pinned == 0) {
+      resources.endRequest(kHolderId);
+      holding = false;
+    }
+    return false;
+  };
+  const CacheSnapshot before = resources.snapshot();
+  executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
+  executor.beginGrowthBlocked = [&] {
+    const CacheSnapshot now = resources.snapshot();
+    return now.kvCache.evictions == before.kvCache.evictions &&
+           now.stateCache.evictions == before.stateCache.evictions;
+  };
+  executor.holdPrefillUntil = std::make_shared<bool>(false);
+
+  engine.submit(request(310, prompt));
+  static_cast<void>(engine.tick(1));
+  require(events.starts.size() == 1 &&
+              events.starts.back().first == EngineCacheStatus::Miss &&
+              resources.cachedTokens(prompt) == 64,
+          "growth reclaim took the found state before another KV leaf");
+  engine.cancel(310);
+  *executor.holdPrefillUntil = true;
+  runUntilIdle(engine);
+  engine.submit(request(311, prompt));
+  runUntilIdle(engine);
+
+  require(events.starts.back().first == EngineCacheStatus::PrefixHit &&
+              events.starts.back().second == 64,
+          "a resend did not hit the state the denied request found");
+}
+
 // Request 301 queued for memory by a non-host begin denial while request 302
 // stays resident, decoding, beside the composite state request 300 left at
 // 64 of their shared 65-token prompt. Growth is never paused, so only the
@@ -5807,6 +5867,7 @@ int main() {
     testRetriedQueuedRequestHoldsOneProtection();
     testQueuedRequestAdmittedColdDropsItsProtection();
     testGrowthReclaimTakesAQueuedPrefixRatherThanStall();
+    testGrowthReclaimSparesAFoundStateForCachedKv();
     testQueuedRequestKeepsItsFoundStateWhileAPeerIsResident();
     testQueuedRequestOutlivedByAPeerAdmitsCold();
     testStateAdmissionWaitsForKvRelease();

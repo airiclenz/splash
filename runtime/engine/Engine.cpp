@@ -498,8 +498,8 @@ bool Engine::admit(Request &active, double now) {
       return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest);
     };
     const uint64_t releaseGeneration = cache_.releaseGeneration();
-    // The lease drop below forgets the state this lookup found; a request
-    // sent to wait still protects it by block.
+    // The lease drop below forgets the state this lookup found; a denied
+    // unstarted request protects it by block from its first denial.
     const uint64_t foundStateBlock =
         lookup.state ? lookup.state->kvBlock() : 0;
     // Nothing in the retry loop below changes residency, so one scan serves
@@ -509,6 +509,15 @@ bool Engine::admit(Request &active, double now) {
           return entry.first != active.request.id && entry.second.stateCell;
         });
     StateAdmission admission = activate();
+    if (!admission.granted() && !resuming) {
+      // Protect the found state before any reclaim below: once the lease
+      // drop forgets it, growth reclaim takes it only after every other
+      // candidate, and Warning reclaim spares it while the request waits.
+      // A retried wait swaps its protection rather than stack it.
+      cache_.unprotectState(std::exchange(active.queuedProtection, {}));
+      if (foundStateBlock)
+        active.queuedProtection = cache_.protectState(foundStateBlock);
+    }
     bool reclaimedForAdmission = false;
     while (!admission.granted() &&
            admission.failure == StateFailure::MemoryPressure) {
@@ -551,13 +560,6 @@ bool Engine::admit(Request &active, double now) {
                                admission.allocationFailure),
                        true});
         return true;
-      }
-      if (!resuming) {
-        // Warning reclaim must not evict the prefix this request will
-        // restore. A retried wait swaps its protection rather than stack it.
-        cache_.unprotectState(std::exchange(active.queuedProtection, {}));
-        if (foundStateBlock)
-          active.queuedProtection = cache_.protectState(foundStateBlock);
       }
       scheduler_.waitForResources(active.request.id);
       deferResourceRetry(active, now, admission.failure);
