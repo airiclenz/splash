@@ -21,7 +21,8 @@ struct StateCheckpoint final {
 };
 
 // Names one publication a request needs: a suspended request's resume state,
-// a queued request's cached prefix or a resident lane's latest checkpoint.
+// a queued request's cached prefix, a resident lane's latest checkpoint, or a
+// conversation end's prompt-end state or kept checkpoint.
 // A handle outlives neither the publication's eviction nor its replacement:
 // releasing a stale handle is a no-op.
 struct StateProtection final {
@@ -151,7 +152,8 @@ private:
     std::shared_ptr<const CompositeState> state;
     uint32_t pins = 0;
     // Requests that need this publication: suspended, queued, or resident
-    // lanes holding it as their latest checkpoint.
+    // lanes holding it as their latest checkpoint, and conversation ends
+    // holding it as a resume state.
     uint32_t protections = 0;
     uint64_t lastUsed = 0;
     uint64_t previousEvictable = 0;

@@ -506,6 +506,35 @@ void runUntilIdle(engine::Engine &engine) {
   require(engine.idle(), "engine did not reach idle");
 }
 
+// Finishes maximumBatchWidth unrelated one-page conversations, ids and
+// tokens from firstId, so every earlier conversation end leaves the engine's
+// ring and loses its protection; the new ends hold the ring instead.
+void pushOutConversationEnds(engine::Engine &engine, uint32_t firstId) {
+  for (uint32_t index = 0; index < model::ExecutionLimits::maximumBatchWidth;
+       ++index) {
+    const uint32_t id = firstId + index;
+    engine.submit(request(id, std::vector<uint32_t>(65, id)));
+    runUntilIdle(engine);
+  }
+}
+
+// Runs request id until its prompt-end state is cached, then cancels it: the
+// state stays cached without the conversation-end protection that only a
+// Stop or Length finish keeps.
+void cancelAfterPromptEnd(engine::Engine &engine, engine::Cache &resources,
+                          uint64_t id, const std::vector<uint32_t> &prompt) {
+  const uint32_t promptEnd = static_cast<uint32_t>(
+      (prompt.size() - 1) / KvCache::pageTokens * KvCache::pageTokens);
+  engine.submit(request(id, prompt));
+  for (uint32_t step = 0;
+       step < 32 && resources.cachedTokens(prompt) < promptEnd; ++step)
+    static_cast<void>(engine.tick(step + 1));
+  require(resources.cachedTokens(prompt) == promptEnd && !engine.idle(),
+          "request did not stop running at its published prompt end");
+  engine.cancel(id);
+  runUntilIdle(engine);
+}
+
 void testConcurrentColdPrefixesComputeOnce() {
   Backing backing(64);
   KvPool pool(backing);
@@ -787,7 +816,7 @@ void testColdPublishesReplayStateAndLazyJunctionCanRebuildIt() {
               events.starts[0].first == EngineCacheStatus::Miss,
           "cold request reported a cache hit");
 
-  require(resources.reclaimCache(1, false) != 0,
+  require(resources.reclaimOneState(),
           "test could not remove the latest replay state");
   engine.submit(request(2, prompt));
   runUntilIdle(engine);
@@ -913,7 +942,7 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
   engine.submit(request(5, prompt));
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimCache(1, false) != 0,
+    require(resources.reclaimOneState(),
             "test could not leave a KV-only shared prefix");
   }
 
@@ -934,8 +963,9 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
 }
 
 // A denied snapshot at the latest replay boundary recycles the least recently
-// used cached state, which is an older unrelated state, not the junction state
-// this same request published one command earlier.
+// used unprotected state, which is an older unrelated state pushed out of the
+// conversation-ends ring, not the junction state this same request published
+// one command earlier.
 void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   Backing backing(64);
   KvPool pool(backing);
@@ -950,13 +980,16 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   engine.submit(request(7, prompt));
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimCache(1, false) != 0,
+    require(resources.reclaimOneState(),
             "test could not remove the old composite state");
   }
   engine.submit(request(70, std::vector<uint32_t>(65, 7000)));
   runUntilIdle(engine);
+  pushOutConversationEnds(engine, 7100);
+  const uint32_t ringEnds = model::ExecutionLimits::maximumBatchWidth;
   const auto older = resources.snapshot();
-  require(older.stateCache.entries == 1 && older.stateCache.evictions == 1,
+  require(older.stateCache.entries == 1 + ringEnds &&
+              older.stateCache.evictions == 1,
           "older unrelated state was not left in the cache");
 
   prompt.resize(161, 888);
@@ -964,7 +997,7 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   require(engine.tick(1) && engine.tick(2),
           "request did not publish its junction state");
   require(engine.snapshot().junctionMaterializations == 1 &&
-              resources.snapshot().stateCache.entries == 2,
+              resources.snapshot().stateCache.entries == 2 + ringEnds,
           "lazy junction was not materialized in the first command");
   executor.deniedSnapshots = 1;
   runUntilIdle(engine);
@@ -977,10 +1010,10 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
           "boundaries were not armed without reservation");
   require(executor.deniedSnapshots == 0 &&
               snapshot.recycledStatePublications == 1 &&
-              snapshot.replayStatePublications == 3 &&
+              snapshot.replayStatePublications == 3 + ringEnds &&
               snapshot.replayStatePublicationFailures == 0 &&
               snapshot.resources.stateCache.evictions == 2 &&
-              snapshot.resources.stateCache.entries == 2,
+              snapshot.resources.stateCache.entries == 2 + ringEnds,
           "latest-state denial did not recycle exactly one older state");
 
   // The junction state survived the recycle: the original prompt resumes
@@ -1015,7 +1048,7 @@ void testCancellationAfterJunctionDiscardsLaterState() {
   engine.submit(request(9, prompt));
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimCache(1, false) != 0,
+    require(resources.reclaimOneState(),
             "test could not remove the old composite state");
   }
 
@@ -1465,8 +1498,9 @@ void testPressureReclaimRespectsStateLifetimes() {
   Events events;
   engine::Engine engine({}, resources, executor, events);
 
-  engine.submit(request(27, std::vector<uint32_t>(65, 27)));
-  runUntilIdle(engine);
+  // Cancelled past its prompt end, the request leaves its state cached but
+  // outside the conversation-ends ring, so Warning reclaim may take it.
+  cancelAfterPromptEnd(engine, resources, 27, std::vector<uint32_t>(65, 27));
   const auto cached = resources.snapshot();
   require(cached.stateCache.entries == 1 && cached.kvCache.blocks == 2,
           "pressure setup did not retain KV and composite state");
@@ -3553,17 +3587,16 @@ MemoryReclaimDirective warningReclaim(uint64_t targetBytes) {
 // Request 280 suspended by a request-sized host denial while global pressure
 // stays Normal (growthPaused false), after its first dispatch left an ordinary
 // replay state at 128 of its 129 prompt tokens. With peerState, request 279
-// first leaves an unrelated state at 64 on the same prefix.
+// first leaves an unrelated state at 64 on the same prefix, cancelled past
+// its prompt end so no conversation end protects it.
 struct SuspendedResumeFixture final {
   explicit SuspendedResumeFixture(bool peerState = false)
       : pool(backing), resources(pool, CacheNamespace{}), executor(2),
         engine(normalPressureConfig(), resources, executor, events) {
     executor.unblockGrowthOnSuspend = false;
     executor.physicalGrowthBlocked = &backing.growthBlocked;
-    if (peerState) {
-      engine.submit(request(279, peerPrompt));
-      runUntilIdle(engine);
-    }
+    if (peerState)
+      cancelAfterPromptEnd(engine, resources, 279, peerPrompt);
     backing.allocationFailure = metal::AllocationFailure::HostPressure;
     backing.growthAllowed = [this] { return !backing.growthBlocked; };
     engine.submit(request(280, prompt));
@@ -3679,8 +3712,8 @@ void testSuspendedLanesSharingAResumeStateKeepItUntilBothRelease() {
   engine::Engine engine(SuspendedResumeFixture::normalPressureConfig(),
                         resources, executor, events);
   const std::vector<uint32_t> shared(129, 290);
-  engine.submit(request(289, shared));
-  runUntilIdle(engine);
+  // Cancelled past its prompt end: only the two lanes protect the state.
+  cancelAfterPromptEnd(engine, resources, 289, shared);
   require(resources.cachedTokens(shared) == 128,
           "shared-state fixture did not cache the 128-token state");
   // Unmap the empty extent the finished request left, so neither lane can
@@ -3722,16 +3755,14 @@ void testSuspendedLanesSharingAResumeStateKeepItUntilBothRelease() {
 
 // Request 301 queued for memory by a host-pressure begin denial while growth
 // is paused, after request 300 left a composite state at 64 of their shared
-// 65-token prompt. A host denial skips admit's growth reclaim, so the state
+// 65-token prompt, cancelled past its prompt end so no conversation end
+// protects it. A host denial skips admit's growth reclaim, so the state
 // survives until the reclaim under test.
 struct QueuedPrefixFixture final {
   QueuedPrefixFixture()
       : pool(backing), resources(pool, CacheNamespace{}), executor(1),
         engine(pausedWhileBlocked(), resources, executor, events) {
-    engine.submit(request(300, prompt));
-    runUntilIdle(engine);
-    require(resources.cachedTokens(prompt) == 64,
-            "queued-prefix fixture did not cache the 64-token state");
+    cancelAfterPromptEnd(engine, resources, 300, prompt);
     blocked = true;
     executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
     executor.beginGrowthBlocked = [this] { return blocked; };
@@ -4517,7 +4548,9 @@ std::vector<uint32_t> checkpointLanePrompt(uint32_t token) {
 }
 
 // Under paused growth the lane's next chunk takes idle cached pages: the
-// idle prefix's state and KV go, and the lane's fresh checkpoint stays.
+// idle prefix's state and KV go, and the lane's fresh checkpoint stays. The
+// idle conversation's end is first pushed out of the ring, so its state is
+// the only unprotected one.
 void testPausedGrowthReclaimKeepsTheResidentLanesCheckpoint() {
   Backing backing(512);
   KvPool pool(backing);
@@ -4531,6 +4564,8 @@ void testPausedGrowthReclaimKeepsTheResidentLanesCheckpoint() {
   const std::vector<uint32_t> idle(4097, 600);
   engine.submit(request(600, idle));
   runUntilIdle(engine);
+  pushOutConversationEnds(engine, 6000);
+  const uint64_t promptEnd = engine.snapshot().replayStatePublications + 1;
   engine.submit(request(601, checkpointLanePrompt(601)));
   runUntilCheckpoint(engine, 1);
   const uint64_t evictions = resources.snapshot().stateCache.evictions;
@@ -4539,26 +4574,29 @@ void testPausedGrowthReclaimKeepsTheResidentLanesCheckpoint() {
   backing.growthBlocked = true;
   backing.allocationFailure = metal::AllocationFailure::HostPressure;
   for (uint32_t step = 0;
-       step < 64 && engine.snapshot().replayStatePublications < 2; ++step)
+       step < 64 && engine.snapshot().replayStatePublications < promptEnd;
+       ++step)
     static_cast<void>(engine.tick(step + 1));
 
   const StateCacheSnapshot states = resources.snapshot().stateCache;
-  require(engine.snapshot().replayStatePublications == 2 &&
-              executor.suspensions == 0 &&
-              resources.cachedTokens(idle) == 0 &&
+  require(engine.snapshot().replayStatePublications == promptEnd &&
+              executor.suspensions == 0 && resources.cachedTokens(idle) == 0 &&
               states.evictions == evictions + 1 &&
               states.checkpointEvictions == 0 &&
               states.checkpointRetirements == 0,
           "paused growth reclaim evicted the resident lane's checkpoint");
 
-  // Kept beside the prompt-end state, the checkpoint is unprotected: the
-  // decode step's growth takes it before the ordinary state.
+  // The decode step's growth fits in the pages the idle prefix left; the
+  // lane finishes with its conversation end, the prompt-end state and the
+  // checkpoint kept beside it, still cached.
   runUntilIdle(engine);
+  const uint32_t ringEnds = model::ExecutionLimits::maximumBatchWidth;
   const StateCacheSnapshot finished = resources.snapshot().stateCache;
-  require(events.completedCount == 2 && executor.suspensions == 0 &&
-              finished.checkpointEvictions == 1 &&
-              finished.checkpointEntries == 0 && finished.entries == 1,
-          "paused growth reclaim took an ordinary state before the kept checkpoint");
+  require(events.completedCount == 2 + ringEnds && executor.suspensions == 0 &&
+              finished.checkpointEvictions == 0 &&
+              finished.checkpointEntries == 1 &&
+              finished.entries == 2 + ringEnds,
+          "paused growth reclaim took the lane's conversation end");
 }
 
 // With the lane's protected checkpoint the only state left, growth reclaim
@@ -4594,7 +4632,8 @@ void testGrowthReclaimTakesAResidentCheckpointRatherThanStall() {
 }
 
 // A lane suspended by host pressure resumes from its latest checkpoint and,
-// once finished, leaves no protection behind.
+// once finished, keeps only its conversation end, protected until pushed out
+// of the ring.
 void testHostPressureSuspensionResumesFromTheLanesCheckpoint() {
   Backing backing(512);
   KvPool pool(backing);
@@ -4605,7 +4644,8 @@ void testHostPressureSuspensionResumesFromTheLanesCheckpoint() {
   EngineConfig config;
   config.growthPaused = [&] { return paused; };
   engine::Engine engine(config, resources, executor, events);
-  engine.submit(request(620, checkpointLanePrompt(620)));
+  const std::vector<uint32_t> prompt = checkpointLanePrompt(620);
+  engine.submit(request(620, prompt));
   runUntilCheckpoint(engine, 1);
   const uint32_t restored = executor.restored;
   paused = true;
@@ -4625,15 +4665,22 @@ void testHostPressureSuspensionResumesFromTheLanesCheckpoint() {
   require(engine.idle() && events.completedCount == 1 &&
               executor.restored - restored == defaultCheckpointTokens,
           "suspended lane did not resume from its checkpoint");
-  static_cast<void>(engine.reclaimMemory(
-      warningReclaim(std::numeric_limits<uint64_t>::max())));
-  require(resources.snapshot().stateCache.entries == 0,
+  const MemoryReclaimDirective warning =
+      warningReclaim(std::numeric_limits<uint64_t>::max());
+  static_cast<void>(engine.reclaimMemory(warning));
+  require(resources.cachedTokens(prompt) != 0,
+          "warning reclaim took a finished lane's conversation end");
+  pushOutConversationEnds(engine, 6200);
+  static_cast<void>(engine.reclaimMemory(warning));
+  require(resources.cachedTokens(prompt) == 0 &&
+              resources.snapshot().stateCache.checkpointEntries == 0,
           "a finished lane left a protection behind");
 }
 
-// A pinned checkpoint survives the lane's rolling replacement; once the lane
-// moves its recovery point to an ordinary state, the checkpoint carries no
-// protection even while the lane stays resident.
+// A pinned checkpoint survives the lane's rolling replacement and is kept
+// beside the prompt-end state: protected with the lane's conversation end
+// while the lane stays resident and once it finishes, and released only when
+// that end leaves the ring.
 void testOverwrittenCheckpointLeavesNoProtectionBehind() {
   Backing backing(1024);
   KvPool pool(backing);
@@ -4655,12 +4702,21 @@ void testOverwrittenCheckpointLeavesNoProtectionBehind() {
           "fixture did not move the lane past its pinned checkpoint");
 
   pinned = {};
-  static_cast<void>(engine.reclaimMemory(
-      warningReclaim(std::numeric_limits<uint64_t>::max())));
+  const MemoryReclaimDirective warning =
+      warningReclaim(std::numeric_limits<uint64_t>::max());
+  static_cast<void>(engine.reclaimMemory(warning));
+  require(resources.snapshot().stateCache.checkpointEntries == 1,
+          "warning reclaim took a resident lane's kept checkpoint");
+  runUntilIdle(engine);
+  static_cast<void>(engine.reclaimMemory(warning));
+  require(resources.snapshot().stateCache.checkpointEntries == 1,
+          "warning reclaim took a finished lane's kept checkpoint");
+
+  pushOutConversationEnds(engine, 6300);
+  static_cast<void>(engine.reclaimMemory(warning));
 
   require(resources.snapshot().stateCache.checkpointEntries == 0,
           "an overwritten checkpoint kept the lane's protection");
-  runUntilIdle(engine);
 }
 
 void testFailedReplacementContinuesWithoutRecoveryPoint() {
@@ -4789,9 +4845,10 @@ void testCancelAtCheckpointDoesNotPublishDrainingCommand() {
           "cancellation published a checkpoint from the draining command");
 }
 
-// The prompt-end state keeps the deepest checkpoint unprotected beside it:
-// a governor-denied prompt-end capture recycles that checkpoint, not an
-// unrelated hot state, and the prompt-end state wins.
+// The prompt-end state keeps the deepest checkpoint beside it, unprotected
+// until the prompt-end publication lands: a governor-denied prompt-end
+// capture recycles that checkpoint, not an unrelated hot state, and the
+// prompt-end state wins.
 void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
   Backing backing(1024);
   KvPool pool(backing);
@@ -4968,6 +5025,213 @@ void testKeptCheckpointIsReclaimedBeforeOrdinaryStates() {
               resources.lookup(prompt).resumeBoundary() ==
                   defaultCheckpointTokens + 96,
           "reclaim took an ordinary state before the kept checkpoint");
+}
+
+// A one-lane engine over a 64-page backing, for conversation-end tests.
+struct ConversationEndFixture final {
+  // Runs request id over prompt to its Length finish.
+  void finish(uint64_t id, const std::vector<uint32_t> &prompt) {
+    engine.submit(request(id, prompt));
+    runUntilIdle(engine);
+  }
+
+  // A Warning pass with an unbounded target.
+  void warningPass() {
+    static_cast<void>(engine.reclaimMemory(
+        warningReclaim(std::numeric_limits<uint64_t>::max())));
+  }
+
+  Backing backing{64};
+  KvPool pool{backing};
+  engine::Cache resources{pool, CacheNamespace{}};
+  Executor executor{1};
+  Events events;
+  engine::Engine engine{EngineConfig{}, resources, executor, events};
+};
+
+// Two conversations each finish with a prompt-end state; a Warning pass keeps
+// both, and each re-sent, extended prompt resumes from its own.
+void testWarningReclaimKeepsTheNewestConversationEnds() {
+  ConversationEndFixture fixture;
+  std::vector<uint32_t> first(129, 800);
+  std::vector<uint32_t> second(129, 801);
+  fixture.finish(800, first);
+  fixture.finish(801, second);
+
+  fixture.warningPass();
+
+  const std::pair<EngineCacheStatus, uint32_t> promptEndHit{
+      EngineCacheStatus::PrefixHit, 128};
+  first.resize(200, 802);
+  fixture.finish(802, first);
+  require(fixture.events.starts.back() == promptEndHit,
+          "warning reclaim took the older conversation's prompt-end state");
+  second.resize(200, 803);
+  fixture.finish(803, second);
+  require(fixture.events.starts.back() == promptEndHit,
+          "warning reclaim took the newer conversation's prompt-end state");
+}
+
+// Each follow-up turn replaces its conversation's end rather than pushing a
+// new one: after four turns of one conversation, an idle conversation's end
+// is still in the ring and a Warning pass keeps it.
+void testFollowUpTurnsReplaceTheirConversationsEnd() {
+  ConversationEndFixture fixture;
+  const std::vector<uint32_t> idle(129, 810);
+  fixture.finish(810, idle);
+  std::vector<uint32_t> turn(65, 811);
+  for (uint64_t id = 811; id < 815; ++id) {
+    fixture.finish(id, turn);
+    turn.resize(turn.size() + KvCache::pageTokens, static_cast<uint32_t>(id));
+  }
+  require(fixture.events.starts.back().first == EngineCacheStatus::PrefixHit,
+          "follow-up turns did not resume from their conversation's end");
+
+  fixture.warningPass();
+
+  require(fixture.resources.cachedTokens(idle) == 128,
+          "follow-up turns pushed an idle conversation's end out of the ring");
+}
+
+// The ring holds maximumBatchWidth conversation ends: one more finished
+// conversation releases the oldest end's protections, and only that one.
+void testAnotherConversationReleasesTheOldestEnd() {
+  ConversationEndFixture fixture;
+  const uint32_t ringEnds = model::ExecutionLimits::maximumBatchWidth;
+  std::vector<std::vector<uint32_t>> prompts;
+  for (uint32_t index = 0; index <= ringEnds; ++index)
+    prompts.emplace_back(129, 820 + index);
+  for (uint32_t index = 0; index < ringEnds; ++index)
+    fixture.finish(820 + index, prompts[index]);
+  fixture.warningPass();
+  require(fixture.resources.cachedTokens(prompts.front()) == 128,
+          "warning reclaim took an end the ring still holds");
+
+  fixture.finish(820 + ringEnds, prompts.back());
+  fixture.warningPass();
+
+  require(
+      fixture.resources.cachedTokens(prompts.front()) == 0,
+      "the oldest conversation end stayed protected after it was pushed out");
+  for (uint32_t index = 1; index <= ringEnds; ++index)
+    require(fixture.resources.cachedTokens(prompts[index]) == 128,
+            "pushing out the oldest end released a newer one");
+}
+
+// A Stop finish moves the request's end into the ring like a Length finish.
+void testAStoppedRequestKeepsItsConversationEnd() {
+  ConversationEndFixture fixture;
+  const std::vector<uint32_t> prompt(129, 830);
+  fixture.engine.submit(replyRequest(830, prompt, 1000));
+  double now = 1;
+  for (; now < 64 && fixture.events.outputs[830].empty(); ++now)
+    static_cast<void>(fixture.engine.tick(now));
+  while (fixture.engine.commandInFlight())
+    static_cast<void>(fixture.engine.tick(now++));
+  fixture.engine.stop(830);
+  runUntilIdle(fixture.engine);
+  require(fixture.events.reasons.at(830) == EngineFinishReason::Stop,
+          "the request did not finish as Stop");
+
+  fixture.warningPass();
+
+  require(fixture.resources.cachedTokens(prompt) == 128,
+          "warning reclaim took a stopped request's conversation end");
+}
+
+// The end protection taken at the prompt-end publication holds through a
+// suspension and resume, and the finished request's end survives Warning.
+void testResumedRequestKeepsItsConversationEnd() {
+  SuspendedResumeFixture fixture;
+  fixture.resume();
+
+  static_cast<void>(fixture.engine.reclaimMemory(
+      warningReclaim(std::numeric_limits<uint64_t>::max())));
+
+  require(fixture.resources.cachedTokens(fixture.prompt) == 128,
+          "warning reclaim took a resumed request's conversation end");
+}
+
+// With a conversation end the only state left, growth reclaim for a new
+// request takes it rather than stall the admission.
+void testGrowthReclaimTakesAConversationEndRatherThanStall() {
+  ConversationEndFixture fixture;
+  Executor &executor = fixture.executor;
+  engine::Cache &resources = fixture.resources;
+  fixture.finish(840, std::vector<uint32_t>(129, 840));
+  require(resources.snapshot().stateCache.entries == 1,
+          "fixture did not leave the conversation end as the only state");
+  executor.beginGrowthBlocked = [&] {
+    return resources.snapshot().stateCache.entries != 0;
+  };
+
+  fixture.engine.submit(request(841, std::vector<uint32_t>(65, 841)));
+  for (double now = 200; now < 1000 && fixture.events.starts.size() < 2; ++now)
+    static_cast<void>(fixture.engine.tick(now));
+
+  require(fixture.events.starts.size() == 2 &&
+              resources.snapshot().stateCache.evictions == 1,
+          "growth reclaim stalled on a protected conversation end");
+  runUntilIdle(fixture.engine);
+  require(fixture.events.completedCount == 2 && fixture.events.failedCount == 0,
+          "requests did not complete after taking the conversation end");
+}
+
+// A resident lane's prompt-end state and the checkpoint kept beside it are
+// its conversation end from their publication: a Warning pass keeps both
+// while the lane decodes.
+void testWarningReclaimKeepsAResidentLanesConversationEnd() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  const std::vector<uint32_t> prompt(defaultCheckpointTokens + 100, 860);
+  engine.submit(replyRequest(860, prompt, 1000));
+  for (uint32_t step = 0;
+       step < 128 && !engine.snapshot().replayStatePublications; ++step)
+    static_cast<void>(engine.tick(step + 1));
+  require(!engine.idle() && resources.snapshot().stateCache.entries == 2 &&
+              resources.snapshot().stateCache.checkpointEntries == 1,
+          "fixture did not keep a checkpoint beside a resident prompt end");
+
+  static_cast<void>(engine.reclaimMemory(
+      warningReclaim(std::numeric_limits<uint64_t>::max())));
+
+  require(resources.snapshot().stateCache.entries == 2 &&
+              resources.snapshot().stateCache.checkpointEntries == 1,
+          "warning reclaim took a resident lane's conversation end");
+  engine.cancel(860);
+  runUntilIdle(engine);
+}
+
+// A cancelled or failed request releases the end protection it took at its
+// prompt-end publication: a Warning pass then takes the state.
+void testCancelledOrFailedRequestReleasesItsConversationEnd() {
+  for (const bool failed : {false, true}) {
+    ConversationEndFixture fixture;
+    const std::vector<uint32_t> prompt(129, failed ? 851 : 850);
+    fixture.engine.submit(replyRequest(850, prompt, 1000));
+    for (uint32_t step = 0;
+         step < 64 && !fixture.engine.snapshot().replayStatePublications;
+         ++step)
+      static_cast<void>(fixture.engine.tick(step + 1));
+    require(!fixture.engine.idle() &&
+                fixture.resources.cachedTokens(prompt) == 128,
+            "fixture did not publish the prompt end of a running request");
+
+    if (failed)
+      fixture.engine.failRequest(850, "test_failure",
+                                 "failed after prompt end");
+    else
+      fixture.engine.cancel(850);
+    runUntilIdle(fixture.engine);
+    fixture.warningPass();
+
+    require(fixture.resources.cachedTokens(prompt) == 0,
+            "an unfinished request's conversation end stayed protected");
+  }
 }
 
 void testShortSuffixContinuesCheckpointDraftState() {
@@ -5402,6 +5666,14 @@ int main() {
     testDivergentPromptResumesFromTheKeptCheckpoint();
     testConversationKeepsOneCheckpoint();
     testKeptCheckpointIsReclaimedBeforeOrdinaryStates();
+    testWarningReclaimKeepsTheNewestConversationEnds();
+    testFollowUpTurnsReplaceTheirConversationsEnd();
+    testAnotherConversationReleasesTheOldestEnd();
+    testAStoppedRequestKeepsItsConversationEnd();
+    testResumedRequestKeepsItsConversationEnd();
+    testGrowthReclaimTakesAConversationEndRatherThanStall();
+    testWarningReclaimKeepsAResidentLanesConversationEnd();
+    testCancelledOrFailedRequestReleasesItsConversationEnd();
     testShortSuffixContinuesCheckpointDraftState();
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testCheckpointIntervalValidationAndDisable();

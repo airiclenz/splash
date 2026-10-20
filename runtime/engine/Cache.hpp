@@ -149,7 +149,8 @@ public:
 
   // One cache reclaimer for memory growth and pressure warnings. After empty
   // backing, disposable checkpoints are reclaimed first, except protected
-  // ones such as a resident lane's latest checkpoint. Ordinary states and
+  // ones such as a resident lane's latest checkpoint or a conversation end's
+  // kept checkpoint. Ordinary states and
   // state-free KV leaves retain their shared oldest-first access order.
   // Active requests and pinned restores are never selected. Physical release
   // is paced by the backing: while an earlier release is still being torn
@@ -167,8 +168,9 @@ public:
   // released.
   // A pass without evictAll (Warning pressure) spares every protected state
   // (a suspended request's resume state, a queued request's prefix, a
-  // resident lane's latest checkpoint) and evicts the next publication
-  // instead; evictAll (Critical pressure) takes protected states too.
+  // resident lane's latest checkpoint, a conversation end's prompt-end state
+  // and kept checkpoint) and evicts the next publication instead; evictAll
+  // (Critical pressure) takes protected states too.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
                                       bool keepResumePoint = false,
                                       bool keepRunway = false);
@@ -201,7 +203,8 @@ public:
   [[nodiscard]] StateProtection protectDeepestState(uint64_t requestId,
                                                     uint32_t resumeTokens);
   // Protects the state published at kvBlock: the prefix a queued request
-  // found and will restore, or a resident lane's latest checkpoint.
+  // found and will restore, a resident lane's latest checkpoint, or a
+  // conversation end's prompt-end state or kept checkpoint.
   // Returns an empty handle when no state is published there.
   [[nodiscard]] StateProtection protectState(uint64_t kvBlock);
   // Ends one protection. No-op once its publication is gone.

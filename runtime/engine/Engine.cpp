@@ -608,9 +608,11 @@ bool Engine::admit(Request &active, double now) {
     if (lookup.state) {
       model_.restore(active.request.id, resumeBoundary, lookup.state->state(),
                      !draft.draftStateRestoreSkipped);
-      if (!resuming)
+      if (!resuming) {
         active.inheritedCheckpoint =
             cache_.keptCheckpoint(lookup.state->kvBlock());
+        active.restoredStateBlock = lookup.state->kvBlock();
+      }
       setLatestCheckpoint(active,
                           cache_.checkpointState(lookup.state->kvBlock()));
       // A restored endpoint already has the ordinary replay state we need.
@@ -932,6 +934,52 @@ void Engine::recordKeptCheckpoint(Request &active, uint64_t promptEndBlock) {
   cache_.recordKeptCheckpoint(promptEndBlock, own);
 }
 
+// ============================================================================
+// Protects the conversation's resume states once its prompt-end state at
+// promptEndBlock is published: that state and the checkpoint recorded beside
+// it, while it is still that checkpoint publication. O(1).
+void Engine::protectConversationEnd(Request &active, uint64_t promptEndBlock) {
+  releaseConversationEnd(active.conversationEnd);
+  active.conversationEnd.promptEnd = cache_.protectState(promptEndBlock);
+  const StateCheckpoint kept = cache_.keptCheckpoint(promptEndBlock);
+  if (kept &&
+      cache_.checkpointState(kept.kvBlock).publication == kept.publication)
+    active.conversationEnd.keptCheckpoint = cache_.protectState(kept.kvBlock);
+}
+
+// ============================================================================
+// Moves the finishing request's end into conversationEnds_ as the newest
+// entry. The entry of the conversation it continues (holding the state its
+// first admission restored, or its own prompt-end state) is replaced;
+// otherwise a full ring pushes out its oldest entry. A replaced or pushed-out
+// entry loses its protections. O(maximumBatchWidth) per finish.
+void Engine::keepConversationEnd(Request &active) {
+  ConversationEnd end = std::exchange(active.conversationEnd, {});
+  if (!end)
+    return;
+  const auto first = conversationEnds_.begin();
+  const auto last = first + static_cast<std::ptrdiff_t>(conversationEndCount_);
+  auto dropped = std::find_if(first, last, [&](const ConversationEnd &entry) {
+    return entry.holds(active.restoredStateBlock) ||
+           entry.holds(end.promptEnd.kvBlock);
+  });
+  if (dropped == last && conversationEndCount_ == conversationEnds_.size())
+    dropped = first;
+  if (dropped != last) {
+    releaseConversationEnd(*dropped);
+    std::move(dropped + 1, last, dropped);
+    --conversationEndCount_;
+  }
+  conversationEnds_[conversationEndCount_++] = end;
+}
+
+// ============================================================================
+// Drops both protections of end and empties it. Stale handles are no-ops.
+void Engine::releaseConversationEnd(ConversationEnd &end) noexcept {
+  cache_.unprotectState(std::exchange(end.promptEnd, {}));
+  cache_.unprotectState(std::exchange(end.keptCheckpoint, {}));
+}
+
 // Counts one checkpoint publication failure in the total and under its cause,
 // so the causes always sum to the total. Runs only on a failed publication.
 void Engine::countCheckpointFailure(PublicationFailure cause) noexcept {
@@ -1014,8 +1062,10 @@ void Engine::publishReachedStateBoundaries(Request &active,
         cache_.publishCompositeState(block, std::move(state), checkpoint);
         ++publications;
       }
-      if (promptEnd)
+      if (promptEnd) {
         recordKeptCheckpoint(active, block);
+        protectConversationEnd(active, block);
+      }
       if (active.latestCheckpoint.kvBlock != block)
         static_cast<void>(retireCheckpoint(active));
       setLatestCheckpoint(active, checkpoint ? cache_.checkpointState(block)
@@ -1414,8 +1464,9 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
   // kept previous checkpoint: its resume cannot restore the boundary's state.
   active.resumeProtection =
       cache_.protectDeepestState(active.request.id, active.replayTokens);
-  // A suspended lane is no longer resident: its recovery points are protected
-  // only as the resume state, when one is the deepest usable one.
+  // A suspended lane's rolling recovery points are protected only as the
+  // resume state, when one is the deepest usable one. Its conversation end,
+  // once published, stays protected until the request finishes or ends.
   cache_.unprotectState(std::exchange(active.checkpointProtection, {}));
   dropPreviousCheckpoint(active);
   cache_.endRequest(active.request.id);
@@ -1507,8 +1558,9 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
   // lane's next chunk or a waiting request's admission needs it; each check
   // walks the request table once per pressure pass, never per token. A
   // warning pass also spares each protected state, a suspended request's
-  // resume state, a queued request's prefix or a resident lane's latest
-  // checkpoint; Critical evicts it.
+  // resume state, a queued request's prefix, a resident lane's latest
+  // checkpoint or a newest conversation end's resume states; Critical evicts
+  // it.
   const bool warning = !directive.evictAllUnpinnedPrefixes;
   reclaimKeptKvRunway_ = warning && (residentLaneNeedsKvRunway() ||
                                      waitingRequestNeedsKvRunway());
@@ -1697,6 +1749,7 @@ void Engine::finish(Request &active, EngineFinishReason reason,
   } else {
     static_cast<void>(retireCheckpoint(active));
     retirePreviousCheckpoint(active);
+    keepConversationEnd(active);
     ++counters_.completed;
   }
   release(active);
@@ -1744,6 +1797,8 @@ void Engine::release(Request &active) {
   cache_.unprotectState(std::exchange(active.queuedProtection, {}));
   cache_.unprotectState(std::exchange(active.checkpointProtection, {}));
   dropPreviousCheckpoint(active);
+  // Empty after a Stop or Length finish moved it into conversationEnds_.
+  releaseConversationEnd(active.conversationEnd);
   if (active.stateCell || active.suspended) {
     discardPendingStateBoundaries(active);
     model_.end(active.request.id);
