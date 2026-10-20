@@ -3847,6 +3847,123 @@ void testGrowthReclaimTakesAQueuedPrefixRatherThanStall() {
           "the queued request did not complete after growth reclaim");
 }
 
+// Request 301 queued for memory by a non-host begin denial while request 302
+// stays resident, decoding, beside the composite state request 300 left at
+// 64 of their shared 65-token prompt. Growth is never paused, so only the
+// resident peer can keep admission from dropping the found state's lease.
+struct ResidentPeerQueueFixture final {
+  explicit ResidentPeerQueueFixture(double resourceWaitTimeoutMilliseconds)
+      : pool(backing), resources(pool, CacheNamespace{}), executor(2),
+        engine(configured(resourceWaitTimeoutMilliseconds), resources,
+               executor, events) {
+    engine.submit(request(300, prompt));
+    runUntilIdle(engine);
+    require(resources.cachedTokens(prompt) == 64,
+            "resident-peer fixture did not cache the 64-token state");
+    executor.decodeFinishes = false;
+    auto peer = request(302, {302});
+    peer.maxNewTokens = kPeerTokens;
+    peer.deadlineMilliseconds = kFarDeadlineMilliseconds;
+    engine.submit(std::move(peer));
+    static_cast<void>(engine.tick(now));
+    require(events.startIds.back() == 302, "the peer lane was not admitted");
+  }
+
+  static EngineConfig configured(double resourceWaitTimeoutMilliseconds) {
+    EngineConfig config;
+    config.resourceWaitTimeoutMilliseconds = resourceWaitTimeoutMilliseconds;
+    config.growthPaused = [] { return false; };
+    return config;
+  }
+
+  // Submits request 301 under a begin denial `blocked` decides, and ticks
+  // through its first admission attempt.
+  void queue(std::function<bool()> blocked) {
+    executor.beginAllocationFailure = metal::AllocationFailure::None;
+    executor.beginGrowthBlocked = std::move(blocked);
+    auto queued = request(301, prompt);
+    queued.deadlineMilliseconds = kFarDeadlineMilliseconds;
+    engine.submit(std::move(queued));
+    // The queued request reaches admission behind the peer's decode step.
+    const uint32_t attemptsBefore = executor.beginAttempts;
+    for (uint32_t step = 0;
+         step < kAdmissionTicks && executor.beginAttempts == attemptsBefore;
+         ++step)
+      static_cast<void>(engine.tick(++now));
+    require(engine.resourceWaitSnapshot(now).memory == 1,
+            "resident-peer fixture did not queue the request for memory");
+  }
+
+  bool started(uint64_t id) const {
+    return std::find(events.startIds.begin(), events.startIds.end(), id) !=
+           events.startIds.end();
+  }
+
+  static constexpr uint32_t kPeerTokens = 100000;
+  static constexpr double kFarDeadlineMilliseconds = 1.0e9;
+  static constexpr uint32_t kAdmissionTicks = 10;
+  const std::vector<uint32_t> prompt = std::vector<uint32_t>(65, 300);
+  Backing backing{16};
+  KvPool pool;
+  engine::Cache resources;
+  Executor executor;
+  Events events;
+  engine::Engine engine;
+  double now = 100;
+};
+
+void testQueuedRequestKeepsItsFoundStateWhileAPeerIsResident() {
+  // Each retry tick lands just past the 100 ms resource retry backoff.
+  constexpr double kRetryStrideMilliseconds = 101.0;
+  constexpr uint32_t kDeniedRetries = 5;
+  ResidentPeerQueueFixture fixture(30000.0);
+  bool blocked = true;
+  fixture.queue([&] { return blocked; });
+  require(fixture.resources.cachedTokens(fixture.prompt) == 64,
+          "the first denial evicted the state a peer-blocked request found");
+
+  for (uint32_t retry = 0; retry < kDeniedRetries; ++retry) {
+    fixture.now += kRetryStrideMilliseconds;
+    static_cast<void>(fixture.engine.tick(fixture.now));
+    require(fixture.resources.cachedTokens(fixture.prompt) == 64,
+            "a retried denial evicted the state a peer-blocked request found");
+  }
+  blocked = false;
+  for (uint32_t step = 0;
+       step < ResidentPeerQueueFixture::kAdmissionTicks &&
+       !fixture.started(301);
+       ++step)
+    static_cast<void>(
+        fixture.engine.tick(fixture.now += kRetryStrideMilliseconds));
+
+  require(fixture.started(301) &&
+              fixture.events.starts.back().first ==
+                  EngineCacheStatus::PrefixHit &&
+              fixture.events.starts.back().second == 64,
+          "a peer-blocked request did not restore the state it found");
+}
+
+void testQueuedRequestOutlivedByAPeerAdmitsCold() {
+  constexpr double kTimeoutMilliseconds = 1000.0;
+  constexpr double kStrideMilliseconds = 150.0;
+  ResidentPeerQueueFixture fixture(kTimeoutMilliseconds);
+  const auto pinned = [&] {
+    return fixture.resources.snapshot().stateCache.pinned != 0;
+  };
+  fixture.queue(pinned);
+
+  // The peer stays resident past the queued request's wait deadline.
+  const double deadline = fixture.now + kTimeoutMilliseconds;
+  while (fixture.now < deadline + kStrideMilliseconds)
+    static_cast<void>(fixture.engine.tick(fixture.now += kStrideMilliseconds));
+
+  require(fixture.started(301) &&
+              fixture.events.starts.back().first == EngineCacheStatus::Miss &&
+              fixture.events.failures.empty() &&
+              fixture.executor.requests.contains(302),
+          "a request outlived by a resident peer did not admit cold");
+}
+
 void testAdmissionReopensAfterLastSuspendedRequestResumes() {
   Backing backing(32);
   KvPool pool(backing);
@@ -5264,6 +5381,8 @@ int main() {
     testRetriedQueuedRequestHoldsOneProtection();
     testQueuedRequestAdmittedColdDropsItsProtection();
     testGrowthReclaimTakesAQueuedPrefixRatherThanStall();
+    testQueuedRequestKeepsItsFoundStateWhileAPeerIsResident();
+    testQueuedRequestOutlivedByAPeerAdmitsCold();
     testStateAdmissionWaitsForKvRelease();
     testAdmissionsWaitForBackgroundRelease();
     testAllocationCausesRemainRetryableAndDistinct();

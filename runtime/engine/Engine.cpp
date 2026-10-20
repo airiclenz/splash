@@ -10,7 +10,23 @@ namespace splash::engine {
 namespace {
 
 constexpr double kResourceRetryBackoffMilliseconds = 100.0;
+// The share of the resource wait timeout, counted back from the deadline,
+// during which a queued request no longer keeps its found state for a peer.
+constexpr double kColdFallbackWaitFraction = 0.5;
 constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
+
+// ============================================================================
+// True while a resource wait has more than kColdFallbackWaitFraction of its
+// timeout left, or has no deadline yet (deferResourceRetry sets it only after
+// a first denial). The margin covers peer steps longer than the retry
+// backoff, so the cold-admission fallback still runs before resource_timeout.
+bool isResourceWaitYoung(double deadlineMilliseconds,
+                         double timeoutMilliseconds,
+                         double nowMilliseconds) noexcept {
+  return deadlineMilliseconds <= 0.0 ||
+         nowMilliseconds < deadlineMilliseconds -
+                               timeoutMilliseconds * kColdFallbackWaitFraction;
+}
 
 uint32_t replayStateBoundary(uint32_t tokens) noexcept {
   return tokens > 1 ? (tokens - 1) / KvCache::pageTokens * KvCache::pageTokens
@@ -455,6 +471,12 @@ bool Engine::admit(Request &active, double now) {
     // sent to wait still protects it by block.
     const uint64_t foundStateBlock =
         lookup.state ? lookup.state->kvBlock() : 0;
+    // Nothing in the retry loop below changes residency, so one scan serves
+    // both the lease drop and the capacity check after it.
+    const bool anotherResident = std::any_of(
+        requests_.begin(), requests_.end(), [&](const auto &entry) {
+          return entry.first != active.request.id && entry.second.stateCell;
+        });
     StateAdmission admission = activate();
     bool reclaimedForAdmission = false;
     while (!admission.granted() &&
@@ -471,7 +493,13 @@ bool Engine::admit(Request &active, double now) {
       // A useful restore remains pinned throughout ordinary eviction. If
       // that pin is the last obstacle to admitting even one lane, prefer
       // cold recomputation over waiting forever for our own cache lease.
-      if (!growthPaused() && lookup.state) {
+      // With a peer resident, its retirement may free the room instead, so
+      // a young wait keeps the found state rather than evict it.
+      if (!growthPaused() && lookup.state &&
+          !(anotherResident &&
+            isResourceWaitYoung(active.resourceWait.deadlineMilliseconds,
+                                config_.resourceWaitTimeoutMilliseconds,
+                                now))) {
         lookup = {};
         continue;
       }
@@ -481,10 +509,6 @@ bool Engine::admit(Request &active, double now) {
       const bool terminalAllocation =
           admission.allocationFailure == metal::AllocationFailure::EngineBudget ||
           admission.allocationFailure == metal::AllocationFailure::DriverRejected;
-      const bool anotherResident = std::any_of(
-          requests_.begin(), requests_.end(), [&](const auto &entry) {
-            return entry.first != active.request.id && entry.second.stateCell;
-          });
       const bool releasingBudget = budgetMayRecover(
           admission.allocationFailure, releaseGeneration, reclaimedForAdmission);
       if (terminalAllocation && !growthPaused() && !anotherResident &&
