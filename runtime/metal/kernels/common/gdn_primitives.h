@@ -52,42 +52,36 @@ inline void gdn_write_gates(device const bfloat *packed_row,
   decay = fast::exp(a_scale[head] * float(softplus));
 }
 
-// Gated RMSNorm of the recurrent rows, one task per (token, value head) and
-// one lane per dimension. Decode walks a lane's rows persistently; prefill
-// dispatches one task per threadgroup.
-template <uint ValueHeads, uint HeadDim, uint ConvDim, uint Simdgroups = 8>
-inline void
-gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
-               device const bfloat *norm_weight, device bfloat *hidden,
-               uint tasks, uint groups, uint packed_width,
-               threadgroup float *scratch, uint group, uint thread_index,
-               uint lane, uint simd_group) {
+// Gated RMSNorm of one (token, value head) task by one simdgroup, with no
+// threadgroup memory or barriers. Lane `lane` holds dims 32q + lane
+// (q = 0..3); each quarter is simd_summed and the four partials are added in
+// q order, the order the per-simdgroup partials were added in before.
+template <uint ValueHeads, uint HeadDim, uint ConvDim>
+inline void gdn_gate_phase(device const bfloat *recurrent,
+                           device const bfloat *packed,
+                           device const bfloat *norm_weight,
+                           device bfloat *hidden, uint task,
+                           uint packed_width, uint lane) {
   constexpr uint ZOffset = ConvDim;
-  for (uint task = group; task < tasks; task += groups) {
-    uint token = task / ValueHeads;
-    uint head = task % ValueHeads;
-    ulong base = ulong(task) * HeadDim;
-    float value =
-        thread_index < HeadDim ? float(recurrent[base + thread_index]) : 0.0f;
-    float square_sum = simd_sum(value * value);
-    if (lane == 0)
-      scratch[simd_group] = square_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (thread_index == 0) {
-      float total = 0.0f;
-      for (uint i = 0; i < Simdgroups; ++i)
-        total += scratch[i];
-      scratch[0] = rsqrt(total / HeadDim + 1e-6f);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (thread_index < HeadDim) {
-      bfloat normalized =
-          bfloat(value * scratch[0] * float(norm_weight[thread_index]));
-      float gate = float(packed[token * packed_width + ZOffset +
-                                head * HeadDim + thread_index]);
-      float silu = gate / (1.0f + fast::exp2(-1.44269504089f * gate));
-      hidden[base + thread_index] = bfloat(float(normalized) * silu);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+  constexpr uint Quarters = HeadDim / 32;
+  static_assert(HeadDim % 32 == 0, "whole 32-dim quarters per lane");
+  const uint token = task / ValueHeads;
+  const uint head = task % ValueHeads;
+  const ulong base = ulong(task) * HeadDim;
+  float value[Quarters];
+  for (uint q = 0; q < Quarters; ++q)
+    value[q] = float(recurrent[base + 32 * q + lane]);
+  float total = 0.0f;
+  for (uint q = 0; q < Quarters; ++q)
+    total += simd_sum(value[q] * value[q]);
+  const float scale = rsqrt(total / HeadDim + 1e-6f);
+  device const bfloat *gates =
+      packed + token * packed_width + ZOffset + head * HeadDim;
+  for (uint q = 0; q < Quarters; ++q) {
+    const uint dim = 32 * q + lane;
+    bfloat normalized = bfloat(value[q] * scale * float(norm_weight[dim]));
+    float gate = float(gates[dim]);
+    float silu = gate / (1.0f + fast::exp2(-1.44269504089f * gate));
+    hidden[base + dim] = bfloat(float(normalized) * silu);
   }
 }

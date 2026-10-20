@@ -300,15 +300,14 @@ GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_vh32, 16, 32, 128, 8192)
       device const bfloat *norm_weight [[buffer(2)]],                         \
       device bfloat *hidden [[buffer(3)]],                                    \
       constant GDNPreparePrefillParams &params [[buffer(4)]],                 \
-      uint task [[threadgroup_position_in_grid]],                             \
-      uint thread_index [[thread_index_in_threadgroup]],                      \
+      uint group [[threadgroup_position_in_grid]],                            \
       uint lane [[thread_index_in_simdgroup]],                                \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
-    threadgroup float reductions[4];                                          \
-    gdn_gate_phase<ValueHeads, HeadDim, ConvDim, 4>(                          \
-        recurrent, packed, norm_weight, hidden, params.tokens * ValueHeads,   \
-        params.tokens * ValueHeads, params.packed_width, reductions, task,     \
-        thread_index, lane, simd_group);                                      \
+    const uint task = group * SPLASH_GDN_GATE_TASKS_PER_GROUP + simd_group;   \
+    if (task < params.tokens * ValueHeads)                                    \
+      gdn_gate_phase<ValueHeads, HeadDim, ConvDim>(                           \
+          recurrent, packed, norm_weight, hidden, task, params.packed_width,  \
+          lane);                                                              \
   }
 
 GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate, 48, 128, 10240)

@@ -31,4 +31,7 @@
 // prefill/gdn.metal ties the two literals together.
 #define SPLASH_GDN_SCAN_STATE_ROWS 16u
 #define SPLASH_GDN_SCAN_THREADS 128u
+// (token, value head) tasks one prefill GDN gate threadgroup carries: one
+// simdgroup per task, so the threadgroup is 32 threads per task.
+#define SPLASH_GDN_GATE_TASKS_PER_GROUP 4u
 #define SPLASH_ALLOCATION_EXTENT_TARGET_BYTES (128ull * 1024ull * 1024ull)

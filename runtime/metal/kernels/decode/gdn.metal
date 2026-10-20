@@ -320,7 +320,7 @@ inline void gdn_decode_batch_phase(
     device bfloat *gdn_hidden, device atomic_uint *arrived,
     device atomic_uint *generation, constant GDNDecodeBatchParams &params,
     uint2 group, uint thread_index, uint lane, uint simd_group,
-    threadgroup float *scratch, threadgroup bfloat *prepared,
+    threadgroup bfloat *prepared,
     device bfloat *q4_table = nullptr, device float *q4_sums = nullptr) {
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
@@ -363,14 +363,15 @@ inline void gdn_decode_batch_phase(
       mixed, decay, beta, state_in, state_out, lane_recurrent, queries, keys,
       group.x, lane, simd_group);
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  gdn_gate_phase<ValueHeads, HeadDim, ConvDim, kDecodeSimdgroups>(
-      lane_recurrent, packed, gdn_norm_weight, lane_hidden, Rows * ValueHeads,
-      ValueHeads, params.packed_width, scratch, group.x, thread_index, lane,
-      simd_group);
+  // One simdgroup per verify row gates this head, the row it then transposes.
+  static_assert(Rows == kDecodeSimdgroups, "one simdgroup per verify row");
+  gdn_gate_phase<ValueHeads, HeadDim, ConvDim>(
+      lane_recurrent, packed, gdn_norm_weight, lane_hidden,
+      simd_group * ValueHeads + group.x, params.packed_width, lane);
   if (q4_table) {
-    // Each group owns this head for all eight rows. Publish its rounded
-    // outputs before the eight SIMD groups transpose one row each.
-    threadgroup_barrier(mem_flags::mem_device);
+    // Each SIMD group transposes the row it gated: publish its rounded
+    // outputs across its own lanes first.
+    simdgroup_barrier(mem_flags::mem_device);
     for (uint g = 0; g < HeadDim / 64; ++g) {
       const uint column = group.x * HeadDim + g * 64 + 2 * lane;
       const uint index = simd_group * ValueWidth + column;
@@ -401,13 +402,12 @@ inline void gdn_decode_batch_phase(
     uint thread_index [[thread_index_in_threadgroup]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
 #define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, Table, Sums) \
-    threadgroup float scratch[kDecodeSimdgroups]; \
     threadgroup bfloat prepared[2 * SPLASH_TARGET_VERIFY_ROWS * HeadDim]; \
     gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 2>( \
         packed, conv_weights, current0, current1, current2, current3, next0, \
         next1, next2, next3, mixed, a_scale, dt_bias, decay, beta, recurrent, \
         gdn_norm_weight, gdn_hidden, arrived, generation, params, group, \
-        thread_index, lane, simd_group, scratch, prepared, Table, Sums);
+        thread_index, lane, simd_group, prepared, Table, Sums);
 #define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim) \
   kernel void Name(GDN_DECODE_BUFFERS, \
       constant GDNDecodeBatchParams &params [[buffer(20)]], GDN_DECODE_THREADS) { \

@@ -62,8 +62,12 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
                        "prefill_gdn_gate_vh32"),
             {buffers.recurrentRows, buffers.packed, buffers.mixerNorm,
              buffers.hidden},
-            prepare, {uint64_t{tokens} * shape.valueHeads, 1, 1},
-            {128, 1, 1});
+            prepare,
+            {(uint64_t{tokens} * shape.valueHeads +
+              SPLASH_GDN_GATE_TASKS_PER_GROUP - 1) /
+                 SPLASH_GDN_GATE_TASKS_PER_GROUP,
+             1, 1},
+            {32 * SPLASH_GDN_GATE_TASKS_PER_GROUP, 1, 1});
 }
 
 void GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
