@@ -262,8 +262,9 @@ struct Runtime::Impl {
   std::unique_ptr<kv::LayerStorage[]> kvLayerStorage;
   std::span<const kv::LayerStorage> kvLayers;
   std::unordered_map<uint64_t, Request> requests;
-  // Allocated for image cache misses and reclaimable once pending encodes
-  // finish. Injecting already encoded rows needs no vision arena.
+  // Allocated for image cache misses, sized to the largest image staged since
+  // it was built, and reclaimable once pending encodes finish. Injecting
+  // already encoded rows needs no vision arena.
   std::unique_ptr<ops::Vision> vision;
   // Image buffers owned by the current admission attempt until a state cell
   // is activated. Failed attempts leave no image allocations behind.
@@ -479,32 +480,66 @@ struct Runtime::Impl {
     return released;
   }
 
+  // Rolls back an uncommitted image admission: drops its staged buffers and
+  // restores the encoder that preceded it, so a failure after the arena grew
+  // keeps the smaller arena and a failure after the first build keeps none.
   struct ImageAdmission final {
     Impl &runtime;
     uint64_t requestId;
-    bool hadVision;
+    // Encoder replaced during this admission; released on commit.
+    std::unique_ptr<ops::Vision> priorVision;
+    bool hasReplacedVision = false;
     bool committed = false;
 
-    ImageAdmission(Impl &owner, uint64_t id)
-        : runtime(owner), requestId(id), hadVision(bool(owner.vision)) {}
+    ImageAdmission(Impl &owner, uint64_t id) : runtime(owner), requestId(id) {}
     ~ImageAdmission() {
       if (!committed) {
         runtime.stagedImages.erase(requestId);
-        if (!hadVision)
-          runtime.vision.reset();
+        if (hasReplacedVision)
+          runtime.vision = std::move(priorVision);
       }
     }
   };
 
+  // Ensures the encoder arena covers images of `patches`, building one sized
+  // by ops::imagePatchCapacity() when there is none or the current one is too
+  // small. The replaced encoder moves into the admission, so a later failure
+  // restores it; graphs and submitted commands that already bound its arena
+  // hold their own references to the allocation until they complete.
+  metal::AllocationResult reserveVision(uint32_t patches,
+                                        ImageAdmission &admission) {
+    const uint32_t capacity =
+        ops::imagePatchCapacity(patches, maximumImagePatches);
+    if (vision && vision->maximumPatches() >= capacity)
+      return true;
+    std::unique_ptr<ops::Vision> candidate;
+    const auto result = admitAllocation(
+        ops::Vision::scratchBytes(package.vision.tensors.layout, capacity),
+        [&] {
+          candidate = std::make_unique<ops::Vision>(
+              backend, package.vision.tensors, capacity);
+        });
+    if (!result)
+      return result;
+    if (!admission.hasReplacedVision) {
+      admission.priorVision = std::move(vision);
+      admission.hasReplacedVision = true;
+    }
+    vision = std::move(candidate);
+    return true;
+  }
+
   // Admits the memory an image request needs before its state cell: the
   // shared vision scratch and per-image pixel and embedding buffers, all
   // through the governor, preserving the allocation refusal reason.
-  metal::AllocationResult stageImages(const ModelRequest &request) {
+  metal::AllocationResult stageImages(const ModelRequest &request,
+                                      ImageAdmission &admission) {
     if (request.images.empty() || stagedImages.contains(request.id))
       return true;
     std::vector<ImageState> staged;
     staged.reserve(request.images.size());
     uint64_t bytes = 0;
+    uint32_t largestMissPatches = 0;
     for (const ImageSpan &span : request.images) {
       ImageState image{span, {}};
       const auto duplicate = std::find_if(
@@ -519,25 +554,20 @@ struct Runtime::Impl {
         image.data->encoded = static_cast<bool>(image.data->embeddings);
         if (image.data->encoded)
           ++counters.imageEmbeddingReuses;
-        else
+        else {
           bytes += span.pixelBytes() + embeddingBytes(span);
+          largestMissPatches = std::max(largestMissPatches,
+                                        span.gridHeight * span.gridWidth);
+        }
       }
       staged.push_back(std::move(image));
     }
     // Keep cache references alive during admission. Only misses need the
     // encoder; cached rows can be injected after its arena has been reclaimed.
-    if (bytes && !vision) {
-      std::unique_ptr<ops::Vision> candidate;
-      const auto admission = admitAllocation(
-              ops::Vision::scratchBytes(package.vision.tensors.layout,
-                                        maximumImagePatches),
-              [&] {
-                candidate = std::make_unique<ops::Vision>(
-                    backend, package.vision.tensors, maximumImagePatches);
-              });
-      if (!admission)
-        return admission;
-      vision = std::move(candidate);
+    if (bytes) {
+      if (auto reserved = reserveVision(largestMissPatches, admission);
+          !reserved)
+        return reserved;
     }
     const uint8_t *pixels = request.imagePixels.data();
     const auto allocateImages = [&] {
@@ -1860,7 +1890,8 @@ void Runtime::beginColdRequest(const ModelRequest &request,
 StateAdmission Runtime::begin(const ModelRequest &request) {
   Impl::ImageAdmission images(*impl_, request.id);
   StateAdmission admission = admitIdleSlot(impl_->states, [&](uint32_t slot) {
-    if (auto imageAdmission = impl_->stageImages(request); !imageAdmission)
+    if (auto imageAdmission = impl_->stageImages(request, images);
+        !imageAdmission)
       return imageAdmission;
     return beginAt(request, slot);
   });
@@ -1915,7 +1946,8 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
   Impl::ImageAdmission images(*impl_, request.id);
   StateAdmission admission =
       admitIdleSlot(impl_->states, [&](uint32_t slot) {
-        if (auto imageAdmission = impl_->stageImages(request); !imageAdmission)
+        if (auto imageAdmission = impl_->stageImages(request, images);
+            !imageAdmission)
           return imageAdmission;
         return impl_->states.tryActivateSlot(slot, request.id);
       });

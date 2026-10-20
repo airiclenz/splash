@@ -523,12 +523,13 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   prefillChunk(executor, request.id, slot, 0, 0,
                std::span<const uint32_t>(prompt).first(64), pages,
                BatchCohort::Greedy, false);
-  // Nothing else is idle, so the pass releases exactly the encoder arena.
+  // Nothing else is idle, so the pass releases exactly the encoder arena,
+  // sized to the smallest capacity that covers the 8x8-patch image.
   uint64_t reclaimed = 0;
   while (const uint64_t bytes = executor.reclaimIdleState())
     reclaimed += bytes;
   const uint64_t encoderBytes = ops::Vision::scratchBytes(
-      model.vision.tensors.layout, ops::kMaximumImagePatches);
+      model.vision.tensors.layout, ops::kMinimumImagePatchCapacity);
   require(reclaimed == encoderBytes,
           "encoder whose only image is encoded survived reclaim");
   prefillChunk(executor, request.id, slot, 64, 64,
@@ -540,11 +541,12 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
 
   // Free only pooled state, keeping the image cache. A cache-only request
   // must fit a fresh state cell and its checkpoint reserve without recreating
-  // the reclaimed encoder.
+  // the reclaimed encoder: a budget of exactly the state bytes, fully spent,
+  // and an allocation delta of exactly those bytes leave no room for an
+  // arena of any size.
   static_cast<void>(states.releaseIdle(0, 0));
   const uint64_t stateBytes = model.stateLayout().activeCellBytes() +
                               model.stateLayout().cachedBytes();
-  require(stateBytes < encoderBytes, "image budget fixture cannot deny the encoder");
   const uint64_t beforeReuse = backend.memoryStats().allocatedBytes;
   request.id = 96;
   fault.remainingBytes = stateBytes;

@@ -3,6 +3,8 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 
+#include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <vector>
 
@@ -59,6 +61,19 @@ struct VisionWeights final {
 inline constexpr uint32_t kImagePatchPixels = 16;
 inline constexpr uint32_t kImageChannels = 3;
 inline constexpr uint32_t kMaximumImagePatches = 16384;
+// Smallest vision scratch arena, in patches. Arenas grow in powers of two from
+// here, so common image sizes share one arena and regrowth stays rare.
+inline constexpr uint32_t kMinimumImagePatchCapacity = 1024;
+// Patch capacity of the scratch arena an image of `patches` needs: the
+// smallest power of two at least max(kMinimumImagePatchCapacity, patches),
+// capped at maximumPatches, the configured per-image limit. A capped result is
+// a valid arena size because that limit is a positive multiple of four.
+[[nodiscard]] constexpr uint32_t
+imagePatchCapacity(uint32_t patches, uint32_t maximumPatches) noexcept {
+  const uint64_t needed = std::max(kMinimumImagePatchCapacity, patches);
+  return static_cast<uint32_t>(
+      std::min<uint64_t>(std::bit_ceil(needed), maximumPatches));
+}
 [[nodiscard]] constexpr uint64_t imagePixelBytes(uint32_t gridHeight,
                                                  uint32_t gridWidth) noexcept {
   return uint64_t{gridHeight} * kImagePatchPixels * gridWidth *
@@ -82,7 +97,8 @@ struct ImageGrid final {
   }
 };
 
-// GPU vision encoder with one reusable scratch arena sized for maximumPatches.
+// GPU vision encoder with one reusable scratch arena sized for maximumPatches;
+// callers size it with imagePatchCapacity() for the largest image it encodes.
 // encode() appends one image's dispatches, from resized uint8 RGB pixels to
 // bf16 language embeddings. Injection uses the encoded buffers independently,
 // so the arena can be released after encoding while later chunks inject rows.
@@ -102,6 +118,10 @@ public:
 
   [[nodiscard]] uint64_t arenaBytes() const noexcept {
     return arena_.sizeBytes();
+  }
+  // Largest image, in patches, encode() accepts.
+  [[nodiscard]] uint32_t maximumPatches() const noexcept {
+    return maximumPatches_;
   }
 
   void encode(metal::CommandGraph &graph, ImageGrid grid,

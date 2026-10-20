@@ -116,6 +116,7 @@ TEST_GDN_PROFILE := $(ENGINE_TEST_BUILD)/gdn-profile
 TEST_GRAPH_ENCODE_BENCHMARK := $(ENGINE_TEST_BUILD)/graph-encode-benchmark
 TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 TEST_VISION_ENCODER_TEST := $(ENGINE_TEST_BUILD)/vision-encoder
+TEST_VISION_SCRATCH_TEST := $(ENGINE_TEST_BUILD)/vision-scratch
 TEST_Q8_AIR := $(ENGINE_TEST_BUILD)/q8-paged-kv.air
 TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
 # Both Q8 tests share the attention and store kernels of both phases.
@@ -158,7 +159,8 @@ TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_MEMORY_AUDIT_TEST) \
 	$(TEST_STATUS_TEST) \
 	$(TEST_MEMORY_GOVERNOR_TEST) \
-	$(TEST_Q8_CPU_TEST)
+	$(TEST_Q8_CPU_TEST) \
+	$(TEST_VISION_SCRATCH_TEST)
 
 TEST_METAL_TARGETS := $(TEST_Q4_SGMATRIX_TEST) $(TEST_TUNING_WORKLOADS) \
 	$(TEST_LINEAR_TUNING) \
@@ -534,6 +536,14 @@ $(TEST_VISION_ENCODER_TEST): runtime/metal/DeviceCapabilities.cpp \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
+# CPU-only arena sizing checks; Vision links the backend it would encode with.
+$(TEST_VISION_SCRATCH_TEST): runtime/metal/DeviceCapabilities.cpp \
+		runtime/metal/MetalBackend.mm \
+		runtime/ops/Vision.mm \
+		dev/tests/engine/vision_scratch_test.mm | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+		$(ENGINE_LINKFLAGS) -o $@
+
 $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
@@ -621,6 +631,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
 	$(TEST_STATUS_TEST)
 	$(TEST_MEMORY_GOVERNOR_TEST)
 	$(TEST_Q8_CPU_TEST)
+	$(TEST_VISION_SCRATCH_TEST)
 
 $(TEST_Q4_SGMATRIX_TEST): dev/tests/engine/q4_sgmatrix_metal_test.mm $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
