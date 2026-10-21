@@ -231,6 +231,18 @@ class LaneRecordTests(unittest.TestCase):
         self.assertEqual(record["error"], "HTTP 503")
         self.assertIsNone(record["cached_tokens"])
 
+    def test_sendLane_failedRequest_printsTheErrorAtOnce(self):
+        client = mock.Mock()
+        client.request.side_effect = probe.ProbeError("HTTP 503: engine stopped")
+        records = []
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            probe.send_lane(client, 2, "burst", {}, 1.0, records)
+
+        self.assertEqual(records[0]["error"], "HTTP 503: engine stopped")
+        self.assertIn("lane 2 burst: HTTP 503: engine stopped", stderr.getvalue())
+
 
 class PressureSummaryTests(unittest.TestCase):
     def sample(self, at, server, os_level, **readings):

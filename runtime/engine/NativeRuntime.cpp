@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -462,6 +463,9 @@ void NativeRuntime::requestError(uint64_t requestId, std::string code,
 }
 
 void NativeRuntime::engineError(std::string code, std::string message) {
+  // The frontend logs only the HTTP error code; the cause goes to the
+  // server log here, once, before the connection closes.
+  std::cerr << "error: engine " << code << ": " << message << '\n';
   send(protocol::ErrorEvent{protocol::FailureClass::EngineUnhealthy, 0, false,
                             std::move(code), std::move(message)});
   engineHealthy_ = false;

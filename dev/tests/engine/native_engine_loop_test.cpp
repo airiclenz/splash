@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -672,11 +673,21 @@ void testControlFailureUsesExecutionBoundary() {
     loop.announceReady();
     require(loop.runControl([] { return true; }) && loop.engineHealthy(),
             "ordinary deferred control work failed");
-    require(!loop.runControl([&]() -> bool {
-              if (metalFailure)
-                throw metal::MetalBackendError("control test");
-              throw std::runtime_error("control test");
-            }), "failed control work requested another retry");
+    std::ostringstream log;
+    std::streambuf *const stderrBuffer = std::cerr.rdbuf(log.rdbuf());
+    const bool retry = loop.runControl([&]() -> bool {
+      if (metalFailure)
+        throw metal::MetalBackendError("control test");
+      throw std::runtime_error("control test");
+    });
+    std::cerr.rdbuf(stderrBuffer);
+    require(!retry, "failed control work requested another retry");
+    require(log.str().find(std::string("error: engine ") +
+                           (metalFailure ? "metal_execution_failed"
+                                         : "engine_execution_failed") +
+                           ": ") != std::string::npos &&
+                log.str().find("control test") != std::string::npos,
+            "engine failure cause was not written to the server log");
     uint32_t errors = 0;
     for (const auto &message : decodeMessages(output)) {
       if (const auto *error = std::get_if<protocol::ErrorEvent>(&message)) {

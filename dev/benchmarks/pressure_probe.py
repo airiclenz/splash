@@ -360,7 +360,8 @@ def send_lane(client, lane, phase, body, timeout, records, replies=None) -> None
     """Send one lane's request and append its row to `records`.
 
     When `replies` is given, the decoded reply (None on failure) is stored
-    there under `lane`.
+    there under `lane`. A failure is also printed at once, so its server
+    message survives a run that stops before the report.
     """
     started = time.monotonic()
     reply, error = None, None
@@ -368,6 +369,7 @@ def send_lane(client, lane, phase, body, timeout, records, replies=None) -> None
         reply = client.request("POST", "/v1/chat/completions", body, timeout=timeout)
     except ProbeError as caught:
         error = str(caught)
+        print(f"pressure_probe: lane {lane} {phase}: {error}", file=sys.stderr)
     records.append(lane_record(lane, phase, reply, time.monotonic() - started, error))
     if replies is not None:
         replies[lane] = reply
