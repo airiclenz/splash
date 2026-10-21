@@ -191,8 +191,9 @@ For repeatable measurements on your Mac, see [local benchmarks](DEVELOPMENT.md#l
 The runtime, scheduler, cache, and API are shared. Everything else is rebuilt
 per model:
 
-- **A draft trained for the model.** Speculative decoding is the decode path in
-  Splash, not an option. Every model ships with its own [DFlash
+- **A draft trained for the model.** Speculative decoding is the default decode path in
+  Splash. `--no-speculation` turns it off: the draft stays loaded but does no
+  work, and decode is roughly 7x slower on the M2 Pro. Every model ships with its own [DFlash
   2](https://inco.ai/blog/dflash2/) draft, and one pass of the target verifies a
   block of tokens in parallel.
 - **Kernels compiled for exact shapes.** Fused Metal kernels, written and tuned

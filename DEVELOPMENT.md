@@ -359,8 +359,11 @@ entropy concentration, `1 - H(p) / log(K)`, not an estimate of correctness.
 Score answers are probability-weighted level indices. Measure accuracy and
 calibrate on representative held-out data before using decision thresholds.
 
-Native wire version 6 appends score-token IDs to requests and selected f32 logits
-to Done events; a version mismatch is fatal. Scoring requires 2–255 distinct,
+Native wire version 6 added score-token IDs to requests and selected f32 logits
+to Done events; a version mismatch is fatal. The current native wire version is
+7, which adds the Stop frame (0x0005): a stop-sequence match or a reasoning-loop
+trip ends the native call with a Stop, finishing as `EngineFinishReason::Stop`
+and counted as completed. Scoring requires 2–255 distinct,
 in-vocabulary tokens, no images or generation constraints, and a zero output budget.
 It may use the full context window because no generated token needs a reserved
 position. The final prefill chunk runs the target head but no sampling policy or
