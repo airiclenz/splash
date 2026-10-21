@@ -168,8 +168,14 @@ MCP. Omitted effort uses the model default.
 Hidden thinking signatures use a persistent user key; imported encrypted thinking
 preserves visible history without recovering the private reasoning.
 
-`/status.admission` distinguishes memory and concurrency waits, reports suspended
-requests, recovery draining and the oldest current wait age. Memory transitions
+`/status.admission` distinguishes memory, concurrency and scheduling waits,
+reports suspended requests, recovery draining and the oldest current wait age.
+A scheduling wait (`waiting_schedule`) is an unstarted request the next prefill
+command has no rows for: fewest-remaining-first runs equal cold prompts one
+after another and admits a prompt only when it gets rows, so it reserves no
+memory meanwhile (a request held behind recovery draining counts there too). A
+reply's `metrics.request_latency.queue_to_start_ms` is its time from arrival to
+admission; `start_to_first_token_ms` starts at admission. Memory transitions
 also appear in the console. Warning pressure can pause growth while `/ready`
 remains healthy for work that fits existing allocations.
 

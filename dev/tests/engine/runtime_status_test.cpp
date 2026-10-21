@@ -488,13 +488,15 @@ void testMemoryPressureTelemetry() {
 }
 
 void testResourceWaitDiagnostics() {
-  ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .suspended = 1,
-                            .oldestWaitMilliseconds = 1250.0, .draining = true};
+  ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .schedule = 2,
+                            .suspended = 1, .oldestWaitMilliseconds = 1250.0,
+                            .draining = true};
   const auto memoryPlan = plan();
   const std::string json = runtimeStatusJson(
       memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait);
-  require(json.find("\"admission\":{\"waiting\":3,\"waiting_memory\":2,"
-                    "\"waiting_concurrency\":1,\"suspended\":1,\"draining\":true,"
+  require(json.find("\"admission\":{\"waiting\":5,\"waiting_memory\":2,"
+                    "\"waiting_concurrency\":1,\"waiting_schedule\":2,"
+                    "\"suspended\":1,\"draining\":true,"
                     "\"oldest_wait_ms\":1250}") != std::string::npos,
           "resource wait summary is missing or inaccurate");
   MemoryStatusReporter reporter;

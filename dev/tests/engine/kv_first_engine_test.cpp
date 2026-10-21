@@ -1952,6 +1952,47 @@ void testQueuedLongPrefillsLeaveRoomForShortWork() {
           "admission lost work, introduced replay, or stranded queued requests");
 }
 
+// Equal cold prompts run one after another: only the leader is admitted, and
+// the others are reported as scheduling waits until they get rows.
+void testEqualColdPromptsReportSchedulingWait() {
+  Backing backing(2048);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  for (uint64_t id = 1; id <= 3; ++id)
+    engine.submit(request(id, std::vector<uint32_t>(8193, id)));
+  require(engine.tick(1) && executor.requests.size() == 1 &&
+              executor.requests.contains(1),
+          "equal cold prompts were not admitted one at a time");
+  // The leader's last row shares its command with the next prompt's first.
+  uint32_t now = 1;
+  while (executor.prefillRows < 8192) {
+    require(++now < 100 && engine.tick(now) && executor.requests.size() == 1,
+            "a held-back prompt was admitted while the leader prefilled");
+    const ResourceWaitSnapshot waiting = engine.resourceWaitSnapshot(now);
+    require(waiting.schedule == 2 && waiting.memory == 0 &&
+                waiting.concurrency == 0 && waiting.suspended == 0 &&
+                waiting.oldestWaitMilliseconds == now - 1.0 &&
+                engine.snapshot().scheduler.queued == 2,
+            "held-back prompts were not reported as scheduling waits");
+  }
+  while (!executor.requests.contains(2) && !executor.requests.contains(3))
+    require(++now < 100 && engine.tick(now),
+            "the leader's last command admitted no held-back prompt");
+  require(executor.requests.contains(2) != executor.requests.contains(3) &&
+              engine.resourceWaitSnapshot(now).schedule == 1,
+          "the leader's last command admitted both equal prompts at once");
+  for (++now; now < 200 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  const ResourceWaitSnapshot done = engine.resourceWaitSnapshot(200);
+  require(engine.idle() && events.completedCount == 3 &&
+              executor.prefillRows == 3 * 8193 && executor.suspensions == 0 &&
+              done.schedule == 0 && done.oldestWaitMilliseconds == 0.0,
+          "scheduling waits lost work or outlived admission");
+}
+
 void testAdmissionUsesCachedRemainingWork() {
   Backing backing(1024);
   KvPool pool(backing);
@@ -5809,6 +5850,7 @@ int main() {
     testAdmissionCanDropItsOwnCachePinToMakeProgress();
     testSingletonCapacityFailureTerminatesCleanly();
     testQueuedLongPrefillsLeaveRoomForShortWork();
+    testEqualColdPromptsReportSchedulingWait();
     testAdmissionUsesCachedRemainingWork();
     testFailedAdmissionDoesNotBlockOtherWork();
     testSchedulingWaitDoesNotConsumeMemoryTimeout();

@@ -368,7 +368,15 @@ ResourceWaitSnapshot Engine::resourceWaitSnapshot(double now) const {
                    now - *active.backoffStartedMilliseconds);
       continue;
     }
-    if (scheduler_.phase(id) != Phase::WaitingResources)
+    const Phase phase = scheduler_.phase(id);
+    if (phase == Phase::Queued && active.scheduleWaitStartedMilliseconds) {
+      ++result.schedule;
+      result.oldestWaitMilliseconds =
+          std::max(result.oldestWaitMilliseconds,
+                   now - *active.scheduleWaitStartedMilliseconds);
+      continue;
+    }
+    if (phase != Phase::WaitingResources)
       continue;
     if (active.resourceWait.reason == StateFailure::ConcurrencyLimit)
       ++result.concurrency;
@@ -400,6 +408,10 @@ bool Engine::admitQueued(double now) {
       Request &active = request(id);
       if (active.suspended && resourceRetryReady(active, now) && admit(active, now))
         return true;
+      // A new request waits behind recovery as it would for rows.
+      if (!active.suspended && scheduler_.phase(id) == Phase::Queued &&
+          !active.scheduleWaitStartedMilliseconds)
+        active.scheduleWaitStartedMilliseconds = now;
     }
     return false;
   }
@@ -436,9 +448,18 @@ bool Engine::admitQueued(double now) {
       break;
   }
   // Waiting for scheduling does not consume the memory-retry deadline.
+  // Admitting only what the next prefill command serves is deliberate: under
+  // fewest-remaining-first, equal cold prompts run one after another, which
+  // minimizes mean time to first token (each one starts decoding as early as
+  // possible) and reserves no cells, states or KV for a prompt that would
+  // get no rows. A shorter arrival still overtakes; the wait is reported in
+  // /status.admission.waiting_schedule and as the reply's queue time.
   for (const auto &candidate : candidates) {
     Request &active = request(candidate.requestId);
     active.admissionProbe.reset();
+    if (!active.scheduleWaitStartedMilliseconds)
+      active.scheduleWaitStartedMilliseconds =
+          active.resourceWait.startedMilliseconds.value_or(now);
     active.resourceWait = {};
     scheduler_.deferAdmission(candidate.requestId);
   }

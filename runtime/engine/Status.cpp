@@ -131,9 +131,10 @@ std::string runtimeStatusJson(
       << ",\"memory_pressure\":"
       << json::quote(memoryPressureName(memoryGovernor.pressure))
       << ",\"admission\":{\"waiting\":"
-      << resourceWait.memory + resourceWait.concurrency
+      << resourceWait.memory + resourceWait.concurrency + resourceWait.schedule
       << ",\"waiting_memory\":" << resourceWait.memory
       << ",\"waiting_concurrency\":" << resourceWait.concurrency
+      << ",\"waiting_schedule\":" << resourceWait.schedule
       << ",\"suspended\":" << resourceWait.suspended
       << ",\"draining\":" << boolean(resourceWait.draining)
       << ",\"oldest_wait_ms\":" << resourceWait.oldestWaitMilliseconds << "}"

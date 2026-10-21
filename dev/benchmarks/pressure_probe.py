@@ -72,6 +72,9 @@ AGENT_COLD_TURN_EXIT_CODE = 4
 AGENT_LANE = 0
 # The chat reply path of the server-side TTFT (prefill wall, no network).
 TTFT_PATH = ("metrics", "request_latency", "start_to_first_token_ms")
+# Arrival to engine admission: the time a lane waited unadmitted, which the
+# engine TTFT above leaves out.
+QUEUE_PATH = ("metrics", "request_latency", "queue_to_start_ms")
 BYTES_PER_MB = 2**20
 
 # The `/status` causes that split checkpoint_publication_failures.
@@ -124,6 +127,7 @@ PHASE_COUNTERS = (
 SAMPLE_READINGS = (
     ("suspended", ("admission", "suspended")),
     ("waiting_memory", ("admission", "waiting_memory")),
+    ("waiting_schedule", ("admission", "waiting_schedule")),
     ("governor_headroom_bytes", ("memory_governor", "headroom_bytes")),
     ("host_available_bytes", ("memory_governor", "host_available_bytes")),
     ("host_headroom_bytes", ("memory_governor", "host_headroom_bytes")),
@@ -144,6 +148,7 @@ LANE_COLUMNS = (
     ("prompt_tokens", "prompt"),
     ("cached_tokens", "cached"),
     ("completion_tokens", "completion"),
+    ("queue_ms", "queue ms"),
     ("ttft_ms", "ttft ms"),
     ("wall_s", "wall s"),
 )
@@ -343,6 +348,7 @@ def lane_record(lane: int, phase: str, reply, wall_s: float, error) -> dict:
         "prompt_tokens": usage.get("prompt_tokens"),
         "cached_tokens": details.get("cached_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
+        "queue_ms": status_reading(reply or {}, QUEUE_PATH),
         "ttft_ms": status_reading(reply or {}, TTFT_PATH),
         "wall_s": round(wall_s, 1),
         "error": error,
@@ -563,7 +569,9 @@ def parse_args(argv=None):
     parser.add_argument(
         "--model", help="model id (default: the first one /v1/models lists)"
     )
-    parser.add_argument("--lanes", type=int, default=DEFAULT_LANES)
+    parser.add_argument(
+        "--lanes", type=int, help=f"default {DEFAULT_LANES}, or one per --nonces value"
+    )
     parser.add_argument("--warm-tokens", type=int, default=DEFAULT_WARM_TOKENS)
     parser.add_argument("--extend-tokens", type=int, default=DEFAULT_EXTEND_TOKENS)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
@@ -598,6 +606,12 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.warm_tokens < MINIMUM_WARM_TOKENS:
         parser.error(f"--warm-tokens must be at least {MINIMUM_WARM_TOKENS}")
+    if args.nonces is not None and args.lanes not in (None, len(args.nonces)):
+        parser.error(
+            f"--lanes {args.lanes} does not match the {len(args.nonces)} --nonces values"
+        )
+    if args.lanes is None:
+        args.lanes = DEFAULT_LANES if args.nonces is None else len(args.nonces)
     if min(args.lanes, args.extend_tokens, args.max_tokens, args.swap_guard_mb) < 1:
         parser.error(
             "--lanes, --extend-tokens, --max-tokens and --swap-guard-mb must be positive"

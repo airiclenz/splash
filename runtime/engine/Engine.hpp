@@ -46,6 +46,9 @@ struct EngineConfig final {
 struct ResourceWaitSnapshot final {
   uint32_t memory = 0;
   uint32_t concurrency = 0;
+  // Unstarted requests the scheduler held back because the next prefill
+  // command has no rows for them; they reserve no memory while they wait.
+  uint32_t schedule = 0;
   uint32_t suspended = 0;
   double oldestWaitMilliseconds = 0.0;
   bool draining = false;
@@ -216,6 +219,9 @@ private:
     // resourceWait's, whose deadline stays 0 while the lane is resident. Ends
     // on a grant, at suspension and at release.
     std::optional<double> backoffStartedMilliseconds;
+    // First time admission deferred this request for scheduling; it is
+    // reported as a scheduling wait for as long as it stays Queued.
+    std::optional<double> scheduleWaitStartedMilliseconds;
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     // Written only through setLatestCheckpoint, which moves

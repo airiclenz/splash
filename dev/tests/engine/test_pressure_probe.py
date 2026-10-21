@@ -203,6 +203,28 @@ class LaneRecordTests(unittest.TestCase):
 
         self.assertEqual(record["ttft_ms"], 1830.5)
 
+    def test_laneRecord_readsQueueTimeFromMetrics(self):
+        reply = {
+            "metrics": {
+                "request_latency": {
+                    "start_to_first_token_ms": 1356.1,
+                    "queue_to_start_ms": 956.7,
+                }
+            }
+        }
+
+        record = probe.lane_record(0, "burst", reply, 2.0, None)
+
+        self.assertEqual(record["queue_ms"], 956.7)
+        self.assertEqual(record["ttft_ms"], 1356.1)
+
+    def test_statusSample_readsSchedulingWait(self):
+        snapshot = {"admission": {"waiting_schedule": 2, "waiting_memory": 0}}
+
+        sample = probe.status_sample(snapshot, "normal", "burst", 1.0)
+
+        self.assertEqual(sample["waiting_schedule"], 2)
+
     def test_laneRecord_failedRequest_keepsErrorAndNoCounts(self):
         record = probe.lane_record(0, "warm0", None, 2.0, "HTTP 503")
 
@@ -489,6 +511,18 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(code, probe.SWAP_ABORT_EXIT_CODE)
         self.assertIn("swap guard tripped", output)
         self.assertLessEqual(len(stub.chat_bodies), 1)
+
+    def test_parseArgs_lanesNotMatchingNonces_isRefused(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            probe.parse_args(
+                ["--base-url", "http://x", "--lanes", "3", "--nonces", "a"]
+            )
+
+    def test_parseArgs_noncesWithoutLanes_runsOneLanePerNonce(self):
+        args = probe.parse_args(["--base-url", "http://x", "--nonces", "a", "b", "c"])
+
+        self.assertEqual(args.lanes, 3)
+        self.assertFalse(args.warm)
 
     def test_parseArgs_agentTurnsWithNonces_isRefused(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
