@@ -68,14 +68,21 @@ private:
   std::vector<bool> resident_;
 };
 
+// refillsReserve models a state whose drop refills its producing lane's
+// checkpoint reserve, so it returns nothing to the model's pool.
 class State final : public CompositeState {
 public:
-  explicit State(bool carriesDraft = true) : carriesDraft_(carriesDraft) {}
+  explicit State(bool carriesDraft = true, bool refillsReserve = false)
+      : carriesDraft_(carriesDraft), refillsReserve_(refillsReserve) {}
   uint64_t bytes() const noexcept override { return 64; }
+  uint64_t reclaimableBytes() const noexcept override {
+    return refillsReserve_ ? 0 : bytes();
+  }
   bool carriesDraft() const noexcept override { return carriesDraft_; }
 
 private:
   bool carriesDraft_;
+  bool refillsReserve_;
 };
 
 // A live state moved out at suspension. Dropping it parks its bytes in the
@@ -345,8 +352,9 @@ public:
       return nullptr;
     }
     ++snapshots;
-    return std::make_shared<State>(targetOnlyAtBoundary !=
-                                   requests.at(id).position);
+    return std::make_shared<State>(
+        targetOnlyAtBoundary != requests.at(id).position,
+        reserveRefillingSnapshots);
   }
   uint64_t reclaimIdleState() noexcept override {
     if (idleStateReclaimable && !idleStateReclaimable())
@@ -384,6 +392,8 @@ public:
   std::optional<uint32_t> denySnapshotAtBoundary;
   // A snapshot taken at this boundary is target-only.
   std::optional<uint32_t> targetOnlyAtBoundary;
+  // Snapshots return states whose drop refills their lane's reserve.
+  bool reserveRefillingSnapshots = false;
   std::unordered_map<uint64_t, uint32_t> restoredLengths;
   uint32_t beginAttempts = 0;
   uint32_t deniedBegins = 0;

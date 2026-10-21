@@ -1146,6 +1146,34 @@ void testPressureReclaimRespectsStateLifetimes() {
           "critical pressure left evictable cached state or KV backing");
 }
 
+// A cached state whose drop refills its lane's checkpoint reserve frees no
+// memory. A pressure pass credits its eviction zero bytes and walks on to a
+// state that frees real ones rather than stopping short of its target.
+void testPressureReclaimCreditsNoBytesForAReserveRefill() {
+  Backing backing(8);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  // Both cancelled past their prompt ends, so Warning reclaim may take each.
+  executor.reserveRefillingSnapshots = true;
+  cancelAfterPromptEnd(engine, resources, 31, std::vector<uint32_t>(65, 31));
+  executor.reserveRefillingSnapshots = false;
+  cancelAfterPromptEnd(engine, resources, 32, std::vector<uint32_t>(65, 32));
+  require(resources.snapshot().stateCache.entries == 2,
+          "reserve refill setup did not cache both states");
+  // Drain empty extents first, so only state eviction can meet the target.
+  static_cast<void>(engine.reclaimMemory({.reclaimEmptyKvExtents = true}));
+
+  const uint64_t released = engine.reclaimMemory(
+      {.reclaimEmptyKvExtents = true, .targetBytes = State{}.bytes()});
+
+  require(released == State{}.bytes() &&
+              resources.snapshot().stateCache.entries == 0,
+          "pressure reclaim counted bytes a reserve refill kept");
+}
+
 // Maps the first extents before the pool sees the backing, so they start out
 // resident and empty.
 Backing &mapLeadingPages(Backing &backing, uint32_t pages) {
@@ -5832,6 +5860,7 @@ int main() {
     testKvGrowthReclaimsIdleStateBeforeCache();
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testPressureReclaimRespectsStateLifetimes();
+    testPressureReclaimCreditsNoBytesForAReserveRefill();
     testPressureReclaimKeepsRunwayOnlyForWarning();
     testConcurrencyLimitDoesNotEvictCache();
     testHostPressureDoesNotDrainCacheOnStateAdmission();

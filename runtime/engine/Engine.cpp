@@ -1150,6 +1150,9 @@ bool Engine::recycleOwnCheckpoint(Request &active) {
 // Copies the lane's live state for a publication. When no slot is free it
 // recycles one of the lane's own checkpoints, or else one cached state, a
 // checkpoint for a checkpoint, and retries once; nullptr when that fails too.
+// A recycled state of a live peer whose reserve is short refills that
+// reserve rather than the pool, so the retry fails then: the peer's next
+// checkpoint is secured instead of this one.
 std::shared_ptr<const CompositeState> Engine::captureState(Request &active,
                                                            bool checkpoint) {
   const uint64_t requestId = active.request.id;
@@ -1541,8 +1544,8 @@ bool Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
   const CacheReclaimResult reused =
       cache_.reclaimOneForGrowth(CacheReclaimMode::ReuseBacking);
   if (reused.madeProgress) {
-    // An evicted state parks its buffers in the model's pool (only a lane's
-    // own retired checkpoint refills that lane's reserve instead); under
+    // An evicted state parks its buffers in the model's pool (a live lane's
+    // own state refills that lane's short reserve instead); under
     // pressure that memory goes back to the host now rather than waiting for
     // the next background pass.
     while (model_.reclaimIdleState()) {
@@ -1726,8 +1729,8 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
   released += cache_.reclaimCache(remaining, directive.evictAllUnpinnedPrefixes,
                                  directive.keepResumePoint,
                                  reclaimKeptKvRunway_);
-  // Evicted states park their buffers in the model's pool (only a lane's own
-  // retired checkpoint refills that lane's reserve instead); a pressure pass
+  // Evicted states park their buffers in the model's pool (a live lane's own
+  // state refills that lane's short reserve instead); a pressure pass
   // returns that memory to the host now rather than keeping it warm.
   while (model_.reclaimIdleState()) {
   }

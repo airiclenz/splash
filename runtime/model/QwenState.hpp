@@ -102,8 +102,9 @@ struct QwenBufferPool final {
 // The checkpoint quantum a live lane holds outside the pool: one cache slot
 // that the lane's next snapshot takes before the pool or the governor, so a
 // lane admitted under pressure can still publish its recovery point. Idle
-// reclaim never sees it. Only the lane's own retired checkpoint refills it;
-// slot release returns what is left to the pool.
+// reclaim never sees it. Any dropped state of the lane, retired or evicted,
+// refills it while it is short; slot release returns what is left to the
+// pool.
 struct QwenSlotReserve final {
   // Owner of the live slot; zero while the slot is unassigned.
   uint64_t requestId = 0;
@@ -124,8 +125,8 @@ struct QwenStateOrigin final {
 // after construction. A target-only state, moved out of a lane whose draft
 // window was incomplete, holds a GDN cell and no draft ring. When it is
 // dropped, each non-null buffer returns to its origin: the producing slot's
-// reserve when the state was retired while that slot is still live and its
-// reserve is short, otherwise the shared pool.
+// reserve while that slot is still live and its reserve is short of that
+// buffer, otherwise the shared pool.
 class QwenCompositeState final : public CompositeState {
 public:
   ~QwenCompositeState() override;
@@ -135,16 +136,20 @@ public:
   [[nodiscard]] uint64_t bytes() const noexcept override {
     return slot_.draft ? layout_.cachedBytes() : layout_.target.cellBytes();
   }
+  // bytes() less each buffer the drop would put in the origin's reserve. O(1).
+  [[nodiscard]] uint64_t reclaimableBytes() const noexcept override;
   [[nodiscard]] bool carriesDraft() const noexcept override {
     return slot_.draft != nullptr;
   }
-  void markRetired() const noexcept override { retired_ = true; }
 
 private:
   QwenCompositeState(std::shared_ptr<QwenBufferPool> pool,
                      std::shared_ptr<QwenSlotReserves> reserves,
                      QwenStateOrigin origin, QwenCacheSlot slot,
                      CompositeStateLayout layout, QwenLogicalLengths lengths);
+  // The reserve a drop may refill: the origin slot's, while the pool is open
+  // and that slot is still owned by the producing request; else null.
+  [[nodiscard]] QwenCacheSlot *refillableReserve() const noexcept;
 
   std::shared_ptr<QwenBufferPool> pool_;
   std::shared_ptr<QwenSlotReserves> reserves_;
@@ -152,8 +157,6 @@ private:
   QwenCacheSlot slot_;
   CompositeStateLayout layout_;
   QwenLogicalLengths lengths_;
-  // A disposal hint, not state: it only chooses where the buffers go.
-  mutable bool retired_ = false;
 
   friend class QwenStateStorage;
 };
@@ -258,7 +261,7 @@ private:
   CompositeStateLayout layout_;
   std::shared_ptr<StateAllocationTracker> allocations_;
   std::shared_ptr<QwenBufferPool> pool_;
-  // Shared with cached states so a retired one can refill its lane's reserve.
+  // Shared with cached states so a dropped one can refill its lane's reserve.
   std::shared_ptr<QwenSlotReserves> reserves_;
   std::array<Slot, ExecutionLimits::maximumBatchWidth> slots_;
 };

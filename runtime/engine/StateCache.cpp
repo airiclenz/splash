@@ -234,17 +234,18 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
   auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.pins)
     return {};
-  const uint64_t reclaimed = found->second.state->bytes();
-  if (retirement)
-    found->second.state->markRetired();
+  const uint64_t stateBytes = found->second.state->bytes();
+  // Read before the drop: a buffer that refills its lane's reserve is not
+  // returned to the pool, so reclaim must not count it.
+  const uint64_t reclaimed = found->second.state->reclaimableBytes();
   removeEvictable(kvBlock);
   if (found->second.checkpoint) {
     --checkpointEntries_;
-    checkpointBytes_ -= reclaimed;
+    checkpointBytes_ -= stateBytes;
     if (!retirement)
       ++checkpointEvictions_;
   }
-  bytes_ -= reclaimed;
+  bytes_ -= stateBytes;
   entries_.erase(found);
   if (retirement)
     ++checkpointRetirements_;

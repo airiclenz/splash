@@ -34,6 +34,20 @@ private:
   bool carriesDraft_;
 };
 
+// A state whose drop refills its producing lane's checkpoint reserve: it
+// returns nothing to the model's pool.
+class ReserveRefillingState final : public CompositeState {
+public:
+  explicit ReserveRefillingState(uint64_t byteCount) : byteCount_(byteCount) {}
+  [[nodiscard]] uint64_t bytes() const noexcept override { return byteCount_; }
+  [[nodiscard]] uint64_t reclaimableBytes() const noexcept override {
+    return 0;
+  }
+
+private:
+  uint64_t byteCount_;
+};
+
 struct SharedBudget {
   static constexpr uint64_t capacity = 600;
   uint64_t used = 0;
@@ -760,6 +774,39 @@ void testCheckpointReclaimPrecedesOlderKv() {
           "ordinary state and KV lost their shared LRU order");
 }
 
+// A checkpoint whose drop refills its lane's reserve frees no memory: its
+// eviction credits zero bytes while the cache still drops its footprint, a
+// growth step counts it as progress and the next one keeps reclaiming, and a
+// pressure pass walks on to a state that frees real bytes.
+void testReserveRefillingEvictionCreditsNoBytes() {
+  const auto publishRefilling = [](CacheFixture &fixture) {
+    fixture.cache.publishCompositeState(
+        fixture.blocks[0], std::make_shared<ReserveRefillingState>(200), true);
+    fixture.publish(3, 150);
+  };
+  {
+    CacheFixture fixture;
+    publishRefilling(fixture);
+    const CacheReclaimResult refill = fixture.cache.reclaimOneForGrowth();
+    const auto states = fixture.cache.snapshot().stateCache;
+    require(refill.madeProgress && refill.reclaimedBytes == 0 &&
+                states.entries == 1 && states.bytes == 150 &&
+                states.checkpointBytes == 0,
+            "growth reclaim credited bytes a reserve refill kept");
+    const CacheReclaimResult next = fixture.cache.reclaimOneForGrowth();
+    require(next.madeProgress && next.reclaimedBytes == 150 &&
+                fixture.cache.snapshot().stateCache.entries == 0,
+            "growth reclaim stopped after a reserve refill");
+  }
+  {
+    CacheFixture fixture;
+    publishRefilling(fixture);
+    require(fixture.cache.reclaimCache(1, false) == 150 &&
+                fixture.cache.snapshot().stateCache.entries == 0,
+            "pressure reclaim stopped at a checkpoint that freed no bytes");
+  }
+}
+
 void testOptionalReclaimLeavesOrdinaryStateIntact() {
   CacheFixture fixture;
   fixture.publish(0, 150);
@@ -990,6 +1037,7 @@ int main() {
     testRestoredCheckpointsKeepTheirEvictionPriority();
     testCheckpointReclaimPrecedesOlderKv();
     testOptionalReclaimLeavesOrdinaryStateIntact();
+    testReserveRefillingEvictionCreditsNoBytes();
     testCheckpointPinsAndBoundaryUpgrade();
     testCheckpointPressurePreservesHotPrefix();
     testLogicalKvPressureStillReclaimsPages();

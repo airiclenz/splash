@@ -80,14 +80,16 @@ public:
   // state and planned with an explicit target-only restored boundary.
   [[nodiscard]] virtual bool carriesDraft() const noexcept { return true; }
   // Footprint retained by the cache. A cached state owns a private copy of
-  // the lane's state; dropping the reference returns that slot to the model's
-  // pool, and idle-state reclaim frees it.
+  // the lane's state; dropping the reference returns that slot to the
+  // producing lane's short checkpoint reserve while the lane is live, else to
+  // the model's pool, where idle-state reclaim frees it.
   [[nodiscard]] virtual uint64_t bytes() const noexcept = 0;
-  // Marks the state as its lane's replaced checkpoint, called only when the
-  // cache retires it. Its buffers may then refill the producing lane's
-  // reserve instead of the pool; an evicted state is never marked, so the
-  // bytes eviction credits really reach the pool.
-  virtual void markRetired() const noexcept {}
+  // The part of bytes() that dropping the state now would return to the
+  // model's pool. A buffer that refills the producing lane's checkpoint
+  // reserve instead stays allocated, so eviction credits only these bytes.
+  [[nodiscard]] virtual uint64_t reclaimableBytes() const noexcept {
+    return bytes();
+  }
 };
 
 enum class DraftBoundaryPurpose : uint8_t { Active, Materialization };
@@ -480,7 +482,8 @@ public:
   // Copies the request's committed state at its current page-aligned
   // boundary into a cache slot. Returns nullptr when no slot is free and the
   // governor denies a new one; the caller may release a cached state and
-  // retry.
+  // retry. A released state of another live lane may refill that lane's
+  // reserve instead of freeing a slot, so the retry can still fail.
   [[nodiscard]] virtual std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) = 0;
   // Releases one unit of idle model state (an unused buffer, then caches

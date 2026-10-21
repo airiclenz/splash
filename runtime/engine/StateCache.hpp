@@ -88,6 +88,8 @@ struct StateCacheSnapshot {
 
 struct StateEviction final {
   bool evicted = false;
+  // The state's reclaimable bytes: zero for the part that refilled its
+  // lane's checkpoint reserve rather than reaching the model's pool.
   uint64_t reclaimedBytes = 0;
 };
 

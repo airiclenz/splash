@@ -158,17 +158,30 @@ QwenCompositeState::QwenCompositeState(
     throw std::invalid_argument("composite state origin is not a live slot");
 }
 
+QwenCacheSlot *QwenCompositeState::refillableReserve() const noexcept {
+  if (!pool_->open)
+    return nullptr;
+  QwenSlotReserve &origin = (*reserves_)[origin_.slot];
+  return origin.requestId == origin_.requestId ? &origin.buffers : nullptr;
+}
+
+uint64_t QwenCompositeState::reclaimableBytes() const noexcept {
+  const QwenCacheSlot *reserve = refillableReserve();
+  if (!reserve)
+    return bytes();
+  const uint64_t cell = reserve->gdn ? layout_.target.cellBytes() : 0;
+  const uint64_t ring =
+      slot_.draft && reserve->draft ? layout_.draft.ringBytes() : 0;
+  return cell + ring;
+}
+
+// Any drop, retired or evicted, refills a live lane's short reserve first;
+// reclaimableBytes() predicts the same split, so eviction credits only what
+// reaches the pool.
 QwenCompositeState::~QwenCompositeState() {
   if (!pool_->open)
     return;
-  // Only a retired checkpoint refills its lane's reserve. An evicted state's
-  // bytes are credited to reclaim, so they must reach the pool.
-  QwenCacheSlot *reserve = nullptr;
-  if (retired_) {
-    QwenSlotReserve &origin = (*reserves_)[origin_.slot];
-    if (origin.requestId == origin_.requestId)
-      reserve = &origin.buffers;
-  }
+  QwenCacheSlot *reserve = refillableReserve();
   returnBuffer(slot_.gdn, reserve ? &reserve->gdn : nullptr, pool_->cells);
   returnBuffer(slot_.draft, reserve ? &reserve->draft : nullptr, pool_->rings);
 }
