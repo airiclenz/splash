@@ -40,6 +40,12 @@ namespace {
 // pipeline objects and encoder scratch, and the process's own runtime overhead.
 constexpr uint64_t kPipelineReserveBytes = 256ULL << 20;
 constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
+// Prefill rows per command buffer. The M2 Pro prefills ~40-75 rows/s, so a
+// 2048-row chunk in one buffer held the GPU for 30+ s and macOS aborted it
+// as impacting interactivity. Segments split the dispatch list, about a
+// layer group each, so a chunk gets one buffer per 64 rows of work: near
+// 1-2 s each up to the backend's 32-buffer cap (2048 rows).
+constexpr uint32_t kPrefillRowsPerCommandBuffer = 64;
 
 using metal::BufferStorage;
 using metal::CommandGraph;
@@ -2192,8 +2198,12 @@ Runtime::prefillAsync(const BatchPlan &plan,
     if (completion)
       completion();
   };
-  CommandTicket command =
-      impl_->backend.submitCommandAsync(graph.dispatches(), std::move(notify));
+  uint32_t rows = 0;
+  for (const ModelBatchItem &item : items)
+    rows += item.tokenCount;
+  CommandTicket command = impl_->backend.submitCommandAsync(
+      graph.dispatches(), std::move(notify),
+      (rows + kPrefillRowsPerCommandBuffer - 1) / kPrefillRowsPerCommandBuffer);
   visionGuard.submitted();
   Impl *impl = impl_.get();
   auto finish = [impl, entries,

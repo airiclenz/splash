@@ -308,13 +308,17 @@ struct BackendAsyncState {
         return activeSequence;
     }
 
+    // Commits a segmented command's earlier buffers (nil for one buffer) in
+    // order, then the buffer whose completion ends the ticket.
     bool commitSubmission(uint64_t sequence, id<MTLCommandBuffer> command,
+                          NSArray<id<MTLCommandBuffer>> *earlier,
                           std::function<void(id<MTLCommandBuffer>)> completion) {
         std::lock_guard lock(gateMutex);
         if (stopping.stop_requested()) return false;
         activeCommand = command;
         activeCompletion = std::move(completion);
         commandWatchdog.start(sequence, steadySeconds());
+        for (id<MTLCommandBuffer> segment in earlier) [segment commit];
         [command commit];
         return true;
     }
@@ -379,16 +383,41 @@ struct CommandTicket::State {
     uint64_t sequence = 0;
     CommandTiming timing;
     std::chrono::steady_clock::time_point wallStart;
+    // GPU time spans every command buffer of a segmented command.
+    __strong id<MTLCommandBuffer> firstCommand = nil;
+    uint32_t commandBuffers = 1;
     uint64_t sparseEventValue = 0;
     std::string error;
+    // Guarded by mutex: the first failure among a segmented command's earlier
+    // buffers, reported when the last buffer completes.
+    std::string segmentFailure;
     bool completed = false;
     bool released = false;
+
+    std::string commandFailure(id<MTLCommandBuffer> command) const {
+        if (command.status == MTLCommandBufferStatusCompleted) return {};
+        std::ostringstream message;
+        message << "Metal command " << sequence
+                << " failed (sparse event " << sparseEventValue << ')';
+        if (command.error) {
+            message << ": " << errorDescription(command.error);
+        }
+        return message.str();
+    }
+
+    // An earlier segment failed. The ticket still ends only when the last
+    // buffer is done, so the GPU has finished with every buffer it bound.
+    void segmentFailed(id<MTLCommandBuffer> command) {
+        std::lock_guard lock(mutex);
+        if (segmentFailure.empty()) segmentFailure = commandFailure(command);
+    }
 
     void finishCommand(id<MTLCommandBuffer> command) {
         auto wallEnd = std::chrono::steady_clock::now();
         CommandTiming timing;
-        timing.gpuSeconds =
-            command.GPUEndTime - command.GPUStartTime;
+        const id<MTLCommandBuffer> first = firstCommand ? firstCommand : command;
+        timing.gpuSeconds = command.GPUEndTime - first.GPUStartTime;
+        timing.commandBuffers = commandBuffers;
         if (!std::isfinite(timing.gpuSeconds) || timing.gpuSeconds < 0.0) {
             timing.gpuSeconds = 0.0;
         }
@@ -396,15 +425,11 @@ struct CommandTicket::State {
             std::chrono::duration<double>(wallEnd - wallStart).count();
 
         std::string error;
-        if (command.status != MTLCommandBufferStatusCompleted) {
-            std::ostringstream message;
-            message << "Metal command " << sequence
-                    << " failed (sparse event " << sparseEventValue << ')';
-            if (command.error) {
-                message << ": " << errorDescription(command.error);
-            }
-            error = message.str();
+        {
+            std::lock_guard lock(mutex);
+            error = segmentFailure;
         }
+        if (error.empty()) error = commandFailure(command);
 
         finish(timing, std::move(error));
     }
@@ -1351,7 +1376,7 @@ std::vector<DispatchTiming> MetalBackend::takeDispatchProfile() {
 
 CommandTicket MetalBackend::submitCommandAsync(
     std::span<const ComputeDispatch> dispatches,
-    CommandCompletion completion) {
+    CommandCompletion completion, uint32_t segments) {
     checkOperation();
     if (dispatches.empty()) {
         throw MetalBackendError("Metal command must contain a dispatch");
@@ -1453,52 +1478,85 @@ CommandTicket MetalBackend::submitCommandAsync(
         throw MetalBackendError(std::move(message));
     };
 
+    // macOS aborts a command buffer that holds the GPU too long while the
+    // display needs it, so long work is split into segments committed
+    // back-to-back. Every buffer the backend allocates, placement-sparse ones
+    // included, is hazard-tracked, so Metal orders the segments' accesses.
+    // A queue hands out at most 64 uncommitted command buffers and blocks on
+    // the next, and every segment is encoded before the first commits.
+    constexpr size_t kMaximumSegments = 32;
+    const size_t segmentCount = std::clamp<size_t>(
+        segments, 1, std::min(prepared.size(), kMaximumSegments));
     auto wallStart = std::chrono::steady_clock::now();
-    id<MTLCommandBuffer> command = [impl_->queue commandBuffer];
-    if (!command) {
-        failBeforeCommit("unable to create Metal command buffer");
-    }
     const uint64_t sparseEventValue = impl_->pendingSparseEventValue;
     ticketState->wallStart = wallStart;
     ticketState->sparseEventValue = sparseEventValue;
-    if (sparseEventValue) {
-        // Keep the queue dependency explicit; the CPU resolves it before commit.
-        [command encodeWaitForEvent:impl_->sparseEvent value:sparseEventValue];
-    }
+    // One buffer, the decode case, needs no array.
+    NSMutableArray<id<MTLCommandBuffer>> *earlier = segmentCount > 1
+        ? [[NSMutableArray alloc] initWithCapacity:segmentCount - 1]
+        : nil;
+    id<MTLCommandBuffer> command = nil;
     // Encoders can remain autoreleased after their command has completed.
     // The serving loop is long-lived, so bound their temporary ownership to
     // encoding; the command retains everything needed for GPU execution.
     @autoreleasepool {
-        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-        if (!encoder) {
-            failBeforeCommit("unable to create Metal compute encoder");
-        }
-        try {
-            for (const PreparedDispatch &item : prepared) {
-                const ComputeDispatch &dispatch = *item.source;
-                [encoder setComputePipelineState:item.pipeline];
-                for (const BufferBinding &binding : dispatch.buffers) {
-                    const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
-                    [encoder setBuffer:buffer.allocation->buffer
-                                offset:checkedNSUInteger(buffer.offsetBytes,
-                                                         "buffer offset")
-                               atIndex:binding.index];
-                }
-                for (const BytesBinding &binding : dispatch.bytes) {
-                    [encoder setBytes:binding.data
-                               length:checkedNSUInteger(binding.sizeBytes,
-                                                        "byte binding size")
-                              atIndex:binding.index];
-                }
-                [encoder dispatchThreadgroups:item.groups
-                         threadsPerThreadgroup:item.threads];
+        for (size_t segment = 0; segment < segmentCount; ++segment) {
+            command = [impl_->queue commandBuffer];
+            if (!command) {
+                failBeforeCommit("unable to create Metal command buffer");
             }
-            [encoder endEncoding];
-        } catch (...) {
-            impl_->asyncState->releaseSubmission(ticketState->sequence);
-            throw;
+            if (segment == 0 && sparseEventValue) {
+                // Keep the queue dependency explicit; the CPU resolves it before commit.
+                [command encodeWaitForEvent:impl_->sparseEvent value:sparseEventValue];
+            }
+            id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+            if (!encoder) {
+                failBeforeCommit("unable to create Metal compute encoder");
+            }
+            const size_t first = prepared.size() * segment / segmentCount;
+            const size_t last = prepared.size() * (segment + 1) / segmentCount;
+            try {
+                for (size_t index = first; index < last; ++index) {
+                    const PreparedDispatch &item = prepared[index];
+                    const ComputeDispatch &dispatch = *item.source;
+                    [encoder setComputePipelineState:item.pipeline];
+                    for (const BufferBinding &binding : dispatch.buffers) {
+                        const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
+                        [encoder setBuffer:buffer.allocation->buffer
+                                    offset:checkedNSUInteger(buffer.offsetBytes,
+                                                             "buffer offset")
+                                   atIndex:binding.index];
+                    }
+                    for (const BytesBinding &binding : dispatch.bytes) {
+                        [encoder setBytes:binding.data
+                                   length:checkedNSUInteger(binding.sizeBytes,
+                                                            "byte binding size")
+                                  atIndex:binding.index];
+                    }
+                    [encoder dispatchThreadgroups:item.groups
+                             threadsPerThreadgroup:item.threads];
+                }
+                [encoder endEncoding];
+            } catch (...) {
+                impl_->asyncState->releaseSubmission(ticketState->sequence);
+                throw;
+            }
+            if (segment + 1 < segmentCount) {
+                // Weak: the ticket holds the first buffer, which holds this.
+                std::weak_ptr<CommandTicket::State> segmentTicket = ticketState;
+                [command addCompletedHandler:
+                    ^(id<MTLCommandBuffer> completedCommand) {
+                        if (completedCommand.status == MTLCommandBufferStatusCompleted)
+                            return;
+                        if (auto ticket = segmentTicket.lock())
+                            ticket->segmentFailed(completedCommand);
+                    }];
+                [earlier addObject:command];
+            }
         }
     }
+    ticketState->firstCommand = earlier.firstObject;
+    ticketState->commandBuffers = static_cast<uint32_t>(segmentCount);
 
     // Driver callbacks only complete the ticket. Device-wide memory telemetry
     // is sampled on the host before submission and when consuming the result.
@@ -1516,7 +1574,7 @@ CommandTicket MetalBackend::submitCommandAsync(
         observer->mapWaitEvent.store(sparseEventValue, std::memory_order_release);
     }
     afterMetalEvent(event, sparseEventValue, kSparseMapTimeoutMilliseconds,
-        [command, event, observer, ticketState, sparseEventValue,
+        [command, earlier, event, observer, ticketState, sparseEventValue,
          pendingMap, mapWaitStart, wallStart](bool signaled) {
             if (pendingMap) {
                 const double waited = steadySeconds() - mapWaitStart;
@@ -1542,7 +1600,7 @@ CommandTicket MetalBackend::submitCommandAsync(
                 ticketState->finish(timing, message.str());
                 return;
             }
-            if (!observer->commitSubmission(ticketState->sequence, command,
+            if (!observer->commitSubmission(ticketState->sequence, command, earlier,
                     [weakTicket = std::weak_ptr(ticketState)](id<MTLCommandBuffer> completed) {
                         if (auto ticket = weakTicket.lock()) ticket->finishCommand(completed);
                     })) {

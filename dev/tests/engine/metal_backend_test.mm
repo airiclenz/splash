@@ -40,6 +40,7 @@ using splash::metal::BufferList;
 using splash::metal::BufferStorage;
 using splash::metal::BytesBinding;
 using splash::metal::CommandGraph;
+using splash::metal::CommandTiming;
 using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
@@ -233,6 +234,59 @@ NSUInteger delayedCompletionMemoryQuery(id device, SEL selector) {
         releaseMemoryQuery.wait();
     }
     return reinterpret_cast<NSUInteger (*)(id, SEL)>(originalAllocatedSize)(device, selector);
+}
+
+// A segmented command runs its dispatches in submission order across command
+// buffers and completes one ticket. Each round copies, increments and copies
+// back a large buffer, so a segment that overlapped its predecessor would lose
+// increments.
+void segmentedCommandRunsInOrder(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    constexpr uint32_t count = 1u << 20, rounds = 32, increment = 1;
+    auto values = backend.allocateBuffer(count * sizeof(uint32_t));
+    auto scratch = backend.allocateBuffer(count * sizeof(uint32_t));
+    std::fill_n(static_cast<uint32_t *>(values.contents()), count, 0u);
+    auto copy = [&](const MetalBuffer &source, const MetalBuffer &destination) {
+        ComputeDispatch item;
+        item.pipelineName = "test_copy_u32";
+        item.buffers = {{0, source}, {1, destination}};
+        item.bytes = {{2, &count, sizeof(count)}};
+        item.threadgroups = {count / 256, 1, 1};
+        item.threadsPerThreadgroup = {256, 1, 1};
+        return item;
+    };
+    ComputeDispatch add;
+    add.pipelineName = "test_add_u32";
+    add.buffers = {{0, scratch}};
+    add.bytes = {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}};
+    add.threadgroups = {count / 256, 1, 1};
+    add.threadsPerThreadgroup = {256, 1, 1};
+    std::vector<ComputeDispatch> command;
+    for (uint32_t round = 0; round < rounds; ++round) {
+        command.push_back(copy(values, scratch));
+        command.push_back(add);
+        command.push_back(copy(scratch, values));
+    }
+    uint32_t expected = 0;
+    // 7 segments cut mid-round; more than 32 segments, or than the
+    // dispatches, are capped.
+    for (const auto &[segments, buffers] :
+         {std::pair<uint32_t, uint32_t>{7, 7}, {1000, 32}, {1, 1}}) {
+        unsigned completions = 0;
+        CommandTiming timing =
+            backend.submitCommandAsync(command, [&](uint64_t) { ++completions; },
+                                       segments)
+                .wait();
+        expected += rounds * increment;
+        require(timing.commandBuffers == buffers,
+                "segmented command used the wrong number of command buffers");
+        require(completions == 1 && timing.gpuSeconds > 0.0,
+                "segmented command did not complete one ticket");
+        const auto *result = static_cast<const uint32_t *>(values.contents());
+        require(std::all_of(result, result + count,
+                            [&](uint32_t value) { return value == expected; }),
+                "segmented command ran dispatches out of order");
+    }
 }
 
 void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
@@ -1038,6 +1092,7 @@ void sparsePacedRelease(MetalBackend &backend) {
 void run(const std::string &metallibPath) {
     placementProbeFailures(metallibPath);
     backendDeferredSubmission(metallibPath);
+    segmentedCommandRunsInOrder(metallibPath);
     NSData *libraryData = [NSData dataWithContentsOfFile:
         [NSString stringWithUTF8String:metallibPath.c_str()]];
     const auto expectedDigest = libraryDigest(libraryData);

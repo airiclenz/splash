@@ -162,6 +162,7 @@ struct ComputeDispatch {
 struct CommandTiming {
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
+  uint32_t commandBuffers = 1;
 };
 
 // GPU time of one dispatch replayed as its own command while profiling.
@@ -348,12 +349,15 @@ public:
   // notifies host control flow; command results and errors are consumed from
   // the returned ticket. A second command is rejected until wait() consumes
   // the first ticket, preserving the one-in-flight runtime invariant.
+  // segments > 1 splits the dispatches into that many command buffers (at
+  // most one per dispatch, and at most 32) that run in order and complete one
+  // ticket, so no buffer holds the GPU long enough for macOS to abort it.
   [[nodiscard]] CommandTicket
   submitAsync(const ComputeDispatch &dispatch,
               CommandCompletion completion = {});
   [[nodiscard]] CommandTicket
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
-                     CommandCompletion completion = {});
+                     CommandCompletion completion = {}, uint32_t segments = 1);
 
   // Development profiling replays a multi-dispatch command synchronously,
   // one dispatch per command buffer. Even submitCommandAsync() then blocks,
