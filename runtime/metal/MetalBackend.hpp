@@ -163,6 +163,10 @@ struct CommandTiming {
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
   uint32_t commandBuffers = 1;
+  // The slowest command buffer's own GPU time and its index: what macOS's
+  // interactivity watchdog judges, not the command's total.
+  double longestBufferGpuSeconds = 0.0;
+  uint32_t longestBuffer = 0;
 };
 
 // GPU time of one dispatch replayed as its own command while profiling.

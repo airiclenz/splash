@@ -15,7 +15,9 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <ctime>
 #include <functional>
+#include <iostream>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -85,6 +87,29 @@ std::string errorDescription(NSError *error) {
     if (!error) return "unknown Metal error";
     std::string result = stringFromNSString(error.localizedDescription);
     return result.empty() ? "unknown Metal error" : result;
+}
+
+// A command buffer at least this long is logged with its dispatch range: the
+// evidence for sizing segments under macOS's interactivity watchdog.
+constexpr double kSlowCommandBufferSeconds = 1.0;
+
+double bufferGpuSeconds(id<MTLCommandBuffer> command) {
+    const double seconds = command.GPUEndTime - command.GPUStartTime;
+    return std::isfinite(seconds) && seconds > 0.0 ? seconds : 0.0;
+}
+
+// One stderr line, written from a completion handler; diagnostics never fail
+// the command.
+void logCommandBuffers(const std::string &message) noexcept {
+    try {
+        const std::time_t now = std::time(nullptr);
+        std::tm local{};
+        char timestamp[9] = "--:--:--";
+        if (localtime_r(&now, &local))
+            std::strftime(timestamp, sizeof(timestamp), "%H:%M:%S", &local);
+        std::cerr << timestamp << " metal: " << message << '\n';
+    } catch (...) {
+    }
 }
 
 NSUInteger checkedNSUInteger(uint64_t value, std::string_view field) {
@@ -391,6 +416,17 @@ struct CommandTicket::State {
     // Guarded by mutex: the first failure among a segmented command's earlier
     // buffers, reported when the last buffer completes.
     std::string segmentFailure;
+    // A segmented command's buffers, filled before commit and then guarded by
+    // mutex: each one's dispatch range, first pipeline and GPU time, for the
+    // slow-buffer log. Empty for a one-buffer command.
+    struct Segment {
+        size_t firstDispatch = 0;
+        size_t endDispatch = 0;
+        std::string firstPipeline;
+        double gpuSeconds = 0.0;
+        bool failed = false;
+    };
+    std::vector<Segment> segments;
     bool completed = false;
     bool released = false;
 
@@ -405,10 +441,15 @@ struct CommandTicket::State {
         return message.str();
     }
 
-    // An earlier segment failed. The ticket still ends only when the last
-    // buffer is done, so the GPU has finished with every buffer it bound.
-    void segmentFailed(id<MTLCommandBuffer> command) {
+    // An earlier segment is done. A failure is kept for the ticket, which still
+    // ends only when the last buffer is done, so the GPU has finished with
+    // every buffer it bound.
+    void segmentCompleted(size_t index, id<MTLCommandBuffer> command) {
         std::lock_guard lock(mutex);
+        Segment &segment = segments[index];
+        segment.gpuSeconds = bufferGpuSeconds(command);
+        if (command.status == MTLCommandBufferStatusCompleted) return;
+        segment.failed = true;
         if (segmentFailure.empty()) segmentFailure = commandFailure(command);
     }
 
@@ -423,15 +464,67 @@ struct CommandTicket::State {
         }
         timing.wallSeconds =
             std::chrono::duration<double>(wallEnd - wallStart).count();
+        timing.longestBufferGpuSeconds = bufferGpuSeconds(command);
+        const bool lastFailed = command.status != MTLCommandBufferStatusCompleted;
 
         std::string error;
+        std::string slow;
         {
             std::lock_guard lock(mutex);
+            // Host recovery and the late driver callback may both arrive.
+            if (completed) return;
             error = segmentFailure;
+            if (!segments.empty()) {
+                segments.back().gpuSeconds = timing.longestBufferGpuSeconds;
+                segments.back().failed = lastFailed;
+                for (size_t index = 0; index < segments.size(); ++index) {
+                    if (segments[index].gpuSeconds > timing.longestBufferGpuSeconds) {
+                        timing.longestBufferGpuSeconds = segments[index].gpuSeconds;
+                        timing.longestBuffer = static_cast<uint32_t>(index);
+                    }
+                }
+            }
+            if (timing.longestBufferGpuSeconds >= kSlowCommandBufferSeconds ||
+                !error.empty() || lastFailed)
+                slow = describeBuffers(timing);
         }
         if (error.empty()) error = commandFailure(command);
+        if (!slow.empty()) logCommandBuffers(slow);
 
         finish(timing, std::move(error));
+    }
+
+    // Caller holds mutex. One line: the slowest buffer and every failed one,
+    // with their dispatch ranges, so a log shows which work held the GPU.
+    std::string describeBuffers(const CommandTiming &timing) const {
+        std::ostringstream line;
+        line.setf(std::ios::fixed);
+        line.precision(2);
+        line << "command " << sequence << ": " << commandBuffers
+             << (commandBuffers == 1 ? " buffer" : " buffers") << ", gpu "
+             << timing.gpuSeconds << " s, longest "
+             << timing.longestBufferGpuSeconds << " s";
+        const auto describe = [&](size_t index) {
+            const Segment &segment = segments[index];
+            line << " (buffer " << index << ", dispatches "
+                 << segment.firstDispatch << '-' << segment.endDispatch - 1
+                 << " from " << segment.firstPipeline << ')';
+        };
+        if (segments.empty()) return line.str();
+        describe(timing.longestBuffer);
+        constexpr size_t kMaximumListedFailures = 4;
+        size_t listed = 0;
+        for (size_t index = 0; index < segments.size(); ++index) {
+            if (!segments[index].failed) continue;
+            if (listed == kMaximumListedFailures) {
+                line << " ...";
+                break;
+            }
+            line << (listed++ ? "," : "; failed") << ' ' << segments[index].gpuSeconds
+                 << " s";
+            describe(index);
+        }
+        return line.str();
     }
 
     void finish(CommandTiming result, std::string failure = {}) {
@@ -1495,6 +1588,17 @@ CommandTicket MetalBackend::submitCommandAsync(
     NSMutableArray<id<MTLCommandBuffer>> *earlier = segmentCount > 1
         ? [[NSMutableArray alloc] initWithCapacity:segmentCount - 1]
         : nil;
+    if (segmentCount > 1) {
+        // The names are copied: a dispatch's name need not outlive the submit.
+        ticketState->segments.resize(segmentCount);
+        for (size_t segment = 0; segment < segmentCount; ++segment) {
+            auto &record = ticketState->segments[segment];
+            record.firstDispatch = prepared.size() * segment / segmentCount;
+            record.endDispatch = prepared.size() * (segment + 1) / segmentCount;
+            record.firstPipeline =
+                prepared[record.firstDispatch].source->pipelineName;
+        }
+    }
     id<MTLCommandBuffer> command = nil;
     // Encoders can remain autoreleased after their command has completed.
     // The serving loop is long-lived, so bound their temporary ownership to
@@ -1546,10 +1650,8 @@ CommandTicket MetalBackend::submitCommandAsync(
                 std::weak_ptr<CommandTicket::State> segmentTicket = ticketState;
                 [command addCompletedHandler:
                     ^(id<MTLCommandBuffer> completedCommand) {
-                        if (completedCommand.status == MTLCommandBufferStatusCompleted)
-                            return;
                         if (auto ticket = segmentTicket.lock())
-                            ticket->segmentFailed(completedCommand);
+                            ticket->segmentCompleted(segment, completedCommand);
                     }];
                 [earlier addObject:command];
             }

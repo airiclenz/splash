@@ -282,6 +282,14 @@ void segmentedCommandRunsInOrder(const std::string &metallibPath) {
                 "segmented command used the wrong number of command buffers");
         require(completions == 1 && timing.gpuSeconds > 0.0,
                 "segmented command did not complete one ticket");
+        // The span from the first buffer's start to the last one's end holds
+        // every buffer; one buffer's span is the whole command.
+        require(timing.longestBuffer < buffers &&
+                    timing.longestBufferGpuSeconds > 0.0 &&
+                    timing.longestBufferGpuSeconds <= timing.gpuSeconds &&
+                    (buffers > 1 ||
+                     timing.longestBufferGpuSeconds == timing.gpuSeconds),
+                "segmented command misreported its longest buffer");
         const auto *result = static_cast<const uint32_t *>(values.contents());
         require(std::all_of(result, result + count,
                             [&](uint32_t value) { return value == expected; }),
