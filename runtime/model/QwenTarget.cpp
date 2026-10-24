@@ -307,13 +307,32 @@ void QwenTarget::addPrefillImpl(
               ops::PagedAttention::addPrefillStore(
                   graph, kvLayers[attentionIndex], keys, values,
                   sequence.pageTable, sequence.q8, geometry_.kvLayout);
-              ops::PagedAttention::addPrefill(
-                  graph, kvLayers[attentionIndex], queries, attentionRows,
-                  buffers.attentionPartials, buffers.attentionStatistics,
-                  sequence.pageTable, sequence.q8,
-                  operators_.prefillAttention(
-                      sequence.rows, geometry_.attentionQueryHeads,
-                      geometry_.kvLayout, sequence.q8.committed_tokens));
+              const uint32_t sliceRows = ops::PagedAttention::prefillSliceRows(
+                  sequence.rows, sequence.q8.committed_tokens);
+              const uint64_t rowBytes =
+                  uint64_t{geometry_.attentionQueryHeads /
+                           geometry_.kvLayout.kvHeads} *
+                  geometry_.attentionHeadDimension * sizeof(uint16_t);
+              const auto fromRow = [&](const metal::MetalBuffer &buffer,
+                                       uint32_t firstRow) {
+                return firstRow ? backend_.view(buffer, firstRow * rowBytes,
+                                                queryBytes - firstRow * rowBytes)
+                                : buffer;
+              };
+              for (uint32_t firstRow = 0; firstRow < sequence.rows;
+                   firstRow += sliceRows) {
+                const kv::Q8ChunkedPrefillParams slice =
+                    ops::PagedAttention::prefillSlice(
+                        sequence.q8, firstRow,
+                        std::min(sliceRows, sequence.rows - firstRow));
+                ops::PagedAttention::addPrefill(
+                    graph, kvLayers[attentionIndex], fromRow(queries, firstRow),
+                    fromRow(attentionRows, firstRow), buffers.attentionPartials,
+                    buffers.attentionStatistics, sequence.pageTable, slice,
+                    operators_.prefillAttention(
+                        slice.chunk_tokens, geometry_.attentionQueryHeads,
+                        geometry_.kvLayout, slice.committed_tokens));
+              }
               ops::PagedAttention::addPrefillGate(
                   graph,
                   u16(buffers.fullPacked, sequence.rowBegin, sequence.rows,

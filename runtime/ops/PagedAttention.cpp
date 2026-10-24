@@ -434,6 +434,27 @@ void PagedAttention::addPrefillStore(
             {layout.headDimension, 1, 1});
 }
 
+uint32_t PagedAttention::prefillSliceRows(uint32_t rows, uint32_t historyTokens,
+                                          uint64_t pairs) noexcept {
+  const uint64_t fit = pairs / (uint64_t{historyTokens} + std::max(rows, 1U));
+  if (fit >= rows || rows <= kPrefillSliceRows)
+    return rows;
+  return static_cast<uint32_t>(std::max<uint64_t>(
+      fit / kPrefillSliceRows * kPrefillSliceRows, kPrefillSliceRows));
+}
+
+kv::Q8ChunkedPrefillParams
+PagedAttention::prefillSlice(const kv::Q8ChunkedPrefillParams &chunk,
+                             uint32_t firstRow, uint32_t rows) {
+  if (!rows || firstRow > chunk.chunk_tokens ||
+      rows > chunk.chunk_tokens - firstRow)
+    throw std::invalid_argument("prefill attention slice exceeds its chunk");
+  kv::Q8ChunkedPrefillParams slice = chunk;
+  slice.committed_tokens += firstRow;
+  slice.chunk_tokens = rows;
+  return slice;
+}
+
 void PagedAttention::addPrefill(
     metal::CommandGraph &graph, const kv::LayerStorage &layer,
     metal::MetalBuffer queries, metal::MetalBuffer output,

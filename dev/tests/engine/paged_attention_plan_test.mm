@@ -299,6 +299,33 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
           "a slot stride below the split count is not a valid partition");
 }
 
+// Deep chunks split their attention into whole 64-row slices that each read
+// at most the pair budget; a slice is its rows with the earlier rows as history.
+void checkSlices() {
+  using ops::PagedAttention;
+  for (const auto [rows, history, expected] :
+       std::array<std::array<uint32_t, 3>, 7>{{{2048, 0, 2048},
+                                               {2048, 1000, 2048},
+                                               {2048, 14000, 448},
+                                               {2048, 61000, 64},
+                                               {2048, 160000, 64},
+                                               {37, 200000, 37},
+                                               {130, 200000, 64}}})
+    require(PagedAttention::prefillSliceRows(rows, history) == expected,
+            "prefill attention slice rows left the pair budget");
+  require(PagedAttention::prefillSliceRows(2048, 6145, 256 * (6145 + 2048)) == 256,
+          "an explicit pair budget did not set the slice rows");
+  const kv::Q8ChunkedPrefillParams chunk{6145, 2048, 2048, 257, 600, 0, 0, 0};
+  const auto slice = PagedAttention::prefillSlice(chunk, 1984, 64);
+  require(slice.committed_tokens == 6145 + 1984 && slice.chunk_tokens == 64 &&
+              slice.chunk_stride == 2048 && slice.page_table_entries == 257 &&
+              slice.physical_page_count == 600,
+          "a prefill attention slice changed more than its history and rows");
+  rejects([&] { (void)PagedAttention::prefillSlice(chunk, 1984, 65); });
+  rejects([&] { (void)PagedAttention::prefillSlice(chunk, 2049, 1); });
+  rejects([&] { (void)PagedAttention::prefillSlice(chunk, 0, 0); });
+}
+
 struct Case final {
   uint32_t queryHeads;
   kv::Layout layout;
@@ -717,6 +744,37 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
   return {values, values + output.sizeBytes() / 2};
 }
 
+// Encodes the chunk's store, then its attention as sliceRows-row slices, each
+// with its own plan over query and output views starting at the slice.
+std::vector<uint16_t> runSliced(metal::MetalBackend &backend, const Case &data,
+                                uint32_t sliceRows) {
+  const kv::Q8ChunkedPrefillParams &chunk = data.stores[0];
+  const auto workspace =
+      ops::PagedAttention::prefillWorkspace(data.rows, data.queryHeads, data.layout);
+  const auto partials = allocate(backend, workspace.partialsBytes);
+  const auto statistics = allocate(backend, workspace.statisticsBytes);
+  const auto output = allocate(backend, data.queries.sizeBytes());
+  const uint64_t rowBytes = uint64_t{data.queryHeads / data.layout.kvHeads} * 256 * 2;
+  metal::CommandGraph graph;
+  ops::PagedAttention::addPrefillStore(graph, data.layer, data.keys, data.values,
+                                      data.tables[0], chunk, data.layout);
+  for (uint32_t firstRow = 0; firstRow < data.rows; firstRow += sliceRows) {
+    const auto slice = ops::PagedAttention::prefillSlice(
+        chunk, firstRow, std::min(sliceRows, data.rows - firstRow));
+    const uint64_t offset = firstRow * rowBytes;
+    ops::PagedAttention::addPrefill(
+        graph, data.layer,
+        backend.view(data.queries, offset, data.queries.sizeBytes() - offset),
+        backend.view(output, offset, output.sizeBytes() - offset), partials,
+        statistics, data.tables[0], slice,
+        ops::PagedAttention::prefillPlan(slice.chunk_tokens, data.queryHeads,
+                                         data.layout, slice.committed_tokens));
+  }
+  (void)backend.submitCommand(graph.dispatches());
+  const auto *values = static_cast<const uint16_t *>(output.contents());
+  return {values, values + output.sizeBytes() / 2};
+}
+
 void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout,
                    uint32_t history, uint32_t rows) {
   auto data = makeCase(backend, heads, layout, 1, rows, history, false);
@@ -739,6 +797,16 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
   require(!defaultOutput.empty(), "default prefill configuration was not tested");
   checkEquivalent(data, defaultOutput,
                   run(backend, data, ops::PrefillAttentionConfig{}, false));
+  if (rows == 2048 && history) {
+    // 256-row slices keep the whole chunk's split count, so the output is
+    // bit-identical.
+    const uint32_t sliceRows = ops::PagedAttention::prefillSliceRows(
+        rows, history, uint64_t{256} * (history + rows));
+    require(sliceRows == 256, "slice test did not get 256-row slices");
+    const auto sliced = runSliced(backend, data, sliceRows);
+    checkReference(data, sliced);
+    require(sliced == defaultOutput, "sliced prefill attention changed the output");
+  }
   if (rows == 1057) {
     // Reuse the identical packed BF16 inputs and KV history across unaligned
     // host chunks, checking each path against its independent causal oracle.
@@ -805,6 +873,7 @@ int main(int argc, char **argv) {
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
       for (uint32_t heads : {24U, 16U})
         checkPlans(heads, {1, heads == 24 ? 4U : 2U, 256, format});
+    checkSlices();
     if (argc == 1) {
       std::cout << "paged attention plans: CPU PASS\n";
       return 0;

@@ -392,6 +392,26 @@ public:
   // compute encoder. The plan owns both dispatch grids and their exact scratch.
   // prefillWorkspace() bounds every legal history for
   // the command's largest sequence and configuration.
+  // macOS aborts a command buffer as impacting interactivity when one
+  // dispatch keeps the display waiting. A prefill attention dispatch reads
+  // rows x visible history token pairs, ~8 ns each on the M2 Pro (956 ms for
+  // 2048 rows at 57k), so a sequence's attention is encoded as row slices of
+  // at most this many pairs, ~65 ms each.
+  static constexpr uint64_t kPrefillDispatchPairs = 8'000'000;
+  // Slices are whole multiples of this many rows.
+  static constexpr uint32_t kPrefillSliceRows = 64;
+  // Rows per attention slice of a rows-row chunk after historyTokens: all
+  // rows when they fit in pairs, else the most whole slices that do, at
+  // least one.
+  [[nodiscard]] static uint32_t
+  prefillSliceRows(uint32_t rows, uint32_t historyTokens,
+                   uint64_t pairs = kPrefillDispatchPairs) noexcept;
+  // Rows [firstRow, firstRow + rows) of chunk as their own chunk: the same
+  // stride and page table, with firstRow more tokens of history. Queries and
+  // output views start firstRow rows into the chunk's.
+  [[nodiscard]] static kv::Q8ChunkedPrefillParams
+  prefillSlice(const kv::Q8ChunkedPrefillParams &chunk, uint32_t firstRow,
+               uint32_t rows);
   static void addPrefill(metal::CommandGraph &graph,
                          const kv::LayerStorage &layer,
                          metal::MetalBuffer queries, metal::MetalBuffer output,
