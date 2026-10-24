@@ -3566,6 +3566,183 @@ void testSuspendedLanesSharingAResumeStateKeepItUntilBothRelease() {
           "the shared state stayed exempt after both lanes released it");
 }
 
+// Lane 312 prefills a long prompt beside the decode lanes until physical KV
+// growth is blocked. It suspends at a page boundary and its live state,
+// published there, becomes its resume state; every other cached page is held
+// by the decode lanes, which then grow against the blocked backing.
+struct PeerGrowthFixture final {
+  // Two decode lanes whose growth, once one of them has suspended, fits in
+  // the pages the suspended one freed.
+  static constexpr uint32_t kFittingDecodeTokens = 96;
+
+  explicit PeerGrowthFixture(
+      std::vector<uint64_t> decodeLaneIds = {310, 311},
+      uint32_t decodeTokens = kFittingDecodeTokens,
+      metal::AllocationFailure failure = metal::AllocationFailure::Capacity)
+      : decodeLanes(std::move(decodeLaneIds)), pool(backing),
+        resources(pool, CacheNamespace{}),
+        executor(static_cast<uint32_t>(decodeLanes.size() + 1)),
+        engine({}, resources, executor, events) {
+    backing.allocationFailure = failure;
+    executor.moveStateOnSuspend = true;
+    executor.decodeFinishes = false;
+    for (uint64_t id : decodeLanes) {
+      EngineRequest decoding = request(id, std::vector<uint32_t>(65, id));
+      decoding.maxNewTokens = decodeTokens;
+      engine.submit(std::move(decoding));
+    }
+    tickUntil([&] {
+      return std::all_of(decodeLanes.begin(), decodeLanes.end(),
+                         [&](uint64_t id) { return events.outputs.contains(id); });
+    });
+    engine.submit(request(312, prompt));
+    tickUntil([&] {
+      return executor.requests.contains(312) &&
+             executor.requests.at(312).position >= kSuspendAfter;
+    });
+    backing.growthBlocked = true;
+    tickUntil([&] { return engine.snapshot().resourceSuspensions == 1; });
+    suspendedAt = resources.cachedTokens(prompt);
+    require(!executor.requests.at(312).resident &&
+                suspendedAt >= kSuspendAfter && suspendedAt < prompt.size(),
+            "peer-growth fixture did not suspend the prefilling lane");
+  }
+
+  void tickUntil(const std::function<bool()> &done) {
+    const double limit = now + kTickLimit;
+    for (; now < limit && !done(); ++now)
+      static_cast<void>(engine.tick(now));
+    require(done(), "peer-growth fixture did not reach its next stage");
+  }
+
+  // Ticks until the decode lanes' blocked growth suspends one of them, then
+  // until the other completes.
+  void growDecodeLanesDry() {
+    tickUntil([&] { return engine.snapshot().resourceSuspensions == 2; });
+    tickUntil([&] { return events.completedCount == 1; });
+  }
+
+  // Unblocks growth and lets every suspended lane resume and complete.
+  void resumeAll() {
+    backing.growthBlocked = false;
+    tickUntil([&] { return engine.idle(); });
+    require(events.completedCount == decodeLanes.size() + 1 &&
+                events.failedCount == 0,
+            "peer-growth fixture did not complete every lane");
+  }
+
+  // Replay that recomputes prompt rows, as live pressure runs judge it.
+  uint64_t prefillReplayTokens() const {
+    const EngineSnapshot snapshot = engine.snapshot();
+    return snapshot.resourceReplayTokens - snapshot.resourceDecodeReplayTokens;
+  }
+
+  static constexpr double kTickLimit = 2048;
+  static constexpr uint32_t kSuspendAfter = 4096;
+  const std::vector<uint32_t> prompt = std::vector<uint32_t>(8193, 312);
+  std::vector<uint64_t> decodeLanes;
+  Backing backing{1024};
+  KvPool pool;
+  engine::Cache resources;
+  Executor executor;
+  Events events;
+  engine::Engine engine;
+  double now = 1;
+  uint32_t suspendedAt = 0;
+};
+
+void testPeerGrowthSparesASuspendedLanesResumeState() {
+  PeerGrowthFixture fixture;
+
+  fixture.growDecodeLanesDry();
+  require(fixture.resources.cachedTokens(fixture.prompt) == fixture.suspendedAt,
+          "peer growth took a suspended lane's resume state");
+  fixture.resumeAll();
+
+  require(fixture.executor.restoredLengths.at(312) == fixture.suspendedAt &&
+              fixture.prefillReplayTokens() <
+                  EngineConfig{}.prefillCheckpointTokens &&
+              fixture.engine.snapshot().resourceResumeStateEvictions == 0,
+          "the suspended lane did not resume from its spared state");
+}
+
+void testPausedPeerGrowthSparesASuspendedLanesResumeState() {
+  PeerGrowthFixture fixture({310, 311}, PeerGrowthFixture::kFittingDecodeTokens,
+                            metal::AllocationFailure::HostPressure);
+
+  fixture.growDecodeLanesDry();
+  require(fixture.resources.cachedTokens(fixture.prompt) == fixture.suspendedAt,
+          "growth reusing idle backing took a suspended lane's resume state");
+  fixture.resumeAll();
+
+  require(fixture.executor.restoredLengths.at(312) == fixture.suspendedAt &&
+              fixture.engine.snapshot().resourceResumeStateEvictions == 0,
+          "the suspended lane did not resume from its spared state");
+}
+
+void testCriticalReclaimTakesAResumeStateBesideGrowingPeers() {
+  PeerGrowthFixture fixture;
+
+  static_cast<void>(fixture.engine.reclaimMemory(
+      {.reclaimEmptyKvExtents = true,
+       .evictAllUnpinnedPrefixes = true,
+       .targetBytes = std::numeric_limits<uint64_t>::max()}));
+
+  require(fixture.resources.cachedTokens(fixture.prompt) == 0,
+          "critical reclaim spared a suspended lane's resume state");
+  fixture.growDecodeLanesDry();
+  fixture.resumeAll();
+  require(fixture.engine.snapshot().resourceResumeStateEvictions == 1,
+          "the resume did not count the state critical reclaim took");
+}
+
+void testSoleResidentLaneGrowthTakesAResumeState() {
+  // The decode lane outgrows every page but the suspended lane's.
+  PeerGrowthFixture fixture({310}, 256);
+
+  fixture.tickUntil([&] { return fixture.events.completedCount == 1; });
+  require(fixture.resources.cachedTokens(fixture.prompt) < fixture.suspendedAt &&
+              fixture.events.failedCount == 0,
+          "the sole resident lane did not take a resume state to grow");
+  fixture.resumeAll();
+
+  require(fixture.engine.snapshot().resourceResumeStateEvictions == 1,
+          "the resume did not count the state the sole lane took");
+}
+
+void testAdmissionWithNoLaneResidentTakesAResumeState() {
+  PeerGrowthFixture fixture;
+  fixture.tickUntil(
+      [&] { return fixture.engine.snapshot().resourceSuspensions == 2; });
+  const uint64_t resident =
+      fixture.executor.requests.at(310).resident ? 310 : 311;
+  const uint64_t suspended = resident == 310 ? 311 : 310;
+  // With the last resident lane gone, every unprotected page released and
+  // the free resident pages held by a cache-only request, the suspended
+  // decode lane admitQueued resumes first needs pages that only lane 312's
+  // resume state holds.
+  fixture.engine.cancel(resident);
+  static_cast<void>(fixture.engine.tick(fixture.now++));
+  static_cast<void>(fixture.resources.reclaimCache(
+      std::numeric_limits<uint64_t>::max(), false));
+  const uint32_t freePages =
+      fixture.resources.snapshot().pool.pagesFreeResident;
+  fixture.resources.beginRequest(999);
+  require(fixture.resources
+              .ensureTokens(999, uint64_t{freePages} * KvCache::pageTokens)
+              .granted(),
+          "the cache-only request did not take the free resident pages");
+
+  fixture.tickUntil([&] { return fixture.events.reasons.contains(suspended); });
+
+  require(fixture.events.failedCount == 0 &&
+              fixture.resources.cachedTokens(fixture.prompt) <
+                  fixture.suspendedAt,
+          "the first admission with no lane resident stalled on a resume state");
+  fixture.resources.endRequest(999);
+  fixture.resumeAll();
+}
+
 // Request 301 queued for memory by a host-pressure begin denial while growth
 // is paused, after request 300 left a composite state at 64 of their shared
 // 65-token prompt, cancelled past its prompt end so no conversation end
@@ -5971,6 +6148,11 @@ int main() {
     testCancelledSuspendedRequestCountsItsEvictedResumeState();
     testCancelledSuspendedRequestReleasesItsResumeExemption();
     testSuspendedLanesSharingAResumeStateKeepItUntilBothRelease();
+    testPeerGrowthSparesASuspendedLanesResumeState();
+    testPausedPeerGrowthSparesASuspendedLanesResumeState();
+    testCriticalReclaimTakesAResumeStateBesideGrowingPeers();
+    testSoleResidentLaneGrowthTakesAResumeState();
+    testAdmissionWithNoLaneResidentTakesAResumeState();
     testWarningReclaimKeepsQueuedRequestsPrefix();
     testRetriedQueuedRequestHoldsOneProtection();
     testQueuedRequestAdmittedColdDropsItsProtection();

@@ -116,6 +116,10 @@ public:
   [[nodiscard]] CacheLookup shallowerState(const CacheLookup &lookup);
   void restoreRequest(uint64_t requestId, const CacheLookup &lookup);
 
+  // Grows the request's page table to cover tokenCount tokens. Short of
+  // logical pages it evicts the oldest cached KV leaves; one that carries a
+  // suspended request's resume state is taken only while this request is the
+  // sole resident one.
   [[nodiscard]] TokenAdmission ensureTokens(uint64_t requestId,
                                             uint64_t tokenCount);
   [[nodiscard]] PageTableView pageTable(uint64_t requestId) const;
@@ -170,30 +174,37 @@ public:
   // (a suspended request's resume state, a queued request's prefix, a
   // resident lane's latest checkpoint, a conversation end's prompt-end state
   // and kept checkpoints) and evicts the next publication instead; evictAll
-  // (Critical pressure) takes protected states too.
+  // (Critical pressure) takes protected states too, resume states included.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
                                       bool keepResumePoint = false,
                                       bool keepRunway = false);
   // One bounded reclaim step for an allocation retry. Progress is distinct
   // from physical bytes because evicting a KV reference can make a resident
   // page reusable without immediately emptying its extent.
-  // spareProtectedStates walks past protected states and never takes one.
+  // sparing names the protected states it walks past and never takes.
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
       bool keepResumePoint = false, bool keepRunway = false,
-      bool spareProtectedStates = false);
+      StateSparing sparing = StateSparing::None);
   // One reclaim step for an allocation a request is waiting on: spares
   // protected states while any other state or KV qualifies, then takes the
-  // oldest protected state rather than stall. Costs the protected states at
-  // the head of each eviction queue, bounded by waiting and resident lanes.
+  // oldest protected state rather than stall, except a suspended request's
+  // resume state: that one is taken only with takeResumeStates, which the
+  // caller passes when no lane other than the growing one is resident. Costs
+  // the protected states at the head of each eviction queue, bounded by
+  // waiting and resident lanes.
   [[nodiscard]] CacheReclaimResult reclaimOneForGrowth(
-      CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
+      CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
+      bool takeResumeStates = false);
   // Recycles an unpinned state, preferring checkpoints, for a required state
   // publication. KV bytes only return once an extent unmaps. A protected
-  // state is taken only when no other state qualifies; with checkpointsOnly
-  // only an unprotected checkpoint qualifies, so a protected checkpoint is
-  // recycled rather than none.
-  [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
+  // state is taken only when no other state qualifies, and a suspended
+  // request's resume state only with takeResumeStates (no lane other than
+  // the publishing one is resident); with checkpointsOnly only an
+  // unprotected checkpoint qualifies, so a protected checkpoint is recycled
+  // rather than none.
+  [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false,
+                                     bool takeResumeStates = false);
   // Recycles exactly this checkpoint publication for a required state
   // publication, through the eviction path, while no more than
   // heldProtections protections hold it: the caller passes the ones its own
@@ -202,11 +213,12 @@ public:
   [[nodiscard]] bool recycleCheckpointState(StateCheckpoint checkpoint,
                                             uint32_t heldProtections) noexcept;
   // Protects the deepest composite state on the request's published prefix
-  // that a resume of resumeTokens tokens can restore, from Warning reclaim:
-  // like lookup, it leaves one token to recompute, so a state on the block
-  // ending at resumeTokens is skipped. Call before endRequest; returns an
-  // empty handle when no such state exists. Reads the request's own block
-  // list: no lookup, hashing or pin.
+  // that a resume of resumeTokens tokens can restore, as a resume state: from
+  // Warning reclaim, and from growth and publication reclaim while another
+  // lane is resident. Like lookup, it leaves one token to recompute, so a
+  // state on the block ending at resumeTokens is skipped. Call before
+  // endRequest; returns an empty handle when no such state exists. Reads the
+  // request's own block list: no lookup, hashing or pin.
   [[nodiscard]] StateProtection protectDeepestState(uint64_t requestId,
                                                     uint32_t resumeTokens);
   // Protects the state published at kvBlock: the prefix a queued request

@@ -276,7 +276,8 @@ private:
     // The block of the state the first admission restored, or 0: names the
     // conversationEnds_ entry this request continues.
     uint64_t restoredStateBlock = 0;
-    // The state a suspended request resumes from, spared by Warning reclaim
+    // The state a suspended request resumes from, spared by Warning reclaim,
+    // and by growth and publication reclaim while another lane is resident,
     // until the resume succeeds or the request ends.
     StateProtection resumeProtection;
     // The cached prefix an unstarted request found, protected from its
@@ -371,9 +372,12 @@ private:
                                      const TokenAdmission &admission,
                                      double nowMilliseconds);
   [[nodiscard]] bool reclaimForGrowth(
+      const Request &request,
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
   [[nodiscard]] bool reclaimIdleState() noexcept;
-  [[nodiscard]] bool reuseIdleBackingWhilePaused(const TokenAdmission &admission);
+  [[nodiscard]] bool reuseIdleBackingWhilePaused(
+      const Request &request, const TokenAdmission &admission);
+  [[nodiscard]] bool anotherLaneResident(const Request &request) const;
   [[nodiscard]] bool growthPaused() const;
   [[nodiscard]] uint32_t completedTokens(const Request &request) const;
   [[nodiscard]] bool residentLaneNeedsKvRunway() const;

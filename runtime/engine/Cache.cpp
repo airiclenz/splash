@@ -323,9 +323,9 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
   const uint64_t target = targetBytes > keptBytes ? targetBytes - keptBytes : 0;
   auto needsMore = [&] { return evictAll || released < target; };
   while (needsMore() && !releaseDeferred(keepRunway)) {
-    const CacheReclaimResult result =
-        reclaimOne(CacheReclaimMode::ReleaseBacking, keepResumePoint,
-                   keepRunway, !evictAll);
+    const CacheReclaimResult result = reclaimOne(
+        CacheReclaimMode::ReleaseBacking, keepResumePoint, keepRunway,
+        evictAll ? StateSparing::None : StateSparing::Protected);
     if (!result.madeProgress)
       break;
     released += result.reclaimedBytes;
@@ -335,7 +335,7 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
 
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
                                      bool keepResumePoint, bool keepRunway,
-                                     bool spareProtectedStates) {
+                                     StateSparing sparing) {
   if (mode == CacheReclaimMode::ReleaseBacking) {
     if (releaseDeferred(keepRunway))
       return {};
@@ -344,7 +344,7 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
   }
 
   const std::optional<CacheEvictionCandidate> state =
-      states_.evictionCandidate(keepResumePoint, spareProtectedStates);
+      states_.evictionCandidate(keepResumePoint, sparing);
   const bool checkpoint = state && states_.checkpoint(state->id);
   const std::optional<CacheEvictionCandidate> kv =
       checkpoint ? std::nullopt : oldestStateFreeKvBlock();
@@ -362,19 +362,27 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
                     : 0};
 }
 
-CacheReclaimResult Cache::reclaimOneForGrowth(CacheReclaimMode mode) {
-  const CacheReclaimResult spared = reclaimOne(mode, false, false, true);
-  return spared.madeProgress ? spared : reclaimOne(mode);
+CacheReclaimResult Cache::reclaimOneForGrowth(CacheReclaimMode mode,
+                                              bool takeResumeStates) {
+  const CacheReclaimResult spared =
+      reclaimOne(mode, false, false, StateSparing::Protected);
+  return spared.madeProgress
+             ? spared
+             : reclaimOne(mode, false, false,
+                          takeResumeStates ? StateSparing::None
+                                           : StateSparing::ResumeStates);
 }
 
-bool Cache::reclaimOneState(bool checkpointsOnly) {
+bool Cache::reclaimOneState(bool checkpointsOnly, bool takeResumeStates) {
   // checkpointsOnly bounds what qualifies in the spare pass too: an
   // unprotected ordinary state it would reject must not hide a protected
   // checkpoint from the fallback.
   std::optional<CacheEvictionCandidate> state =
-      states_.evictionCandidate(false, true);
+      states_.evictionCandidate(false, StateSparing::Protected);
   if (!state || (checkpointsOnly && !states_.checkpoint(state->id)))
-    state = states_.evictionCandidate();
+    state = states_.evictionCandidate(
+        false, takeResumeStates ? StateSparing::None
+                                : StateSparing::ResumeStates);
   return state && (!checkpointsOnly || states_.checkpoint(state->id)) &&
          states_.evict(state->id).evicted;
 }
@@ -395,7 +403,7 @@ StateProtection Cache::protectDeepestState(uint64_t requestId,
                    : 0;
   for (size_t index = usableBlocks; index > 0; --index) {
     if (states_.contains(active.cachedBlocks[index - 1]))
-      return states_.protect(active.cachedBlocks[index - 1]);
+      return states_.protect(active.cachedBlocks[index - 1], true);
   }
   return {};
 }
@@ -471,9 +479,14 @@ bool Cache::makeLogicalPages(uint32_t count) {
 }
 
 bool Cache::evictOneKvBlock() {
+  // ensureTokens' caller is resident: a peer is resident when it is not the
+  // only request, and then a suspended request's resume state is walked past.
+  const bool spareResumeStates = requests_.size() > 1;
   uint64_t previous = 0;
   while (auto candidate = kv_.evictionCandidate(previous)) {
     previous = candidate->id;
+    if (spareResumeStates && states_.isResumeState(candidate->id))
+      continue;
     if (states_.contains(candidate->id)) {
       if (!states_.evict(candidate->id).evicted)
         continue;

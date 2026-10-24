@@ -561,7 +561,7 @@ bool Engine::admit(Request &active, double now) {
            admission.failure == StateFailure::MemoryPressure) {
       const bool hostPressure =
           admission.allocationFailure == metal::AllocationFailure::HostPressure;
-      if (hostPressure ? reclaimIdleState() : reclaimForGrowth()) {
+      if (hostPressure ? reclaimIdleState() : reclaimForGrowth(active)) {
         reclaimedForAdmission = true;
         admission = activate();
         continue;
@@ -1159,8 +1159,9 @@ std::shared_ptr<const CompositeState> Engine::captureState(Request &active,
                                                            bool checkpoint) {
   const uint64_t requestId = active.request.id;
   std::shared_ptr<const CompositeState> state = model_.snapshot(requestId);
-  if (!state &&
-      (recycleOwnCheckpoint(active) || cache_.reclaimOneState(checkpoint))) {
+  if (!state && (recycleOwnCheckpoint(active) ||
+                 cache_.reclaimOneState(checkpoint,
+                                        !anotherLaneResident(active)))) {
     state = model_.snapshot(requestId);
     if (state)
       ++counters_.recycledStatePublications;
@@ -1483,8 +1484,8 @@ Engine::KvAdmission Engine::admitKv(Request &active, uint64_t workEnd) {
     const bool paused = growthPaused() ||
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
     const bool progressed = paused
-        ? reuseIdleBackingWhilePaused(admission)
-        : reclaimForGrowth(CacheReclaimMode::ReuseBacking);
+        ? reuseIdleBackingWhilePaused(active, admission)
+        : reclaimForGrowth(active, CacheReclaimMode::ReuseBacking);
     if (!progressed)
       break;
     reclaimed = true;
@@ -1508,7 +1509,11 @@ bool Engine::growthPaused() const {
   return config_.growthPaused && config_.growthPaused();
 }
 
-bool Engine::reclaimForGrowth(CacheReclaimMode mode) {
+// ============================================================================
+// One reclaim step for the request's denied growth or admission. A suspended
+// lane's resume state is taken only when no other lane is resident: the sole
+// resident lane's fallback, or the admission a recovery resumes first.
+bool Engine::reclaimForGrowth(const Request &active, CacheReclaimMode mode) {
   if (reclaimIdleState())
     return true;
   // The background pressure controller owns physical shrink. Retrying a
@@ -1516,7 +1521,8 @@ bool Engine::reclaimForGrowth(CacheReclaimMode mode) {
   // any reclaimed bytes.
   if (growthPaused())
     return false;
-  const CacheReclaimResult reclaimed = cache_.reclaimOneForGrowth(mode);
+  const CacheReclaimResult reclaimed =
+      cache_.reclaimOneForGrowth(mode, !anotherLaneResident(active));
   if (reclaimed.madeProgress)
     signalResourceProgress();
   return reclaimed.madeProgress;
@@ -1534,8 +1540,10 @@ bool Engine::reclaimIdleState() noexcept {
 // short of pages may take idle cached pages instead of being suspended and
 // replaying its whole prefix once the pause lifts. Cache is only evicted when
 // the resident idle pages can actually cover the shortfall; otherwise the
-// request yields as before and the cache survives for later hits.
-bool Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
+// request yields as before and the cache survives for later hits. A suspended
+// lane's resume state is taken only when no other lane is resident.
+bool Engine::reuseIdleBackingWhilePaused(const Request &active,
+                                         const TokenAdmission &admission) {
   if (reclaimIdleState())
     return true;
   const KvPoolSnapshot pool = cache_.snapshot().pool;
@@ -1543,8 +1551,8 @@ bool Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
   const uint32_t reusable = pool.pagesResident - pool.pagesActive;
   if (reusable < admission.additionalPages)
     return false;
-  const CacheReclaimResult reused =
-      cache_.reclaimOneForGrowth(CacheReclaimMode::ReuseBacking);
+  const CacheReclaimResult reused = cache_.reclaimOneForGrowth(
+      CacheReclaimMode::ReuseBacking, !anotherLaneResident(active));
   if (reused.madeProgress) {
     // An evicted state parks its buffers in the model's pool (a live lane's
     // own state refills that lane's short reserve instead); under
@@ -1555,6 +1563,15 @@ bool Engine::reuseIdleBackingWhilePaused(const TokenAdmission &admission) {
     signalResourceProgress();
   }
   return reused.madeProgress;
+}
+
+// ============================================================================
+// True while a lane other than the request holds a resident state cell.
+// Runs on denial paths only: one scan of the requests, no allocation.
+bool Engine::anotherLaneResident(const Request &active) const {
+  return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
+    return entry.first != active.request.id && entry.second.stateCell;
+  });
 }
 
 // Tokens a resident lane has processed: the prompt position during prefill,
@@ -1621,9 +1638,12 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
   active.suspended = true;
   active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
   suspendModel(active, position);
-  // Warning reclaim must not turn the resume into a full replay; growth
-  // reclaim takes this state, the one published at suspension included,
-  // only after every unprotected one, and Critical reclaim takes it outright.
+  // Warning reclaim must not turn the resume into a full replay, and neither
+  // must another lane's growth or publication: while another lane is
+  // resident they never take this state, the one published at suspension
+  // included. Critical reclaim takes it outright, and so does the sole
+  // resident lane's growth, or an admission with no lane resident, after
+  // every unprotected one.
   // A decode lane suspended exactly on its checkpoint boundary protects the
   // kept previous checkpoint: its resume cannot restore the boundary's state.
   active.resumeProtection =

@@ -37,7 +37,23 @@ struct KeptCheckpoints final {
 struct StateProtection final {
   uint64_t kvBlock = 0;
   uint64_t publication = 0;
+  // A suspended request's resume state: shielded from growth and publication
+  // reclaim on behalf of another lane; see StateSparing.
+  bool isResume = false;
   [[nodiscard]] explicit operator bool() const noexcept { return kvBlock != 0; }
+};
+
+// The protected publications a state eviction search walks past.
+enum class StateSparing : uint8_t {
+  // Every unpinned state qualifies: Critical reclaim, and growth or
+  // publication reclaim with no other lane resident.
+  None,
+  // Walks past suspended requests' resume states only: the fallback pass of
+  // growth and publication reclaim while another lane is resident.
+  ResumeStates,
+  // Walks past every protected state: Warning reclaim, and the first pass of
+  // growth and publication reclaim.
+  Protected,
 };
 
 class CompositeStateLease final {
@@ -132,14 +148,20 @@ public:
   [[nodiscard]] KeptCheckpoints keptCheckpoint(uint64_t kvBlock) const noexcept;
 
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
-  // Marks the resident publication as one a request needs.
+  // True while a suspended request's resume protection holds the state
+  // published at kvBlock. O(1).
+  [[nodiscard]] bool isResumeState(uint64_t kvBlock) const noexcept;
+  // Marks the resident publication as one a request needs; isResume marks it
+  // as a suspended request's resume state.
   // Protection takes no pin and no lease: the state stays evictable, and only
-  // a candidate search that spares protected states walks past it. Each call
-  // needs one matching unprotect; lanes sharing a state count separately.
+  // a candidate search that spares its class walks past it. Each call needs
+  // one matching unprotect; lanes sharing a state count separately, so a
+  // shared resume state keeps its class until the last of them releases it.
   // Returns an empty handle when no state is published at kvBlock.
-  [[nodiscard]] StateProtection protect(uint64_t kvBlock);
-  // Drops one protection. No-op for an empty handle or a publication that has
-  // since been evicted or replaced.
+  [[nodiscard]] StateProtection protect(uint64_t kvBlock,
+                                        bool isResume = false);
+  // Drops one protection, of the class the handle names. No-op for an empty
+  // handle or a publication that has since been evicted or replaced.
   void unprotect(StateProtection protection) noexcept;
   // True while the publication protection names is still published; false
   // for an empty handle. O(1).
@@ -148,14 +170,15 @@ public:
   // keepResumePoint withholds the publication a follow-up request would
   // resume from, leaving no candidate when it is the only one. Checkpoints
   // keep their disposable priority: one is withheld only when no ordinary
-  // state exists. spareProtected walks each queue past protected states, at
-  // a cost bounded by the protected states ahead of the first other one;
-  // without it the search is O(1). Growth reclaim and publication recycling
-  // spare them first and fall back to them; only Warning reclaim never takes
-  // one.
+  // state exists. sparing walks each queue past the protected states of its
+  // class, at a cost bounded by the spared states ahead of the first other
+  // one; StateSparing::None makes the search O(1). Growth reclaim and
+  // publication recycling spare every protected state first, then fall back
+  // to all but suspended requests' resume states while another lane is
+  // resident; Warning reclaim never takes a protected state.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   evictionCandidate(bool keepResumePoint = false,
-                    bool spareProtected = false) const noexcept;
+                    StateSparing sparing = StateSparing::None) const noexcept;
   [[nodiscard]] StateEviction evict(uint64_t kvBlock) noexcept;
   // Evicts exactly this checkpoint publication, counted as a checkpoint
   // eviction, while no more than allowedProtections protections hold it.
@@ -175,6 +198,8 @@ private:
     // lanes holding it as their latest checkpoint, and conversation ends
     // holding it as a resume state.
     uint32_t protections = 0;
+    // The subset of protections held as suspended requests' resume states.
+    uint32_t resumeProtections = 0;
     uint64_t lastUsed = 0;
     uint64_t previousEvictable = 0;
     uint64_t nextEvictable = 0;

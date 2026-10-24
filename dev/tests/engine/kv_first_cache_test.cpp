@@ -1,8 +1,10 @@
 #include "TestKvPool.hpp"
 #include "engine/Cache.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -1030,6 +1032,107 @@ void testCheckpointRecyclingTakesAProtectedCheckpointOverNone() {
           "checkpoint recycling");
 }
 
+// The fixture's four blocks with a state on the last, protected as the
+// resume state of each listed lane: a lane suspended at 129 tokens restores
+// it, and suspension ends the lane's cache request.
+struct ResumeStateFixture final {
+  explicit ResumeStateFixture(std::initializer_list<uint64_t> lanes = {10}) {
+    fixture.publish(3);
+    for (uint64_t lane : lanes) {
+      fixture.cache.beginRequest(lane);
+      fixture.cache.restoreRequest(lane, fixture.lookup(129));
+      protections.push_back(fixture.cache.protectDeepestState(lane, 129));
+      fixture.cache.endRequest(lane);
+    }
+    require(protections.size() == lanes.size() &&
+                std::all_of(protections.begin(), protections.end(),
+                            [](StateProtection protection) {
+                              return protection.isResume;
+                            }),
+            "fixture did not protect its resume state");
+  }
+
+  bool resumeStateKept() const {
+    return fixture.cache.carriesState(fixture.blocks[3]);
+  }
+
+  // Runs growth reclaim on behalf of a lane with a resident peer until it
+  // stops making progress.
+  void reclaimForGrowthUntilDry() {
+    for (uint32_t step = 0;
+         step < 16 && fixture.cache.reclaimOneForGrowth().madeProgress; ++step) {
+    }
+  }
+
+  CacheFixture fixture;
+  std::vector<StateProtection> protections;
+};
+
+void testPeerGrowthReclaimSparesAResumeState() {
+  ResumeStateFixture resume;
+  resume.fixture.publish(0);
+
+  resume.reclaimForGrowthUntilDry();
+
+  require(resume.resumeStateKept() &&
+              resume.fixture.cache.snapshot().kvCache.blocks == 4 &&
+              !resume.fixture.cache.carriesState(resume.fixture.blocks[0]),
+          "peer growth reclaim took a suspended lane's resume state");
+}
+
+void testSoleLaneGrowthReclaimTakesAResumeState() {
+  ResumeStateFixture resume;
+
+  const CacheReclaimResult reclaimed =
+      resume.fixture.cache.reclaimOneForGrowth(CacheReclaimMode::ReleaseBacking,
+                                               true);
+
+  require(reclaimed.madeProgress && !resume.resumeStateKept(),
+          "sole-lane growth reclaim stalled on a resume state");
+}
+
+void testSharedResumeStateStaysShieldedUntilTheLastRelease() {
+  ResumeStateFixture resume({10, 11});
+
+  resume.fixture.cache.unprotectState(resume.protections[0]);
+  resume.reclaimForGrowthUntilDry();
+  require(resume.resumeStateKept(),
+          "one lane's release dropped the shield its peer still resumes from");
+  resume.fixture.cache.unprotectState(resume.protections[1]);
+  resume.reclaimForGrowthUntilDry();
+
+  require(!resume.resumeStateKept(),
+          "a released resume state stayed shielded from growth reclaim");
+}
+
+void testPeerPublicationRecyclingSparesAResumeState() {
+  ResumeStateFixture resume;
+
+  require(!resume.fixture.cache.reclaimOneState() && resume.resumeStateKept(),
+          "a peer's publication recycled a suspended lane's resume state");
+  require(resume.fixture.cache.reclaimOneState(false, true) &&
+              !resume.resumeStateKept(),
+          "the sole lane's publication did not recycle a resume state");
+}
+
+void testLogicalPagePressureSparesAResumeStateBesideAPeer() {
+  // Every page holds the resume state's chain.
+  ResumeStateFixture resume;
+  engine::Cache &cache = resume.fixture.cache;
+  cache.beginRequest(20);
+  cache.beginRequest(21);
+
+  const TokenAdmission denied = cache.ensureTokens(20, 32);
+  require(denied.failure == KvPageAcquireFailure::LogicalCapacity &&
+              resume.resumeStateKept() && cache.snapshot().kvCache.blocks == 4,
+          "logical page pressure took a resume state beside a resident peer");
+  cache.endRequest(21);
+
+  require(cache.ensureTokens(20, 32).granted() && !resume.resumeStateKept(),
+          "the sole lane's logical page pressure stalled on a resume state");
+  cache.endRequest(20);
+}
+
 int main() {
   try {
     testCheckpointLookupProbeDoesNotPromote();
@@ -1071,6 +1174,11 @@ int main() {
     testGrowthReclaimTakesAProtectedCheckpointLast();
     testReclaimOneStateTakesAProtectedCheckpointLast();
     testCheckpointRecyclingTakesAProtectedCheckpointOverNone();
+    testPeerGrowthReclaimSparesAResumeState();
+    testSoleLaneGrowthReclaimTakesAResumeState();
+    testSharedResumeStateStaysShieldedUntilTheLastRelease();
+    testPeerPublicationRecyclingSparesAResumeState();
+    testLogicalPagePressureSparesAResumeStateBesideAPeer();
     std::cout << "KV-first cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

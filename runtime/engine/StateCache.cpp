@@ -168,7 +168,12 @@ bool StateCache::contains(uint64_t kvBlock) const noexcept {
   return entries_.contains(kvBlock);
 }
 
-StateProtection StateCache::protect(uint64_t kvBlock) {
+bool StateCache::isResumeState(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found != entries_.end() && found->second.resumeProtections;
+}
+
+StateProtection StateCache::protect(uint64_t kvBlock, bool isResume) {
   const auto found = entries_.find(kvBlock);
   if (found == entries_.end())
     return {};
@@ -176,7 +181,10 @@ StateProtection StateCache::protect(uint64_t kvBlock) {
   if (entry.protections == std::numeric_limits<uint32_t>::max())
     throw std::overflow_error("composite state protection count overflowed");
   ++entry.protections;
-  return {kvBlock, entry.publication};
+  // Never exceeds protections, so it cannot overflow first.
+  if (isResume)
+    ++entry.resumeProtections;
+  return {kvBlock, entry.publication, isResume};
 }
 
 void StateCache::unprotect(StateProtection protection) noexcept {
@@ -186,6 +194,8 @@ void StateCache::unprotect(StateProtection protection) noexcept {
       !found->second.protections)
     return;
   --found->second.protections;
+  if (protection.isResume && found->second.resumeProtections)
+    --found->second.resumeProtections;
 }
 
 bool StateCache::isResident(StateProtection protection) const noexcept {
@@ -203,15 +213,19 @@ uint64_t StateCache::resumePoint() const noexcept {
 
 std::optional<CacheEvictionCandidate>
 StateCache::evictionCandidate(bool keepResumePoint,
-                              bool spareProtected) const noexcept {
+                              StateSparing sparing) const noexcept {
   // Withholding the resume point must not also spare the publications behind
   // it: a speculative pass still sheds everything else it would have taken.
   // Sparing protected states likewise walks on to the next publication.
   const uint64_t kept = keepResumePoint ? resumePoint() : 0;
+  const auto spared = [&](const Entry &entry) {
+    return sparing == StateSparing::Protected ? entry.protections != 0
+                                              : entry.resumeProtections != 0;
+  };
   for (uint64_t oldest : {checkpointEviction_.oldest, ordinaryEviction_.oldest}) {
     uint64_t candidate = oldest;
-    while (spareProtected && candidate &&
-           (candidate == kept || entries_.at(candidate).protections))
+    while (sparing != StateSparing::None && candidate &&
+           (candidate == kept || spared(entries_.at(candidate))))
       candidate = entries_.at(candidate).nextEvictable;
     if (candidate && candidate != kept)
       return CacheEvictionCandidate{candidate, entries_.at(candidate).lastUsed};
