@@ -186,7 +186,7 @@ WeightFile::WeightFile(metal::MetalBackend &backend,
 
     impl_->record = {
         std::move(relativePath), std::string(expectedMagic), layer, type,
-        impl_->mapping->bytes(),
+        impl_->mapping->bytes(), impl_->mapping->address(),
     };
     impl_->base = backend.wrapSharedMemory(
         impl_->mapping->address(), impl_->mapping->bytes(), impl_->mapping,

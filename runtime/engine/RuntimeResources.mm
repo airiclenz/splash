@@ -8,9 +8,11 @@
 #include <ctime>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 namespace splash::engine {
 namespace {
@@ -113,6 +115,26 @@ enum class StartupFloor : uint8_t {
   // Stricter here refused starts that would serve with growth paused.
   Reserve,
 };
+
+// The serving governor's host reading: the page estimate charged with the
+// hot weights the host does not hold wired, which it would otherwise credit
+// as reclaimable file cache. The sampler queries the package's mappings, so
+// it lives only in the governor, which RuntimeResources destroys before the
+// package. A test's provider replaces the whole reading.
+MemoryGovernor::HostAvailableMemoryProvider
+servingHostAvailableMemory(const RuntimeResourcesConfig &config,
+                           const model::ModelPackage &package) {
+  if (config.hostAvailableMemory)
+    return config.hostAvailableMemory;
+  const std::vector<model::WeightFileRecord> records =
+      model::hotWeightFiles(package, config.isSpeculationEnabled);
+  std::vector<MappedWeightRange> ranges;
+  ranges.reserve(records.size());
+  for (const model::WeightFileRecord &record : records)
+    ranges.push_back({record.mappedAddress, record.declaredBytes});
+  auto weights = std::make_shared<const WeightWiringSampler>(ranges);
+  return [weights] { return queryHostAvailableMemory(weights.get()); };
+}
 
 // The startup admission rule. Deliberately independent of the model size:
 // weights are mapped, not copied, so the package never has to fit in
@@ -327,9 +349,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
   const HostCushion hostCushion =
       EngineMemoryPolicy::hostCushion(device.physicalMemoryBytes);
+  // Load and its guard read the pages alone: until the package is mapped
+  // there are no weights to charge.
   MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory =
-      config.hostAvailableMemory ? config.hostAvailableMemory
-                                 : queryHostAvailableMemory;
+      config.hostAvailableMemory;
+  if (!hostAvailableMemory)
+    hostAvailableMemory = [] { return queryHostAvailableMemory(); };
   backend->setOperationGuard(
       [cancelled = config.cancelled, pressure = config.memoryPressure,
        hostAvailableMemory, hostCushion] {
@@ -455,7 +480,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     const uint64_t elasticGrowthCeiling =
         baselineBudget.hardBudgetBytes - runtimeReserve;
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
-        *backend, elasticGrowthCeiling, hostCushion, hostAvailableMemory);
+        *backend, elasticGrowthCeiling, hostCushion,
+        servingHostAvailableMemory(config, package));
     // Warmup's lazy state cells and KV meet the load guard's floor, not the
     // serving one; whoever starts serving ends the phase.
     memoryGovernor->setBootstrapping(true);

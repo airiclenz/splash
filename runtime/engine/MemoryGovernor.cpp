@@ -3,6 +3,7 @@
 #include <dispatch/dispatch.h>
 #include <mach/mach.h>
 #include <mach/mach_host.h>
+#include <mach/mach_vm.h>
 #include <mach/vm_statistics.h>
 #include <sys/sysctl.h>
 
@@ -21,9 +22,8 @@ void countDenial(uint64_t &counter) noexcept {
     ++counter;
 }
 
-} // namespace
-
-uint64_t estimateHostAvailableMemory(const HostMemoryPages &statistics,
+// The page estimate alone, before the weight charge.
+uint64_t estimatePageAvailableMemory(const HostMemoryPages &statistics,
                                      uint64_t pageSize,
                                      uint64_t physicalMemoryBytes) noexcept {
   if (!pageSize || !physicalMemoryBytes) return 0;
@@ -46,7 +46,83 @@ uint64_t estimateHostAvailableMemory(const HostMemoryPages &statistics,
   return usedBytes < physicalMemoryBytes ? physicalMemoryBytes - usedBytes : 0;
 }
 
-std::optional<HostMemorySample> queryHostAvailableMemory() noexcept {
+// One range's share of the weight sample budget: in proportion to its bytes,
+// at least one query and at most one per page. No mappable range is near
+// 2^56 bytes, so bytes times the budget cannot overflow.
+uint64_t weightSampleCount(uint64_t bytes, uint64_t totalBytes,
+                           uint64_t pageBytes) noexcept {
+  const uint64_t rangePages = (bytes + pageBytes - 1) / pageBytes;
+  const uint64_t share = bytes * kWeightWiringSamplePages / totalBytes;
+  return std::clamp<uint64_t>(share, 1, rangePages);
+}
+
+} // namespace
+
+uint64_t estimateHostAvailableMemory(const HostMemoryPages &statistics,
+                                     uint64_t pageSize,
+                                     uint64_t physicalMemoryBytes,
+                                     WeightResidency weights) noexcept {
+  const uint64_t available =
+      estimatePageAvailableMemory(statistics, pageSize, physicalMemoryBytes);
+  // Wired bytes above the weight bytes are someone else's and never credit.
+  const uint64_t unwiredWeightBytes =
+      weights.bytes - std::min(weights.bytes, weights.wiredBytes);
+  return available > unwiredWeightBytes ? available - unwiredWeightBytes : 0;
+}
+
+WeightWiringSampler::WeightWiringSampler(
+    std::span<const MappedWeightRange> ranges) {
+  // mach_vm_page_query resolves addresses in the host's VM pages.
+  const uint64_t pageBytes = vm_page_size;
+  uint64_t totalBytes = 0;
+  for (const MappedWeightRange &range : ranges) {
+    if (range.bytes && !range.address)
+      throw std::invalid_argument("a mapped weight range has no address");
+    if (range.bytes > std::numeric_limits<uint64_t>::max() - totalBytes)
+      throw std::invalid_argument("mapped weight ranges overflow");
+    totalBytes += range.bytes;
+  }
+  std::size_t sampleCount = 0;
+  for (const MappedWeightRange &range : ranges)
+    if (range.bytes)
+      sampleCount += weightSampleCount(range.bytes, totalBytes, pageBytes);
+  pages_.reserve(sampleCount);
+
+  // A range's n samples split it at bytes*i/n, so their shares sum to it
+  // exactly. Each queries the page under the middle of its share, which
+  // spaces the queries evenly across the range.
+  for (const MappedWeightRange &range : ranges) {
+    if (!range.bytes)
+      continue;
+    const uint64_t base = reinterpret_cast<uintptr_t>(range.address);
+    const uint64_t samples =
+        weightSampleCount(range.bytes, totalBytes, pageBytes);
+    for (uint64_t index = 0; index < samples; ++index) {
+      const uint64_t start = range.bytes * index / samples;
+      const uint64_t end = range.bytes * (index + 1) / samples;
+      const uint64_t middle = start + (end - start) / 2;
+      pages_.push_back({base + middle - middle % pageBytes, end - start});
+    }
+  }
+  bytes_ = totalBytes;
+}
+
+WeightResidency WeightWiringSampler::sample() const noexcept {
+  const mach_port_t task = mach_task_self();
+  uint64_t wiredBytes = 0;
+  for (const SamplePage &page : pages_) {
+    integer_t disposition = 0;
+    integer_t references = 0;
+    const kern_return_t result =
+        mach_vm_page_query(task, page.address, &disposition, &references);
+    if (result != KERN_SUCCESS || (disposition & VM_PAGE_QUERY_PAGE_WIRED))
+      wiredBytes += page.bytes;
+  }
+  return {bytes_, wiredBytes};
+}
+
+std::optional<HostMemorySample>
+queryHostAvailableMemory(const WeightWiringSampler *weights) noexcept {
   // Physical capacity is immutable; don't add a sysctl to every allocation.
   static const uint64_t physicalMemoryBytes = [] {
     uint64_t bytes = 0;
@@ -76,13 +152,17 @@ std::optional<HostMemorySample> queryHostAvailableMemory() noexcept {
       .compressor = statistics.compressor_page_count,
       .fileBacked = statistics.external_page_count,
       .purgeable = statistics.purgeable_count};
+  const WeightResidency residency = weights ? weights->sample()
+                                            : WeightResidency{};
   // Mach page counts are 32-bit, so their byte sizes cannot overflow.
   return HostMemorySample{
-      .availableBytes =
-          estimateHostAvailableMemory(pages, pageSize, physicalMemoryBytes),
+      .availableBytes = estimateHostAvailableMemory(
+          pages, pageSize, physicalMemoryBytes, residency),
       .inactiveBytes = pages.inactive * pageSize,
       .wiredBytes = pages.wired * pageSize,
-      .compressorBytes = pages.compressor * pageSize};
+      .compressorBytes = pages.compressor * pageSize,
+      .weightBytes = residency.bytes,
+      .weightWiredBytes = residency.wiredBytes};
 }
 
 std::optional<MemoryPressure> querySystemMemoryPressure() noexcept {
@@ -316,6 +396,8 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
       host.availableBytes,
       host.inactiveBytes,
       host.wiredBytes,
+      host.weightBytes,
+      host.weightWiredBytes,
       host.compressorBytes,
       hostCushion_.reserveBytes,
       hostCushion_.warningMarginBytes,

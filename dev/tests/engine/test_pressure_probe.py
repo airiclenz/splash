@@ -641,6 +641,54 @@ class BallastSizingTests(unittest.TestCase):
 
         self.assertEqual(record["host_headroom_bytes"], 0)
 
+    def test_autoBallast_chargesTheServersWeightBytes(self):
+        sample = snapshot(
+            memory_governor__host_reserve_bytes=2 * GIB,
+            memory_governor__reserved_bytes=GIB,
+            memory_governor__host_weight_bytes=15 * GIB,
+        )
+
+        record = probe.auto_ballast(sample, 22 * GIB)
+
+        self.assertEqual(
+            (record["host_headroom_bytes"], record["mb"]),
+            (4 * GIB, 4 * 1024 - 512 + 256),
+        )
+
+    def test_autoBallast_withoutWeightBytes_sizesAsBefore(self):
+        sample = self.governor_sample(2 * GIB, reserved_bytes=GIB)
+
+        record = probe.auto_ballast(sample, 13 * GIB)
+
+        self.assertEqual(
+            (record["host_headroom_bytes"], record["mb"]),
+            (10 * GIB, 10 * 1024 - 512 + 256),
+        )
+
+    def test_autoBallast_measuredIdleHost_sizesFromTheHonestHeadroom(self):
+        # Apollo-II idle: vm_stat credits the server's 16.4 GB of unwired hot
+        # weights as available, so today's sizing filled ~20 GB with ballast.
+        sample = snapshot(
+            memory_governor__host_reserve_bytes=2 * GIB,
+            memory_governor__reserved_bytes=0,
+            memory_governor__host_weight_bytes=16_425_680_896,
+        )
+
+        record = probe.auto_ballast(sample, 22_991_110_144)
+
+        self.assertEqual(record["host_headroom_bytes"], 4_417_945_600)
+
+    def test_autoBallast_weightAboveAvailable_readsZeroHeadroom(self):
+        sample = snapshot(
+            memory_governor__host_reserve_bytes=2 * GIB,
+            memory_governor__reserved_bytes=0,
+            memory_governor__host_weight_bytes=20 * GIB,
+        )
+
+        record = probe.auto_ballast(sample, 16 * GIB)
+
+        self.assertEqual((record["host_headroom_bytes"], record["mb"]), (0, 0))
+
     def test_autoBallast_serverWithoutReserveReadings_raises(self):
         with self.assertRaises(probe.ProbeError):
             probe.auto_ballast(

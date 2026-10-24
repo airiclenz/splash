@@ -194,6 +194,8 @@ SAMPLE_READINGS = (
     ("host_available_bytes", ("memory_governor", "host_available_bytes")),
     ("host_headroom_bytes", ("memory_governor", "host_headroom_bytes")),
     ("host_wired_bytes", ("memory_governor", "host_wired_bytes")),
+    ("host_weight_bytes", ("memory_governor", "host_weight_bytes")),
+    ("host_weight_wired_bytes", ("memory_governor", "host_weight_wired_bytes")),
     ("host_compressor_bytes", ("memory_governor", "host_compressor_bytes")),
     ("kv_pages_cache", ("kv", "pages_cache")),
     ("kv_pages_resident", ("kv", "pages_resident")),
@@ -298,10 +300,11 @@ def parse_host_available(text: str, physical_bytes: int) -> int:
     """Return the host's available bytes from `vm_stat` output.
 
     Physical memory less the used pages, crediting file-backed and purgeable
-    pages; mirrors estimateHostAvailableMemory
-    (runtime/engine/MemoryGovernor.cpp), so it reads what the server's next
-    host sample would. Keep the two in step. Raises ProbeError when a page
-    category is missing.
+    pages; mirrors the page estimate of estimateHostAvailableMemory
+    (runtime/engine/MemoryGovernor.cpp). Keep the two in step. The server
+    also charges its unwired hot weights, which `vm_stat` counts as
+    file-backed and this credits: auto_ballast takes them off. Raises
+    ProbeError when a page category is missing.
     """
     page_bytes, _swapouts = parse_vm_stat(text)
     counts = {}
@@ -418,10 +421,17 @@ def auto_ballast(snapshot: dict, host_available_bytes: int) -> dict:
 
     The host headroom is computed as the server does (MemoryGovernor::
     hostHeadroomBytes): `host_available_bytes`, read from `vm_stat` just now,
-    less the `/status` host_reserve_bytes and reserved_bytes, floored at 0.
-    The `/status` host_headroom_bytes is not used: the server refreshes its
-    host sample only every few tens of seconds, so a ballast sized from it
-    overshoots by every step taken in between.
+    less the `/status` host_weight_bytes, host_reserve_bytes and
+    reserved_bytes, floored at 0. The `/status` host_headroom_bytes is not
+    used: the server refreshes its host sample only every few tens of
+    seconds, so a ballast sized from it overshoots by every step taken in
+    between.
+
+    The server charges only the part of its hot weights the GPU does not hold
+    wired; `vm_stat` cannot tell which part that is, so the full
+    host_weight_bytes is charged. While the weights are wired (decode) this
+    under-reads and the ballast holds; it never overshoots. A server without
+    host_weight_bytes charges nothing, as before.
 
     N = headroom - the warning margin + BALLAST_OVERSHOOT_BYTES, floored at 0,
     so holding N more drops the headroom just past the server's warning
@@ -436,7 +446,8 @@ def auto_ballast(snapshot: dict, host_available_bytes: int) -> dict:
             "/status memory_governor carries no host_reserve_bytes or "
             "reserved_bytes to size --ballast-mb auto"
         )
-    headroom = max(0, host_available_bytes - reserve - reserved)
+    weight = status_reading(snapshot, (*governor, "host_weight_bytes")) or 0
+    headroom = max(0, host_available_bytes - weight - reserve - reserved)
     margin = host_warning_margin_bytes(reserve)
     ballast_bytes = max(0, headroom - margin + BALLAST_OVERSHOOT_BYTES)
     return {

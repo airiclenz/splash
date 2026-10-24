@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace splash::model {
 
@@ -87,6 +88,12 @@ loadModelPackage(metal::MetalBackend &backend,
 loadModelPackage(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
                  const ModelDescriptor &descriptor);
+
+// The weight files decode reads every step: the target's, plus the draft's
+// while speculation runs. Never the vision encoder's, which only image
+// prefill reads, so the host may evict it at no decode cost.
+[[nodiscard]] std::vector<WeightFileRecord>
+hotWeightFiles(const ModelPackage &package, bool isSpeculationEnabled);
 
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const DeviceCapabilities &device,

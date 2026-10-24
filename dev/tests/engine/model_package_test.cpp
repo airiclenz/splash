@@ -36,6 +36,7 @@ using splash::model::Qwen3_8Layout;
 using splash::model::Qwen3_8Weights;
 using splash::ops::VisionLayout;
 using splash::model::kWeightFileAlignment;
+using splash::model::hotWeightFiles;
 using splash::model::loadModelPackage;
 using splash::model::makeModelDescriptor;
 using splash::model::weightManifestFingerprint;
@@ -364,6 +365,10 @@ void testWeightFileValidationAndLifetime(MetalBackend &backend,
         require(reinterpret_cast<uintptr_t>(mappedAddress) %
                     kWeightFileAlignment == 0,
                 "mapped section start is not 16 KiB-aligned");
+        require(static_cast<const char *>(file.record().mappedAddress) +
+                        kWeightFileAlignment ==
+                    static_cast<const char *>(mappedAddress),
+                "weight file record does not carry its mapping's address");
         file.finish();
         require(backend.memoryStats().allocatedBytes >= baseline + fileBytes,
                 "zero-copy base allocation was not tracked");
@@ -560,10 +565,36 @@ void testSyntheticPackage(MetalBackend &backend,
         require(weightManifestFingerprint(records) ==
                     package.manifestFingerprintSha256,
                 "manifest fingerprint depends on load order");
+        for (WeightFileRecord &record : records)
+            record.mappedAddress = nullptr;
+        require(weightManifestFingerprint(records) ==
+                    package.manifestFingerprintSha256,
+                "manifest fingerprint depends on where files are mapped");
         records.front().declaredBytes += kWeightFileAlignment;
         require(weightManifestFingerprint(records) !=
                     package.manifestFingerprintSha256,
                 "manifest fingerprint ignores declared file sizes");
+
+        // The host estimate charges only decode-path weights: the target,
+        // the draft while speculation runs, never the cold vision encoder.
+        const std::vector<WeightFileRecord> hot =
+            hotWeightFiles(package, true);
+        const std::vector<WeightFileRecord> targetOnly =
+            hotWeightFiles(package, false);
+        require(hot.size() == target.layers + 2 + draft.layers + 1 &&
+                    declaredBytes(hot) ==
+                        expected.targetBytes + expected.draftBytes,
+                "hot weights with speculation are not target plus draft");
+        require(targetOnly.size() == target.layers + 2 &&
+                    declaredBytes(targetOnly) == expected.targetBytes,
+                "hot weights without speculation still charge the draft");
+        for (const WeightFileRecord &record : hot) {
+            require(record.mappedAddress != nullptr,
+                    "a hot weight file carries no mapped address");
+            for (const WeightFileRecord &vision : package.vision.files)
+                require(record.relativePath != vision.relativePath,
+                        "the vision encoder was charged as a hot weight");
+        }
 
         require(package.draft.layers[0].attentionDynamic.outputSize ==
                         draft.dynamicSize &&

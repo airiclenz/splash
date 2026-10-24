@@ -3,11 +3,14 @@
 #include "engine/MemoryPlan.hpp"
 #include "metal/MetalBackend.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <utility>
+#include <vector>
 
 namespace splash::engine {
 
@@ -21,12 +24,62 @@ struct HostMemoryPages {
   uint64_t purgeable = 0;
 };
 
+// The server's own hot weights: the bytes mapped and the part of them the
+// host holds wired at the moment of the sample.
+struct WeightResidency {
+  uint64_t bytes = 0;
+  uint64_t wiredBytes = 0;
+};
+
 // Physical memory minus used pages, crediting pageable file-backed and
-// purgeable pages regardless of active/inactive status. The governor also
-// enforces the engine budget, host reserve and system pressure.
+// purgeable pages regardless of active/inactive status, then charging the
+// unwired part of weights: those pages are file-backed and would be credited,
+// yet decode must fault them back in. Wired weights already count as used, so
+// the result does not depend on whether the GPU holds them wired at the
+// sample. Saturates at 0. The governor also enforces the engine budget, host
+// reserve and system pressure.
 [[nodiscard]] uint64_t estimateHostAvailableMemory(
     const HostMemoryPages &pages, uint64_t pageSize,
-    uint64_t physicalMemoryBytes) noexcept;
+    uint64_t physicalMemoryBytes, WeightResidency weights = {}) noexcept;
+
+// One mapped weight file, read-only and owned elsewhere.
+struct MappedWeightRange {
+  const void *address = nullptr;
+  uint64_t bytes = 0;
+};
+
+// The page queries one weight sample spends, at 0.5-1 us each; a range too
+// small for a share still gets one.
+inline constexpr std::size_t kWeightWiringSamplePages = 256;
+
+// Measures how much of the mapped weights is wired by querying the disposition
+// of evenly spaced pages, each standing for an equal share of its range.
+// Ranges get samples in proportion to their bytes, at least one each and at
+// most one per page. The page addresses are fixed at construction, so a
+// sample allocates nothing and takes no lock.
+//
+// The kernel reports an unmapped address as an unwired page, not as an
+// error, so the sampler must not outlive the ranges' mappings: a sample after
+// an unmap would charge those bytes as unwired.
+class WeightWiringSampler final {
+public:
+  // Throws std::invalid_argument for a range with bytes and no address.
+  explicit WeightWiringSampler(std::span<const MappedWeightRange> ranges);
+
+  // bytes is the sum of the ranges' bytes; wiredBytes the share of it whose
+  // sampled pages are wired. A failed query counts its share as wired, so a
+  // host that refuses the query charges nothing, as before this estimate.
+  [[nodiscard]] WeightResidency sample() const noexcept;
+
+private:
+  struct SamplePage {
+    uint64_t address = 0;
+    uint64_t bytes = 0;
+  };
+
+  std::vector<SamplePage> pages_;
+  uint64_t bytes_ = 0;
+};
 
 // One host page reading: the available estimate plus the page categories that
 // explain a low one, in bytes. The breakdown is telemetry only; admission and
@@ -36,11 +89,16 @@ struct HostMemorySample {
   uint64_t inactiveBytes = 0;
   uint64_t wiredBytes = 0;
   uint64_t compressorBytes = 0;
+  // The hot weights the estimate charged for, and their wired part.
+  uint64_t weightBytes = 0;
+  uint64_t weightWiredBytes = 0;
 };
 
-// One host_statistics64 call; empty when the host cannot be measured.
+// One host_statistics64 call, plus one weights->sample() when weights is
+// given (the serving governor, once the model is mapped); empty when the host
+// cannot be measured.
 [[nodiscard]] std::optional<HostMemorySample>
-queryHostAvailableMemory() noexcept;
+queryHostAvailableMemory(const WeightWiringSampler *weights = nullptr) noexcept;
 
 enum class MemoryPressure : uint8_t {
   Normal,
@@ -82,6 +140,9 @@ struct MemoryGovernorSnapshot {
   // invalid.
   uint64_t hostInactiveBytes = 0;
   uint64_t hostWiredBytes = 0;
+  // The hot weights charged against the estimate and their wired part.
+  uint64_t hostWeightBytes = 0;
+  uint64_t hostWeightWiredBytes = 0;
   uint64_t hostCompressorBytes = 0;
   uint64_t hostReserveBytes = 0;
   // The cushion's margins over the reserve: serving growth needs the warning
@@ -167,7 +228,7 @@ public:
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                  HostCushion hostCushion)
       : MemoryGovernor(backend, limitBytes, hostCushion,
-                       queryHostAvailableMemory) {}
+                       [] { return queryHostAvailableMemory(); }) {}
   // The backend adapters live here so MemoryGovernor.cpp never calls into
   // MetalBackend and links without it.
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,

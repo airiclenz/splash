@@ -30,6 +30,10 @@ struct WeightFileRecord final {
   uint32_t layer = 0;
   uint32_t type = 0;
   uint64_t declaredBytes = 0;
+  // The base of the file's read-only mapping, non-owning; the buffers cut
+  // from the file keep it mapped. Where a file is mapped is not part of its
+  // identity, so weightManifestFingerprint leaves it out.
+  const void *mappedAddress = nullptr;
 };
 
 // A read-only mmap with one no-copy Metal base buffer.  Sections are checked,

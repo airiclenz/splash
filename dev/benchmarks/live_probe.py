@@ -80,6 +80,8 @@ HOST_READINGS = (
     ("host_available_bytes", ("memory_governor", "host_available_bytes")),
     ("host_inactive_bytes", ("memory_governor", "host_inactive_bytes")),
     ("host_wired_bytes", ("memory_governor", "host_wired_bytes")),
+    ("host_weight_bytes", ("memory_governor", "host_weight_bytes")),
+    ("host_weight_wired_bytes", ("memory_governor", "host_weight_wired_bytes")),
     ("host_compressor_bytes", ("memory_governor", "host_compressor_bytes")),
 )
 
@@ -98,6 +100,8 @@ REPORT_ROWS = (
     ("host_available_bytes", "host available bytes"),
     ("host_inactive_bytes", "host inactive bytes"),
     ("host_wired_bytes", "host wired bytes"),
+    ("host_weight_bytes", "host weight bytes"),
+    ("host_weight_wired_bytes", "host weight wired bytes"),
     ("host_compressor_bytes", "host compressor bytes"),
     ("http_wall_ms", "HTTP wall ms"),
 )

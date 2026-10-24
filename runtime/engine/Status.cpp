@@ -44,6 +44,9 @@ void appendHostPages(std::ostringstream &out,
     return;
   out << ",\"host_inactive_bytes\":" << memoryGovernor.hostInactiveBytes
       << ",\"host_wired_bytes\":" << memoryGovernor.hostWiredBytes
+      << ",\"host_weight_bytes\":" << memoryGovernor.hostWeightBytes
+      << ",\"host_weight_wired_bytes\":"
+      << memoryGovernor.hostWeightWiredBytes
       << ",\"host_compressor_bytes\":" << memoryGovernor.hostCompressorBytes;
 }
 

@@ -57,6 +57,16 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
 
 } // namespace
 
+std::vector<WeightFileRecord> hotWeightFiles(const ModelPackage &package,
+                                             bool isSpeculationEnabled) {
+  std::vector<WeightFileRecord> records(package.targetFiles().begin(),
+                                        package.targetFiles().end());
+  if (isSpeculationEnabled)
+    records.insert(records.end(), package.draft.files.begin(),
+                   package.draft.files.end());
+  return records;
+}
+
 ModelPackage loadModelPackage(metal::MetalBackend &backend,
                               const std::filesystem::path &root) {
   return loadPackage(backend, root, inspectModelPackage(root));

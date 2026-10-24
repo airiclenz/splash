@@ -139,7 +139,8 @@ private:
 
 // Owns every process-wide native resource exactly once. Destruction order is
 // Cache -> logical KV pool -> state -> KV backing -> governor ->
-// model package -> Metal backend.
+// model package -> Metal backend. The governor's host reading samples the
+// package's weight mappings, so it must go before the package.
 class RuntimeResources final {
 public:
   [[nodiscard]] static std::unique_ptr<RuntimeResources>

@@ -1,11 +1,16 @@
 #include "TestFakeHost.hpp"
 #include "engine/MemoryGovernor.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
+#include <vector>
+
+#include <sys/mman.h>
+#include <unistd.h>
 
 using namespace splash;
 using namespace splash::engine;
@@ -347,6 +352,367 @@ void testSystemPressureReadsWithoutSampling() {
   require(host.samples == 1, "system pressure forced a host sample");
 }
 
+
+// Host page sets measured on a 32 GiB, 16 KiB-page host serving a 27B model
+// whose hot (target + draft) weights are kHotWeightBytes. The same state is
+// read with those weights pageable (idleUnwired) and GPU-wired (idleWired):
+// wiring moves exactly kHotWeightBytes of pages from file-backed to wired.
+constexpr uint64_t kHostPageBytes = 16384;
+constexpr uint64_t kHostPhysicalBytes = 34'359'738'368;
+constexpr uint64_t kHotWeightBytes = 16'425'680'896;
+constexpr HostMemoryPages kIdleUnwiredPages{
+    .active = 721'064, .inactive = 793'264, .speculative = 1'554,
+    .wired = 180'029, .compressor = 271'014, .fileBacked = 1'264'808,
+    .purgeable = 8'231};
+constexpr HostMemoryPages kIdleWiredPages{
+    .active = 121'064, .inactive = 390'720, .speculative = 1'554,
+    .wired = 1'182'573, .compressor = 271'014, .fileBacked = 262'264,
+    .purgeable = 8'231};
+// The floor of the run that swapped: 18.4 GB of mlocked ballast, most of the
+// weights evicted, the remaining file-backed pages counted as available.
+constexpr HostMemoryPages kSwapFloorPages{
+    .active = 300'000, .inactive = 153'857, .wired = 1'541'748,
+    .compressor = 68'970, .fileBacked = 250'000};
+// The raw estimate today credits the unwired weights as available.
+constexpr uint64_t kIdleRawAvailableBytes = 22'991'110'144;
+constexpr uint64_t kIdleHonestAvailableBytes = 6'565'429'248;
+constexpr uint64_t kIdleHonestHeadroomBytes = 4'417'945'600;
+constexpr uint64_t kSwapFloorRawAvailableBytes = 4'629'741'568;
+constexpr uint64_t kSwapFloorRawHeadroomBytes = 2'482'257'920;
+
+uint64_t measuredEstimate(const HostMemoryPages &pages,
+                          WeightResidency weights = {}) {
+  return estimateHostAvailableMemory(pages, kHostPageBytes,
+                                     kHostPhysicalBytes, weights);
+}
+
+// A governor on the measured host's cushion whose provider returns the
+// corrected sample for pages and weights, which the test may change.
+struct MeasuredHost final {
+  HostMemoryPages pages = kIdleUnwiredPages;
+  WeightResidency weights{kHotWeightBytes, 0};
+
+  [[nodiscard]] MemoryGovernor::HostAvailableMemoryProvider sampler() {
+    return [this]() -> std::optional<HostMemorySample> {
+      return HostMemorySample{.availableBytes = measuredEstimate(pages, weights),
+                              .weightBytes = weights.bytes,
+                              .weightWiredBytes = weights.wiredBytes};
+    };
+  }
+};
+
+MemoryGovernor makeMeasuredGovernor(MeasuredHost &host) {
+  return MemoryGovernor(
+      [](bool) {
+        metal::MetalMemoryStats stats;
+        stats.allocatedBytes = kResidentBytes;
+        return stats;
+      },
+      kLimitBytes, EngineMemoryPolicy::hostCushion(kHostPhysicalBytes),
+      host.sampler());
+}
+
+// The bug: at the floor of the run that swapped, the raw estimate read
+// 2.48 GB of headroom (Normal) while the unwired hot weights it credited
+// could not be resident. Charging them reads zero and latches Warning.
+void testEstimate_swapFloorWithUnwiredWeights_readsNoHeadroom() {
+  MeasuredHost host;
+  MemoryGovernor governor = makeMeasuredGovernor(host);
+  const uint64_t reserveBytes =
+      EngineMemoryPolicy::hostCushion(kHostPhysicalBytes).reserveBytes;
+
+  const uint64_t raw = measuredEstimate(kSwapFloorPages);
+  const uint64_t charged =
+      measuredEstimate(kSwapFloorPages, {kHotWeightBytes, 0});
+  host.pages = kSwapFloorPages;
+  governor.observe();
+  const MemoryGovernorSnapshot state = governor.snapshot();
+
+  require(raw == kSwapFloorRawAvailableBytes &&
+              raw - reserveBytes == kSwapFloorRawHeadroomBytes,
+          "the swap-floor page set no longer reproduces today's reading");
+  require(charged == 0,
+          "unwired hot weights were credited as available host memory");
+  require(state.pressure == MemoryPressure::Warning &&
+              !state.hostGrowthAllowed && state.hostHeadroomBytes == 0,
+          "the governor read headroom at the floor where the host swapped");
+}
+
+// The measured idle state: today's estimate reads 22.99 GB, of which
+// 16.4 GB is the server's own unwired hot weights.
+void testEstimate_idleWithUnwiredWeights_chargesThem() {
+  const uint64_t raw = measuredEstimate(kIdleUnwiredPages);
+
+  const uint64_t charged =
+      measuredEstimate(kIdleUnwiredPages, {kHotWeightBytes, 0});
+
+  require(raw == kIdleRawAvailableBytes,
+          "the idle page set no longer reproduces today's reading");
+  require(charged == kIdleHonestAvailableBytes,
+          "the idle estimate did not charge the unwired hot weights");
+}
+
+// Wired weights already count as used, so the corrected estimate is the
+// same whether the sample lands while the GPU holds them wired or not.
+void testEstimate_sameStateWiredOrUnwired_readsTheSame() {
+  const uint64_t unwired =
+      measuredEstimate(kIdleUnwiredPages, {kHotWeightBytes, 0});
+  const uint64_t wired =
+      measuredEstimate(kIdleWiredPages, {kHotWeightBytes, kHotWeightBytes});
+  const uint64_t wiredWithoutWeights = measuredEstimate(kIdleWiredPages);
+
+  require(unwired == kIdleHonestAvailableBytes &&
+              wired == kIdleHonestAvailableBytes &&
+              wiredWithoutWeights == kIdleHonestAvailableBytes,
+          "the estimate depends on whether the weights happen to be wired");
+}
+
+// Only the unwired part of the weights is charged; wired bytes above the
+// weight bytes never credit, and the charge saturates at zero.
+void testEstimate_weightCharge_isUnwiredBytesSaturating() {
+  constexpr uint64_t physicalPages = 100;
+  constexpr HostMemoryPages pages{.active = 20, .wired = 10};
+  const uint64_t raw = estimateHostAvailableMemory(pages, kHostPageBytes,
+                                                   physicalPages * kHostPageBytes);
+  auto withWeights = [&](uint64_t weightPages, uint64_t wiredPages) {
+    return estimateHostAvailableMemory(
+        pages, kHostPageBytes, physicalPages * kHostPageBytes,
+        {weightPages * kHostPageBytes, wiredPages * kHostPageBytes});
+  };
+
+  const uint64_t defaulted = estimateHostAvailableMemory(
+      pages, kHostPageBytes, physicalPages * kHostPageBytes, {});
+  const uint64_t none = withWeights(0, 0);
+  const uint64_t fullyWired = withWeights(40, 40);
+  const uint64_t fullyUnwired = withWeights(40, 0);
+  const uint64_t partlyWired = withWeights(40, 30);
+  const uint64_t overWired = withWeights(40, 60);
+  const uint64_t aboveAvailable = withWeights(71, 0);
+  const uint64_t atAvailable = withWeights(70, 0);
+
+  require(raw == 70 * kHostPageBytes && defaulted == raw && none == raw,
+          "no weights changed the estimate");
+  require(fullyWired == raw, "fully wired weights were charged twice");
+  require(fullyUnwired == 30 * kHostPageBytes,
+          "fully unwired weights were not charged in full");
+  require(partlyWired == 60 * kHostPageBytes,
+          "partly wired weights were not charged their unwired part");
+  require(overWired == raw,
+          "wired bytes above the weight bytes credited availability");
+  require(aboveAvailable == 0 && atAvailable == 0,
+          "the weight charge did not saturate at zero");
+}
+
+// The idle shape must not raise a false Warning or reclaim at normal
+// pressure, whether the weights are pageable or wired.
+void testGovernor_idleWithHotWeights_staysNormal() {
+  struct Case {
+    HostMemoryPages pages;
+    WeightResidency weights;
+  };
+  const Case cases[] = {
+      {kIdleUnwiredPages, {kHotWeightBytes, 0}},
+      {kIdleWiredPages, {kHotWeightBytes, kHotWeightBytes}},
+  };
+
+  for (const Case &idle : cases) {
+    MeasuredHost host{idle.pages, idle.weights};
+    MemoryGovernor governor = makeMeasuredGovernor(host);
+    MemoryPressurePolicy policy(64 * kMiB);
+    bool reclaimed = false;
+    for (int index = 0; index < kRepeatedSnapshots; ++index) {
+      governor.observe();
+      const MemoryReclaimDirective directive =
+          policy.update(governor.snapshot(), 1000.0 * index, false);
+      reclaimed = reclaimed || directive.reclaimEmptyKvExtents ||
+                  directive.evictAllUnpinnedPrefixes || directive.targetBytes;
+    }
+    const MemoryGovernorSnapshot state = governor.snapshot();
+
+    require(state.hostHeadroomBytes == kIdleHonestHeadroomBytes,
+            "the idle headroom is not the honest 4.42 GB");
+    require(state.pressure == MemoryPressure::Normal &&
+                state.hostGrowthAllowed && state.growthAllowed,
+            "the idle server latched a false Warning");
+    require(!reclaimed, "the idle server reclaimed at normal pressure");
+  }
+}
+
+void testObserve_storesWeightResidency() {
+  MeasuredHost host;
+  host.weights = {kHotWeightBytes, kHotWeightBytes / 4};
+  MemoryGovernor governor = makeMeasuredGovernor(host);
+  const MemoryGovernorSnapshot stored = governor.snapshot();
+
+  host.weights = {kHotWeightBytes, kHotWeightBytes};
+  host.pages = kIdleWiredPages;
+  governor.observe();
+  const MemoryGovernorSnapshot observed = governor.snapshot();
+
+  require(stored.hostWeightBytes == kHotWeightBytes &&
+              stored.hostWeightWiredBytes == kHotWeightBytes / 4,
+          "the startup weight residency was not stored");
+  require(observed.hostWeightBytes == kHotWeightBytes &&
+              observed.hostWeightWiredBytes == kHotWeightBytes,
+          "observe() did not store the new weight residency");
+}
+
+void testObserve_invalidSample_clearsWeightResidency() {
+  bool measurable = true;
+  MemoryGovernor governor(
+      [](bool) {
+        metal::MetalMemoryStats stats;
+        stats.allocatedBytes = kResidentBytes;
+        return stats;
+      },
+      kLimitBytes, kCushion,
+      [&measurable]() -> std::optional<HostMemorySample> {
+        if (!measurable)
+          return std::nullopt;
+        return HostMemorySample{.availableBytes = kAmpleHostBytes,
+                                .weightBytes = kHotWeightBytes,
+                                .weightWiredBytes = kHotWeightBytes / 2};
+      });
+
+  measurable = false;
+  governor.observe();
+  const MemoryGovernorSnapshot invalid = governor.snapshot();
+
+  require(!invalid.hostMeasurementValid && invalid.hostWeightBytes == 0 &&
+              invalid.hostWeightWiredBytes == 0,
+          "a failed sample kept a stale weight residency");
+}
+
+// An anonymous page-aligned mapping standing in for a weight file, unlocked
+// and unmapped on destruction.
+class TestMapping final {
+public:
+  explicit TestMapping(std::size_t pages)
+      : bytes_(pages * static_cast<std::size_t>(sysconf(_SC_PAGESIZE))) {
+    void *address = mmap(nullptr, bytes_, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON, -1, 0);
+    require(address != MAP_FAILED, "unable to map test weight pages");
+    address_ = address;
+  }
+  ~TestMapping() {
+    munlock(address_, bytes_);
+    munmap(address_, bytes_);
+  }
+  TestMapping(const TestMapping &) = delete;
+  TestMapping &operator=(const TestMapping &) = delete;
+
+  [[nodiscard]] MappedWeightRange range() const noexcept {
+    return {address_, bytes_};
+  }
+  [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
+  void lock(std::size_t offset, std::size_t bytes) {
+    require(mlock(static_cast<char *>(address_) + offset, bytes) == 0,
+            "unable to mlock test weight pages");
+  }
+  void lock() { lock(0, bytes_); }
+  void unlock() noexcept { munlock(address_, bytes_); }
+
+private:
+  std::size_t bytes_ = 0;
+  void *address_ = nullptr;
+};
+
+constexpr std::size_t kFirstRangePages = 24;
+constexpr std::size_t kSecondRangePages = 40;
+
+void testWeightWiringSampler_nothingLocked_readsNoWiredBytes() {
+  TestMapping first(kFirstRangePages);
+  TestMapping second(kSecondRangePages);
+  const std::vector<MappedWeightRange> ranges{first.range(), second.range()};
+  const WeightWiringSampler sampler(ranges);
+
+  const WeightResidency residency = sampler.sample();
+
+  require(residency.bytes == first.bytes() + second.bytes() &&
+              residency.wiredBytes == 0,
+          "pageable weight pages were read as wired");
+}
+
+void testWeightWiringSampler_allLocked_readsAllWired() {
+  TestMapping first(kFirstRangePages);
+  TestMapping second(kSecondRangePages);
+  const std::vector<MappedWeightRange> ranges{first.range(), second.range()};
+  const WeightWiringSampler sampler(ranges);
+  first.lock();
+  second.lock();
+
+  const WeightResidency residency = sampler.sample();
+
+  require(residency.bytes == first.bytes() + second.bytes() &&
+              residency.wiredBytes == residency.bytes,
+          "wired weight pages were not read as wired");
+}
+
+void testWeightWiringSampler_oneRangeLocked_readsThatRangeExactly() {
+  TestMapping first(kFirstRangePages);
+  TestMapping second(kSecondRangePages);
+  const std::vector<MappedWeightRange> ranges{first.range(), second.range()};
+  const WeightWiringSampler sampler(ranges);
+  second.lock();
+
+  const WeightResidency residency = sampler.sample();
+  second.unlock();
+  const WeightResidency released = sampler.sample();
+
+  require(residency.wiredBytes == second.bytes(),
+          "a wired range was not read as exactly its own bytes");
+  require(released.wiredBytes == 0, "an unwired range still read as wired");
+}
+
+// A range larger than the sample budget is sampled evenly: half of it wired
+// reads half, within the weight of one sample on either side.
+void testWeightWiringSampler_largeRangeHalfLocked_readsAboutHalf() {
+  const std::size_t pages = 4 * kWeightWiringSamplePages;
+  TestMapping mapping(pages);
+  const std::vector<MappedWeightRange> ranges{mapping.range()};
+  const WeightWiringSampler sampler(ranges);
+  mapping.lock(0, static_cast<std::size_t>(mapping.bytes() / 2));
+
+  const WeightResidency residency = sampler.sample();
+
+  const uint64_t sampleBytes = mapping.bytes() / kWeightWiringSamplePages;
+  const uint64_t half = mapping.bytes() / 2;
+  require(residency.bytes == mapping.bytes(),
+          "a large range did not report its bytes");
+  require(residency.wiredBytes + sampleBytes >= half &&
+              residency.wiredBytes <= half + sampleBytes,
+          "a half-wired range was not sampled evenly across its pages");
+}
+
+void testWeightWiringSampler_noRanges_readsNothing() {
+  const std::vector<MappedWeightRange> ranges;
+  const WeightWiringSampler sampler(ranges);
+
+  const WeightResidency residency = sampler.sample();
+
+  require(residency.bytes == 0 && residency.wiredBytes == 0,
+          "an empty sampler reported weight bytes");
+}
+
+void testQueryHostAvailableMemory_withSampler_reportsWeightResidency() {
+  TestMapping mapping(kFirstRangePages);
+  const std::vector<MappedWeightRange> ranges{mapping.range()};
+  const WeightWiringSampler sampler(ranges);
+  mapping.lock();
+
+  const std::optional<HostMemorySample> withWeights =
+      queryHostAvailableMemory(&sampler);
+  const std::optional<HostMemorySample> withoutWeights =
+      queryHostAvailableMemory();
+
+  require(withWeights && withWeights->weightBytes == mapping.bytes() &&
+              withWeights->weightWiredBytes == mapping.bytes(),
+          "the host sample did not report the sampler's weight residency");
+  require(withoutWeights && withoutWeights->weightBytes == 0 &&
+              withoutWeights->weightWiredBytes == 0,
+          "a host sample without a sampler reported weight bytes");
+}
+
 } // namespace
 
 int main() {
@@ -363,6 +729,19 @@ int main() {
     testInvalidCushionRejected();
     testSystemPressureReadsWithoutSampling();
     testObserveStoresPageBreakdown();
+    testEstimate_swapFloorWithUnwiredWeights_readsNoHeadroom();
+    testEstimate_idleWithUnwiredWeights_chargesThem();
+    testEstimate_sameStateWiredOrUnwired_readsTheSame();
+    testEstimate_weightCharge_isUnwiredBytesSaturating();
+    testGovernor_idleWithHotWeights_staysNormal();
+    testObserve_storesWeightResidency();
+    testObserve_invalidSample_clearsWeightResidency();
+    testWeightWiringSampler_nothingLocked_readsNoWiredBytes();
+    testWeightWiringSampler_allLocked_readsAllWired();
+    testWeightWiringSampler_oneRangeLocked_readsThatRangeExactly();
+    testWeightWiringSampler_largeRangeHalfLocked_readsAboutHalf();
+    testWeightWiringSampler_noRanges_readsNothing();
+    testQueryHostAvailableMemory_withSampler_reportsWeightResidency();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {
