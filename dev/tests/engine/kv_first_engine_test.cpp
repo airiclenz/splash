@@ -4391,6 +4391,31 @@ std::vector<uint32_t> checkpointLanePrompt(uint32_t token) {
   return std::vector<uint32_t>(defaultCheckpointTokens + 2049, token);
 }
 
+// Under a host that denies every new state quantum, a granted lane still
+// publishes its first checkpoint: its admission armed the reserve from the
+// pool, and the capture spends that reserve without asking the host.
+void testHostConstrainedLanePublishesItsFirstCheckpoint() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  const auto ledger = std::make_shared<SnapshotLedger>();
+  ledger->pooledQuanta = 1;
+  ledger->isHostConstrained = true;
+  executor.snapshotLedger = ledger;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+
+  engine.submit(request(550, checkpointLanePrompt(36)));
+  runUntilCheckpoint(engine, 1);
+
+  require(engine.snapshot().checkpointPublications >= 1 &&
+              engine.snapshot().checkpointPublicationFailures == 0 &&
+              ledger->reserveCaptures == 1 && ledger->allocations == 0,
+          "host-constrained lane did not publish its first checkpoint "
+          "from its reserve");
+}
+
 // Under paused growth the lane's next chunk takes idle cached pages: the
 // idle prefix's state and KV go, and the lane's fresh checkpoint stays. The
 // idle conversation's end is first pushed out of the ring, so its state is
@@ -5797,6 +5822,7 @@ int main() {
     testRestoredCheckpointAtReplayEndBecomesOrdinary();
     testRetryRetiresCheckpointAtDeeperJunction();
     testPinnedCheckpointSkipsReplacementButNotOrdinaryState();
+    testHostConstrainedLanePublishesItsFirstCheckpoint();
     testPausedGrowthReclaimKeepsTheResidentLanesCheckpoint();
     testGrowthReclaimTakesAResidentCheckpointRatherThanStall();
     testHostPressureSuspensionResumesFromTheLanesCheckpoint();

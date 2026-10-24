@@ -101,6 +101,155 @@ private:
   std::shared_ptr<uint64_t> idlePool_;
 };
 
+// ============================================================================
+// Opt-in model of where QwenStateStorage finds a snapshot's buffers, counted
+// in quanta (one GDN cell plus one draft ring). Activation arms the lane's
+// reserve quantum, from the pool first, then a new allocation; a snapshot
+// spends the reserve first, then a pooled quantum, then a new allocation; a
+// host-constrained ledger denies every new allocation. A dropped state
+// refills its origin lane's spent reserve while that lane is resident, as
+// QwenCompositeState::~QwenCompositeState does, else it goes to the pool.
+// Suspension and end clear the owner and return its reserve to the pool, as
+// QwenStateStorage::releaseSlot does; suspension then releases the whole
+// pool, as Runtime::suspend does.
+class SnapshotLedger final {
+public:
+  // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+  // Bytes of one quantum, the size every fake state reports.
+  static constexpr uint64_t quantumBytes = 64;
+
+  // ==========================================================================
+  // Arms the reserve of `slot` for `requestId`; false when no pooled quantum
+  // exists and the host denies a new one, leaving the ledger unchanged.
+  bool activate(uint32_t slot, uint64_t requestId) {
+    if (slot >= reserves_.size())
+      reserves_.resize(slot + 1);
+    if (!acquire())
+      return false;
+    reserves_[slot] = {requestId, true};
+    return true;
+  }
+
+  // ==========================================================================
+  // Clears the owner of `slot` and returns its unspent reserve to the pool.
+  void release(uint32_t slot) {
+    if (slot >= reserves_.size())
+      return;
+    if (reserves_[slot].isArmed)
+      ++pooledQuanta;
+    reserves_[slot] = {};
+  }
+
+  // ==========================================================================
+  // Releases pooled quanta to the host until `keep` remain, as
+  // QwenStateStorage::releaseIdle does; returns how many it released.
+  uint32_t releasePooled(uint32_t keep) noexcept {
+    const uint32_t released = pooledQuanta > keep ? pooledQuanta - keep : 0;
+    pooledQuanta -= released;
+    releasedQuanta += released;
+    return released;
+  }
+
+  // ==========================================================================
+  // Takes the quantum a snapshot of `slot` copies into: the slot's reserve,
+  // then the pool, then a new allocation. False when all three are denied.
+  bool takeForSnapshot(uint32_t slot) {
+    if (slot < reserves_.size() && reserves_[slot].isArmed) {
+      reserves_[slot].isArmed = false;
+      ++reserveCaptures;
+      return true;
+    }
+    return acquire();
+  }
+
+  // ==========================================================================
+  // True when dropping a state captured by `requestId` on `slot` would refill
+  // that lane's spent reserve rather than reach the pool.
+  bool refillsReserve(uint32_t slot, uint64_t requestId) const noexcept {
+    return slot < reserves_.size() && reserves_[slot].requestId == requestId &&
+           !reserves_[slot].isArmed;
+  }
+
+  // ==========================================================================
+  // Returns a dropped state's quantum to its origin lane's spent reserve, or
+  // else to the pool.
+  void drop(uint32_t slot, uint64_t requestId) noexcept {
+    if (refillsReserve(slot, requestId)) {
+      reserves_[slot].isArmed = true;
+      ++reserveRefills;
+      return;
+    }
+    ++pooledQuanta;
+  }
+
+  // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+  // Quanta free for any activation or snapshot.
+  uint32_t pooledQuanta = 0;
+  // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+  // Set, the host denies every new quantum, as the governor does under its
+  // host cushion.
+  bool isHostConstrained = false;
+  // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+  // New quanta the host granted and denied.
+  uint32_t allocations = 0;
+  uint32_t deniedAllocations = 0;
+  // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+  // Snapshots that spent a reserve, and drops that refilled one.
+  uint32_t reserveCaptures = 0;
+  uint32_t reserveRefills = 0;
+  // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+  // Pooled quanta released to the host.
+  uint32_t releasedQuanta = 0;
+
+private:
+  struct Reserve final {
+    uint64_t requestId = 0;
+    bool isArmed = false;
+  };
+
+  bool acquire() noexcept {
+    if (pooledQuanta) {
+      --pooledQuanta;
+      return true;
+    }
+    if (isHostConstrained) {
+      ++deniedAllocations;
+      return false;
+    }
+    ++allocations;
+    return true;
+  }
+
+  // Indexed by slot; a zero request id marks a slot with no owner.
+  std::vector<Reserve> reserves_;
+};
+
+// A snapshot whose quantum the ledger tracks: dropping it refills its origin
+// lane's reserve or pools the quantum, and eviction credits only the bytes
+// that reach the pool, as QwenCompositeState::reclaimableBytes does.
+class LedgerState final : public CompositeState {
+public:
+  LedgerState(bool carriesDraft, std::shared_ptr<SnapshotLedger> ledger,
+              uint32_t originSlot, uint64_t originRequestId)
+      : carriesDraft_(carriesDraft), ledger_(std::move(ledger)),
+        originSlot_(originSlot), originRequestId_(originRequestId) {}
+  ~LedgerState() override { ledger_->drop(originSlot_, originRequestId_); }
+  uint64_t bytes() const noexcept override {
+    return SnapshotLedger::quantumBytes;
+  }
+  uint64_t reclaimableBytes() const noexcept override {
+    return ledger_->refillsReserve(originSlot_, originRequestId_) ? 0
+                                                                  : bytes();
+  }
+  bool carriesDraft() const noexcept override { return carriesDraft_; }
+
+private:
+  bool carriesDraft_;
+  std::shared_ptr<SnapshotLedger> ledger_;
+  uint32_t originSlot_;
+  uint64_t originRequestId_;
+};
+
 struct MaskOverlapState final {
   uint64_t requestId = 0;
   bool emitted = false;
@@ -176,6 +325,9 @@ public:
             return entry.second.resident && entry.second.slot == slot;
           });
       if (!used) {
+        if (snapshotLedger && !snapshotLedger->activate(slot, request.id))
+          return {{}, StateFailure::MemoryPressure,
+                  metal::AllocationFailure::HostPressure};
         requests.emplace(
             request.id,
             Request{slot, 0, true, false, 0, request.maxNewTokens});
@@ -189,6 +341,10 @@ public:
     if (!entry.resident)
       throw std::logic_error("request is already suspended");
     suspendedPositions.push_back(entry.position);
+    if (snapshotLedger) {
+      snapshotLedger->release(entry.slot);
+      static_cast<void>(snapshotLedger->releasePooled(0));
+    }
     entry.resident = false;
     entry.position = 0;
     ++suspensions;
@@ -221,6 +377,9 @@ public:
                    candidate.second.slot == slot;
           });
       if (!used) {
+        if (snapshotLedger && !snapshotLedger->activate(slot, id))
+          return {{}, StateFailure::MemoryPressure,
+                  metal::AllocationFailure::HostPressure};
         entry.slot = slot;
         entry.resident = true;
         entry.position = 0;
@@ -338,7 +497,8 @@ public:
   // The production model copies the lane's state into a cache slot at its
   // current page-aligned boundary and returns nullptr when no slot is free
   // and the governor denies a new one. The fake denies the next
-  // `deniedSnapshots` calls, or every call made at `denySnapshotAtBoundary`.
+  // `deniedSnapshots` calls, or every call made at `denySnapshotAtBoundary`,
+  // and, with a `snapshotLedger`, every call the ledger finds no quantum for.
   std::shared_ptr<const CompositeState> snapshot(uint64_t id) override {
     ++snapshotAttempts;
     if (snapshotObserver)
@@ -351,14 +511,31 @@ public:
         *denySnapshotAtBoundary == requests.at(id).position) {
       return nullptr;
     }
+    const Request &lane = requests.at(id);
+    if (snapshotLedger) {
+      if (!snapshotLedger->takeForSnapshot(lane.slot))
+        return nullptr;
+      ++snapshots;
+      return std::make_shared<LedgerState>(
+          targetOnlyAtBoundary != lane.position, snapshotLedger, lane.slot, id);
+    }
     ++snapshots;
-    return std::make_shared<State>(
-        targetOnlyAtBoundary != requests.at(id).position,
-        reserveRefillingSnapshots);
+    return std::make_shared<State>(targetOnlyAtBoundary != lane.position,
+                                   reserveRefillingSnapshots);
   }
   uint64_t reclaimIdleState() noexcept override {
     if (idleStateReclaimable && !idleStateReclaimable())
       return 0;
+    // One pooled quantum per call, as the production pool releases one idle
+    // buffer per call before anything rebuildable.
+    if (snapshotLedger && snapshotLedger->pooledQuanta) {
+      static_cast<void>(
+          snapshotLedger->releasePooled(snapshotLedger->pooledQuanta - 1));
+      reclaimedIdleStateBytes += SnapshotLedger::quantumBytes;
+      if (physicalGrowthBlocked)
+        *physicalGrowthBlocked = false;
+      return SnapshotLedger::quantumBytes;
+    }
     const uint64_t released = reclaimableIdleStateBytes + *parkedStateBytes;
     reclaimableIdleStateBytes = 0;
     *parkedStateBytes = 0;
@@ -371,7 +548,12 @@ public:
     if (overlap && overlap->emitted && overlap->requestId == id)
       overlap->provided = true;
   }
-  void end(uint64_t id) override { requests.erase(id); }
+  void end(uint64_t id) override {
+    const auto found = requests.find(id);
+    if (snapshotLedger && found != requests.end() && found->second.resident)
+      snapshotLedger->release(found->second.slot);
+    requests.erase(id);
+  }
 
   struct Request {
     uint32_t slot = 0;
@@ -394,6 +576,9 @@ public:
   std::optional<uint32_t> targetOnlyAtBoundary;
   // Snapshots return states whose drop refills their lane's reserve.
   bool reserveRefillingSnapshots = false;
+  // Set, snapshots draw on and return to this reserve and pool ledger, which
+  // also gates activation; null keeps the count and boundary denials only.
+  std::shared_ptr<SnapshotLedger> snapshotLedger;
   std::unordered_map<uint64_t, uint32_t> restoredLengths;
   uint32_t beginAttempts = 0;
   uint32_t deniedBegins = 0;
