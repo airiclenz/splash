@@ -27,10 +27,12 @@ exits AGENT_COLD_TURN_EXIT_CODE when a turn after the first reuses 0 tokens.
 from the burst phase's start until it ends (with ``--agent-turns``, from the
 second turn's start until the last turn ends), so the server serves under host
 pressure. ``--ballast-mb auto`` engages only once the server holds a request in
-prefill or decode, then grows the ballast a step at a time from fresh
-``/status`` ``memory_governor`` samples, to keep the host just past the server's
-warning margin; it stops growing at half the swap guard's cap and sheds a step
-while swapouts still rise past three quarters of it. The child wires its pages
+prefill or decode, then grows the ballast a step at a time, each sized from a
+fresh ``vm_stat`` host reading taken as the server's ``memory_governor`` does,
+to keep the host just past the server's warning margin. A step never exceeds a
+quarter of the swap guard's cap nor the swap room left below half of it, and
+swapouts are re-read before each step: growth stops at half the cap and a step
+is shed while swapouts still rise past three quarters of it. The child wires its pages
 (mlock), or touches the ones the host would not wire, so they stay resident. It
 exits when its pipe to the probe closes, so a killed probe leaves no ballast
 behind.
@@ -102,10 +104,14 @@ BALLAST_AUTO = "auto"
 # The agent turn the ballast is held from: the first turn warms the conversation.
 BALLAST_AGENT_TURN = 1
 # os.urandom chunk the ballast is filled with: bounds the transient copy. Also
-# the smallest step `auto` grows by.
+# the smallest target `auto` still grows toward.
 BALLAST_CHUNK_BYTES = 64 * BYTES_PER_MB
-# The most `auto` grows by between two `/status` readings.
+# The most `auto` grows by between two host readings.
 BALLAST_STEP_BYTES = 256 * BYTES_PER_MB
+# Share of the swap guard's cap one `auto` step holds at most: a step that
+# swapped out in full, seen a tick late, still leaves swapouts at most at
+# BALLAST_SWAP_SHED_SHARE of the cap, short of the trip.
+BALLAST_STEP_GUARD_SHARE = 0.25
 # Share of the swap guard's cap at which `auto` stops growing the ballast.
 BALLAST_SWAP_GROW_SHARE = 0.5
 # Share past which `auto` sheds its newest step while swapouts still rise.
@@ -120,6 +126,15 @@ BALLAST_EXIT_SECONDS = 5.0
 MINIMUM_HOST_WARNING_MARGIN_BYTES = 256 * BYTES_PER_MB
 # How far `auto` pushes host headroom below the warning margin.
 BALLAST_OVERSHOOT_BYTES = 256 * BYTES_PER_MB
+# `vm_stat` labels of the page categories estimateHostAvailableMemory reads.
+VM_STAT_USED_PAGES = (
+    "Pages active",
+    "Pages inactive",
+    "Pages speculative",
+    "Pages wired down",
+    "Pages occupied by compressor",
+)
+VM_STAT_RECLAIMABLE_PAGES = ("File-backed pages", "Pages purgeable")
 
 # The `/status` causes that split checkpoint_publication_failures.
 CHECKPOINT_FAILURE_CAUSES = (
@@ -279,6 +294,39 @@ def read_vm_stat() -> tuple[int, int]:
 
 
 # ------------------------------------------------------------------------------
+def parse_host_available(text: str, physical_bytes: int) -> int:
+    """Return the host's available bytes from `vm_stat` output.
+
+    Physical memory less the used pages, crediting file-backed and purgeable
+    pages; mirrors estimateHostAvailableMemory
+    (runtime/engine/MemoryGovernor.cpp), so it reads what the server's next
+    host sample would. Keep the two in step. Raises ProbeError when a page
+    category is missing.
+    """
+    page_bytes, _swapouts = parse_vm_stat(text)
+    counts = {}
+    for label in VM_STAT_USED_PAGES + VM_STAT_RECLAIMABLE_PAGES:
+        found = re.search(rf"{label}:\s+(\d+)", text)
+        if not found:
+            raise ProbeError(f"vm_stat output carries no '{label}' count")
+        counts[label] = int(found.group(1))
+    used_pages = sum(counts[label] for label in VM_STAT_USED_PAGES) - sum(
+        counts[label] for label in VM_STAT_RECLAIMABLE_PAGES
+    )
+    if used_pages < 0:
+        return 0
+    return max(0, physical_bytes - used_pages * page_bytes)
+
+
+# ------------------------------------------------------------------------------
+def read_host_available() -> int:
+    """Run `vm_stat` and return the host's available bytes, read now."""
+    output = subprocess.run(["vm_stat"], capture_output=True, text=True, check=True)
+    physical_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    return parse_host_available(output.stdout, physical_bytes)
+
+
+# ------------------------------------------------------------------------------
 def read_os_pressure_level():
     """Return `kern.memorystatus_vm_pressure_level`, or None when unreadable."""
     try:
@@ -365,23 +413,30 @@ def host_warning_margin_bytes(reserve_bytes: int) -> int:
 
 
 # ------------------------------------------------------------------------------
-def auto_ballast(snapshot: dict) -> dict:
-    """Return how much more `--ballast-mb auto` holds, from one `/status` sample.
+def auto_ballast(snapshot: dict, host_available_bytes: int) -> dict:
+    """Return how much more `--ballast-mb auto` holds, from a fresh host reading.
 
-    N = host headroom - the warning margin + BALLAST_OVERSHOOT_BYTES, floored
-    at 0, so holding N more drops the headroom just past the server's warning
-    margin; Ballast.step grows by it a step at a time. host_headroom_bytes is already net of host_reserve_bytes, so the
-    reserve is not subtracted again. Raises ProbeError when the server exports
-    neither reading.
+    The host headroom is computed as the server does (MemoryGovernor::
+    hostHeadroomBytes): `host_available_bytes`, read from `vm_stat` just now,
+    less the `/status` host_reserve_bytes and reserved_bytes, floored at 0.
+    The `/status` host_headroom_bytes is not used: the server refreshes its
+    host sample only every few tens of seconds, so a ballast sized from it
+    overshoots by every step taken in between.
+
+    N = headroom - the warning margin + BALLAST_OVERSHOOT_BYTES, floored at 0,
+    so holding N more drops the headroom just past the server's warning
+    margin; Ballast.step grows toward it a bounded step at a time. Raises
+    ProbeError when the server exports neither reserve reading.
     """
     governor = ("memory_governor",)
-    headroom = status_reading(snapshot, (*governor, "host_headroom_bytes"))
     reserve = status_reading(snapshot, (*governor, "host_reserve_bytes"))
-    if headroom is None or reserve is None:
+    reserved = status_reading(snapshot, (*governor, "reserved_bytes"))
+    if reserve is None or reserved is None:
         raise ProbeError(
-            "/status memory_governor carries no host_headroom_bytes or "
-            "host_reserve_bytes to size --ballast-mb auto"
+            "/status memory_governor carries no host_reserve_bytes or "
+            "reserved_bytes to size --ballast-mb auto"
         )
+    headroom = max(0, host_available_bytes - reserve - reserved)
     margin = host_warning_margin_bytes(reserve)
     ballast_bytes = max(0, headroom - margin + BALLAST_OVERSHOOT_BYTES)
     return {
@@ -390,6 +445,26 @@ def auto_ballast(snapshot: dict) -> dict:
         "host_reserve_bytes": reserve,
         "warning_margin_bytes": margin,
     }
+
+
+# ------------------------------------------------------------------------------
+def auto_step_bytes(target_bytes: int, swap_grown_bytes: int, swap_cap_bytes: int):
+    """Return the page-aligned size of the next `auto` growth step; 0 holds.
+
+    The least of the auto_ballast target, BALLAST_STEP_BYTES,
+    BALLAST_STEP_GUARD_SHARE of the swap guard's cap and the swap room left
+    below BALLAST_SWAP_GROW_SHARE of it. A step whose bytes all push other
+    pages to swap therefore lifts swapouts no further than the share where
+    growth stops, so `swap_limited` engages before the guard trips.
+    """
+    swap_room = int(swap_cap_bytes * BALLAST_SWAP_GROW_SHARE) - swap_grown_bytes
+    step_bytes = min(
+        target_bytes,
+        BALLAST_STEP_BYTES,
+        int(swap_cap_bytes * BALLAST_STEP_GUARD_SHARE),
+        swap_room,
+    )
+    return max(0, step_bytes - step_bytes % mmap.PAGESIZE)
 
 
 # ------------------------------------------------------------------------------
@@ -550,19 +625,24 @@ class Ballast:
     held from; a fixed size is filled there, before the phase's requests. An
     `auto` ballast is driven by `tend`, which run_phase calls about every
     SWAP_POLL_SECONDS: it engages once the server holds a request in prefill or
-    decode, then grows the ballast BALLAST_STEP_BYTES at a time while the
-    fresh `/status` headroom stays above the auto_ballast target, and stops
+    decode, then each tick re-reads the host with `read_host_available()` and
+    grows the ballast toward the auto_ballast target by at most one
+    auto_step_bytes step, checking swapouts before every step and stopping
     short of the swap guard. `start_child()` returns an object offering
     `resize(command, byte_count, stop)` and `close()`. `arm` and `release` are
     idempotent, so phase edges, guard trips and `main` may all release.
     """
 
     # --------------------------------------------------------------------------
-    def __init__(self, request, client, start_child):
-        """`request` is None (no ballast), BALLAST_AUTO, or a size in MB."""
+    def __init__(self, request, client, start_child, read_host_available):
+        """`request` is None (no ballast), BALLAST_AUTO, or a size in MB.
+
+        `read_host_available()` returns the host's available bytes, read now.
+        """
         self.request = request
         self.client = client
         self.start_child = start_child
+        self.read_host_available = read_host_available
         self.child = None
         self.record = None
         self.armed_at = 0.0
@@ -598,10 +678,11 @@ class Ballast:
 
     # --------------------------------------------------------------------------
     def tend(self, guard: SwapGuard) -> None:
-        """Take one `auto` step from a fresh `/status`; a no-op otherwise.
+        """Take one `auto` step from a fresh `/status` and host reading.
 
-        Before engaging, waits for lanes_resident and then records the
-        engage-time readings. A failed `/status` read skips the step.
+        A no-op for a fixed or no ballast. Before engaging, waits for
+        lanes_resident and then records the engage-time readings. A failed
+        `/status` read skips the step.
         """
         if self.request != BALLAST_AUTO or self.record is None or self.has_failed:
             return
@@ -612,26 +693,26 @@ class Ballast:
         except ProbeError as error:
             print(f"pressure_probe: ballast step skipped: {error}", file=sys.stderr)
             return
+        if not self.is_engaged and not lanes_resident(status):
+            return
+        sizing = auto_ballast(status, self.read_host_available())
         if not self.is_engaged:
-            if not lanes_resident(status):
-                return
             self.is_engaged = True
-            engaged = auto_ballast(status)
-            del engaged["mb"]
+            engaged = {key: value for key, value in sizing.items() if key != "mb"}
             engaged["engage_s"] = round(time.monotonic() - self.armed_at, 1)
             self.record.update(engaged)
             self.swap_seen_bytes = guard.grown_bytes
-        self.step(status, guard)
+        self.step(sizing["mb"] * BYTES_PER_MB, guard)
 
     # --------------------------------------------------------------------------
-    def step(self, status: dict, guard: SwapGuard) -> None:
+    def step(self, target_bytes: int, guard: SwapGuard) -> None:
         """Shed, hold or grow the `auto` ballast by one step.
 
-        Sheds the newest region while swapouts still rise past
-        BALLAST_SWAP_SHED_SHARE of the guard's cap; grows no more once they
-        reach BALLAST_SWAP_GROW_SHARE; otherwise grows by the auto_ballast
-        target, at most BALLAST_STEP_BYTES and only once it reaches
-        BALLAST_CHUNK_BYTES.
+        Takes a fresh swap reading first. Sheds the newest region while
+        swapouts still rise past BALLAST_SWAP_SHED_SHARE of the guard's cap;
+        grows no more once they reach BALLAST_SWAP_GROW_SHARE; otherwise grows
+        by auto_step_bytes toward `target_bytes`, only while that target
+        reaches BALLAST_CHUNK_BYTES.
         """
         if guard.check():
             return
@@ -646,9 +727,10 @@ class Ballast:
         if grown >= guard.cap_bytes * BALLAST_SWAP_GROW_SHARE:
             self.record["swap_limited"] = True
             return
-        target_bytes = auto_ballast(status)["mb"] * BYTES_PER_MB
-        if target_bytes >= BALLAST_CHUNK_BYTES:
-            step_bytes = min(target_bytes, BALLAST_STEP_BYTES)
+        if target_bytes < BALLAST_CHUNK_BYTES:
+            return
+        step_bytes = auto_step_bytes(target_bytes, grown, guard.cap_bytes)
+        if step_bytes > 0:
             self.resize(BALLAST_GROW, step_bytes, guard)
 
     # --------------------------------------------------------------------------
@@ -1047,8 +1129,9 @@ def parse_args(argv=None):
         type=ballast_request,
         help="hold this much incompressible host memory during the burst (with "
         f"--agent-turns, from the second turn on); {BALLAST_AUTO} grows it in "
-        "steps once a request is in prefill or decode, from /status, to keep the "
-        "host past the server's warning margin, stopping short of the swap guard",
+        "steps once a request is in prefill or decode, from fresh vm_stat "
+        "readings, to keep the host past the server's warning margin, stopping "
+        "short of the swap guard",
     )
     parser.add_argument(
         "--require-warning-suspension",
@@ -1124,7 +1207,7 @@ def main(argv=None) -> int:
     """
     args = parse_args(argv)
     client = ProbeClient(args.base_url, args.api_key)
-    ballast = Ballast(args.ballast_mb, client, BallastChild)
+    ballast = Ballast(args.ballast_mb, client, BallastChild, read_host_available)
     stop = threading.Event()
     sink = open(args.samples, "a") if args.samples else None
     threads = []

@@ -19,6 +19,18 @@ Pages free:                               12345.
 Swapins:                                      7.
 Swapouts:                                  {swapouts}.
 """
+HOST_VM_STAT = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                   100.
+Pages active:                                 400.
+Pages inactive:                               300.
+Pages speculative:                             50.
+Pages wired down:                             200.
+Pages purgeable:                               30.
+File-backed pages:                            120.
+Pages occupied by compressor:                  70.
+Swapouts:                                       9.
+"""
+HOST_USED_PAGES = 400 + 300 + 50 + 200 + 70 - 120 - 30
 REPLY_CONTENT = "1\n2\n3"
 TTFT_MS = 412.5
 GIB = 2**30
@@ -573,11 +585,27 @@ class AgentModeTests(unittest.TestCase):
             )
 
 
+class HostAvailableTests(unittest.TestCase):
+    def test_parseHostAvailable_isPhysicalLessUsedPagesCreditingReclaimable(self):
+        physical_bytes = 4096 * PAGE_BYTES
+
+        available = probe.parse_host_available(HOST_VM_STAT, physical_bytes)
+
+        self.assertEqual(available, (4096 - HOST_USED_PAGES) * PAGE_BYTES)
+
+    def test_parseHostAvailable_usedPastPhysical_floorsAtZero(self):
+        self.assertEqual(probe.parse_host_available(HOST_VM_STAT, PAGE_BYTES), 0)
+
+    def test_parseHostAvailable_missingPageCategory_raises(self):
+        with self.assertRaises(probe.ProbeError):
+            probe.parse_host_available(VM_STAT.format(swapouts=1), GIB)
+
+
 class BallastSizingTests(unittest.TestCase):
-    def governor_sample(self, headroom_bytes, reserve_bytes):
+    def governor_sample(self, reserve_bytes, reserved_bytes=0):
         return snapshot(
-            memory_governor__host_headroom_bytes=headroom_bytes,
             memory_governor__host_reserve_bytes=reserve_bytes,
+            memory_governor__reserved_bytes=reserved_bytes,
         )
 
     def test_hostWarningMarginBytes_isAQuarterOfTheReserveAboveTheFloor(self):
@@ -588,10 +616,10 @@ class BallastSizingTests(unittest.TestCase):
 
         self.assertEqual(margins, [512 * MIB, 256 * MIB, 256 * MIB])
 
-    def test_autoBallast_isHeadroomLessWarningMarginPlusOvershoot(self):
-        sample = self.governor_sample(10 * GIB, 2 * GIB)
+    def test_autoBallast_isFreshHeadroomLessWarningMarginPlusOvershoot(self):
+        sample = self.governor_sample(2 * GIB, reserved_bytes=GIB)
 
-        record = probe.auto_ballast(sample)
+        record = probe.auto_ballast(sample, 13 * GIB)
 
         self.assertEqual(
             record,
@@ -604,13 +632,47 @@ class BallastSizingTests(unittest.TestCase):
         )
 
     def test_autoBallast_headroomBelowTheMargin_floorsAtZero(self):
-        sample = self.governor_sample(100 * MIB, 2 * GIB)
+        sample = self.governor_sample(2 * GIB)
 
-        self.assertEqual(probe.auto_ballast(sample)["mb"], 0)
+        self.assertEqual(probe.auto_ballast(sample, 2 * GIB + 100 * MIB)["mb"], 0)
 
-    def test_autoBallast_serverWithoutHostReadings_raises(self):
+    def test_autoBallast_availableBelowTheReserve_readsZeroHeadroom(self):
+        record = probe.auto_ballast(self.governor_sample(2 * GIB), GIB)
+
+        self.assertEqual(record["host_headroom_bytes"], 0)
+
+    def test_autoBallast_serverWithoutReserveReadings_raises(self):
         with self.assertRaises(probe.ProbeError):
-            probe.auto_ballast(snapshot(memory_governor__host_headroom_bytes=GIB))
+            probe.auto_ballast(
+                snapshot(memory_governor__host_reserve_bytes=GIB), 10 * GIB
+            )
+
+    def test_autoStepBytes_farTarget_isAQuarterOfTheSwapGuardCap(self):
+        cases = ((128 * MIB, 32 * MIB), (512 * MIB, 128 * MIB), (GIB, 256 * MIB))
+        for cap_bytes, expected_bytes in cases:
+            with self.subTest(cap_mb=cap_bytes // MIB):
+                step_bytes = probe.auto_step_bytes(10 * GIB, 0, cap_bytes)
+
+                self.assertEqual(step_bytes, expected_bytes)
+
+    def test_autoStepBytes_largeGuard_isCappedAtTheStepCeiling(self):
+        step_bytes = probe.auto_step_bytes(10 * GIB, 0, 8 * GIB)
+
+        self.assertEqual(step_bytes, probe.BALLAST_STEP_BYTES)
+
+    def test_autoStepBytes_nearTarget_growsByTheTargetOnly(self):
+        self.assertEqual(probe.auto_step_bytes(80 * MIB, 0, 512 * MIB), 80 * MIB)
+
+    def test_autoStepBytes_swapGrown_neverExceedsTheRoomBelowTheGrowShare(self):
+        for cap_bytes in (128 * MIB, 512 * MIB):
+            for grown_bytes in range(0, cap_bytes // 2 + 1, MIB):
+                with self.subTest(cap_mb=cap_bytes // MIB, grown=grown_bytes):
+                    step_bytes = probe.auto_step_bytes(10 * GIB, grown_bytes, cap_bytes)
+
+                    self.assertLessEqual(grown_bytes + step_bytes, cap_bytes // 2)
+
+    def test_autoStepBytes_swapAtTheGrowShare_holds(self):
+        self.assertEqual(probe.auto_step_bytes(10 * GIB, 64 * MIB, 128 * MIB), 0)
 
     def test_parseArgs_ballastMb_acceptsAutoOrAPositiveSize(self):
         sizes = [
@@ -699,8 +761,10 @@ class BallastChildTests(unittest.TestCase):
 class FakeHost:
     """A server and host whose headroom the fake ballast child's holding lowers.
 
-    `headroom_bytes(status_reads)` gives the headroom before the ballast;
-    `is_resident(chat_count)` whether a request is in prefill or decode.
+    `headroom_bytes(host_reads)` gives the headroom before the ballast;
+    `is_resident(chat_count)` whether a request is in prefill or decode. The
+    `/status` host_headroom_bytes stays at the first reading, as a server whose
+    host sample is stale would report; `available_bytes` reads the host now.
     """
 
     def __init__(self, headroom_bytes, is_resident, reserve_bytes=GIB):
@@ -709,18 +773,21 @@ class FakeHost:
         self.reserve_bytes = reserve_bytes
         self.held_bytes = 0
         self.peak_held_bytes = 0
-        self.status_reads = itertools.count()
+        self.host_reads = itertools.count()
 
     def status(self, chat_count):
         resident = 1 if self.is_resident(chat_count) else 0
         return snapshot(
-            memory_governor__host_headroom_bytes=(
-                self.headroom_bytes(next(self.status_reads)) - self.held_bytes
-            ),
+            memory_governor__host_headroom_bytes=self.headroom_bytes(0),
             memory_governor__host_reserve_bytes=self.reserve_bytes,
+            memory_governor__reserved_bytes=0,
             scheduler__prefilling=resident,
             scheduler__decoding=0,
         )
+
+    def available_bytes(self):
+        headroom_bytes = self.headroom_bytes(next(self.host_reads))
+        return headroom_bytes + self.reserve_bytes - self.held_bytes
 
     def hold(self, held_bytes):
         self.held_bytes = held_bytes
@@ -758,7 +825,8 @@ def fake_ballast_child(stub, host=None):
 
 
 BURST_ARGUMENTS = ("--lanes", "2", "--warm-tokens", "80", "--extend-tokens", "20")
-STEP = 256 * MIB
+# One `auto` step under the default 512 MB swap guard: a quarter of its cap.
+STEP = 128 * MIB
 
 
 def resident_after_first_request(chat_count):
@@ -772,7 +840,14 @@ def constant_headroom(headroom_bytes):
 class BallastMainTests(unittest.TestCase):
     def run_with_fake_child(self, stub, arguments, swapouts=(0,), host=None):
         child, events = fake_ballast_child(stub, host)
-        with mock.patch.object(probe, "BallastChild", child):
+        with contextlib.ExitStack() as patches:
+            patches.enter_context(mock.patch.object(probe, "BallastChild", child))
+            if host is not None:
+                patches.enter_context(
+                    mock.patch.object(
+                        probe, "read_host_available", host.available_bytes
+                    )
+                )
             code, output = run_main(arguments, swapouts)
         return code, output, events
 
@@ -879,12 +954,20 @@ class BallastMainTests(unittest.TestCase):
         _code, ballast, events = self.run_auto(host)
 
         grows = [event[1] for event in events if event[0] == probe.BALLAST_GROW]
-        self.assertEqual(grows, [STEP] * 8)
+        self.assertEqual(grows, [STEP] * 16)
         self.assertEqual((ballast["mb"], ballast["wired_mb"]), (2048, 2048))
 
+    def test_main_ballastAuto_staleStatusHeadroom_stopsAtTheFreshHostTarget(self):
+        host = FakeHost(constant_headroom(2 * GIB), resident_after_first_request)
+
+        _code, ballast, _events = self.run_auto(host)
+
+        self.assertEqual(host.peak_held_bytes, 2 * GIB)
+        self.assertEqual(ballast["mb"], 2048)
+
     def test_main_ballastAuto_headroomRisingAfterEngage_topsUp(self):
-        def rising(status_reads):
-            return 256 * MIB if status_reads < 10 else 1280 * MIB
+        def rising(host_reads):
+            return 256 * MIB if host_reads < 10 else 1280 * MIB
 
         host = FakeHost(rising, resident_after_first_request)
 
@@ -892,18 +975,44 @@ class BallastMainTests(unittest.TestCase):
 
         self.assertEqual(ballast["mb"], 256 + 1024)
 
-    def test_main_ballastAuto_swapAtHalfTheGuardCap_stopsGrowing(self):
+    def test_main_ballastAuto_everyStepSwappedOut_limitsBeforeTheGuardTrips(self):
+        for guard_mb in (128, 512):
+            with self.subTest(guard_mb=guard_mb):
+                host = FakeHost(
+                    constant_headroom(10 * GIB), resident_after_first_request
+                )
+
+                code, ballast, events = self.run_auto(
+                    host,
+                    "--swap-guard-mb",
+                    str(guard_mb),
+                    swapouts=lambda: host.held_bytes // PAGE_BYTES,
+                )
+
+                grows = [e[1] for e in events if e[0] == probe.BALLAST_GROW]
+                self.assertEqual(code, 0)
+                self.assertEqual(grows, [guard_mb * MIB // 4] * 2)
+                self.assertEqual(
+                    (ballast["mb"], ballast["swap_limited"]), (guard_mb // 2, True)
+                )
+
+    def test_main_ballastAuto_swapRisingBetweenSteps_shrinksTheNextStep(self):
         host = FakeHost(constant_headroom(10 * GIB), resident_after_first_request)
 
-        code, ballast, _events = self.run_auto(
-            host,
-            "--swap-guard-mb",
-            "4",
-            swapouts=lambda: host.held_bytes // STEP * MIB // PAGE_BYTES,
+        def swapouts():
+            # The first step swaps out 48 MB, every later byte swaps in full.
+            if not host.held_bytes:
+                return 0
+            return (16 * MIB + host.held_bytes) // PAGE_BYTES
+
+        code, ballast, events = self.run_auto(
+            host, "--swap-guard-mb", "128", swapouts=swapouts
         )
 
+        grows = [event[1] for event in events if event[0] == probe.BALLAST_GROW]
         self.assertEqual(code, 0)
-        self.assertEqual((ballast["mb"], ballast["swap_limited"]), (512, True))
+        self.assertEqual(grows, [32 * MIB, 16 * MIB])
+        self.assertTrue(ballast["swap_limited"])
 
     def test_main_ballastAuto_swapRisingPastThreeQuarters_shedsAStep(self):
         host = FakeHost(constant_headroom(10 * GIB), resident_after_first_request)
