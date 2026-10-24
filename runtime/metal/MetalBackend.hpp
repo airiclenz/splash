@@ -148,6 +148,10 @@ struct BytesBinding {
 inline constexpr size_t kInlineBufferBindings = 22;
 // Production dispatches bind at most one parameter struct.
 inline constexpr size_t kInlineBytesBindings = 1;
+// The most command buffers one command is split into: a 2048-row prefill
+// chunk on the M2 Pro takes 26-40 s shallow and ~70 s at 160k history, ~250 ms
+// per buffer.
+inline constexpr size_t kMaximumCommandSegments = 512;
 
 struct ComputeDispatch {
   // Must view static storage, or storage that outlives the submit: the
@@ -354,8 +358,9 @@ public:
   // the returned ticket. A second command is rejected until wait() consumes
   // the first ticket, preserving the one-in-flight runtime invariant.
   // segments > 1 splits the dispatches into that many command buffers (at
-  // most one per dispatch, and at most 32) that run in order and complete one
-  // ticket, so no buffer holds the GPU long enough for macOS to abort it.
+  // most one per dispatch, and at most kMaximumCommandSegments) that run in
+  // order and complete one ticket, so no buffer holds the GPU long enough for
+  // macOS to abort it.
   [[nodiscard]] CommandTicket
   submitAsync(const ComputeDispatch &dispatch,
               CommandCompletion completion = {});

@@ -903,7 +903,11 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
             throw MetalBackendError("Metal device unavailable");
         }
         impl_->asyncState->device = impl_->device;
-        impl_->queue = [impl_->device newCommandQueue];
+        // The default queue hands out at most 64 uncommitted command buffers
+        // and blocks on the next; a segmented command needs up to
+        // kMaximumCommandSegments at once.
+        impl_->queue = [impl_->device
+            newCommandQueueWithMaxCommandBufferCount:2 * kMaximumCommandSegments];
         if (!impl_->queue) {
             throw MetalBackendError("unable to create Metal command queue");
         }
@@ -1575,9 +1579,9 @@ CommandTicket MetalBackend::submitCommandAsync(
     // display needs it, so long work is split into segments committed
     // back-to-back. Every buffer the backend allocates, placement-sparse ones
     // included, is hazard-tracked, so Metal orders the segments' accesses.
-    // A queue hands out at most 64 uncommitted command buffers and blocks on
-    // the next, and every segment is encoded before the first commits.
-    constexpr size_t kMaximumSegments = 32;
+    // Every segment is encoded before the first commits, so the queue is
+    // created with room for twice this many uncommitted command buffers.
+    constexpr size_t kMaximumSegments = kMaximumCommandSegments;
     const size_t segmentCount = std::clamp<size_t>(
         segments, 1, std::min(prepared.size(), kMaximumSegments));
     auto wallStart = std::chrono::steady_clock::now();

@@ -40,11 +40,14 @@ namespace {
 // pipeline objects and encoder scratch, and the process's own runtime overhead.
 constexpr uint64_t kPipelineReserveBytes = 256ULL << 20;
 constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
-// Prefill rows per command buffer. The M2 Pro prefills ~40-75 rows/s, so a
-// 2048-row chunk in one buffer held the GPU for 30+ s and macOS aborted it
-// as impacting interactivity. Segments split the dispatch list, about a
-// layer group each, so a chunk gets one buffer per 64 rows of work: near
-// 1-2 s each up to the backend's 32-buffer cap (2048 rows).
+// A prefill command is split into command buffers of about this much GPU
+// time, so the GPU reaches a buffer boundary often while the display waits.
+// The M2 Pro prefills ~40-75 rows/s: one buffer per 64 rows ran 1-1.8 s, and
+// macOS still aborted one as impacting interactivity with the display on.
+// The estimate is the previous prefill command's GPU time per row; consecutive
+// chunks run at nearly the same depth. Before the first sample, one buffer
+// per 64 rows.
+constexpr double kPrefillCommandBufferMilliseconds = 250.0;
 constexpr uint32_t kPrefillRowsPerCommandBuffer = 64;
 
 using metal::BufferStorage;
@@ -314,6 +317,9 @@ struct Runtime::Impl {
   const DraftEncoders decodeDraft;
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
+  // GPU milliseconds per row of the last prefill command, which sizes the
+  // next one's command buffers; 0 before the first.
+  double prefillGpuMillisecondsPerRow = 0.0;
   // Each place that builds a command graph; graphs from one site share a shape.
   enum class GraphSite : uint8_t {
     RestoredHead,
@@ -2201,13 +2207,19 @@ Runtime::prefillAsync(const BatchPlan &plan,
   uint32_t rows = 0;
   for (const ModelBatchItem &item : items)
     rows += item.tokenCount;
+  const double estimatedMilliseconds = rows * impl_->prefillGpuMillisecondsPerRow;
+  const uint32_t segments = estimatedMilliseconds > 0.0
+      ? static_cast<uint32_t>(std::ceil(
+            estimatedMilliseconds / kPrefillCommandBufferMilliseconds))
+      : (rows + kPrefillRowsPerCommandBuffer - 1) / kPrefillRowsPerCommandBuffer;
   CommandTicket command = impl_->backend.submitCommandAsync(
-      graph.dispatches(), std::move(notify),
-      (rows + kPrefillRowsPerCommandBuffer - 1) / kPrefillRowsPerCommandBuffer);
+      graph.dispatches(), std::move(notify), segments);
   visionGuard.submitted();
   Impl *impl = impl_.get();
-  auto finish = [impl, entries,
+  auto finish = [impl, entries, rows,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
+    if (timing.gpuSeconds > 0.0)
+      impl->prefillGpuMillisecondsPerRow = timing.gpuSeconds * 1000.0 / rows;
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       for (Impl::ImageState &image : entries[lane]->images) {
         if (!image.data || !image.data->encoding)

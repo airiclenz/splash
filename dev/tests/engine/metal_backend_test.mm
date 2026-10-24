@@ -42,6 +42,7 @@ using splash::metal::BytesBinding;
 using splash::metal::CommandGraph;
 using splash::metal::CommandTiming;
 using splash::metal::ComputeDispatch;
+using splash::metal::kMaximumCommandSegments;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
 using splash::metal::MetalBuffer;
@@ -242,7 +243,7 @@ NSUInteger delayedCompletionMemoryQuery(id device, SEL selector) {
 // increments.
 void segmentedCommandRunsInOrder(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
-    constexpr uint32_t count = 1u << 20, rounds = 32, increment = 1;
+    constexpr uint32_t count = 1u << 20, rounds = 256, increment = 1;
     auto values = backend.allocateBuffer(count * sizeof(uint32_t));
     auto scratch = backend.allocateBuffer(count * sizeof(uint32_t));
     std::fill_n(static_cast<uint32_t *>(values.contents()), count, 0u);
@@ -268,10 +269,13 @@ void segmentedCommandRunsInOrder(const std::string &metallibPath) {
         command.push_back(copy(scratch, values));
     }
     uint32_t expected = 0;
-    // 7 segments cut mid-round; more than 32 segments, or than the
+    // 7 segments cut mid-round; 100 is more than a default queue's 64
+    // uncommitted buffers; more than kMaximumCommandSegments, or than the
     // dispatches, are capped.
+    constexpr auto kCap = static_cast<uint32_t>(kMaximumCommandSegments);
+    static_assert(kCap < rounds * 3, "the cap case must cap below the dispatches");
     for (const auto &[segments, buffers] :
-         {std::pair<uint32_t, uint32_t>{7, 7}, {1000, 32}, {1, 1}}) {
+         {std::pair<uint32_t, uint32_t>{7, 7}, {100, 100}, {1000, kCap}, {1, 1}}) {
         unsigned completions = 0;
         CommandTiming timing =
             backend.submitCommandAsync(command, [&](uint64_t) { ++completions; },
