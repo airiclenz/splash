@@ -26,10 +26,14 @@ exits AGENT_COLD_TURN_EXIT_CODE when a turn after the first reuses 0 tokens.
 ``--ballast-mb N`` holds N MB of incompressible host memory in a child process
 from the burst phase's start until it ends (with ``--agent-turns``, from the
 second turn's start until the last turn ends), so the server serves under host
-pressure. ``--ballast-mb auto`` sizes N when the ballast engages, from that
-instant's ``/status`` ``memory_governor`` sample, to push the host just past the
-server's warning margin. The child exits when its pipe to the probe closes, so
-a killed probe leaves no ballast behind.
+pressure. ``--ballast-mb auto`` engages only once the server holds a request in
+prefill or decode, then grows the ballast a step at a time from fresh
+``/status`` ``memory_governor`` samples, to keep the host just past the server's
+warning margin; it stops growing at half the swap guard's cap and sheds a step
+while swapouts still rise past three quarters of it. The child wires its pages
+(mlock), or touches the ones the host would not wire, so they stay resident. It
+exits when its pipe to the probe closes, so a killed probe leaves no ballast
+behind.
 
 ``--require-warning-suspension`` and ``--require-waiting-memory`` assert that
 the pressure paths ran: the probe exits WARNING_SUSPENSION_MISSING_EXIT_CODE or
@@ -39,6 +43,7 @@ WAITING_MEMORY_MISSING_EXIT_CODE when the samples show none.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import mmap
 import multiprocessing
@@ -94,11 +99,21 @@ TTFT_PATH = ("metrics", "request_latency", "start_to_first_token_ms")
 QUEUE_PATH = ("metrics", "request_latency", "queue_to_start_ms")
 BYTES_PER_MB = 2**20
 BALLAST_AUTO = "auto"
-# The agent turn the ballast engages at: the first turn warms the conversation.
+# The agent turn the ballast is held from: the first turn warms the conversation.
 BALLAST_AGENT_TURN = 1
-# os.urandom chunk the ballast is filled with: bounds the transient copy.
+# os.urandom chunk the ballast is filled with: bounds the transient copy. Also
+# the smallest step `auto` grows by.
 BALLAST_CHUNK_BYTES = 64 * BYTES_PER_MB
-BALLAST_READY = "ready"
+# The most `auto` grows by between two `/status` readings.
+BALLAST_STEP_BYTES = 256 * BYTES_PER_MB
+# Share of the swap guard's cap at which `auto` stops growing the ballast.
+BALLAST_SWAP_GROW_SHARE = 0.5
+# Share past which `auto` sheds its newest step while swapouts still rise.
+BALLAST_SWAP_SHED_SHARE = 0.75
+BALLAST_GROW = "grow"
+BALLAST_SHED = "shed"
+# How often the ballast child re-reads pages the host would not wire.
+BALLAST_TOUCH_SECONDS = 1.0
 BALLAST_POLL_SECONDS = 0.5
 BALLAST_EXIT_SECONDS = 5.0
 # MemoryPlan.hpp EngineMemoryPolicy::minimumHostWarningMarginBytes.
@@ -351,11 +366,11 @@ def host_warning_margin_bytes(reserve_bytes: int) -> int:
 
 # ------------------------------------------------------------------------------
 def auto_ballast(snapshot: dict) -> dict:
-    """Size `--ballast-mb auto` from one `/status` memory_governor sample.
+    """Return how much more `--ballast-mb auto` holds, from one `/status` sample.
 
     N = host headroom - the warning margin + BALLAST_OVERSHOOT_BYTES, floored
-    at 0, so holding it drops the headroom just past the server's warning
-    margin. host_headroom_bytes is already net of host_reserve_bytes, so the
+    at 0, so holding N more drops the headroom just past the server's warning
+    margin; Ballast.step grows by it a step at a time. host_headroom_bytes is already net of host_reserve_bytes, so the
     reserve is not subtracted again. Raises ProbeError when the server exports
     neither reading.
     """
@@ -378,6 +393,25 @@ def auto_ballast(snapshot: dict) -> dict:
 
 
 # ------------------------------------------------------------------------------
+def lanes_resident(snapshot: dict) -> bool:
+    """Return whether the server holds a request in prefill or decode.
+
+    `--ballast-mb auto` engages only then, so it is never sized from an idle
+    server's headroom. Raises ProbeError when the server lacks either count.
+    """
+    counts = [
+        status_reading(snapshot, ("scheduler", key))
+        for key in ("prefilling", "decoding")
+    ]
+    if None in counts:
+        raise ProbeError(
+            "/status scheduler carries no prefilling or decoding count to "
+            "engage --ballast-mb auto"
+        )
+    return sum(counts) > 0
+
+
+# ------------------------------------------------------------------------------
 def fill_incompressible(region) -> None:
     """Overwrite a writable buffer with random bytes, chunk by chunk.
 
@@ -391,50 +425,113 @@ def fill_incompressible(region) -> None:
 
 
 # ------------------------------------------------------------------------------
-def hold_ballast(byte_count: int, control) -> None:
-    """Allocate and fill `byte_count` bytes, report ready, hold until EOF.
+def wire_pages(region) -> bool:
+    """Wire a writable buffer's pages into RAM with mlock(2).
 
-    The ballast child's body. `control` is its end of a pipe to the probe: the
-    child blocks reading it and returns once the probe closes its end or dies.
+    Wired pages are neither compressed nor swapped out, so an idle ballast
+    keeps pressing on the host. Returns False, after saying why on stderr,
+    when the host refuses (the wire limit, or no mlock); the caller then keeps
+    the pages warm by touching them.
     """
-    # Anonymous memory is mapped lazily, so the fill touches each page once.
-    region = mmap.mmap(-1, byte_count)
-    fill_incompressible(region)
     try:
-        control.send(BALLAST_READY)
-        control.recv()
+        anchor = ctypes.c_char.from_buffer(region)
+        address = ctypes.addressof(anchor)
+        # Drop the buffer export at once, or the region could not be closed.
+        del anchor
+        libc = ctypes.CDLL(None, use_errno=True)
+        result = libc.mlock(ctypes.c_void_p(address), ctypes.c_size_t(len(region)))
+        reason = os.strerror(ctypes.get_errno())
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        result, reason = -1, str(error)
+    if result != 0:
+        print(f"pressure_probe: ballast pages not wired: {reason}", file=sys.stderr)
+    return result == 0
+
+
+# ------------------------------------------------------------------------------
+def touch_pages(region) -> None:
+    """Read one byte of every page, so the host keeps unwired pages resident."""
+    region[:: mmap.PAGESIZE]
+
+
+# ------------------------------------------------------------------------------
+def held_bytes(regions: list) -> tuple[int, int]:
+    """Return (bytes held, bytes wired) of the ballast child's (region, wired) list."""
+    held = sum(len(region) for region, _ in regions)
+    wired = sum(len(region) for region, is_wired in regions if is_wired)
+    return held, wired
+
+
+# ------------------------------------------------------------------------------
+def apply_ballast_command(regions: list, command: str, byte_count: int) -> None:
+    """Grow the ballast by `byte_count` filled, wired bytes, or shed its newest region."""
+    if command == BALLAST_GROW:
+        # Anonymous memory is mapped lazily, so the fill touches each page once.
+        region = mmap.mmap(-1, byte_count)
+        fill_incompressible(region)
+        regions.append((region, wire_pages(region)))
+    elif regions:
+        regions.pop()[0].close()
+
+
+# ------------------------------------------------------------------------------
+def hold_ballast(control) -> None:
+    """Hold ballast regions as the probe commands, until its pipe closes.
+
+    The ballast child's body. `control` is its end of a pipe to the probe,
+    carrying (BALLAST_GROW, byte count) or (BALLAST_SHED, 0) commands; each is
+    answered with (bytes held, bytes wired). Between commands the child touches
+    the pages it could not wire every BALLAST_TOUCH_SECONDS. It returns once
+    the probe closes its end or dies.
+    """
+    regions: list = []
+    try:
+        while True:
+            if not control.poll(BALLAST_TOUCH_SECONDS):
+                for region, is_wired in regions:
+                    if not is_wired:
+                        touch_pages(region)
+                continue
+            command, byte_count = control.recv()
+            apply_ballast_command(regions, command, byte_count)
+            control.send(held_bytes(regions))
     except (EOFError, OSError):
         # The probe closed its end or exited: EOF is the release signal.
         pass
     finally:
-        region.close()
+        for region, _ in regions:
+            region.close()
 
 
 class BallastChild:
     """One spawned process holding the ballast until its pipe closes."""
 
     # --------------------------------------------------------------------------
-    def __init__(self, byte_count: int):
-        """Spawn the child; it starts filling `byte_count` bytes at once."""
+    def __init__(self):
+        """Spawn the child; it holds nothing until the first `resize`."""
         # Spawn, not fork: the probe runs sampler and guard threads.
         context = multiprocessing.get_context("spawn")
         self.control, child_end = context.Pipe()
         self.process = context.Process(
-            target=hold_ballast, args=(byte_count, child_end), daemon=True
+            target=hold_ballast, args=(child_end,), daemon=True
         )
         self.process.start()
         child_end.close()
 
     # --------------------------------------------------------------------------
-    def wait_ready(self, stop: threading.Event) -> bool:
-        """Wait until the ballast is filled; False when `stop` or the child ends."""
-        while not self.control.poll(BALLAST_POLL_SECONDS):
-            if stop.is_set() or not self.process.is_alive():
-                return False
+    def resize(self, command: str, byte_count: int, stop: threading.Event):
+        """Send one command; return (bytes held, bytes wired) once it applied.
+
+        Returns None when `stop` is set or the child ends first.
+        """
         try:
-            return self.control.recv() == BALLAST_READY
-        except EOFError:
-            return False
+            self.control.send((command, byte_count))
+            while not self.control.poll(BALLAST_POLL_SECONDS):
+                if stop.is_set() or not self.process.is_alive():
+                    return None
+            return self.control.recv()
+        except (EOFError, OSError):
+            return None
 
     # --------------------------------------------------------------------------
     def close(self) -> None:
@@ -447,12 +544,17 @@ class BallastChild:
 
 
 class Ballast:
-    """Holds `--ballast-mb` of host memory between `engage` and `release`.
+    """Holds `--ballast-mb` of host memory between `arm` and `release`.
 
-    Runs on the probe's main thread only. `engage` sizes the ballast (from a
-    fresh `/status` for `auto`) and starts `start_child(byte_count)`, whose
-    result offers `wait_ready(stop)` and `close()`; `release` closes it. Both
-    are idempotent, so phase edges, guard trips and `main` may all release.
+    Runs on the probe's main thread only. `arm` marks the phase the ballast is
+    held from; a fixed size is filled there, before the phase's requests. An
+    `auto` ballast is driven by `tend`, which run_phase calls about every
+    SWAP_POLL_SECONDS: it engages once the server holds a request in prefill or
+    decode, then grows the ballast BALLAST_STEP_BYTES at a time while the
+    fresh `/status` headroom stays above the auto_ballast target, and stops
+    short of the swap guard. `start_child()` returns an object offering
+    `resize(command, byte_count, stop)` and `close()`. `arm` and `release` are
+    idempotent, so phase edges, guard trips and `main` may all release.
     """
 
     # --------------------------------------------------------------------------
@@ -463,28 +565,111 @@ class Ballast:
         self.start_child = start_child
         self.child = None
         self.record = None
+        self.armed_at = 0.0
+        self.held_bytes = 0
+        self.swap_seen_bytes = 0
+        self.is_engaged = False
+        self.has_failed = False
 
     # --------------------------------------------------------------------------
-    def engage(self, phase: str, stop: threading.Event) -> None:
-        """Size and start the ballast once, at the start of `phase`.
+    def arm(self, phase: str, guard: SwapGuard) -> None:
+        """Hold the ballast from the start of `phase` on; once only.
 
-        Starts nothing once `stop` is set. Returns once the child has filled
-        its memory, `stop` is set or the child failed; the report's `held` says
-        which.
+        A fixed size is filled now and this returns once the child holds it,
+        the guard tripped or the child failed; the report's `held` says which.
+        Starts nothing once the guard has tripped.
         """
-        if self.request is None or self.record is not None or stop.is_set():
+        if self.request is None or self.record is not None:
             return
+        if guard.tripped.is_set():
+            return
+        self.record = {
+            "requested": self.request,
+            "phase": phase,
+            "held": False,
+            "mb": 0,
+            "wired_mb": 0,
+        }
+        self.armed_at = time.monotonic()
         if self.request == BALLAST_AUTO:
-            self.record = auto_ballast(fresh_status(self.client))
-        else:
-            self.record = {"mb": self.request}
-        self.record.update(requested=self.request, phase=phase, held=False)
-        if self.record["mb"] <= 0:
+            self.record["swap_limited"] = False
             return
-        self.child = self.start_child(self.record["mb"] * BYTES_PER_MB)
-        self.record["held"] = self.child.wait_ready(stop)
-        if not self.record["held"]:
+        self.resize(BALLAST_GROW, self.request * BYTES_PER_MB, guard)
+
+    # --------------------------------------------------------------------------
+    def tend(self, guard: SwapGuard) -> None:
+        """Take one `auto` step from a fresh `/status`; a no-op otherwise.
+
+        Before engaging, waits for lanes_resident and then records the
+        engage-time readings. A failed `/status` read skips the step.
+        """
+        if self.request != BALLAST_AUTO or self.record is None or self.has_failed:
+            return
+        if guard.tripped.is_set():
+            return
+        try:
+            status = fresh_status(self.client)
+        except ProbeError as error:
+            print(f"pressure_probe: ballast step skipped: {error}", file=sys.stderr)
+            return
+        if not self.is_engaged:
+            if not lanes_resident(status):
+                return
+            self.is_engaged = True
+            engaged = auto_ballast(status)
+            del engaged["mb"]
+            engaged["engage_s"] = round(time.monotonic() - self.armed_at, 1)
+            self.record.update(engaged)
+            self.swap_seen_bytes = guard.grown_bytes
+        self.step(status, guard)
+
+    # --------------------------------------------------------------------------
+    def step(self, status: dict, guard: SwapGuard) -> None:
+        """Shed, hold or grow the `auto` ballast by one step.
+
+        Sheds the newest region while swapouts still rise past
+        BALLAST_SWAP_SHED_SHARE of the guard's cap; grows no more once they
+        reach BALLAST_SWAP_GROW_SHARE; otherwise grows by the auto_ballast
+        target, at most BALLAST_STEP_BYTES and only once it reaches
+        BALLAST_CHUNK_BYTES.
+        """
+        if guard.check():
+            return
+        grown = guard.grown_bytes
+        is_swap_rising = grown > self.swap_seen_bytes
+        self.swap_seen_bytes = grown
+        if grown >= guard.cap_bytes * BALLAST_SWAP_SHED_SHARE:
+            self.record["swap_limited"] = True
+            if is_swap_rising and self.held_bytes > 0:
+                self.resize(BALLAST_SHED, 0, guard)
+            return
+        if grown >= guard.cap_bytes * BALLAST_SWAP_GROW_SHARE:
+            self.record["swap_limited"] = True
+            return
+        target_bytes = auto_ballast(status)["mb"] * BYTES_PER_MB
+        if target_bytes >= BALLAST_CHUNK_BYTES:
+            step_bytes = min(target_bytes, BALLAST_STEP_BYTES)
+            self.resize(BALLAST_GROW, step_bytes, guard)
+
+    # --------------------------------------------------------------------------
+    def resize(self, command: str, byte_count: int, guard: SwapGuard) -> None:
+        """Send one command to the child, starting it first, and record the result.
+
+        `mb` and `wired_mb` keep the peak held; a child that ends or a guard
+        trip stops the ballast from changing again.
+        """
+        if self.child is None:
+            self.child = self.start_child()
+        reply = self.child.resize(command, byte_count, guard.tripped)
+        if reply is None:
+            self.has_failed = True
             print("pressure_probe: ballast not held", file=sys.stderr)
+            return
+        self.held_bytes, wired_bytes = reply
+        record = self.record
+        record["held"] = record["held"] or self.held_bytes > 0
+        record["mb"] = max(record["mb"], self.held_bytes // BYTES_PER_MB)
+        record["wired_mb"] = max(record["wired_mb"], wired_bytes // BYTES_PER_MB)
 
     # --------------------------------------------------------------------------
     def release(self) -> None:
@@ -588,13 +773,16 @@ def send_lane(client, lane, phase, body, timeout, records, replies=None) -> None
 
 
 # ------------------------------------------------------------------------------
-def run_phase(client, sampler, guard, phase, bodies, timeout, replies=None) -> dict:
+def run_phase(
+    client, sampler, guard, phase, bodies, timeout, replies=None, ballast=None
+) -> dict:
     """Send `bodies` (lane -> request) concurrently and wait for all or the guard.
 
     Returns the phase row: lane rows, counter deltas and whether the swap guard
     stopped it. On a trip the unfinished lanes are left to the server and the
     after-snapshot is taken at once. `replies`, when given, receives each
-    finished lane's decoded reply.
+    finished lane's decoded reply. `ballast`, when given, is tended about every
+    SWAP_POLL_SECONDS while the lanes run.
     """
     sampler.phase = phase
     before = fresh_status(client)
@@ -612,6 +800,8 @@ def run_phase(client, sampler, guard, phase, bodies, timeout, replies=None) -> d
     while any(thread.is_alive() for thread in threads):
         if guard.tripped.wait(SWAP_POLL_SECONDS):
             break
+        if ballast is not None:
+            ballast.tend(guard)
     after = fresh_status(client)
     return {
         "phase": phase,
@@ -625,8 +815,8 @@ def run_phase(client, sampler, guard, phase, bodies, timeout, replies=None) -> d
 def run_probe(client, model, args, sampler, guard, ballast) -> list[dict]:
     """Warm each lane alone (unless `args.nonces` names warmed ones), then burst.
 
-    `ballast` is held for the burst. Stops once the swap guard has tripped or
-    a warm-up fails.
+    `ballast` is held for the burst and tended while it runs. Stops once the
+    swap guard has tripped or a warm-up fails.
     """
     warm_words = max(1, args.warm_tokens - PROMPT_FRAME_TOKENS)
     burst_words = warm_words + args.extend_tokens
@@ -654,11 +844,19 @@ def run_probe(client, model, args, sampler, guard, ballast) -> list[dict]:
         for lane, nonce in enumerate(args.nonces)
     }
     try:
-        ballast.engage("burst", guard.tripped)
+        ballast.arm("burst", guard)
         if guard.tripped.is_set():
             return phases
         phases.append(
-            run_phase(client, sampler, guard, "burst", bodies, args.request_timeout)
+            run_phase(
+                client,
+                sampler,
+                guard,
+                "burst",
+                bodies,
+                args.request_timeout,
+                ballast=ballast,
+            )
         )
     finally:
         ballast.release()
@@ -692,7 +890,7 @@ def run_agent(client, model, args, sampler, guard, ballast) -> list[dict]:
     try:
         for turn in range(args.agent_turns):
             if turn == BALLAST_AGENT_TURN:
-                ballast.engage(f"turn{turn}", guard.tripped)
+                ballast.arm(f"turn{turn}", guard)
             if guard.tripped.is_set():
                 return phases
             body = conversation_body(model, messages, args.max_tokens)
@@ -705,6 +903,7 @@ def run_agent(client, model, args, sampler, guard, ballast) -> list[dict]:
                 {AGENT_LANE: body},
                 args.request_timeout,
                 replies,
+                ballast,
             )
             phases.append(phase)
             content = reply_text(replies.get(AGENT_LANE))
@@ -847,8 +1046,9 @@ def parse_args(argv=None):
         "--ballast-mb",
         type=ballast_request,
         help="hold this much incompressible host memory during the burst (with "
-        f"--agent-turns, from the second turn on); {BALLAST_AUTO} sizes it from "
-        "/status to push the host past the server's warning margin",
+        f"--agent-turns, from the second turn on); {BALLAST_AUTO} grows it in "
+        "steps once a request is in prefill or decode, from /status, to keep the "
+        "host past the server's warning margin, stopping short of the swap guard",
     )
     parser.add_argument(
         "--require-warning-suspension",

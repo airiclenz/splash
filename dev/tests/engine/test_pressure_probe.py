@@ -632,6 +632,22 @@ class BallastSizingTests(unittest.TestCase):
                 probe.parse_args(["--base-url", "http://x", "--ballast-mb", text])
 
 
+class LanesResidentTests(unittest.TestCase):
+    def test_lanesResident_aRequestInPrefillOrDecode_isResident(self):
+        cases = [((0, 0), False), ((1, 0), True), ((0, 2), True)]
+        for (prefilling, decoding), expected in cases:
+            with self.subTest(prefilling=prefilling, decoding=decoding):
+                status = snapshot(
+                    scheduler__prefilling=prefilling, scheduler__decoding=decoding
+                )
+
+                self.assertEqual(probe.lanes_resident(status), expected)
+
+    def test_lanesResident_serverWithoutSchedulerCounts_raises(self):
+        with self.assertRaises(probe.ProbeError):
+            probe.lanes_resident(snapshot(scheduler__prefilling=1))
+
+
 class BallastChildTests(unittest.TestCase):
     def test_fillIncompressible_writesBytesTheCompressorCannotShrink(self):
         region = bytearray(64 * 1024)
@@ -641,33 +657,99 @@ class BallastChildTests(unittest.TestCase):
 
         self.assertGreater(len(zlib.compress(bytes(region))), len(region))
 
-    def test_holdBallast_reportsReadyThenEndsWhenThePipeCloses(self):
+    def run_child(self, commands):
+        """Run hold_ballast on a thread, send `commands`, return the held bytes."""
         control, child_end = multiprocessing.Pipe()
-        child = threading.Thread(target=probe.hold_ballast, args=(4096, child_end))
+        child = threading.Thread(target=probe.hold_ballast, args=(child_end,))
         child.start()
-
-        ready = control.recv()
+        replies = []
+        for command in commands:
+            control.send(command)
+            replies.append(control.recv())
         control.close()
         child.join(5.0)
-
-        self.assertEqual(ready, probe.BALLAST_READY)
         self.assertFalse(child.is_alive())
+        return replies
+
+    def test_holdBallast_growsThenShedsThenEndsWhenThePipeCloses(self):
+        replies = self.run_child(
+            [
+                (probe.BALLAST_GROW, 64 * 1024),
+                (probe.BALLAST_GROW, 32 * 1024),
+                (probe.BALLAST_SHED, 0),
+            ]
+        )
+
+        self.assertEqual([held for held, _wired in replies], [65536, 98304, 65536])
+
+    def test_holdBallast_hostRefusesWiring_holdsThePagesUnwired(self):
+        with mock.patch.object(probe, "wire_pages", lambda _region: False):
+            replies = self.run_child([(probe.BALLAST_GROW, 64 * 1024)])
+
+        self.assertEqual(replies, [(65536, 0)])
+
+    def test_touchPages_readsWithoutChangingTheBytes(self):
+        region = bytearray(b"\x07" * (3 * probe.mmap.PAGESIZE))
+
+        probe.touch_pages(region)
+
+        self.assertEqual(region, bytearray(b"\x07" * (3 * probe.mmap.PAGESIZE)))
 
 
-def fake_ballast_child(stub):
-    """Return a BallastChild stand-in that logs starts and closes, and its log.
+class FakeHost:
+    """A server and host whose headroom the fake ballast child's holding lowers.
+
+    `headroom_bytes(status_reads)` gives the headroom before the ballast;
+    `is_resident(chat_count)` whether a request is in prefill or decode.
+    """
+
+    def __init__(self, headroom_bytes, is_resident, reserve_bytes=GIB):
+        self.headroom_bytes = headroom_bytes
+        self.is_resident = is_resident
+        self.reserve_bytes = reserve_bytes
+        self.held_bytes = 0
+        self.peak_held_bytes = 0
+        self.status_reads = itertools.count()
+
+    def status(self, chat_count):
+        resident = 1 if self.is_resident(chat_count) else 0
+        return snapshot(
+            memory_governor__host_headroom_bytes=(
+                self.headroom_bytes(next(self.status_reads)) - self.held_bytes
+            ),
+            memory_governor__host_reserve_bytes=self.reserve_bytes,
+            scheduler__prefilling=resident,
+            scheduler__decoding=0,
+        )
+
+    def hold(self, held_bytes):
+        self.held_bytes = held_bytes
+        self.peak_held_bytes = max(self.peak_held_bytes, held_bytes)
+
+
+def fake_ballast_child(stub, host=None):
+    """Return a BallastChild stand-in that logs its commands, and its log.
 
     Each event records how many chat requests the stub had received, which
-    places it at a phase edge. Nothing is allocated.
+    places it at a phase edge. Nothing is allocated; `host`, when given, sees
+    what the fake holds.
     """
     events = []
+    steps = []
 
     class FakeBallastChild:
-        def __init__(self, byte_count):
-            events.append(("start", byte_count, len(stub.chat_bodies)))
+        def __init__(self):
+            events.append(("start", len(stub.chat_bodies)))
 
-        def wait_ready(self, _stop):
-            return True
+        def resize(self, command, byte_count, _stop):
+            events.append((command, byte_count, len(stub.chat_bodies)))
+            if command == probe.BALLAST_GROW:
+                steps.append(byte_count)
+            elif steps:
+                steps.pop()
+            if host is not None:
+                host.hold(sum(steps))
+            return sum(steps), sum(steps)
 
         def close(self):
             events.append(("close", len(stub.chat_bodies)))
@@ -675,23 +757,44 @@ def fake_ballast_child(stub):
     return FakeBallastChild, events
 
 
-def headroom_falling_per_request(chat_count):
-    """Status whose host headroom drops 1 GiB per chat request received."""
-    return snapshot(
-        memory_governor__host_headroom_bytes=(10 - chat_count) * GIB,
-        memory_governor__host_reserve_bytes=GIB,
-    )
-
-
 BURST_ARGUMENTS = ("--lanes", "2", "--warm-tokens", "80", "--extend-tokens", "20")
+STEP = 256 * MIB
+
+
+def resident_after_first_request(chat_count):
+    return chat_count > 0
+
+
+def constant_headroom(headroom_bytes):
+    return lambda _status_reads: headroom_bytes
 
 
 class BallastMainTests(unittest.TestCase):
-    def run_with_fake_child(self, stub, arguments, swapouts=(0,)):
-        child, events = fake_ballast_child(stub)
+    def run_with_fake_child(self, stub, arguments, swapouts=(0,), host=None):
+        child, events = fake_ballast_child(stub, host)
         with mock.patch.object(probe, "BallastChild", child):
             code, output = run_main(arguments, swapouts)
         return code, output, events
+
+    def run_auto(self, host, *extra, swapouts=(0,)):
+        """Run one lane with `--ballast-mb auto`; return (code, ballast, events)."""
+        with StubServer(host.status, reply_delay=1.0) as stub:
+            code, output, events = self.run_with_fake_child(
+                stub,
+                [
+                    "--base-url",
+                    stub.base_url,
+                    "--nonces",
+                    "aaaa",
+                    "--ballast-mb",
+                    "auto",
+                    "--json",
+                    *extra,
+                ],
+                swapouts,
+                host,
+            )
+        return code, json.loads(output)["ballast"], events
 
     def test_main_ballast_heldFromBurstStartUntilBurstEnds(self):
         with StubServer(snapshot()) as stub:
@@ -701,7 +804,10 @@ class BallastMainTests(unittest.TestCase):
             )
 
         self.assertEqual(code, 0)
-        self.assertEqual(events, [("start", 64 * MIB, 2), ("close", 4)])
+        self.assertEqual(
+            events,
+            [("start", 2), (probe.BALLAST_GROW, 64 * MIB, 2), ("close", 4)],
+        )
 
     def test_main_agentTurns_ballastHeldFromSecondTurnUntilLastTurnEnds(self):
         with StubServer(AGENT_STATUS, cached_tokens=[0, 90, 150]) as stub:
@@ -710,7 +816,10 @@ class BallastMainTests(unittest.TestCase):
             )
 
         self.assertEqual(code, 0)
-        self.assertEqual(events, [("start", 64 * MIB, 1), ("close", 3)])
+        self.assertEqual(
+            events,
+            [("start", 1), (probe.BALLAST_GROW, 64 * MIB, 1), ("close", 3)],
+        )
 
     def test_main_swapGuardTripsDuringBurst_closesTheBallastChild(self):
         grown = 2 * MIB // PAGE_BYTES
@@ -731,47 +840,104 @@ class BallastMainTests(unittest.TestCase):
             )
 
         self.assertEqual(code, probe.SWAP_ABORT_EXIT_CODE)
-        self.assertEqual([event[0] for event in events], ["start", "close"])
-
-    def test_main_ballastAuto_sizedFromTheStatusAtBurstStart(self):
-        with StubServer(headroom_falling_per_request) as stub:
-            _code, output, events = self.run_with_fake_child(
-                stub,
-                [
-                    "--base-url",
-                    stub.base_url,
-                    *BURST_ARGUMENTS,
-                    "--ballast-mb",
-                    "auto",
-                    "--json",
-                ],
-            )
-
-        self.assertEqual(events[0], ("start", 8 * GIB, 2))
         self.assertEqual(
-            json.loads(output)["ballast"],
+            [event[0] for event in events], ["start", probe.BALLAST_GROW, "close"]
+        )
+
+    def test_main_ballastAuto_idleServer_startsNoChild(self):
+        host = FakeHost(constant_headroom(20 * GIB), lambda _chat_count: False)
+
+        _code, ballast, events = self.run_auto(host)
+
+        self.assertEqual(events, [])
+        self.assertEqual(
+            ballast,
             {
-                "mb": 8 * 1024,
-                "host_headroom_bytes": 8 * GIB,
-                "host_reserve_bytes": GIB,
-                "warning_margin_bytes": 256 * MIB,
                 "requested": "auto",
                 "phase": "burst",
-                "held": True,
+                "held": False,
+                "mb": 0,
+                "wired_mb": 0,
+                "swap_limited": False,
             },
         )
 
-    def test_main_agentTurnsBallastAuto_sizedAtTheSecondTurnsStart(self):
-        with StubServer(headroom_falling_per_request) as stub:
+    def test_main_ballastAuto_engagesOnceALaneIsResident(self):
+        host = FakeHost(constant_headroom(2 * GIB), resident_after_first_request)
+
+        _code, ballast, events = self.run_auto(host)
+
+        self.assertEqual(events[0], ("start", 1))
+        self.assertEqual(
+            {key: ballast[key] for key in ("held", "phase", "host_headroom_bytes")},
+            {"held": True, "phase": "burst", "host_headroom_bytes": 2 * GIB},
+        )
+
+    def test_main_ballastAuto_growsInStepsUntilPastTheWarningMargin(self):
+        host = FakeHost(constant_headroom(2 * GIB), resident_after_first_request)
+
+        _code, ballast, events = self.run_auto(host)
+
+        grows = [event[1] for event in events if event[0] == probe.BALLAST_GROW]
+        self.assertEqual(grows, [STEP] * 8)
+        self.assertEqual((ballast["mb"], ballast["wired_mb"]), (2048, 2048))
+
+    def test_main_ballastAuto_headroomRisingAfterEngage_topsUp(self):
+        def rising(status_reads):
+            return 256 * MIB if status_reads < 10 else 1280 * MIB
+
+        host = FakeHost(rising, resident_after_first_request)
+
+        _code, ballast, _events = self.run_auto(host)
+
+        self.assertEqual(ballast["mb"], 256 + 1024)
+
+    def test_main_ballastAuto_swapAtHalfTheGuardCap_stopsGrowing(self):
+        host = FakeHost(constant_headroom(10 * GIB), resident_after_first_request)
+
+        code, ballast, _events = self.run_auto(
+            host,
+            "--swap-guard-mb",
+            "4",
+            swapouts=lambda: host.held_bytes // STEP * MIB // PAGE_BYTES,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual((ballast["mb"], ballast["swap_limited"]), (512, True))
+
+    def test_main_ballastAuto_swapRisingPastThreeQuarters_shedsAStep(self):
+        host = FakeHost(constant_headroom(10 * GIB), resident_after_first_request)
+        swapped_pages = 7 * MIB // 2 // PAGE_BYTES
+
+        code, ballast, events = self.run_auto(
+            host,
+            "--swap-guard-mb",
+            "4",
+            swapouts=lambda: swapped_pages if host.peak_held_bytes else 0,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [event[0] for event in events],
+            ["start", probe.BALLAST_GROW, probe.BALLAST_SHED, "close"],
+        )
+        self.assertEqual(host.held_bytes, 0)
+
+    def test_main_agentTurnsBallastAuto_engagesDuringTheSecondTurn(self):
+        host = FakeHost(constant_headroom(GIB), lambda _chat_count: True)
+        with StubServer(host.status, reply_delay=0.3) as stub:
             _code, output, events = self.run_with_fake_child(
-                stub, agent_arguments(stub, 3, "--ballast-mb", "auto", "--json")
+                stub,
+                agent_arguments(stub, 3, "--ballast-mb", "auto", "--json"),
+                host=host,
             )
 
-        self.assertEqual(events[0], ("start", 9 * GIB, 1))
+        self.assertEqual(events[0], ("start", 2))
         self.assertEqual(json.loads(output)["ballast"]["phase"], "turn1")
 
     def test_formatReport_ballast_rendersSizeAndHeadroom(self):
-        with StubServer(headroom_falling_per_request) as stub:
+        host = FakeHost(constant_headroom(GIB), resident_after_first_request)
+        with StubServer(host.status, reply_delay=1.0) as stub:
             _code, output, _events = self.run_with_fake_child(
                 stub,
                 [
@@ -782,10 +948,11 @@ class BallastMainTests(unittest.TestCase):
                     "--ballast-mb",
                     "auto",
                 ],
+                host=host,
             )
 
-        self.assertRegex(output, r"ballast_mb\s+10240")
-        self.assertRegex(output, rf"ballast_host_headroom_bytes\s+{10 * GIB}")
+        self.assertRegex(output, r"ballast_mb\s+1024")
+        self.assertRegex(output, rf"ballast_host_headroom_bytes\s+{GIB}")
 
     def test_main_withoutBallast_reportsNoneAndStartsNoChild(self):
         with StubServer(snapshot()) as stub:
