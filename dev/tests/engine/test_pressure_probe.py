@@ -1,8 +1,12 @@
+import argparse
 import contextlib
 import io
+import itertools
 import json
+import multiprocessing
 import threading
 import unittest
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
@@ -17,6 +21,8 @@ Swapouts:                                  {swapouts}.
 """
 REPLY_CONTENT = "1\n2\n3"
 TTFT_MS = 412.5
+GIB = 2**30
+MIB = 2**20
 
 
 def snapshot(pressure="normal", **counters):
@@ -38,8 +44,9 @@ def snapshot(pressure="normal", **counters):
 class StubServer:
     """Serve one `/status` document and a chat reply that reports cached tokens.
 
-    `cached_tokens` is one count for every reply, or a list read one entry per
-    chat request in arrival order.
+    `status` is a document, or a callable taking the count of chat requests
+    received so far and returning one. `cached_tokens` is one count for every
+    reply, or a list read one entry per chat request in arrival order.
     """
 
     def __init__(
@@ -66,7 +73,10 @@ class StubServer:
                 if self.path == "/v1/models":
                     self.reply({"data": [{"id": MODEL}]})
                     return
-                self.reply(stub.status)
+                status = stub.status
+                if callable(status):
+                    status = status(len(stub.chat_bodies))
+                self.reply(status)
 
             def do_POST(self):
                 length = int(self.headers["Content-Length"])
@@ -355,12 +365,17 @@ class PromptTests(unittest.TestCase):
 
 
 def run_main(arguments, swapouts=(0,)):
-    readings = iter(list(swapouts) + [swapouts[-1]] * 1000)
+    """Run main against stubbed vm_stat; `swapouts` is a sequence or a callable."""
+    if callable(swapouts):
+        read_swapouts = swapouts
+    else:
+        readings = iter(list(swapouts) + [swapouts[-1]] * 1000)
+        read_swapouts = readings.__next__
     output = io.StringIO()
     with (
         contextlib.redirect_stdout(output),
         contextlib.redirect_stderr(io.StringIO()),
-        mock.patch.object(probe, "read_vm_stat", lambda: (PAGE_BYTES, next(readings))),
+        mock.patch.object(probe, "read_vm_stat", lambda: (PAGE_BYTES, read_swapouts())),
         mock.patch.object(probe, "read_os_pressure_level", lambda: 2),
         mock.patch.object(probe, "SWAP_POLL_SECONDS", 0.01),
     ):
@@ -556,6 +571,340 @@ class AgentModeTests(unittest.TestCase):
             probe.parse_args(
                 ["--base-url", "http://x", "--agent-turns", "2", "--nonces", "aaaa"]
             )
+
+
+class BallastSizingTests(unittest.TestCase):
+    def governor_sample(self, headroom_bytes, reserve_bytes):
+        return snapshot(
+            memory_governor__host_headroom_bytes=headroom_bytes,
+            memory_governor__host_reserve_bytes=reserve_bytes,
+        )
+
+    def test_hostWarningMarginBytes_isAQuarterOfTheReserveAboveTheFloor(self):
+        margins = [
+            probe.host_warning_margin_bytes(reserve)
+            for reserve in (2 * GIB, 512 * MIB, 0)
+        ]
+
+        self.assertEqual(margins, [512 * MIB, 256 * MIB, 256 * MIB])
+
+    def test_autoBallast_isHeadroomLessWarningMarginPlusOvershoot(self):
+        sample = self.governor_sample(10 * GIB, 2 * GIB)
+
+        record = probe.auto_ballast(sample)
+
+        self.assertEqual(
+            record,
+            {
+                "mb": 10 * 1024 - 512 + 256,
+                "host_headroom_bytes": 10 * GIB,
+                "host_reserve_bytes": 2 * GIB,
+                "warning_margin_bytes": 512 * MIB,
+            },
+        )
+
+    def test_autoBallast_headroomBelowTheMargin_floorsAtZero(self):
+        sample = self.governor_sample(100 * MIB, 2 * GIB)
+
+        self.assertEqual(probe.auto_ballast(sample)["mb"], 0)
+
+    def test_autoBallast_serverWithoutHostReadings_raises(self):
+        with self.assertRaises(probe.ProbeError):
+            probe.auto_ballast(snapshot(memory_governor__host_headroom_bytes=GIB))
+
+    def test_parseArgs_ballastMb_acceptsAutoOrAPositiveSize(self):
+        sizes = [
+            probe.parse_args(
+                ["--base-url", "http://x", "--ballast-mb", text]
+            ).ballast_mb
+            for text in ("auto", "512")
+        ]
+
+        self.assertEqual(sizes, ["auto", 512])
+
+    def test_parseArgs_ballastMb_refusesZeroNegativeAndText(self):
+        for text in ("0", "-3", "lots"):
+            with (
+                self.subTest(text=text),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                probe.parse_args(["--base-url", "http://x", "--ballast-mb", text])
+
+
+class BallastChildTests(unittest.TestCase):
+    def test_fillIncompressible_writesBytesTheCompressorCannotShrink(self):
+        region = bytearray(64 * 1024)
+
+        with mock.patch.object(probe, "BALLAST_CHUNK_BYTES", 4096):
+            probe.fill_incompressible(region)
+
+        self.assertGreater(len(zlib.compress(bytes(region))), len(region))
+
+    def test_holdBallast_reportsReadyThenEndsWhenThePipeCloses(self):
+        control, child_end = multiprocessing.Pipe()
+        child = threading.Thread(target=probe.hold_ballast, args=(4096, child_end))
+        child.start()
+
+        ready = control.recv()
+        control.close()
+        child.join(5.0)
+
+        self.assertEqual(ready, probe.BALLAST_READY)
+        self.assertFalse(child.is_alive())
+
+
+def fake_ballast_child(stub):
+    """Return a BallastChild stand-in that logs starts and closes, and its log.
+
+    Each event records how many chat requests the stub had received, which
+    places it at a phase edge. Nothing is allocated.
+    """
+    events = []
+
+    class FakeBallastChild:
+        def __init__(self, byte_count):
+            events.append(("start", byte_count, len(stub.chat_bodies)))
+
+        def wait_ready(self, _stop):
+            return True
+
+        def close(self):
+            events.append(("close", len(stub.chat_bodies)))
+
+    return FakeBallastChild, events
+
+
+def headroom_falling_per_request(chat_count):
+    """Status whose host headroom drops 1 GiB per chat request received."""
+    return snapshot(
+        memory_governor__host_headroom_bytes=(10 - chat_count) * GIB,
+        memory_governor__host_reserve_bytes=GIB,
+    )
+
+
+BURST_ARGUMENTS = ("--lanes", "2", "--warm-tokens", "80", "--extend-tokens", "20")
+
+
+class BallastMainTests(unittest.TestCase):
+    def run_with_fake_child(self, stub, arguments, swapouts=(0,)):
+        child, events = fake_ballast_child(stub)
+        with mock.patch.object(probe, "BallastChild", child):
+            code, output = run_main(arguments, swapouts)
+        return code, output, events
+
+    def test_main_ballast_heldFromBurstStartUntilBurstEnds(self):
+        with StubServer(snapshot()) as stub:
+            code, _output, events = self.run_with_fake_child(
+                stub,
+                ["--base-url", stub.base_url, *BURST_ARGUMENTS, "--ballast-mb", "64"],
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(events, [("start", 64 * MIB, 2), ("close", 4)])
+
+    def test_main_agentTurns_ballastHeldFromSecondTurnUntilLastTurnEnds(self):
+        with StubServer(AGENT_STATUS, cached_tokens=[0, 90, 150]) as stub:
+            code, _output, events = self.run_with_fake_child(
+                stub, agent_arguments(stub, 3, "--ballast-mb", "64")
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(events, [("start", 64 * MIB, 1), ("close", 3)])
+
+    def test_main_swapGuardTripsDuringBurst_closesTheBallastChild(self):
+        grown = 2 * MIB // PAGE_BYTES
+        with StubServer(snapshot(), reply_delay=30.0) as stub:
+            code, _output, events = self.run_with_fake_child(
+                stub,
+                [
+                    "--base-url",
+                    stub.base_url,
+                    "--nonces",
+                    "aaaa",
+                    "--ballast-mb",
+                    "64",
+                    "--swap-guard-mb",
+                    "1",
+                ],
+                swapouts=lambda: grown if stub.chat_bodies else 0,
+            )
+
+        self.assertEqual(code, probe.SWAP_ABORT_EXIT_CODE)
+        self.assertEqual([event[0] for event in events], ["start", "close"])
+
+    def test_main_ballastAuto_sizedFromTheStatusAtBurstStart(self):
+        with StubServer(headroom_falling_per_request) as stub:
+            _code, output, events = self.run_with_fake_child(
+                stub,
+                [
+                    "--base-url",
+                    stub.base_url,
+                    *BURST_ARGUMENTS,
+                    "--ballast-mb",
+                    "auto",
+                    "--json",
+                ],
+            )
+
+        self.assertEqual(events[0], ("start", 8 * GIB, 2))
+        self.assertEqual(
+            json.loads(output)["ballast"],
+            {
+                "mb": 8 * 1024,
+                "host_headroom_bytes": 8 * GIB,
+                "host_reserve_bytes": GIB,
+                "warning_margin_bytes": 256 * MIB,
+                "requested": "auto",
+                "phase": "burst",
+                "held": True,
+            },
+        )
+
+    def test_main_agentTurnsBallastAuto_sizedAtTheSecondTurnsStart(self):
+        with StubServer(headroom_falling_per_request) as stub:
+            _code, output, events = self.run_with_fake_child(
+                stub, agent_arguments(stub, 3, "--ballast-mb", "auto", "--json")
+            )
+
+        self.assertEqual(events[0], ("start", 9 * GIB, 1))
+        self.assertEqual(json.loads(output)["ballast"]["phase"], "turn1")
+
+    def test_formatReport_ballast_rendersSizeAndHeadroom(self):
+        with StubServer(headroom_falling_per_request) as stub:
+            _code, output, _events = self.run_with_fake_child(
+                stub,
+                [
+                    "--base-url",
+                    stub.base_url,
+                    "--nonces",
+                    "aaaa",
+                    "--ballast-mb",
+                    "auto",
+                ],
+            )
+
+        self.assertRegex(output, r"ballast_mb\s+10240")
+        self.assertRegex(output, rf"ballast_host_headroom_bytes\s+{10 * GIB}")
+
+    def test_main_withoutBallast_reportsNoneAndStartsNoChild(self):
+        with StubServer(snapshot()) as stub:
+            _code, output, events = self.run_with_fake_child(
+                stub, ["--base-url", stub.base_url, "--nonces", "aaaa", "--json"]
+            )
+
+        self.assertIsNone(json.loads(output)["ballast"])
+        self.assertEqual(events, [])
+
+
+class RequireFlagTests(unittest.TestCase):
+    def sample(self, server, suspensions=None, waiting_memory=None):
+        return {
+            "server_pressure": server,
+            "resource_suspensions": suspensions,
+            "waiting_memory": waiting_memory,
+        }
+
+    def test_hasWarningSuspension_riseBetweenTwoWarningSamples_passes(self):
+        samples = [
+            self.sample("warning", 3),
+            {"t": 1, "error": "timed out"},
+            self.sample("warning", 4),
+        ]
+
+        self.assertTrue(probe.has_warning_suspension(samples))
+
+    def test_hasWarningSuspension_riseLeavingNormal_fails(self):
+        samples = [
+            self.sample("normal", 3),
+            self.sample("warning", 4),
+            self.sample("warning", 4),
+            self.sample("normal", 5),
+        ]
+
+        self.assertFalse(probe.has_warning_suspension(samples))
+
+    def test_hasWaitingMemory_aSampleWaiting_passes(self):
+        samples = [self.sample("normal", waiting_memory=0), self.sample("warning")]
+        samples.append(self.sample("warning", waiting_memory=1))
+
+        self.assertTrue(probe.has_waiting_memory(samples))
+
+    def test_hasWaitingMemory_noSampleWaiting_fails(self):
+        samples = [self.sample("normal", waiting_memory=0), self.sample("warning")]
+
+        self.assertFalse(probe.has_waiting_memory(samples))
+
+    def test_exitCode_swapGuardTrip_winsOverTheRequireFlags(self):
+        args = argparse.Namespace(
+            agent_turns=None,
+            require_warning_suspension=True,
+            require_waiting_memory=True,
+        )
+        document = {"swap_aborted": True, "phases": []}
+
+        self.assertEqual(
+            probe.exit_code(args, document, []), probe.SWAP_ABORT_EXIT_CODE
+        )
+
+    def run_required(self, status, flag):
+        with StubServer(status, reply_delay=0.1) as stub:
+            code, _output = run_main(
+                [
+                    "--base-url",
+                    stub.base_url,
+                    "--nonces",
+                    "aaaa",
+                    "--sample-seconds",
+                    "0.01",
+                    flag,
+                ]
+            )
+        return code
+
+    def test_main_requireWarningSuspension_suspensionUnderWarning_exitsZero(self):
+        calls = itertools.count()
+
+        def rising(_chat_count):
+            return snapshot("warning", cache__resource_suspensions=next(calls))
+
+        code = self.run_required(rising, "--require-warning-suspension")
+
+        self.assertEqual(code, 0)
+
+    def test_main_requireWarningSuspension_noSuspension_exitsFive(self):
+        status = snapshot("warning", cache__resource_suspensions=2)
+
+        code = self.run_required(status, "--require-warning-suspension")
+
+        self.assertEqual(code, probe.WARNING_SUSPENSION_MISSING_EXIT_CODE)
+
+    def test_main_requireWaitingMemory_requestWaiting_exitsZero(self):
+        status = snapshot(admission__waiting_memory=1)
+
+        code = self.run_required(status, "--require-waiting-memory")
+
+        self.assertEqual(code, 0)
+
+    def test_main_requireWaitingMemory_nothingWaiting_exitsSix(self):
+        status = snapshot(admission__waiting_memory=0)
+
+        code = self.run_required(status, "--require-waiting-memory")
+
+        self.assertEqual(code, probe.WAITING_MEMORY_MISSING_EXIT_CODE)
+
+
+class ReportTests(unittest.TestCase):
+    def test_formatReport_rendersResumeDeltasPerPhase(self):
+        status = snapshot(
+            cache__resource_resume_restored_tokens=4096,
+            cache__resource_resume_state_evictions=0,
+        )
+        with StubServer(status) as stub:
+            _code, output = run_main(["--base-url", stub.base_url, "--nonces", "a"])
+
+        self.assertRegex(output, r"resume_restored_tokens\s+0")
+        self.assertRegex(output, r"resume_state_evictions\s+0")
 
 
 if __name__ == "__main__":

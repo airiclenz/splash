@@ -22,12 +22,26 @@ previous prompt, the returned reply and ``--tool-tokens`` filler words, so the
 whole earlier conversation is reusable. Each turn is its own phase, reported
 with its cached tokens, TTFT, counter deltas and OS warn seconds; the probe
 exits AGENT_COLD_TURN_EXIT_CODE when a turn after the first reuses 0 tokens.
+
+``--ballast-mb N`` holds N MB of incompressible host memory in a child process
+from the burst phase's start until it ends (with ``--agent-turns``, from the
+second turn's start until the last turn ends), so the server serves under host
+pressure. ``--ballast-mb auto`` sizes N when the ballast engages, from that
+instant's ``/status`` ``memory_governor`` sample, to push the host just past the
+server's warning margin. The child exits when its pipe to the probe closes, so
+a killed probe leaves no ballast behind.
+
+``--require-warning-suspension`` and ``--require-waiting-memory`` assert that
+the pressure paths ran: the probe exits WARNING_SUSPENSION_MISSING_EXIT_CODE or
+WAITING_MEMORY_MISSING_EXIT_CODE when the samples show none.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import mmap
+import multiprocessing
 import os
 import random
 import re
@@ -69,6 +83,9 @@ OS_PRESSURE_WARN = 2
 SERVER_NORMAL = "normal"
 SWAP_ABORT_EXIT_CODE = 3
 AGENT_COLD_TURN_EXIT_CODE = 4
+WARNING_SUSPENSION_MISSING_EXIT_CODE = 5
+WAITING_MEMORY_MISSING_EXIT_CODE = 6
+SERVER_WARNING = "warning"
 AGENT_LANE = 0
 # The chat reply path of the server-side TTFT (prefill wall, no network).
 TTFT_PATH = ("metrics", "request_latency", "start_to_first_token_ms")
@@ -76,6 +93,18 @@ TTFT_PATH = ("metrics", "request_latency", "start_to_first_token_ms")
 # engine TTFT above leaves out.
 QUEUE_PATH = ("metrics", "request_latency", "queue_to_start_ms")
 BYTES_PER_MB = 2**20
+BALLAST_AUTO = "auto"
+# The agent turn the ballast engages at: the first turn warms the conversation.
+BALLAST_AGENT_TURN = 1
+# os.urandom chunk the ballast is filled with: bounds the transient copy.
+BALLAST_CHUNK_BYTES = 64 * BYTES_PER_MB
+BALLAST_READY = "ready"
+BALLAST_POLL_SECONDS = 0.5
+BALLAST_EXIT_SECONDS = 5.0
+# MemoryPlan.hpp EngineMemoryPolicy::minimumHostWarningMarginBytes.
+MINIMUM_HOST_WARNING_MARGIN_BYTES = 256 * BYTES_PER_MB
+# How far `auto` pushes host headroom below the warning margin.
+BALLAST_OVERSHOOT_BYTES = 256 * BYTES_PER_MB
 
 # The `/status` causes that split checkpoint_publication_failures.
 CHECKPOINT_FAILURE_CAUSES = (
@@ -128,6 +157,7 @@ PHASE_COUNTERS = (
 # (sample key, `/status` path) of the point readings each sample keeps.
 SAMPLE_READINGS = (
     ("suspended", ("admission", "suspended")),
+    ("resource_suspensions", ("cache", "resource_suspensions")),
     ("waiting_memory", ("admission", "waiting_memory")),
     ("waiting_schedule", ("admission", "waiting_schedule")),
     ("governor_headroom_bytes", ("memory_governor", "headroom_bytes")),
@@ -310,6 +340,186 @@ class Sampler:
 
 
 # ------------------------------------------------------------------------------
+def host_warning_margin_bytes(reserve_bytes: int) -> int:
+    """Return the host cushion's warning margin for a host reserve.
+
+    Mirrors EngineMemoryPolicy::hostCushionForReserve
+    (runtime/engine/MemoryPlan.hpp); keep the two in step.
+    """
+    return max(reserve_bytes // 4, MINIMUM_HOST_WARNING_MARGIN_BYTES)
+
+
+# ------------------------------------------------------------------------------
+def auto_ballast(snapshot: dict) -> dict:
+    """Size `--ballast-mb auto` from one `/status` memory_governor sample.
+
+    N = host headroom - the warning margin + BALLAST_OVERSHOOT_BYTES, floored
+    at 0, so holding it drops the headroom just past the server's warning
+    margin. host_headroom_bytes is already net of host_reserve_bytes, so the
+    reserve is not subtracted again. Raises ProbeError when the server exports
+    neither reading.
+    """
+    governor = ("memory_governor",)
+    headroom = status_reading(snapshot, (*governor, "host_headroom_bytes"))
+    reserve = status_reading(snapshot, (*governor, "host_reserve_bytes"))
+    if headroom is None or reserve is None:
+        raise ProbeError(
+            "/status memory_governor carries no host_headroom_bytes or "
+            "host_reserve_bytes to size --ballast-mb auto"
+        )
+    margin = host_warning_margin_bytes(reserve)
+    ballast_bytes = max(0, headroom - margin + BALLAST_OVERSHOOT_BYTES)
+    return {
+        "mb": ballast_bytes // BYTES_PER_MB,
+        "host_headroom_bytes": headroom,
+        "host_reserve_bytes": reserve,
+        "warning_margin_bytes": margin,
+    }
+
+
+# ------------------------------------------------------------------------------
+def fill_incompressible(region) -> None:
+    """Overwrite a writable buffer with random bytes, chunk by chunk.
+
+    Random pages defeat the macOS memory compressor, which would absorb zero
+    or repeated pages without raising host pressure.
+    """
+    size = len(region)
+    for offset in range(0, size, BALLAST_CHUNK_BYTES):
+        length = min(BALLAST_CHUNK_BYTES, size - offset)
+        region[offset : offset + length] = os.urandom(length)
+
+
+# ------------------------------------------------------------------------------
+def hold_ballast(byte_count: int, control) -> None:
+    """Allocate and fill `byte_count` bytes, report ready, hold until EOF.
+
+    The ballast child's body. `control` is its end of a pipe to the probe: the
+    child blocks reading it and returns once the probe closes its end or dies.
+    """
+    # Anonymous memory is mapped lazily, so the fill touches each page once.
+    region = mmap.mmap(-1, byte_count)
+    fill_incompressible(region)
+    try:
+        control.send(BALLAST_READY)
+        control.recv()
+    except (EOFError, OSError):
+        # The probe closed its end or exited: EOF is the release signal.
+        pass
+    finally:
+        region.close()
+
+
+class BallastChild:
+    """One spawned process holding the ballast until its pipe closes."""
+
+    # --------------------------------------------------------------------------
+    def __init__(self, byte_count: int):
+        """Spawn the child; it starts filling `byte_count` bytes at once."""
+        # Spawn, not fork: the probe runs sampler and guard threads.
+        context = multiprocessing.get_context("spawn")
+        self.control, child_end = context.Pipe()
+        self.process = context.Process(
+            target=hold_ballast, args=(byte_count, child_end), daemon=True
+        )
+        self.process.start()
+        child_end.close()
+
+    # --------------------------------------------------------------------------
+    def wait_ready(self, stop: threading.Event) -> bool:
+        """Wait until the ballast is filled; False when `stop` or the child ends."""
+        while not self.control.poll(BALLAST_POLL_SECONDS):
+            if stop.is_set() or not self.process.is_alive():
+                return False
+        try:
+            return self.control.recv() == BALLAST_READY
+        except EOFError:
+            return False
+
+    # --------------------------------------------------------------------------
+    def close(self) -> None:
+        """Close the pipe so the child exits; terminate it if it lingers."""
+        self.control.close()
+        self.process.join(BALLAST_EXIT_SECONDS)
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join()
+
+
+class Ballast:
+    """Holds `--ballast-mb` of host memory between `engage` and `release`.
+
+    Runs on the probe's main thread only. `engage` sizes the ballast (from a
+    fresh `/status` for `auto`) and starts `start_child(byte_count)`, whose
+    result offers `wait_ready(stop)` and `close()`; `release` closes it. Both
+    are idempotent, so phase edges, guard trips and `main` may all release.
+    """
+
+    # --------------------------------------------------------------------------
+    def __init__(self, request, client, start_child):
+        """`request` is None (no ballast), BALLAST_AUTO, or a size in MB."""
+        self.request = request
+        self.client = client
+        self.start_child = start_child
+        self.child = None
+        self.record = None
+
+    # --------------------------------------------------------------------------
+    def engage(self, phase: str, stop: threading.Event) -> None:
+        """Size and start the ballast once, at the start of `phase`.
+
+        Starts nothing once `stop` is set. Returns once the child has filled
+        its memory, `stop` is set or the child failed; the report's `held` says
+        which.
+        """
+        if self.request is None or self.record is not None or stop.is_set():
+            return
+        if self.request == BALLAST_AUTO:
+            self.record = auto_ballast(fresh_status(self.client))
+        else:
+            self.record = {"mb": self.request}
+        self.record.update(requested=self.request, phase=phase, held=False)
+        if self.record["mb"] <= 0:
+            return
+        self.child = self.start_child(self.record["mb"] * BYTES_PER_MB)
+        self.record["held"] = self.child.wait_ready(stop)
+        if not self.record["held"]:
+            print("pressure_probe: ballast not held", file=sys.stderr)
+
+    # --------------------------------------------------------------------------
+    def release(self) -> None:
+        """End the ballast child, if one runs."""
+        child, self.child = self.child, None
+        if child is not None:
+            child.close()
+
+
+# ------------------------------------------------------------------------------
+def has_warning_suspension(samples: list[dict]) -> bool:
+    """Return whether resource suspensions rose between two warning samples.
+
+    Only consecutive usable samples (those with a server pressure) count, and
+    both must read `warning`.
+    """
+    usable = [sample for sample in samples if sample.get("server_pressure")]
+    for current, following in zip(usable, usable[1:]):
+        pressures = (current["server_pressure"], following["server_pressure"])
+        if pressures != (SERVER_WARNING, SERVER_WARNING):
+            continue
+        before = current.get("resource_suspensions")
+        after = following.get("resource_suspensions")
+        if before is not None and after is not None and after > before:
+            return True
+    return False
+
+
+# ------------------------------------------------------------------------------
+def has_waiting_memory(samples: list[dict]) -> bool:
+    """Return whether some sample shows a request waiting for memory."""
+    return any((sample.get("waiting_memory") or 0) > 0 for sample in samples)
+
+
+# ------------------------------------------------------------------------------
 def lane_words(nonce: str, count: int) -> list[str]:
     """Return the lane's first `count` filler words, fixed by its nonce."""
     return random.Random(nonce).choices(FILLER_WORDS, k=count)
@@ -412,10 +622,11 @@ def run_phase(client, sampler, guard, phase, bodies, timeout, replies=None) -> d
 
 
 # ------------------------------------------------------------------------------
-def run_probe(client, model, args, sampler, guard) -> list[dict]:
+def run_probe(client, model, args, sampler, guard, ballast) -> list[dict]:
     """Warm each lane alone (unless `args.nonces` names warmed ones), then burst.
 
-    Stops once the swap guard has tripped or a warm-up fails.
+    `ballast` is held for the burst. Stops once the swap guard has tripped or
+    a warm-up fails.
     """
     warm_words = max(1, args.warm_tokens - PROMPT_FRAME_TOKENS)
     burst_words = warm_words + args.extend_tokens
@@ -434,8 +645,6 @@ def run_probe(client, model, args, sampler, guard) -> list[dict]:
         phases.append(phase)
         if phase["swap_aborted"] or phase["lanes"][0]["error"]:
             return phases
-    if guard.tripped.is_set():
-        return phases
     bodies = {
         lane: chat_body(
             model,
@@ -444,9 +653,15 @@ def run_probe(client, model, args, sampler, guard) -> list[dict]:
         )
         for lane, nonce in enumerate(args.nonces)
     }
-    phases.append(
-        run_phase(client, sampler, guard, "burst", bodies, args.request_timeout)
-    )
+    try:
+        ballast.engage("burst", guard.tripped)
+        if guard.tripped.is_set():
+            return phases
+        phases.append(
+            run_phase(client, sampler, guard, "burst", bodies, args.request_timeout)
+        )
+    finally:
+        ballast.release()
     return phases
 
 
@@ -460,46 +675,52 @@ def reply_text(reply) -> str | None:
 
 
 # ------------------------------------------------------------------------------
-def run_agent(client, model, args, sampler, guard) -> list[dict]:
+def run_agent(client, model, args, sampler, guard, ballast) -> list[dict]:
     """Drive one conversation for `args.agent_turns` back-to-back turns.
 
     Turn 0 is the warm-up-sized prompt; each later turn resends the whole
     conversation, the previous reply and `args.tool_tokens` new filler words,
-    as an agent does after a tool call. Stops once the swap guard has tripped,
-    a turn fails or a reply carries no content to resend.
+    as an agent does after a tool call. `ballast` is held from the start of
+    turn BALLAST_AGENT_TURN until the last turn ends. Stops once the swap guard
+    has tripped, a turn fails or a reply carries no content to resend.
     """
     nonce = args.nonces[0]
     instruction = f"Write the integers from 1 to {args.max_tokens * 2}, one per line."
     words = lane_words(nonce, max(1, args.warm_tokens - PROMPT_FRAME_TOKENS))
     messages = [{"role": "user", "content": lane_prompt(nonce, words, instruction)}]
     phases = []
-    for turn in range(args.agent_turns):
-        if guard.tripped.is_set():
-            return phases
-        body = conversation_body(model, messages, args.max_tokens)
-        replies: dict = {}
-        phase = run_phase(
-            client,
-            sampler,
-            guard,
-            f"turn{turn}",
-            {AGENT_LANE: body},
-            args.request_timeout,
-            replies,
-        )
-        phases.append(phase)
-        content = reply_text(replies.get(AGENT_LANE))
-        record = phase["lanes"][0] if phase["lanes"] else None
-        if phase["swap_aborted"] or record is None or record["error"]:
-            return phases
-        if content is None:
-            record["error"] = "reply carries no message content to resend"
-            return phases
-        tool_words = lane_words(f"{nonce}-{turn}", args.tool_tokens)
-        messages = messages + [
-            {"role": "assistant", "content": content},
-            {"role": "user", "content": f"{' '.join(tool_words)}\n{instruction}"},
-        ]
+    try:
+        for turn in range(args.agent_turns):
+            if turn == BALLAST_AGENT_TURN:
+                ballast.engage(f"turn{turn}", guard.tripped)
+            if guard.tripped.is_set():
+                return phases
+            body = conversation_body(model, messages, args.max_tokens)
+            replies: dict = {}
+            phase = run_phase(
+                client,
+                sampler,
+                guard,
+                f"turn{turn}",
+                {AGENT_LANE: body},
+                args.request_timeout,
+                replies,
+            )
+            phases.append(phase)
+            content = reply_text(replies.get(AGENT_LANE))
+            record = phase["lanes"][0] if phase["lanes"] else None
+            if phase["swap_aborted"] or record is None or record["error"]:
+                return phases
+            if content is None:
+                record["error"] = "reply carries no message content to resend"
+                return phases
+            tool_words = lane_words(f"{nonce}-{turn}", args.tool_tokens)
+            messages = messages + [
+                {"role": "assistant", "content": content},
+                {"role": "user", "content": f"{' '.join(tool_words)}\n{instruction}"},
+            ]
+    finally:
+        ballast.release()
     return phases
 
 
@@ -552,10 +773,29 @@ def format_report(document: dict) -> str:
     lines.append("")
     for key, value in document["pressure"].items():
         lines.append(f"{key:<{width}}{format_value(value):>12}")
+    for key, value in (document["ballast"] or {}).items():
+        cell = value if isinstance(value, str) else format_value(value)
+        lines.append(f"{'ballast_' + key:<{width}}{cell:>12}")
     if document["swap_aborted"]:
         grown = document["swap_grown_bytes"] / BYTES_PER_MB
         lines.append(f"\nswap guard tripped: swapouts grew {grown:.0f} MB")
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------------------------
+def ballast_request(text: str):
+    """Parse `--ballast-mb`: BALLAST_AUTO or a positive size in MB."""
+    if text == BALLAST_AUTO:
+        return BALLAST_AUTO
+    try:
+        megabytes = int(text)
+    except ValueError:
+        megabytes = 0
+    if megabytes < 1:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive size in MB or {BALLAST_AUTO}, got {text!r}"
+        )
+    return megabytes
 
 
 # ------------------------------------------------------------------------------
@@ -604,6 +844,25 @@ def parse_args(argv=None):
         "--samples", help="append every pressure sample to this JSONL file"
     )
     parser.add_argument(
+        "--ballast-mb",
+        type=ballast_request,
+        help="hold this much incompressible host memory during the burst (with "
+        f"--agent-turns, from the second turn on); {BALLAST_AUTO} sizes it from "
+        "/status to push the host past the server's warning margin",
+    )
+    parser.add_argument(
+        "--require-warning-suspension",
+        action="store_true",
+        help=f"exit {WARNING_SUSPENSION_MISSING_EXIT_CODE} unless a resource "
+        "suspension happened while the server reported warning",
+    )
+    parser.add_argument(
+        "--require-waiting-memory",
+        action="store_true",
+        help=f"exit {WAITING_MEMORY_MISSING_EXIT_CODE} unless a sample shows a "
+        "request waiting for memory",
+    )
+    parser.add_argument(
         "--request-timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS
     )
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
@@ -637,14 +896,35 @@ def parse_args(argv=None):
 
 
 # ------------------------------------------------------------------------------
+def exit_code(args, document: dict, samples: list[dict]) -> int:
+    """Return the probe's exit code; the swap guard is checked first.
+
+    SWAP_ABORT_EXIT_CODE when the swap guard stopped the run, else
+    AGENT_COLD_TURN_EXIT_CODE when an agent turn after the first reused 0
+    tokens, else WARNING_SUSPENSION_MISSING_EXIT_CODE or
+    WAITING_MEMORY_MISSING_EXIT_CODE when a require-flag's path never ran.
+    """
+    if document["swap_aborted"]:
+        return SWAP_ABORT_EXIT_CODE
+    if args.agent_turns is not None and has_cold_turn(document["phases"]):
+        return AGENT_COLD_TURN_EXIT_CODE
+    if args.require_warning_suspension and not has_warning_suspension(samples):
+        return WARNING_SUSPENSION_MISSING_EXIT_CODE
+    if args.require_waiting_memory and not has_waiting_memory(samples):
+        return WAITING_MEMORY_MISSING_EXIT_CODE
+    return 0
+
+
+# ------------------------------------------------------------------------------
 def main(argv=None) -> int:
     """Run the probe and print the report; return the process exit code.
 
-    Exits SWAP_ABORT_EXIT_CODE when the swap guard stopped the run, else
-    AGENT_COLD_TURN_EXIT_CODE when an agent turn after the first reused 0 tokens.
+    See exit_code; 1 when the server or `vm_stat` could not be read. The
+    ballast is released on every exit path, an interrupt included.
     """
     args = parse_args(argv)
     client = ProbeClient(args.base_url, args.api_key)
+    ballast = Ballast(args.ballast_mb, client, BallastChild)
     stop = threading.Event()
     sink = open(args.samples, "a") if args.samples else None
     threads = []
@@ -660,11 +940,12 @@ def main(argv=None) -> int:
             thread.start()
         print(f"pressure_probe: nonces {' '.join(args.nonces)}", file=sys.stderr)
         run = run_probe if args.agent_turns is None else run_agent
-        phases = run(client, model, args, sampler, guard)
+        phases = run(client, model, args, sampler, guard, ballast)
     except (ProbeError, subprocess.CalledProcessError) as error:
         print(f"pressure_probe: {error}", file=sys.stderr)
         return 1
     finally:
+        ballast.release()
         stop.set()
         # A sample in flight finishes before its sink closes.
         for thread in threads:
@@ -680,13 +961,10 @@ def main(argv=None) -> int:
         "pressure": pressure_summary(sampler.samples),
         "swap_aborted": guard.tripped.is_set(),
         "swap_grown_bytes": guard.grown_bytes,
+        "ballast": ballast.record,
     }
     print(json.dumps(document, indent=2) if args.json else format_report(document))
-    if document["swap_aborted"]:
-        return SWAP_ABORT_EXIT_CODE
-    if args.agent_turns is not None and has_cold_turn(phases):
-        return AGENT_COLD_TURN_EXIT_CODE
-    return 0
+    return exit_code(args, document, sampler.samples)
 
 
 if __name__ == "__main__":
