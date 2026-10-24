@@ -670,10 +670,12 @@ bool Engine::admit(Request &active, double now) {
     model_.setDraftContextPlan(active.request.id, std::move(draft));
     if (resuming) {
       // A failed resume attempt returns above and keeps the exemption.
+      countEvictedResumeState(active);
       cache_.unprotectState(std::exchange(active.resumeProtection, {}));
       active.suspended = false;
       active.replaying = true;
       ++counters_.resourceResumptions;
+      counters_.resourceResumeRestoredTokens += resumeBoundary;
       return true;
     }
     active.exactTokens = std::move(active.request.prompt);
@@ -1955,6 +1957,8 @@ void Engine::finishCapacity(Request &active, const TokenAdmission &admission) {
 void Engine::release(Request &active) {
   active.resourceWait = {};
   active.backoffStartedMilliseconds.reset();
+  if (active.suspended)
+    countEvictedResumeState(active);
   cache_.unprotectState(std::exchange(active.resumeProtection, {}));
   cache_.unprotectState(std::exchange(active.queuedProtection, {}));
   cache_.unprotectState(std::exchange(active.checkpointProtection, {}));
@@ -1969,6 +1973,16 @@ void Engine::release(Request &active) {
     active.suspended = false;
     signalResourceProgress();
   }
+}
+
+// ============================================================================
+// Counts the resume state of a suspended lane that is about to resume or end
+// when eviction took it during the suspension. O(1); a lane that found no
+// state to protect at suspension counts nothing.
+void Engine::countEvictedResumeState(const Request &active) noexcept {
+  if (active.resumeProtection &&
+      !cache_.isProtectedStateResident(active.resumeProtection))
+    ++counters_.resourceResumeStateEvictions;
 }
 
 void Engine::sweepTerminal() {

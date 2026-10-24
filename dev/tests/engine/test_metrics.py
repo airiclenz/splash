@@ -191,6 +191,26 @@ class DecodeSuspensionMetricsTests(unittest.TestCase):
             ],
         )
 
+    def test_resume_counters_render_after_decode_replay_tokens(self):
+        lines = prometheus_metrics(
+            {
+                "cache": {
+                    "resource_decode_replay_tokens": 3072,
+                    "resource_resume_restored_tokens": 8192,
+                    "resource_resume_state_evictions": 1,
+                }
+            }
+        ).splitlines()
+
+        start = lines.index("splash_cache_resource_decode_replay_tokens_total 3072")
+        self.assertEqual(
+            lines[start + 1 : start + 3],
+            [
+                "splash_cache_resource_resume_restored_tokens_total 8192",
+                "splash_cache_resource_resume_state_evictions_total 1",
+            ],
+        )
+
     def test_missing_decode_suspension_counters_render_no_lines(self):
         text = prometheus_metrics({"cache": {"resource_replay_tokens": 1}})
 

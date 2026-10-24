@@ -3471,6 +3471,35 @@ void testCriticalReclaimEvictsSuspendedRequestsResumeState() {
   require(fixture.executor.restored == fixture.restoredBeforeResume &&
               fixture.engine.snapshot().resourceReplayTokens == 128,
           "a resume without its state did not replay the processed prefix");
+  require(fixture.engine.snapshot().resourceResumeStateEvictions == 1 &&
+              fixture.engine.snapshot().resourceResumeRestoredTokens == 0,
+          "a resume without its state did not count the evicted resume state");
+}
+
+void testResumeCountsItsRestoredBoundary() {
+  SuspendedResumeFixture fixture;
+
+  fixture.resume();
+
+  require(fixture.engine.snapshot().resourceResumeRestoredTokens == 128 &&
+              fixture.engine.snapshot().resourceResumeStateEvictions == 0,
+          "a resume from its spared state miscounted its restore depth");
+}
+
+void testCancelledSuspendedRequestCountsItsEvictedResumeState() {
+  SuspendedResumeFixture fixture;
+  static_cast<void>(fixture.engine.reclaimMemory(
+      {.reclaimEmptyKvExtents = true,
+       .evictAllUnpinnedPrefixes = true,
+       .targetBytes = std::numeric_limits<uint64_t>::max()}));
+
+  fixture.engine.cancel(280);
+  runUntilIdle(fixture.engine);
+
+  require(fixture.engine.snapshot().resourceResumeStateEvictions == 1 &&
+              fixture.engine.snapshot().resourceResumptions == 0,
+          "a cancelled suspended request did not count its evicted resume "
+          "state");
 }
 
 void testCancelledSuspendedRequestReleasesItsResumeExemption() {
@@ -5938,6 +5967,8 @@ int main() {
     testWarningReclaimKeepsSuspendedRequestsResumeState();
     testWarningReclaimWalksPastProtectedResumeState();
     testCriticalReclaimEvictsSuspendedRequestsResumeState();
+    testResumeCountsItsRestoredBoundary();
+    testCancelledSuspendedRequestCountsItsEvictedResumeState();
     testCancelledSuspendedRequestReleasesItsResumeExemption();
     testSuspendedLanesSharingAResumeStateKeepItUntilBothRelease();
     testWarningReclaimKeepsQueuedRequestsPrefix();

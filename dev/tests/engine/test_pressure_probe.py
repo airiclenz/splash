@@ -128,6 +128,21 @@ class CounterDeltaTests(unittest.TestCase):
         self.assertEqual(delta["suspensions"], 2)
         self.assertEqual(delta["state_evictions"], 4)
 
+    def test_counterDelta_diffsResumeRestoreDepthAndEvictedResumeStates(self):
+        before = snapshot(
+            cache__resource_resume_restored_tokens=4096,
+            cache__resource_resume_state_evictions=1,
+        )
+        after = snapshot(
+            cache__resource_resume_restored_tokens=12288,
+            cache__resource_resume_state_evictions=3,
+        )
+
+        delta = probe.counter_delta(before, after)
+
+        self.assertEqual(delta["resume_restored_tokens"], 8192)
+        self.assertEqual(delta["resume_state_evictions"], 2)
+
     def test_counterDelta_missingCounter_readsAsNoneNotZero(self):
         delta = probe.counter_delta(snapshot(), snapshot(state__evictions=2))
 

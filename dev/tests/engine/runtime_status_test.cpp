@@ -74,6 +74,8 @@ void testCleanRuntimeStatus() {
   engine.resourceReplayTokens = 1234;
   engine.resourceDecodeSuspensions = 5;
   engine.resourceDecodeReplayTokens = 678;
+  engine.resourceResumeRestoredTokens = 4321;
+  engine.resourceResumeStateEvictions = 2;
   engine.deduplicatedStatePublications = 2;
   engine.recycledStatePublications = 1;
   engine.scheduler.waitingPrefix = 3;
@@ -267,7 +269,9 @@ void testCleanRuntimeStatus() {
       json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
           json.find("\"resource_replay_tokens\":1234,"
                     "\"resource_decode_suspensions\":5,"
-                    "\"resource_decode_replay_tokens\":678}") !=
+                    "\"resource_decode_replay_tokens\":678,"
+                    "\"resource_resume_restored_tokens\":4321,"
+                    "\"resource_resume_state_evictions\":2}") !=
               std::string::npos &&
           json.find("\"waiting_prefix\":3") != std::string::npos &&
           json.find("\"deduplicated_state_publications\":2,"

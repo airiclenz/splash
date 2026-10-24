@@ -216,6 +216,11 @@ public:
   [[nodiscard]] StateProtection protectState(uint64_t kvBlock);
   // Ends one protection. No-op once its publication is gone.
   void unprotectState(StateProtection protection) noexcept;
+  // True while the publication protection names is still published: false
+  // once eviction or retirement took it, even if a newer state has since
+  // been published at the same block. O(1).
+  [[nodiscard]] bool
+  isProtectedStateResident(StateProtection protection) const noexcept;
   // Empty resident backing exists but the previous release is still in
   // flight; more reclaim work becomes possible without evicting anything.
   // keepRunway does not count the one extent a runway-keeping pass leaves.

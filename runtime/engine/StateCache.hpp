@@ -141,6 +141,9 @@ public:
   // Drops one protection. No-op for an empty handle or a publication that has
   // since been evicted or replaced.
   void unprotect(StateProtection protection) noexcept;
+  // True while the publication protection names is still published; false
+  // for an empty handle. O(1).
+  [[nodiscard]] bool isResident(StateProtection protection) const noexcept;
   // Unpinned checkpoints precede ordinary states regardless of recency.
   // keepResumePoint withholds the publication a follow-up request would
   // resume from, leaving no candidate when it is the only one. Checkpoints

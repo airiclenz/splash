@@ -188,6 +188,12 @@ void StateCache::unprotect(StateProtection protection) noexcept {
   --found->second.protections;
 }
 
+bool StateCache::isResident(StateProtection protection) const noexcept {
+  const auto found = entries_.find(protection.kvBlock);
+  return found != entries_.end() &&
+         found->second.publication == protection.publication;
+}
+
 uint64_t StateCache::resumePoint() const noexcept {
   // Checkpoints can survive cancellation but remain disposable. Prefer an
   // ordinary state for speculative protection, regardless of recency.

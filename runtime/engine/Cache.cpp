@@ -408,6 +408,11 @@ void Cache::unprotectState(StateProtection protection) noexcept {
   states_.unprotect(protection);
 }
 
+bool Cache::isProtectedStateResident(
+    StateProtection protection) const noexcept {
+  return states_.isResident(protection);
+}
+
 bool Cache::releaseDeferred(bool keepRunway) const noexcept {
   const uint32_t keptExtents = keepRunway ? 1 : 0;
   return pool_.reclaimableExtentCount() > keptExtents && releasePending();

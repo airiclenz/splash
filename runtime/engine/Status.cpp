@@ -240,7 +240,11 @@ std::string runtimeStatusJson(
       << ",\"resource_replay_tokens\":" << core.resourceReplayTokens
       << ",\"resource_decode_suspensions\":" << core.resourceDecodeSuspensions
       << ",\"resource_decode_replay_tokens\":"
-      << core.resourceDecodeReplayTokens << "}"
+      << core.resourceDecodeReplayTokens
+      << ",\"resource_resume_restored_tokens\":"
+      << core.resourceResumeRestoredTokens
+      << ",\"resource_resume_state_evictions\":"
+      << core.resourceResumeStateEvictions << "}"
       << ",\"draft_context\":{\"target_prefill_rows\":"
       << executorTelemetry.targetPrefillRows
       << ",\"active_rows\":" << executorTelemetry.draftContextRowsActive

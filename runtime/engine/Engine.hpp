@@ -107,6 +107,12 @@ struct EngineSnapshot final {
   // suspension started, including rows replayed again after a further
   // suspension during that replay.
   uint64_t resourceDecodeReplayTokens = 0;
+  // The resume boundaries the resourceResumptions restored, summed: a resume
+  // that found no state adds 0.
+  uint64_t resourceResumeRestoredTokens = 0;
+  // Resume states evicted while their lane was suspended, counted once when
+  // that lane resumes or ends.
+  uint64_t resourceResumeStateEvictions = 0;
 };
 
 // KV blocks define prefix identity; composite recurrent state is attached
@@ -395,6 +401,7 @@ private:
   void finishFailure(Request &request, Failure failure);
   void finishCapacity(Request &request, const TokenAdmission &admission);
   void release(Request &request);
+  void countEvictedResumeState(const Request &request) noexcept;
   void sweepTerminal();
 
   EngineConfig config_;

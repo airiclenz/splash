@@ -96,6 +96,8 @@ PHASE_COUNTERS = (
     ("replay_tokens", ("cache", "resource_replay_tokens")),
     ("decode_suspensions", ("cache", "resource_decode_suspensions")),
     ("decode_replay_tokens", ("cache", "resource_decode_replay_tokens")),
+    ("resume_restored_tokens", ("cache", "resource_resume_restored_tokens")),
+    ("resume_state_evictions", ("cache", "resource_resume_state_evictions")),
     ("denied_reservations", ("memory_governor", "denied_reservations")),
     (
         "denied_host_reservations",
