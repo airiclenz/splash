@@ -271,7 +271,7 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
     ++checkpointRetirements_;
   else
     ++evictions_;
-  return {true, reclaimed};
+  return {true, reclaimed, stateBytes};
 }
 
 StateCacheSnapshot StateCache::snapshot() const noexcept {

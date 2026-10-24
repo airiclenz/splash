@@ -202,9 +202,11 @@ public:
   // request's resume state only with takeResumeStates (no lane other than
   // the publishing one is resident); with checkpointsOnly only an
   // unprotected checkpoint qualifies, so a protected checkpoint is recycled
-  // rather than none.
-  [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false,
-                                     bool takeResumeStates = false);
+  // rather than none. The result is false when nothing qualified, and names
+  // the evicted state's bytes and the part of them that reached the model's
+  // pool: a live lane's short reserve takes the rest.
+  [[nodiscard]] StateEviction reclaimOneState(bool checkpointsOnly = false,
+                                              bool takeResumeStates = false);
   // Recycles exactly this checkpoint publication for a required state
   // publication, through the eviction path, while no more than
   // heldProtections protections hold it: the caller passes the ones its own

@@ -373,7 +373,8 @@ CacheReclaimResult Cache::reclaimOneForGrowth(CacheReclaimMode mode,
                                            : StateSparing::ResumeStates);
 }
 
-bool Cache::reclaimOneState(bool checkpointsOnly, bool takeResumeStates) {
+StateEviction Cache::reclaimOneState(bool checkpointsOnly,
+                                     bool takeResumeStates) {
   // checkpointsOnly bounds what qualifies in the spare pass too: an
   // unprotected ordinary state it would reject must not hide a protected
   // checkpoint from the fallback.
@@ -383,8 +384,9 @@ bool Cache::reclaimOneState(bool checkpointsOnly, bool takeResumeStates) {
     state = states_.evictionCandidate(
         false, takeResumeStates ? StateSparing::None
                                 : StateSparing::ResumeStates);
-  return state && (!checkpointsOnly || states_.checkpoint(state->id)) &&
-         states_.evict(state->id).evicted;
+  if (!state || (checkpointsOnly && !states_.checkpoint(state->id)))
+    return {};
+  return states_.evict(state->id);
 }
 
 bool Cache::recycleCheckpointState(StateCheckpoint checkpoint,

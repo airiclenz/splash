@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 
 using namespace splash;
 using namespace splash::engine;
@@ -164,7 +165,7 @@ void testSharedPrefillEvictedPublicationFallsBack() {
   engine.submit(request(2, std::vector<uint32_t>(193, 7)));
   static_cast<void>(engine.tick(0));
   static_cast<void>(engine.tick(1));
-  require(cache.reclaimOneState(),
+  require(cache.reclaimOneState().evicted,
           "published shared prefix was pinned against pressure reclamation");
   runUntilIdle(engine);
   require(events.completedCount == 2 && model.prefillRows == 386 &&
@@ -359,7 +360,7 @@ void testColdPublishesReplayStateAndLazyJunctionCanRebuildIt() {
               events.starts[0].first == EngineCacheStatus::Miss,
           "cold request reported a cache hit");
 
-  require(resources.reclaimOneState(),
+  require(resources.reclaimOneState().evicted,
           "test could not remove the latest replay state");
   engine.submit(request(2, prompt));
   runUntilIdle(engine);
@@ -485,7 +486,7 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
   engine.submit(request(5, prompt));
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimOneState(),
+    require(resources.reclaimOneState().evicted,
             "test could not leave a KV-only shared prefix");
   }
 
@@ -523,7 +524,7 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   engine.submit(request(7, prompt));
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimOneState(),
+    require(resources.reclaimOneState().evicted,
             "test could not remove the old composite state");
   }
   engine.submit(request(70, std::vector<uint32_t>(65, 7000)));
@@ -591,7 +592,7 @@ void testCancellationAfterJunctionDiscardsLaterState() {
   engine.submit(request(9, prompt));
   runUntilIdle(engine);
   while (resources.snapshot().stateCache.entries != 0) {
-    require(resources.reclaimOneState(),
+    require(resources.reclaimOneState().evicted,
             "test could not remove the old composite state");
   }
 
@@ -2577,17 +2578,21 @@ void testShortTargetOnlySuspensionStateIsDropped() {
           "dropped suspension state was restored");
 }
 
-// Publishes KV for `tokens` under a cache-only request, with an ordinary
-// full state at `stateBoundary`.
+// Publishes KV for `tokens` under a cache-only request, with `state` at
+// `stateBoundary`: an ordinary full state unless the caller passes another
+// one, published as a checkpoint when `checkpoint` is set.
 void cachePrefix(engine::Cache &resources, uint64_t requestId,
-                 std::span<const uint32_t> tokens, uint32_t stateBoundary) {
+                 std::span<const uint32_t> tokens, uint32_t stateBoundary,
+                 std::shared_ptr<const CompositeState> state =
+                     std::make_shared<State>(),
+                 bool checkpoint = false) {
   resources.beginRequest(requestId);
   require(resources.ensureTokens(requestId, tokens.size()).granted(),
           "cache-only prefix pages were not acquired");
   static_cast<void>(resources.publishCommittedBlocks(
       requestId, tokens, static_cast<uint32_t>(tokens.size())));
   resources.publishCompositeState(resources.blockAt(requestId, stateBoundary),
-                                  std::make_shared<State>());
+                                  std::move(state), checkpoint);
   resources.endRequest(requestId);
 }
 
@@ -4622,6 +4627,115 @@ void testHostConstrainedLanePublishesItsFirstCheckpoint() {
           "from its reserve");
 }
 
+// A state whose drop refills a lane's reserve with half its bytes and
+// returns the other half to the model's pool.
+class SplitReclaimState final : public CompositeState {
+public:
+  uint64_t bytes() const noexcept override { return 64; }
+  uint64_t reclaimableBytes() const noexcept override { return bytes() / 2; }
+};
+
+// Ticks the engine until its first checkpoint publishes or fails.
+void runUntilFirstCheckpointOutcome(engine::Engine &engine) {
+  for (uint32_t step = 0; step < 32 &&
+                          !engine.snapshot().checkpointPublications &&
+                          !engine.snapshot().checkpointPublicationFailures;
+       ++step)
+    static_cast<void>(engine.tick(step + 1));
+}
+
+// With the lane's reserve spent and the pool dry under a host that denies
+// new quanta, the first cached checkpoint reclaim takes a peer's state,
+// which refills that peer's reserve: the capture reclaims on until a state
+// reaches the pool, and the checkpoint publishes.
+void testDeniedCaptureReclaimsPastAPeerReserveRefill() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  const auto ledger = std::make_shared<SnapshotLedger>();
+  ledger->pooledQuanta = 2;
+  ledger->isHostConstrained = true;
+  executor.snapshotLedger = ledger;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  // Peer 99 on slot 1 spent its reserve on the older checkpoint; the newer
+  // one's origin slot has no owner, so its drop pools.
+  require(ledger->activate(1, 99) && ledger->takeForSnapshot(1),
+          "peer lane reserve setup failed");
+  cachePrefix(resources, 900, std::vector<uint32_t>(65, 90), 64,
+              std::make_shared<LedgerState>(true, ledger, 1, 99), true);
+  cachePrefix(resources, 901, std::vector<uint32_t>(65, 91), 64,
+              std::make_shared<LedgerState>(true, ledger, 2, 98), true);
+  bool isReserveSpent = false;
+  executor.snapshotObserver = [&] {
+    if (!std::exchange(isReserveSpent, true))
+      require(ledger->takeForSnapshot(0), "lane reserve was not armed");
+  };
+
+  engine.submit(request(920, checkpointLanePrompt(92)));
+  runUntilFirstCheckpointOutcome(engine);
+
+  require(engine.snapshot().checkpointPublications == 1 &&
+              engine.snapshot().checkpointPublicationFailures == 0 &&
+              engine.snapshot().recycledStatePublications == 1 &&
+              ledger->reserveRefills == 1 &&
+              resources.snapshot().stateCache.evictions == 2,
+          "a denied capture stopped at a peer's reserve refill");
+  engine.cancel(920);
+  runUntilIdle(engine);
+}
+
+// An eviction that refills a reserve with part of its bytes frees too little
+// for a denied capture: reclaim goes on to a state that reaches the pool.
+void testDeniedCaptureReclaimsPastASplitEviction() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  cachePrefix(resources, 902, std::vector<uint32_t>(65, 93), 64,
+              std::make_shared<SplitReclaimState>(), true);
+  cachePrefix(resources, 903, std::vector<uint32_t>(65, 94), 64,
+              std::make_shared<State>(), true);
+  executor.deniedSnapshots = 2;
+
+  engine.submit(request(921, checkpointLanePrompt(95)));
+  runUntilFirstCheckpointOutcome(engine);
+
+  require(engine.snapshot().checkpointPublications == 1 &&
+              engine.snapshot().checkpointPublicationFailures == 0 &&
+              executor.snapshotAttempts == 3 &&
+              resources.snapshot().stateCache.evictions == 2,
+          "a split eviction stopped a denied capture's reclaim");
+  engine.cancel(921);
+  runUntilIdle(engine);
+}
+
+// With nothing reclaimable a denied capture is not retried: it counts one
+// snapshot_denied failure.
+void testDeniedCaptureWithNothingReclaimableFailsOnce() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  executor.deniedSnapshots = 1;
+
+  engine.submit(request(922, checkpointLanePrompt(96)));
+  runUntilFirstCheckpointOutcome(engine);
+
+  require(engine.snapshot().checkpointPublicationFailureCauses ==
+                  onlyCause(PublicationFailure::SnapshotDenied, 1) &&
+              executor.snapshotAttempts == 1 &&
+              resources.snapshot().stateCache.evictions == 0,
+          "a denied capture with nothing reclaimable was not one failure");
+  engine.cancel(922);
+  runUntilIdle(engine);
+}
+
 // Under paused growth the lane's next chunk takes idle cached pages: the
 // idle prefix's state and KV go, and the lane's fresh checkpoint stays. The
 // idle conversation's end is first pushed out of the ring, so its state is
@@ -6029,6 +6143,9 @@ int main() {
     testRetryRetiresCheckpointAtDeeperJunction();
     testPinnedCheckpointSkipsReplacementButNotOrdinaryState();
     testHostConstrainedLanePublishesItsFirstCheckpoint();
+    testDeniedCaptureReclaimsPastAPeerReserveRefill();
+    testDeniedCaptureReclaimsPastASplitEviction();
+    testDeniedCaptureWithNothingReclaimableFailsOnce();
     testPausedGrowthReclaimKeepsTheResidentLanesCheckpoint();
     testGrowthReclaimTakesAResidentCheckpointRatherThanStall();
     testHostPressureSuspensionResumesFromTheLanesCheckpoint();

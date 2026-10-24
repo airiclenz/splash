@@ -103,10 +103,23 @@ struct StateCacheSnapshot {
 };
 
 struct StateEviction final {
+  // ==========================================================================
+  // True when a state was evicted.
+  explicit operator bool() const noexcept { return evicted; }
+
+  // ==========================================================================
+  // True when every byte of the evicted state reached the model's pool: no
+  // part of it refilled a lane's checkpoint reserve.
+  [[nodiscard]] bool isWhollyReclaimed() const noexcept {
+    return evicted && reclaimedBytes >= bytes;
+  }
+
   bool evicted = false;
   // The state's reclaimable bytes: zero for the part that refilled its
   // lane's checkpoint reserve rather than reaching the model's pool.
   uint64_t reclaimedBytes = 0;
+  // The evicted state's whole footprint, reclaimed or not.
+  uint64_t bytes = 0;
 };
 
 // Attaches one immutable composite state to a complete target-KV block: the

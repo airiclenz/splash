@@ -1150,22 +1150,38 @@ bool Engine::recycleOwnCheckpoint(Request &active) {
 
 // ============================================================================
 // Copies the lane's live state for a publication. When no slot is free it
-// recycles one of the lane's own checkpoints, or else one cached state, a
-// checkpoint for a checkpoint, and retries once; nullptr when that fails too.
-// A recycled state of a live peer whose reserve is short refills that
-// reserve rather than the pool, so the retry fails then: the peer's next
-// checkpoint is secured instead of this one.
+// recycles one of the lane's own checkpoints and retries, then reclaims
+// cached states, a checkpoint for a checkpoint, retrying after each; nullptr
+// when that fails too. A reclaimed state of a live peer whose reserve is
+// short refills that reserve rather than the pool, so reclaim goes on past
+// it; it stops after the first state whose whole bytes reached the pool (a
+// denial that outlasts a pooled slot is not a shortage), when nothing
+// qualifies, or after model::ExecutionLimits::maximumBatchWidth states. Runs
+// only on a denied capture; nothing per step.
 std::shared_ptr<const CompositeState> Engine::captureState(Request &active,
                                                            bool checkpoint) {
   const uint64_t requestId = active.request.id;
   std::shared_ptr<const CompositeState> state = model_.snapshot(requestId);
-  if (!state && (recycleOwnCheckpoint(active) ||
-                 cache_.reclaimOneState(checkpoint,
-                                        !anotherLaneResident(active)))) {
+  if (state)
+    return state;
+  if (recycleOwnCheckpoint(active))
     state = model_.snapshot(requestId);
-    if (state)
-      ++counters_.recycledStatePublications;
+
+  // Each refill makes a peer's reserve whole, so its later states reach the
+  // pool: one round per lane bounds the walk.
+  const bool takeResumeStates = !state && !anotherLaneResident(active);
+  for (uint32_t round = 0;
+       !state && round < model::ExecutionLimits::maximumBatchWidth; ++round) {
+    const StateEviction eviction =
+        cache_.reclaimOneState(checkpoint, takeResumeStates);
+    if (!eviction)
+      break;
+    state = model_.snapshot(requestId);
+    if (eviction.isWhollyReclaimed())
+      break;
   }
+  if (state)
+    ++counters_.recycledStatePublications;
   return state;
 }
 
