@@ -220,6 +220,21 @@ an engine restart. Chat streams include token usage when the request sets
 `"stream_options":{"include_usage":true}`; non-streaming Chat responses always
 include usage. A proxy must consume these fields to display statistics.
 
+Every reply's `metrics.engine` is the engine's timing record for that request:
+`prefill_start_tokens` (the lane's depth at admission), `prefilled_tokens`,
+`prefill_wall_ms` and `decode_wall_ms`, `decode_steps`, `drafted_tokens`,
+`accepted_draft_tokens`, `suspensions`, `decode_suspensions` and
+`replay_tokens`. A wall is the full wall of every batch the request rode in, so
+concurrent requests' walls overlap. `GET /requests` returns
+`{"requests": [...]}`, the newest 1024 finished requests oldest first, each
+with `id` (the bare public id a response prefixes with `chatcmpl-`, `resp_` or
+`msg_`), `finished_unix_ms`, `outcome`, `prompt_tokens`, `cached_tokens`,
+`completion_tokens`, `reasoning_tokens`, `output_tokens` (completion minus
+reasoning), `ttft_ms` and `engine`. `?since=<unix ms>` keeps only records
+finished after it; a malformed value is a 400. The ring is memory-only, is
+lost on restart, and needs the API key when authentication is enabled. The
+console `Done ·` line ends with the request's prefill and decode seconds.
+
 Chat completions also include a llama-server-style `timings` object, both in
 non-streaming responses and in the final finish-reason chunk of a stream,
 even without `include_usage`. `prompt_n` and `predicted_n` are the full prompt
@@ -230,8 +245,8 @@ are not isolated GPU timings. `prompt_per_second` uses only uncached prompt
 tokens; `predicted_per_second` excludes the entire first emission (which can
 contain multiple speculative tokens). Thus rates use tokens processed in the
 measured interval, not the full counts. An unavailable rate is zero, including
-responses completed in one emission. Per-request draft counters are omitted
-because the native runtime only reports them at batch level.
+responses completed in one emission. Per-request draft counters are not in
+`timings`; they are in `metrics.engine`.
 
 `/metrics` also exports fixed latency histograms in seconds, with a bounded
 set of stages in `/status.latency`. HTTP duration includes body upload and

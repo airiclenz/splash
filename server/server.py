@@ -16,7 +16,7 @@ import time
 import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 
 from huggingface_hub.utils import validate_repo_id
 from transformers import AutoTokenizer
@@ -149,6 +149,24 @@ SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
+# `GET /requests?since=` takes non-negative integer Unix milliseconds; 19
+# digits bound the parse while covering any real timestamp.
+SINCE_UNIX_MS_PATTERN = re.compile(r"[0-9]{1,19}")
+
+
+def _requests_since(raw_path):
+    """Parse the optional `since` query value of `GET /requests`.
+
+    Returns None without one. A repeated, empty, negative or non-integer value
+    raises a 400 APIError.
+    """
+    query = raw_path.partition("?")[2].partition("#")[0]
+    values = parse_qs(query, keep_blank_values=True).get("since")
+    if values is None:
+        return None
+    if len(values) != 1 or not SINCE_UNIX_MS_PATTERN.fullmatch(values[0]):
+        raise APIError(400, "since must be one integer of Unix milliseconds")
+    return int(values[0])
 
 
 def _normalize_path(raw_path):
@@ -413,6 +431,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 prometheus_metrics(self.server.status()).encode(),
                 "text/plain; version=0.0.4; charset=utf-8",
             )
+            return
+        if path == "/requests":
+            try:
+                since = _requests_since(self.path)
+            except APIError as error:
+                self._safe_error(error)
+                return
+            records = self.app.backend.request_records.finished_after(since)
+            self._json(200, {"requests": records})
             return
         response_match = re.fullmatch(r"/v1/responses/(resp_[A-Za-z0-9_]+)", path)
         if response_match:

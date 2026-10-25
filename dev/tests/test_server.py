@@ -27,6 +27,7 @@ from server import backend as backend_api
 from server import constraints as generation_constraints
 from server import errors as api_errors
 from server import frontend as request_frontend
+from server import metrics as metrics_api
 from server import output as model_output
 from server import protocol as native_wire
 from server import server as api
@@ -293,8 +294,11 @@ class Plan:
         after_terminal=False,
         matched_tokens=1,
         logits=None,
+        engine_timing=None,
     ):
         self.batches = list(batches)
+        # DoneEvent timing fields by name; absent fields stay zero.
+        self.engine_timing = engine_timing or {}
         self.reason = reason
         self.error = error
         self.exception = exception
@@ -517,6 +521,7 @@ class FakeRuntime:
             2_000,
             3_000,
             tuple(plan.logits) if plan.logits is not None else (),
+            **plan.engine_timing,
         )
         call.complete(
             result=api.engine_runtime.GenerationResult(
@@ -3404,6 +3409,140 @@ class ServerTest(unittest.TestCase):
             "14:32:08 Done · input 10,240 · cached 8,192 · output 320"
             " · TTFT 0.8s · 85.0 tok/s",
         )
+
+    def test_console_request_summary_adds_the_engine_walls(self):
+        record = {
+            "outcome": "stop",
+            "prompt_tokens": 10240,
+            "completion_tokens": 320,
+            "metrics": {
+                "cache": {"matched_tokens": 8192},
+                "request_latency": {"ttft_ms": 800},
+                "engine": {"prefill_wall_ms": 1234.0, "decode_wall_ms": 3450.0},
+            },
+        }
+        with (
+            mock.patch.object(api.time, "strftime", return_value="14:32:08"),
+            mock.patch("builtins.print") as output,
+        ):
+            diagnostics.print_request(record)
+        self.assertEqual(
+            output.call_args.args[0],
+            "14:32:08 Done · input 10,240 · cached 8,192 · output 320"
+            " · TTFT 0.8s · prefill 1.2s · decode 3.5s",
+        )
+
+    def test_requests_lists_a_completed_chat_with_its_engine_block(self):
+        timing = {
+            "prefill_start_tokens": 1,
+            "prefilled_tokens": 1,
+            "prefill_wall_micros": 1_500,
+            "decode_wall_micros": 2_500,
+            "decode_steps": 2,
+            "drafted_tokens": 3,
+            "accepted_draft_tokens": 1,
+            "suspensions": 1,
+            "decode_suspensions": 1,
+            "replay_tokens": 4,
+        }
+        harness = self.harness(
+            FakeRuntime(Plan(batches=[(3,), (4,)], engine_timing=timing))
+        )
+        expected_engine = {
+            "prefill_start_tokens": 1,
+            "prefilled_tokens": 1,
+            "prefill_wall_ms": 1.5,
+            "decode_wall_ms": 2.5,
+            "decode_steps": 2,
+            "drafted_tokens": 3,
+            "accepted_draft_tokens": 1,
+            "suspensions": 1,
+            "decode_suspensions": 1,
+            "replay_tokens": 4,
+        }
+
+        _, _, payload = harness.request("POST", "/v1/chat/completions", self.body())
+        response = json.loads(payload)
+        status, _, listing = harness.request("GET", "/requests")
+
+        self.assertEqual(status, 200, listing)
+        [record] = json.loads(listing)["requests"]
+        self.assertTrue(record["id"])
+        self.assertTrue(response["id"].endswith(record["id"]))
+        self.assertEqual(response["metrics"]["engine"], expected_engine)
+        self.assertEqual(record["engine"], expected_engine)
+        self.assertEqual(record["outcome"], "stop")
+        usage = response["usage"]
+        self.assertEqual(record["completion_tokens"], usage["completion_tokens"])
+        self.assertEqual(
+            record["reasoning_tokens"],
+            usage["completion_tokens_details"]["reasoning_tokens"],
+        )
+        self.assertEqual(
+            record["output_tokens"],
+            record["completion_tokens"] - record["reasoning_tokens"],
+        )
+        self.assertEqual(record["cached_tokens"], 1)
+        self.assertEqual(
+            record["ttft_ms"], response["metrics"]["request_latency"]["ttft_ms"]
+        )
+        self.assertIsInstance(record["finished_unix_ms"], int)
+
+    def test_requests_since_keeps_records_finished_after_it(self):
+        harness = self.harness(FakeRuntime())
+        for finished in (100, 200, 300):
+            harness.backend.request_records.append(
+                {"id": str(finished), "finished_unix_ms": finished}
+            )
+
+        status, _, payload = harness.request("GET", "/requests?since=200")
+
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(
+            json.loads(payload)["requests"],
+            [{"id": "300", "finished_unix_ms": 300}],
+        )
+
+    def test_requests_ring_keeps_the_newest_records_oldest_first(self):
+        harness = self.harness(FakeRuntime())
+        capacity = metrics_api.REQUEST_RECORDS_CAPACITY
+        for finished in range(capacity + 1):
+            harness.backend.request_records.append(
+                {"id": str(finished), "finished_unix_ms": finished}
+            )
+
+        status, _, payload = harness.request("GET", "/requests")
+
+        self.assertEqual(status, 200, payload)
+        held = [
+            record["finished_unix_ms"] for record in json.loads(payload)["requests"]
+        ]
+        self.assertEqual(held, list(range(1, capacity + 1)))
+
+    def test_requests_rejects_a_malformed_since(self):
+        harness = self.harness(FakeRuntime())
+        for query in (
+            "since=abc",
+            "since=-1",
+            "since=",
+            "since=1.5",
+            "since=1&since=2",
+        ):
+            with self.subTest(query=query):
+                status, _, payload = harness.request("GET", f"/requests?{query}")
+                self.assertEqual(status, 400, payload)
+
+    def test_requests_requires_auth_when_configured(self):
+        harness = self.harness(FakeRuntime(), api_key="secret")
+
+        status, _, _ = harness.request("GET", "/requests")
+        authorized, _, payload = harness.request(
+            "GET", "/requests", headers={"Authorization": "Bearer secret"}
+        )
+
+        self.assertEqual(status, 401)
+        self.assertEqual(authorized, 200, payload)
+        self.assertEqual(json.loads(payload), {"requests": []})
 
     def test_console_shows_the_tool_block_signature(self):
         record = {

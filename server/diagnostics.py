@@ -43,4 +43,8 @@ def print_request(record):
         parts.append(f"TTFT {ttft / 1000:.1f}s")
     if speed is not None:
         parts.append(f"{speed:.1f} tok/s")
+    engine = metrics.get("engine")
+    if engine is not None:
+        parts.append(f"prefill {engine['prefill_wall_ms'] / 1000:.1f}s")
+        parts.append(f"decode {engine['decode_wall_ms'] / 1000:.1f}s")
     print_status(" · ".join(parts))

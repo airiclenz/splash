@@ -15,7 +15,7 @@ if __package__:
     from .diagnostics import print_status
     from .errors import APIError, NativeError
     from .latency import RequestLatency
-    from .metrics import metrics_dict
+    from .metrics import RequestRecords, engine_dict, metrics_dict
     from .output import ReasoningLoopGuard, hold_partial
     from .tool_schema import THINK_END, ToolPolicy
 else:
@@ -25,7 +25,7 @@ else:
     from diagnostics import print_status
     from errors import APIError, NativeError
     from latency import RequestLatency
-    from metrics import metrics_dict
+    from metrics import RequestRecords, engine_dict, metrics_dict
     from output import ReasoningLoopGuard, hold_partial
     from tool_schema import THINK_END, ToolPolicy
 
@@ -64,6 +64,10 @@ DEFAULT_REASONING_LOOP_LIMIT = 24
 # A rebuilt incremental decoder is primed with at most this many ids, and at
 # most this many held ids are re-stepped, so one recovery costs O(16) steps.
 DECODE_RECOVERY_WINDOW = 16
+
+
+# Converts `time.time()` seconds to the Unix milliseconds `/requests` reports.
+MILLISECONDS_PER_SECOND = 1000
 
 
 def _is_invalid_prefix(error):
@@ -486,6 +490,9 @@ class NativeBackend:
         self.runtime = runtime
         self.tokenizer = tokenizer
         self.request_logger = request_logger
+        # Every finished request's timing record, for `GET /requests`, whether
+        # or not a console logger is attached.
+        self.request_records = RequestRecords()
         self.reasoning_loop_limit = reasoning_loop_limit
         self.active = {}
         self.closing = False
@@ -1074,6 +1081,8 @@ class NativeBackend:
             pass
 
     def _record(self, job, result=None, error=None):
+        metrics = metrics_dict(result) if result else None
+        self.request_records.append(self._timing_record(job, result, metrics))
         if self.request_logger is None:
             return
         record = {
@@ -1085,7 +1094,7 @@ class NativeBackend:
         }
         if result:
             record["completion_tokens"] = result.completion_tokens
-            record["metrics"] = metrics_dict(result)
+            record["metrics"] = metrics
         if job.tools_signature:
             record["tools"] = {
                 "count": job.tools_signature[0],
@@ -1097,6 +1106,28 @@ class NativeBackend:
             self.request_logger(record)
         except Exception:
             pass
+
+    @staticmethod
+    def _timing_record(job, result, metrics):
+        """Build the `GET /requests` record of one finished request.
+
+        A request that ended in an error carries zero completion tokens and an
+        all-zero engine block. `id` is the bare public id; responses prefix it.
+        """
+        completion_tokens = result.completion_tokens if result else 0
+        reasoning_tokens = job.reasoning_tokens if result else 0
+        return {
+            "id": job.public_id,
+            "finished_unix_ms": int(time.time() * MILLISECONDS_PER_SECOND),
+            "outcome": result.reason if result else "error",
+            "prompt_tokens": len(job.prompt_tokens),
+            "cached_tokens": job.cache.matched_tokens,
+            "completion_tokens": completion_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "output_tokens": max(0, completion_tokens - reasoning_tokens),
+            "ttft_ms": metrics["request_latency"].get("ttft_ms") if metrics else None,
+            "engine": metrics["engine"] if metrics else engine_dict(EngineTiming()),
+        }
 
     def close(self):
         with self.lock:

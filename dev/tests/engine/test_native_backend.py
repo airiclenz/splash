@@ -387,6 +387,44 @@ class NativeBackendContractTests(unittest.TestCase):
             backend_api.EngineTiming(2, 3, 90, 180, 4, 5, 6, 7, 8, 9),
         )
 
+    def test_request_record_holds_reasoning_and_output_tokens(self):
+        class ThinkingTokenizer(FakeTokenizer):
+            @staticmethod
+            def convert_tokens_to_ids(_token):
+                return 9
+
+        native = FakeRuntime()
+        transport = backend_api.NativeBackend(native, ThinkingTokenizer())
+        self.addCleanup(transport.close)
+        job = make_job()
+        job.thinking = True
+        job.public_id = "0123abcd"
+        self.assertTrue(transport.submit(job))
+        call = native.calls[0]
+
+        call.emit(wire.TokensEvent(call.request_id, 0, (7, 8, 9, 5)))
+        call.complete(result=success_result(call, tokens=(7, 8, 9, 5)))
+        self.assertEqual(self.terminal(job)[0], "done")
+        [record] = transport.request_records.finished_after()
+
+        self.assertEqual(
+            {
+                key: record[key]
+                for key in (
+                    "id",
+                    "completion_tokens",
+                    "reasoning_tokens",
+                    "output_tokens",
+                )
+            },
+            {
+                "id": "0123abcd",
+                "completion_tokens": 4,
+                "reasoning_tokens": 2,
+                "output_tokens": 2,
+            },
+        )
+
     def test_native_result_without_timing_has_all_zero_engine_timing(self):
         result = backend_api.NativeResult("stop", 4, 1, 1.0, 2.0, 3.0)
 

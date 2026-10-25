@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import threading
+from collections import deque
 from dataclasses import dataclass
 
 if __package__:
@@ -433,5 +435,66 @@ def metrics_dict(result):
         # executor command/GPU time. Native batch throughput lives in /status.
         "request_latency": latency,
         "cache": cache,
+        "engine": engine_dict(result.engine_timing),
     }
     return metrics
+
+
+# Microseconds per millisecond, for the engine record's wall fields.
+MICROS_PER_MILLISECOND = 1000.0
+
+
+def engine_dict(timing):
+    """Render an engine timing record with its walls in milliseconds.
+
+    A request's prefill and decode walls are the full wall of every batch it
+    rode in, so concurrent requests' walls overlap rather than sum.
+    """
+    return {
+        "prefill_start_tokens": timing.prefill_start_tokens,
+        "prefilled_tokens": timing.prefilled_tokens,
+        "prefill_wall_ms": timing.prefill_wall_micros / MICROS_PER_MILLISECOND,
+        "decode_wall_ms": timing.decode_wall_micros / MICROS_PER_MILLISECOND,
+        "decode_steps": timing.decode_steps,
+        "drafted_tokens": timing.drafted_tokens,
+        "accepted_draft_tokens": timing.accepted_draft_tokens,
+        "suspensions": timing.suspensions,
+        "decode_suspensions": timing.decode_suspensions,
+        "replay_tokens": timing.replay_tokens,
+    }
+
+
+# The newest finished-request records `GET /requests` serves.
+REQUEST_RECORDS_CAPACITY = 1024
+
+
+class RequestRecords:
+    """A bounded, thread-safe ring of finished-request records.
+
+    Appending is O(1) and evicts the oldest record once the ring holds
+    `capacity`. Records must not be mutated after they are appended: readers
+    receive the same dicts, outside the lock.
+    """
+
+    def __init__(self, capacity=REQUEST_RECORDS_CAPACITY):
+        """Create an empty ring holding at most `capacity` records."""
+        if capacity <= 0:
+            raise ValueError("request record capacity must be positive")
+        self._records = deque(maxlen=capacity)
+        self._lock = threading.Lock()
+
+    def append(self, record):
+        """Add one finished request's record, evicting the oldest when full."""
+        with self._lock:
+            self._records.append(record)
+
+    def finished_after(self, since_unix_ms=None):
+        """Return the held records oldest first, optionally only those whose
+        `finished_unix_ms` is later than `since_unix_ms`."""
+        with self._lock:
+            records = list(self._records)
+        if since_unix_ms is None:
+            return records
+        return [
+            record for record in records if record["finished_unix_ms"] > since_unix_ms
+        ]
