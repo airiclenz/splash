@@ -449,7 +449,8 @@ public:
         result.push_back(decodeRows(item));
       } else {
         ModelStepResult step{item.requestId, 0, {42}, decodeFinishes,
-                             DecodeStage::Regular, 0, 0};
+                             DecodeStage::Regular, draftedPerStep,
+                             acceptedPerStep};
         step.outputTokensWithoutKv = decodeTokensWithoutKv;
         result.push_back(std::move(step));
       }
@@ -492,7 +493,7 @@ public:
     return splash::test::immediateTicket(plan.kind == WorkKind::Prefill
                                              ? prefill(plan, items)
                                              : decode(plan, items),
-                                         completion);
+                                         completion, ticketWallMilliseconds);
   }
   // The production model copies the lane's state into a cache slot at its
   // current page-aligned boundary and returns nullptr when no slot is free
@@ -608,6 +609,11 @@ public:
   bool decodeFinishes = true;
   DecodeStage replayDecodeStage = DecodeStage::Regular;
   uint32_t decodeTokensWithoutKv = 0;
+  // Drafted and accepted tokens each single-token decode step reports.
+  uint32_t draftedPerStep = 0;
+  uint32_t acceptedPerStep = 0;
+  // The wall every immediately completing batch reports.
+  double ticketWallMilliseconds = 0.0;
   // Nonzero selects decodeRows: rows each Regular decode step may retain.
   uint32_t decodeRowsPerStep = 0;
   // decodeRows commits past the engine's cap, as an uncapped runtime would.
@@ -644,10 +650,12 @@ public:
         requestId, std::vector<uint32_t>(simulation.begin(), simulation.end()));
   }
   void completed(uint64_t id, EngineFinishReason reason, uint32_t prompt,
-                 uint32_t completion, std::span<const float>) override {
+                 uint32_t completion, std::span<const float>,
+                 const EngineRequestTiming &timing) override {
     ++completedCount;
     usage[id] = {prompt, completion};
     reasons[id] = reason;
+    timings[id] = timing;
   }
   void failed(uint64_t, std::string code, std::string message,
               bool retryable) override {
@@ -665,6 +673,7 @@ public:
   std::unordered_map<uint64_t, std::vector<uint32_t>> outputs;
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> usage;
   std::unordered_map<uint64_t, EngineFinishReason> reasons;
+  std::unordered_map<uint64_t, EngineRequestTiming> timings;
   std::vector<std::string> failures;
   std::vector<std::pair<std::string, bool>> failureDetails;
   uint32_t emitted = 0;

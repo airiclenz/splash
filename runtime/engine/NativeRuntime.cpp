@@ -575,7 +575,8 @@ void NativeRuntime::maskRequested(uint64_t requestId,
 
 void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
                               uint32_t promptTokens, uint32_t completionTokens,
-                              std::span<const float> optionLogits) {
+                              std::span<const float> optionLogits,
+                              const EngineRequestTiming &) {
   RequestTelemetry &telemetry = telemetry_.at(requestId);
   double now = clocks_.monotonicMilliseconds();
   double started = telemetry.startedMilliseconds > 0.0

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace splash::engine {
@@ -48,6 +49,30 @@ struct EngineRequest final {
   }
 };
 
+// One request's engine work, accumulated while it runs and handed to
+// EngineEventSink::completed. Fixed size and trivially copyable: the engine
+// adds into it per batch without allocating.
+struct EngineRequestTiming final {
+  // Cached depth the first admission restored; 0 for a cold request.
+  uint32_t prefillStartTokens = 0;
+  // Prefill rows computed for this request, replayed rows included.
+  uint32_t prefilledTokens = 0;
+  // The full wall of every prefill / decode batch the lane rode in, not a
+  // per-lane share of it.
+  uint64_t prefillWallMicros = 0;
+  uint64_t decodeWallMicros = 0;
+  // Decode batches the lane rode in.
+  uint32_t decodeSteps = 0;
+  uint32_t draftedTokens = 0;
+  uint32_t acceptedDraftTokens = 0;
+  // Resource suspensions, and those taken in the Decode or WaitingMask phase.
+  uint32_t suspensions = 0;
+  uint32_t decodeSuspensions = 0;
+  // Prefill rows that recomputed tokens processed before a suspension.
+  uint32_t replayTokens = 0;
+};
+static_assert(std::is_trivially_copyable_v<EngineRequestTiming>);
+
 class EngineEventSink {
 public:
   virtual ~EngineEventSink() = default;
@@ -61,7 +86,8 @@ public:
                              std::span<const uint32_t> simulationTokens) = 0;
   virtual void completed(uint64_t requestId, EngineFinishReason reason,
                          uint32_t promptTokens, uint32_t completionTokens,
-                         std::span<const float> optionLogits) = 0;
+                         std::span<const float> optionLogits,
+                         const EngineRequestTiming &timing) = 0;
   virtual void failed(uint64_t requestId, std::string code, std::string message,
                       bool retryable) = 0;
   virtual void capacityExhausted(uint64_t requestId, uint32_t requiredKvPages,

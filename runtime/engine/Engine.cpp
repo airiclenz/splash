@@ -18,6 +18,7 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 // finishes as Cancelled or Stop rather than as a failure.
 constexpr char kCancelledFailureCode[] = "cancelled";
 constexpr char kStoppedFailureCode[] = "stopped";
+constexpr double kMicrosecondsPerMillisecond = 1000.0;
 
 // ============================================================================
 // True while a resource wait has more than kColdFallbackWaitFraction of its
@@ -30,6 +31,14 @@ bool isResourceWaitYoung(double deadlineMilliseconds,
   return deadlineMilliseconds <= 0.0 ||
          nowMilliseconds < deadlineMilliseconds -
                                timeoutMilliseconds * kColdFallbackWaitFraction;
+}
+
+// ============================================================================
+// A batch wall in whole microseconds; a negative or NaN wall counts as 0.
+uint64_t wholeMicroseconds(double milliseconds) noexcept {
+  return milliseconds > 0.0 ? static_cast<uint64_t>(std::llround(
+                                  milliseconds * kMicrosecondsPerMillisecond))
+                            : 0;
 }
 
 uint32_t replayStateBoundary(uint32_t tokens) noexcept {
@@ -678,6 +687,9 @@ bool Engine::admit(Request &active, double now) {
       }
     }
     model_.setDraftContextPlan(active.request.id, std::move(draft));
+    active.admissionStartTokens = resumeBoundary;
+    if (!resuming)
+      active.timing.prefillStartTokens = resumeBoundary;
     if (resuming) {
       // A failed resume attempt returns above and keeps the exemption.
       countEvictedResumeState(active);
@@ -1694,11 +1706,13 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd, double now) {
         std::exchange(active.backoffStartedMilliseconds, std::nullopt);
   deferResourceRetry(active, now);
   ++counters_.resourceSuspensions;
+  ++active.timing.suspensions;
   if (decodePhase) {
     // Never cleared here: a suspension during the replay is Prefill phase
     // and the replay it interrupts still recomputes decode history.
     active.hasDecodeSuspension = true;
     ++counters_.resourceDecodeSuspensions;
+    ++active.timing.decodeSuspensions;
   }
 }
 
@@ -1799,6 +1813,9 @@ void Engine::apply(const BatchPlan &plan,
   uint32_t outputTokens = 0;
   uint32_t draftedTokens = 0;
   uint32_t acceptedDraftTokens = 0;
+  const uint64_t wallMicros = wholeMicroseconds(wallMilliseconds);
+  // The last lane whose prefill rows count; read only when inputTokens > 0.
+  size_t lastCountedIndex = 0;
   for (size_t index = 0; index < results.size(); ++index) {
     const ModelStepResult &result = results[index];
     const BatchItem &item = plan.items[index];
@@ -1828,11 +1845,16 @@ void Engine::apply(const BatchPlan &plan,
       const uint32_t promptProcessed =
           item.promptOffset + result.consumedPromptTokens;
       inputTokens += result.consumedPromptTokens;
+      active.timing.prefilledTokens += result.consumedPromptTokens;
+      active.timing.prefillWallMicros += wallMicros;
+      if (result.consumedPromptTokens)
+        lastCountedIndex = index;
       // Rows past the suspension point were never processed: ordinary prefill.
       if (active.replaying && item.promptOffset < active.replayCountEnd) {
         const uint32_t replayed =
             std::min(promptProcessed, active.replayCountEnd) - item.promptOffset;
         counters_.resourceReplayTokens += replayed;
+        active.timing.replayTokens += replayed;
         if (active.hasDecodeSuspension)
           counters_.resourceDecodeReplayTokens += replayed;
       }
@@ -1866,6 +1888,10 @@ void Engine::apply(const BatchPlan &plan,
     if (plan.kind == WorkKind::Decode) {
       draftedTokens += result.draftedTokens;
       acceptedDraftTokens += result.acceptedDraftTokens;
+      ++active.timing.decodeSteps;
+      active.timing.decodeWallMicros += wallMicros;
+      active.timing.draftedTokens += result.draftedTokens;
+      active.timing.acceptedDraftTokens += result.acceptedDraftTokens;
       // A terminal anchor is emitted without a target KV row; it never enters
       // a cached block.
       storedTokens = static_cast<uint32_t>(active.exactTokens.size()) -
@@ -1909,6 +1935,8 @@ void Engine::apply(const BatchPlan &plan,
       events_.maskRequested(active.request.id, {});
     }
   }
+  if (plan.kind == WorkKind::Prefill && inputTokens)
+    chargePrefillClasses(results, wallMicros, inputTokens, lastCountedIndex);
   scheduler_.complete(plan, schedulerResults, wallMilliseconds,
                       representativePrefillTiming);
   events_.batchCompleted(plan.kind, plan.width(), inputTokens, outputTokens,
@@ -1935,6 +1963,35 @@ void Engine::apply(const BatchPlan &plan,
   }
 }
 
+// ============================================================================
+// Splits a prefill batch's wall between the cold and cached-tail classes:
+// each counted lane (not failed, rows > 0) takes wallMicros x its rows /
+// countedRows, and the last counted lane also takes the integer remainder,
+// so the two classes gain exactly wallMicros. O(lanes), no allocation.
+void Engine::chargePrefillClasses(std::span<const ModelStepResult> results,
+                                  uint64_t wallMicros, uint32_t countedRows,
+                                  size_t lastCountedIndex) {
+  uint64_t chargedMicros = 0;
+  for (size_t index = 0; index <= lastCountedIndex; ++index) {
+    const ModelStepResult &result = results[index];
+    const Request &active = request(result.requestId);
+    if (active.failure || !result.consumedPromptTokens)
+      continue;
+    const uint64_t share =
+        index == lastCountedIndex
+            ? wallMicros - chargedMicros
+            : wallMicros * result.consumedPromptTokens / countedRows;
+    chargedMicros += share;
+    if (active.admissionStartTokens) {
+      counters_.cachedPrefillTokens += result.consumedPromptTokens;
+      counters_.cachedPrefillWallMicros += share;
+    } else {
+      counters_.coldPrefillTokens += result.consumedPromptTokens;
+      counters_.coldPrefillWallMicros += share;
+    }
+  }
+}
+
 void Engine::finish(Request &active, EngineFinishReason reason,
                     std::span<const float> optionLogits) {
   if (active.finalized)
@@ -1953,7 +2010,7 @@ void Engine::finish(Request &active, EngineFinishReason reason,
                                   active.promptTokens)
           : 0;
   events_.completed(active.request.id, reason, active.promptTokens,
-                    completionTokens, optionLogits);
+                    completionTokens, optionLogits, active.timing);
   if (reason == EngineFinishReason::Cancelled) {
     ++counters_.cancelled;
   } else {

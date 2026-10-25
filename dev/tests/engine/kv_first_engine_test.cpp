@@ -2323,6 +2323,212 @@ void testSuspensionDuringDecodeReplayKeepsCountingDecodeReplay() {
           "a suspension during decode replay stopped counting decode replay");
 }
 
+// A fixture whose fake reports kTimingWallMilliseconds per immediate batch
+// and drafts kDraftedPerStep, accepting kAcceptedPerStep, per decode step.
+constexpr double kTimingWallMilliseconds = 2.5;
+constexpr uint64_t kTimingWallMicros = 2500;
+constexpr uint32_t kDraftedPerStep = 3;
+constexpr uint32_t kAcceptedPerStep = 1;
+// Request 60's prompt; its finish caches the state at kTimingCachedDepth.
+constexpr uint32_t kTimingCachedDepth = 128;
+const std::vector<uint32_t> kTimingCachedPrompt(kTimingCachedDepth + 1, 60);
+
+struct TimingFixture {
+  Backing backing{64};
+  KvPool pool{backing};
+  engine::Cache resources{pool, CacheNamespace{}};
+  Executor executor;
+  Events events;
+  engine::Engine engine;
+
+  TimingFixture() : engine({}, resources, executor, events) {
+    executor.ticketWallMilliseconds = kTimingWallMilliseconds;
+    executor.draftedPerStep = kDraftedPerStep;
+    executor.acceptedPerStep = kAcceptedPerStep;
+    executor.decodeFinishes = false;
+  }
+
+  // Runs request 60 to completion, caching kTimingCachedDepth of its prompt.
+  void cachePrompt() {
+    engine.submit(request(60, kTimingCachedPrompt));
+    runUntilIdle(engine);
+  }
+};
+
+// The cached prompt's first kTimingCachedDepth tokens, then `tail` new ones.
+EngineRequest cachedTailRequest(uint64_t id, uint32_t tail) {
+  std::vector<uint32_t> prompt(kTimingCachedDepth, 60);
+  prompt.insert(prompt.end(), tail, 61);
+  return request(id, prompt);
+}
+
+void testColdRequestRecordsItsTiming() {
+  TimingFixture fixture;
+  auto cold = request(70, std::vector<uint32_t>(193, 70));
+  cold.maxNewTokens = 4;
+
+  fixture.engine.submit(std::move(cold));
+  runUntilIdle(fixture.engine);
+
+  require(fixture.events.timings.contains(70),
+          "completion carried no timing record");
+  const EngineRequestTiming &timing = fixture.events.timings.at(70);
+  require(timing.prefillStartTokens == 0 && timing.prefilledTokens == 193,
+          "cold record miscounted its start depth or prefill rows");
+  require(timing.prefillWallMicros > 0 &&
+              timing.prefillWallMicros % kTimingWallMicros == 0,
+          "cold record did not charge each prefill batch's full wall");
+  require(timing.decodeSteps == 4 &&
+              timing.decodeWallMicros == 4 * kTimingWallMicros,
+          "cold record did not charge each decode batch's full wall");
+  require(timing.draftedTokens == 4 * kDraftedPerStep &&
+              timing.acceptedDraftTokens == 4 * kAcceptedPerStep,
+          "cold record lost the executor's drafted or accepted tokens");
+  require(timing.suspensions == 0 && timing.decodeSuspensions == 0 &&
+              timing.replayTokens == 0,
+          "an unsuspended request recorded a suspension or replay");
+  const EngineSnapshot snapshot = fixture.engine.snapshot();
+  require(snapshot.coldPrefillTokens == 193 &&
+              snapshot.coldPrefillWallMicros == timing.prefillWallMicros &&
+              snapshot.cachedPrefillTokens == 0 &&
+              snapshot.cachedPrefillWallMicros == 0,
+          "a cold request's prefill was not counted as cold");
+}
+
+void testCacheHitRequestRecordsItsStartDepth() {
+  TimingFixture fixture;
+  fixture.cachePrompt();
+  const EngineSnapshot before = fixture.engine.snapshot();
+
+  fixture.engine.submit(cachedTailRequest(71, 7));
+  runUntilIdle(fixture.engine);
+
+  require(fixture.events.starts.back().first == EngineCacheStatus::PrefixHit &&
+              fixture.events.starts.back().second == kTimingCachedDepth,
+          "the resend did not hit the cached prompt");
+  const EngineRequestTiming &timing = fixture.events.timings.at(71);
+  require(timing.prefillStartTokens == kTimingCachedDepth &&
+              timing.prefilledTokens == 7 &&
+              timing.prefillWallMicros == kTimingWallMicros,
+          "cache-hit record miscounted its start depth or prefill");
+  const EngineSnapshot after = fixture.engine.snapshot();
+  require(after.cachedPrefillTokens - before.cachedPrefillTokens == 7 &&
+              after.cachedPrefillWallMicros - before.cachedPrefillWallMicros ==
+                  kTimingWallMicros &&
+              after.coldPrefillTokens == before.coldPrefillTokens &&
+              after.coldPrefillWallMicros == before.coldPrefillWallMicros,
+          "a cached tail was not counted as cached prefill");
+}
+
+void testTwoLanePrefillSplitsItsWallByRows() {
+  TimingFixture fixture;
+  fixture.cachePrompt();
+  fixture.executor.ticketWallMilliseconds = 1.0;
+  const size_t batchesBefore = fixture.executor.prefillWidths.size();
+  const EngineSnapshot before = fixture.engine.snapshot();
+
+  // 7 cached-tail rows and 30 cold rows: 1000 us does not divide by 37.
+  fixture.engine.submit(cachedTailRequest(72, 7));
+  fixture.engine.submit(request(73, std::vector<uint32_t>(30, 73)));
+  runUntilIdle(fixture.engine);
+
+  require(fixture.executor.prefillWidths.size() == batchesBefore + 1 &&
+              fixture.executor.prefillWidths.back() == 2,
+          "the two prompts did not share one prefill batch");
+  require(fixture.events.timings.at(72).prefillWallMicros == 1000 &&
+              fixture.events.timings.at(73).prefillWallMicros == 1000,
+          "a lane was charged less than its batch's full wall");
+  const EngineSnapshot after = fixture.engine.snapshot();
+  const uint64_t cachedWall =
+      after.cachedPrefillWallMicros - before.cachedPrefillWallMicros;
+  const uint64_t coldWall =
+      after.coldPrefillWallMicros - before.coldPrefillWallMicros;
+  require(after.cachedPrefillTokens - before.cachedPrefillTokens == 7 &&
+              after.coldPrefillTokens - before.coldPrefillTokens == 30,
+          "the batch's rows were not split by start depth");
+  require(cachedWall + coldWall == 1000,
+          "the class walls do not sum to the batch wall");
+  require(cachedWall >= 1000 * 7 / 37 && cachedWall <= 1000 * 7 / 37 + 1 &&
+              coldWall >= 1000 * 30 / 37 && coldWall <= 1000 * 30 / 37 + 1,
+          "the batch wall was not apportioned by rows");
+}
+
+void testFailedLaneChargesNoPrefillClass() {
+  TimingFixture fixture;
+  fixture.cachePrompt();
+  fixture.executor.holdPrefillUntil = std::make_shared<bool>(false);
+  const EngineSnapshot before = fixture.engine.snapshot();
+  fixture.engine.submit(cachedTailRequest(74, 7));
+  fixture.engine.submit(request(75, std::vector<uint32_t>(30, 75)));
+  static_cast<void>(fixture.engine.tick(100));
+  require(fixture.executor.prefillWidths.back() == 2,
+          "the two prompts did not share one held prefill batch");
+
+  fixture.engine.cancel(75);
+  *fixture.executor.holdPrefillUntil = true;
+  runUntilIdle(fixture.engine);
+
+  const EngineSnapshot after = fixture.engine.snapshot();
+  require(after.coldPrefillTokens == before.coldPrefillTokens &&
+              after.coldPrefillWallMicros == before.coldPrefillWallMicros,
+          "a lane cancelled in its batch was charged to the cold class");
+  // HeldTicket reports 1 ms; the surviving lane takes all of it.
+  require(after.cachedPrefillTokens - before.cachedPrefillTokens == 7 &&
+              after.cachedPrefillWallMicros - before.cachedPrefillWallMicros ==
+                  1000,
+          "the surviving lane did not take its batch's whole wall");
+  require(fixture.events.timings.at(75).prefilledTokens == 0 &&
+              fixture.events.timings.at(75).prefillWallMicros == 0,
+          "a lane cancelled in its batch recorded its rows");
+}
+
+void testDecodeSuspensionRecordsItsSuspensionAndReplay() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  // Nothing is restored, so the resume replays from the first token.
+  executor.deniedSnapshots = std::numeric_limits<uint32_t>::max();
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  backing.growthAllowed = [&] {
+    return std::count_if(executor.requests.begin(), executor.requests.end(),
+                         [](const auto &entry) { return entry.second.resident; }) < 2;
+  };
+  auto decoding = request(48, std::vector<uint32_t>(4096, 48));
+  decoding.maxNewTokens = 64;
+  engine.submit(std::move(decoding));
+  double now = 1;
+  for (; now < kSuspensionPointTickLimit && !events.outputs.contains(48); ++now)
+    static_cast<void>(engine.tick(now));
+  auto foreground = request(49, std::vector<uint32_t>(8192, 49));
+  foreground.priority = RequestPriority::Foreground;
+  engine.submit(std::move(foreground));
+  for (; now < kSuspensionPointTickLimit && executor.suspensions == 0; ++now)
+    static_cast<void>(engine.tick(now));
+  require(executor.suspensions == 1,
+          "foreground peer did not suspend the decoding lane");
+  const uint32_t history =
+      4096 + static_cast<uint32_t>(events.outputs.at(48).size());
+
+  for (; now < 256 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+
+  require(engine.idle() && events.completedCount == 2,
+          "decode suspension fixture did not finish both requests");
+  const EngineRequestTiming &timing = events.timings.at(48);
+  require(timing.suspensions == 1 && timing.decodeSuspensions == 1,
+          "the decode-suspended record miscounted its suspensions");
+  require(timing.replayTokens == history &&
+              timing.replayTokens == engine.snapshot().resourceReplayTokens &&
+              timing.prefilledTokens == 4096 + history,
+          "the decode-suspended record miscounted its replay rows");
+  require(events.timings.at(49).suspensions == 0 &&
+              events.timings.at(49).replayTokens == 0,
+          "the foreground peer recorded the suspended lane's work");
+}
+
 // testMidPrefillSuspensionCountsOnlyProcessedTokensAsReplay's fixture, with
 // the fake moving its live state out at suspension.
 struct LiveStateSuspension {
@@ -6356,6 +6562,11 @@ int main() {
     testSuspensionStateIsProtectedUntilUnprotectedStatesGo();
     testRepeatedSuspensionKeepsTheFirstReplayEnd();
     testSuspensionDuringDecodeReplayKeepsCountingDecodeReplay();
+    testColdRequestRecordsItsTiming();
+    testCacheHitRequestRecordsItsStartDepth();
+    testTwoLanePrefillSplitsItsWallByRows();
+    testFailedLaneChargesNoPrefillClass();
+    testDecodeSuspensionRecordsItsSuspensionAndReplay();
     testPrefillGrowthPreservesAnActiveDecodePeer();
     testPhysicalKvPressureSuspendsInsteadOfKillingActiveWork();
     testRecoveryDrainDoesNotConsumeResourceWaitBudget();

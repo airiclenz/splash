@@ -117,6 +117,15 @@ struct EngineSnapshot final {
   // evicted or retired before the request was admitted or ended, each
   // counted once.
   uint64_t resourceQueuedPrefixEvictions = 0;
+  // Counted prefill rows split by their lane's start depth at its current
+  // admission: 0 is cold, deeper is a cached tail (a resume counts by its
+  // restore depth). Each lane takes wall x lane rows / batch rows of its
+  // batch's wall, the integer remainder going to the batch's last counted
+  // lane, so the two walls sum to the wall of every batch with counted rows.
+  uint64_t coldPrefillTokens = 0;
+  uint64_t coldPrefillWallMicros = 0;
+  uint64_t cachedPrefillTokens = 0;
+  uint64_t cachedPrefillWallMicros = 0;
 };
 
 // KV blocks define prefix identity; composite recurrent state is attached
@@ -303,6 +312,11 @@ private:
     bool hasDecodeSuspension = false;
     // Captured once the final prompt chunk completes; emitted with Done.
     std::vector<float> scoreLogits;
+    // Accumulated per batch, suspension and admission; emitted with Done.
+    EngineRequestTiming timing;
+    // The resume boundary of the current admission: classes this lane's
+    // prefill rows as cold (0) or cached tail.
+    uint32_t admissionStartTokens = 0;
   };
 
 
@@ -406,6 +420,9 @@ private:
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
              double wallMilliseconds, bool representativePrefillTiming);
+  void chargePrefillClasses(std::span<const ModelStepResult> results,
+                            uint64_t wallMicros, uint32_t countedRows,
+                            size_t lastCountedIndex);
   [[nodiscard]] bool endAfterInFlightBatch(Request &request, Failure failure);
   void finish(Request &request, EngineFinishReason reason,
               std::span<const float> optionLogits);
