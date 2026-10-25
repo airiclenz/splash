@@ -3881,7 +3881,8 @@ void testWarningReclaimKeepsQueuedRequestsPrefix() {
   require(fixture.events.starts.back().first == EngineCacheStatus::PrefixHit &&
               fixture.events.starts.back().second == 64 &&
               fixture.resources.snapshot().stateCache.evictions ==
-                  fixture.evictionsBefore,
+                  fixture.evictionsBefore &&
+              fixture.engine.snapshot().resourceQueuedPrefixEvictions == 0,
           "warning reclaim evicted a queued request's cached prefix");
 }
 
@@ -3901,6 +3902,34 @@ void testRetriedQueuedRequestHoldsOneProtection() {
 
   require(fixture.resources.cachedTokens(fixture.prompt) == 0,
           "a twice-denied request left a protection behind on cancel");
+}
+
+// Request 301 loses its protected state at 64 to Critical reclaim, is denied
+// again with only a state at 32 cached and protects that one, then loses it
+// too before it ends: the request counts once.
+void testQueuedPrefixLostTwiceAcrossARetriedWaitCountsOnce() {
+  QueuedPrefixFixture fixture;
+  const uint32_t attempts = fixture.executor.beginAttempts;
+  static_cast<void>(fixture.resources.reclaimCache(
+      std::numeric_limits<uint64_t>::max(), true));
+  cachePrefix(fixture.resources, 999, std::span(fixture.prompt).first(32), 32);
+  for (double now = 2;
+       now < 1000 && fixture.executor.beginAttempts == attempts; ++now)
+    static_cast<void>(fixture.engine.tick(now));
+  static_cast<void>(fixture.engine.reclaimMemory(
+      warningReclaim(std::numeric_limits<uint64_t>::max())));
+  require(fixture.executor.beginAttempts == attempts + 1 &&
+              fixture.resources.cachedTokens(fixture.prompt) == 32 &&
+              fixture.engine.snapshot().resourceQueuedPrefixEvictions == 1,
+          "the retried wait did not count its lost state and protect the next");
+
+  static_cast<void>(fixture.resources.reclaimCache(
+      std::numeric_limits<uint64_t>::max(), true));
+  fixture.engine.cancel(301);
+  static_cast<void>(fixture.engine.tick(1000));
+
+  require(fixture.engine.snapshot().resourceQueuedPrefixEvictions == 1,
+          "a queued request counted its prefix loss more than once");
 }
 
 void testQueuedRequestAdmittedColdDropsItsProtection() {
@@ -3947,6 +3976,8 @@ void testGrowthReclaimTakesAQueuedPrefixRatherThanStall() {
               fixture.resources.snapshot().stateCache.evictions ==
                   fixture.evictionsBefore + 1,
           "growth reclaim stalled on the queued request's protected state");
+  require(fixture.engine.snapshot().resourceQueuedPrefixEvictions == 1,
+          "growth reclaim's take of a queued prefix was not counted");
   runUntilIdle(fixture.engine);
   require(fixture.events.completedCount == 2 &&
               fixture.events.failedCount == 0,
@@ -6351,6 +6382,7 @@ int main() {
     testAdmissionWithNoLaneResidentTakesAResumeState();
     testWarningReclaimKeepsQueuedRequestsPrefix();
     testRetriedQueuedRequestHoldsOneProtection();
+    testQueuedPrefixLostTwiceAcrossARetriedWaitCountsOnce();
     testQueuedRequestAdmittedColdDropsItsProtection();
     testGrowthReclaimTakesAQueuedPrefixRatherThanStall();
     testGrowthReclaimSparesAFoundStateForCachedKv();

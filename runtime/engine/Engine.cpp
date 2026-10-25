@@ -552,6 +552,7 @@ bool Engine::admit(Request &active, double now) {
       // drop forgets it, growth reclaim takes it only after every other
       // candidate, and Warning reclaim spares it while the request waits.
       // A retried wait swaps its protection rather than stack it.
+      countEvictedQueuedPrefix(active);
       cache_.unprotectState(std::exchange(active.queuedProtection, {}));
       if (foundStateBlock)
         active.queuedProtection = cache_.protectState(foundStateBlock);
@@ -640,6 +641,7 @@ bool Engine::admit(Request &active, double now) {
     }
     active.resourceWait = {};
     // Admitted: the wait, and the queued prefix's protection, end here.
+    countEvictedQueuedPrefix(active);
     cache_.unprotectState(std::exchange(active.queuedProtection, {}));
     if (resuming)
       scheduler_.resumeFromResources(active.request.id, resumeBoundary,
@@ -2004,6 +2006,7 @@ void Engine::release(Request &active) {
   if (active.suspended)
     countEvictedResumeState(active);
   cache_.unprotectState(std::exchange(active.resumeProtection, {}));
+  countEvictedQueuedPrefix(active);
   cache_.unprotectState(std::exchange(active.queuedProtection, {}));
   cache_.unprotectState(std::exchange(active.checkpointProtection, {}));
   dropPreviousCheckpoint(active);
@@ -2027,6 +2030,20 @@ void Engine::countEvictedResumeState(const Request &active) noexcept {
   if (active.resumeProtection &&
       !cache_.isProtectedStateResident(active.resumeProtection))
     ++counters_.resourceResumeStateEvictions;
+}
+
+// ============================================================================
+// Counts a queued request whose protected found state eviction or retirement
+// took while it waited, as that protection ends: at a retried wait's swap, at
+// admission, or when the request ends. O(1); counted at most once per request,
+// so a retried wait that re-protects a shallower state and loses it too adds
+// nothing further.
+void Engine::countEvictedQueuedPrefix(Request &active) noexcept {
+  if (active.queuedPrefixLossCounted || !active.queuedProtection ||
+      cache_.isProtectedStateResident(active.queuedProtection))
+    return;
+  active.queuedPrefixLossCounted = true;
+  ++counters_.resourceQueuedPrefixEvictions;
 }
 
 void Engine::sweepTerminal() {

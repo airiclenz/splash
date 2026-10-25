@@ -247,7 +247,9 @@ std::string runtimeStatusJson(
       << ",\"resource_resume_restored_tokens\":"
       << core.resourceResumeRestoredTokens
       << ",\"resource_resume_state_evictions\":"
-      << core.resourceResumeStateEvictions << "}"
+      << core.resourceResumeStateEvictions
+      << ",\"resource_queued_prefix_evictions\":"
+      << core.resourceQueuedPrefixEvictions << "}"
       << ",\"draft_context\":{\"target_prefill_rows\":"
       << executorTelemetry.targetPrefillRows
       << ",\"active_rows\":" << executorTelemetry.draftContextRowsActive

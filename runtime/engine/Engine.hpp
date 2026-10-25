@@ -113,6 +113,10 @@ struct EngineSnapshot final {
   // Resume states evicted while their lane was suspended, counted once when
   // that lane resumes or ends.
   uint64_t resourceResumeStateEvictions = 0;
+  // Queued requests whose protected found state (queuedProtection) was
+  // evicted or retired before the request was admitted or ended, each
+  // counted once.
+  uint64_t resourceQueuedPrefixEvictions = 0;
 };
 
 // KV blocks define prefix identity; composite recurrent state is attached
@@ -285,6 +289,9 @@ private:
     // reclaim takes it last and Warning reclaim spares it, until admission
     // or the request ends. Never held with resumeProtection.
     StateProtection queuedProtection;
+    // Set once this request's queued prefix loss is counted, so a retried
+    // wait that loses a re-protected shallower state does not count again.
+    bool queuedPrefixLossCounted = false;
     // The scheduler owns the terminal phase; this flag records that the
     // corresponding event was emitted and model/resource ownership ended.
     bool finalized = false;
@@ -406,6 +413,7 @@ private:
   void finishCapacity(Request &request, const TokenAdmission &admission);
   void release(Request &request);
   void countEvictedResumeState(const Request &request) noexcept;
+  void countEvictedQueuedPrefix(Request &request) noexcept;
   void sweepTerminal();
 
   EngineConfig config_;
