@@ -655,6 +655,45 @@ class BallastSizingTests(unittest.TestCase):
             (4 * GIB, 4 * 1024 - 512 + 256),
         )
 
+    def test_autoBallast_chargesOnlyTheUnwiredWeightBytes(self):
+        # vm_stat counts wired weight pages as used already; the server
+        # (estimateHostAvailableMemory) charges only the unwired part.
+        cases = (
+            ("all unwired", 0, 4 * GIB),
+            ("half wired", 8 * GIB, 12 * GIB),
+            ("all wired", 16 * GIB, 20 * GIB),
+            ("wired above weight", 18 * GIB, 20 * GIB),
+        )
+        for name, wired_bytes, expected_headroom in cases:
+            with self.subTest(name):
+                sample = snapshot(
+                    memory_governor__host_reserve_bytes=2 * GIB,
+                    memory_governor__reserved_bytes=0,
+                    memory_governor__host_weight_bytes=16 * GIB,
+                    memory_governor__host_weight_wired_bytes=wired_bytes,
+                )
+
+                record = probe.auto_ballast(sample, 22 * GIB)
+
+                self.assertEqual(record["host_headroom_bytes"], expected_headroom)
+
+    def test_autoBallast_measuredWiredWeights_growsPastTheWarningMargin(self):
+        # Item 10's agent run: the 27B's weights mostly wired during a turn;
+        # charging the full 16.4 GB read 0 headroom and held 128 MB.
+        sample = snapshot(
+            memory_governor__host_reserve_bytes=2 * GIB,
+            memory_governor__reserved_bytes=GIB,
+            memory_governor__host_weight_bytes=16_425_680_896,
+            memory_governor__host_weight_wired_bytes=16_425_680_896,
+        )
+
+        record = probe.auto_ballast(sample, 9 * GIB)
+
+        self.assertEqual(
+            (record["host_headroom_bytes"], record["mb"]),
+            (6 * GIB, 6 * 1024 - 512 + 256),
+        )
+
     def test_autoBallast_withoutWeightBytes_sizesAsBefore(self):
         sample = self.governor_sample(2 * GIB, reserved_bytes=GIB)
 

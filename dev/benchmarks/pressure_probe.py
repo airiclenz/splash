@@ -421,17 +421,17 @@ def auto_ballast(snapshot: dict, host_available_bytes: int) -> dict:
 
     The host headroom is computed as the server does (MemoryGovernor::
     hostHeadroomBytes): `host_available_bytes`, read from `vm_stat` just now,
-    less the `/status` host_weight_bytes, host_reserve_bytes and
-    reserved_bytes, floored at 0. The `/status` host_headroom_bytes is not
-    used: the server refreshes its host sample only every few tens of
-    seconds, so a ballast sized from it overshoots by every step taken in
-    between.
+    less the unwired hot weights, host_reserve_bytes and reserved_bytes,
+    floored at 0. The `/status` host_headroom_bytes is not used: the server
+    refreshes its host sample only every few tens of seconds, so a ballast
+    sized from it overshoots by every step taken in between.
 
-    The server charges only the part of its hot weights the GPU does not hold
-    wired; `vm_stat` cannot tell which part that is, so the full
-    host_weight_bytes is charged. While the weights are wired (decode) this
-    under-reads and the ballast holds; it never overshoots. A server without
-    host_weight_bytes charges nothing, as before.
+    The unwired hot weights are the `/status` host_weight_bytes less
+    host_weight_wired_bytes, floored at 0, as the server charges them
+    (estimateHostAvailableMemory): `vm_stat` already counts the wired part as
+    used, so charging it again would read 0 headroom whenever the GPU holds
+    the weights wired. A server without host_weight_wired_bytes charges the
+    full host_weight_bytes; one without host_weight_bytes charges nothing.
 
     N = headroom - the warning margin + BALLAST_OVERSHOOT_BYTES, floored at 0,
     so holding N more drops the headroom just past the server's warning
@@ -447,7 +447,9 @@ def auto_ballast(snapshot: dict, host_available_bytes: int) -> dict:
             "reserved_bytes to size --ballast-mb auto"
         )
     weight = status_reading(snapshot, (*governor, "host_weight_bytes")) or 0
-    headroom = max(0, host_available_bytes - weight - reserve - reserved)
+    wired = status_reading(snapshot, (*governor, "host_weight_wired_bytes")) or 0
+    unwired_weight = weight - min(weight, wired)
+    headroom = max(0, host_available_bytes - unwired_weight - reserve - reserved)
     margin = host_warning_margin_bytes(reserve)
     ballast_bytes = max(0, headroom - margin + BALLAST_OVERSHOOT_BYTES)
     return {
