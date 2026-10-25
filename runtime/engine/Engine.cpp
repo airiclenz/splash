@@ -601,6 +601,14 @@ bool Engine::admit(Request &active, double now) {
       }
       scheduler_.waitForResources(active.request.id);
       deferResourceRetry(active, now, admission.failure);
+      // Denied for host pressure beside a resident lane, the wait holds no
+      // deadline, as a recovery drain does: that lane's progress or finish
+      // returns the memory, so timing out would fail the request only for
+      // waiting its turn. The first denial with no lane resident starts a
+      // fresh deadline.
+      if (anotherResident && admission.allocationFailure ==
+                                 metal::AllocationFailure::HostPressure)
+        active.resourceWait.deadlineMilliseconds = 0.0;
       return false;
     }
     executorStarted = true;

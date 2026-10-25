@@ -2851,6 +2851,84 @@ void testRecoveryDrainDoesNotConsumeResourceWaitBudget() {
   }
 }
 
+// The live three-lane run's failure: a new request denied for host pressure
+// while a peer stays resident timed out with resource_timeout, although the
+// peer's finish would return the memory. Beside a resident lane the wait
+// holds no deadline; once no lane is resident it takes a fresh one.
+void testHostPressureWaitBesideAResidentLaneHoldsItsDeadline() {
+  constexpr uint64_t peerId = 290;
+  constexpr uint64_t waiterId = 291;
+  constexpr double timeout = 100.0;
+  for (bool pressureClears : {true, false}) {
+    Backing backing(32);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor(2);
+    executor.decodeFinishes = false;
+    bool hostPressure = false;
+    executor.beginGrowthBlocked = [&] { return hostPressure; };
+    executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+    Events events;
+    EngineConfig config;
+    config.resourceWaitTimeoutMilliseconds = timeout;
+    engine::Engine engine(config, resources, executor, events);
+    auto peer = request(peerId, std::vector<uint32_t>(24, peerId));
+    peer.maxNewTokens = 1000;
+    peer.deadlineMilliseconds = 1'000'000;
+    engine.submit(std::move(peer));
+    double now = 1.0;
+    for (; now < 10.0; ++now)
+      static_cast<void>(engine.tick(now));
+    require(events.emitted > 0 && engine.snapshot().cacheHits +
+                                          engine.snapshot().coldMisses == 1,
+            "resident-peer fixture did not start decoding");
+
+    hostPressure = true;
+    auto waiter = request(waiterId, std::vector<uint32_t>(24, waiterId));
+    waiter.deadlineMilliseconds = 1'000'000;
+    engine.submit(std::move(waiter));
+    const double denied = now;
+    for (; now < denied + 3 * timeout; ++now)
+      static_cast<void>(engine.tick(now));
+    const uint32_t attempts = executor.beginAttempts;
+    require(attempts > 2 && events.failedCount == 0 &&
+                engine.snapshot().scheduler.waitingResources == 1,
+            "a host-pressure wait beside a resident lane timed out");
+    require(engine.resourceWaitSnapshot(now).memory == 1 &&
+                engine.resourceWaitSnapshot(now).oldestWaitMilliseconds >=
+                    2 * timeout,
+            "a held wait hid its elapsed time from diagnostics");
+
+    if (pressureClears) {
+      hostPressure = false;
+      for (const double start = now; now < start + 20.0; ++now)
+        static_cast<void>(engine.tick(now));
+      executor.decodeFinishes = true;
+      for (const double start = now; now < start + 50.0 && !engine.idle();
+           ++now)
+        static_cast<void>(engine.tick(now));
+      require(engine.idle() && events.completedCount == 2 &&
+                  events.failedCount == 0 &&
+                  engine.snapshot().resourceSuspensions == 0,
+              "the held waiter did not run once the pressure cleared");
+      continue;
+    }
+    // The peer finishes under persistent pressure: the waiter now has no
+    // lane to wait for, takes a fresh deadline and times out on it.
+    executor.decodeFinishes = true;
+    const double peerDone = now;
+    for (; now < peerDone + timeout / 2; ++now)
+      static_cast<void>(engine.tick(now));
+    require(events.completedCount == 1 && events.failedCount == 0,
+            "the waiter's fresh deadline started before its peer finished");
+    for (; now < peerDone + 3 * timeout && !engine.idle(); ++now)
+      static_cast<void>(engine.tick(now));
+    require(engine.idle() &&
+                events.failures == std::vector<std::string>{"resource_timeout"},
+            "a wait with no lane resident ignored the resource wait limit");
+  }
+}
+
 void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
   Backing backing(2);
   KvPool pool(backing);
@@ -6250,6 +6328,7 @@ int main() {
     testPrefillGrowthPreservesAnActiveDecodePeer();
     testPhysicalKvPressureSuspendsInsteadOfKillingActiveWork();
     testRecoveryDrainDoesNotConsumeResourceWaitBudget();
+    testHostPressureWaitBesideAResidentLaneHoldsItsDeadline();
     testPhysicalPressureRetryIsBackedOffWithoutProgress();
     testRecoveryWakeupIgnoresWaitersItDoesNotRetry();
     testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput();
