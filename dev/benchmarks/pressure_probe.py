@@ -27,9 +27,10 @@ exits AGENT_COLD_TURN_EXIT_CODE when a turn after the first reuses 0 tokens.
 from the burst phase's start until it ends (with ``--agent-turns``, from the
 second turn's start until the last turn ends), so the server serves under host
 pressure. ``--ballast-mb auto`` engages only once the server holds a request in
-prefill or decode, then grows the ballast a step at a time, each sized from a
-fresh ``vm_stat`` host reading taken as the server's ``memory_governor`` does,
-to keep the host just past the server's warning margin. A step never exceeds a
+prefill or decode, then grows the ballast a step at a time, each sized from the
+server's own ``memory_governor`` host headroom less what the ballast grew since
+the server took that host sample, to keep the host just past the server's
+warning margin without ever reading more headroom than the server does. A step never exceeds a
 quarter of the swap guard's cap nor the swap room left below half of it, and
 swapouts are re-read before each step: growth stops at half the cap and a step
 is shed while swapouts still rise past three quarters of it. The child wires its pages
@@ -126,15 +127,15 @@ BALLAST_EXIT_SECONDS = 5.0
 MINIMUM_HOST_WARNING_MARGIN_BYTES = 256 * BYTES_PER_MB
 # How far `auto` pushes host headroom below the warning margin.
 BALLAST_OVERSHOOT_BYTES = 256 * BYTES_PER_MB
-# `vm_stat` labels of the page categories estimateHostAvailableMemory reads.
-VM_STAT_USED_PAGES = (
-    "Pages active",
-    "Pages inactive",
-    "Pages speculative",
-    "Pages wired down",
-    "Pages occupied by compressor",
+# `/status` memory_governor readings taken from one server host sample: any of
+# them changing means the server took a new sample.
+HOST_SAMPLE_READINGS = (
+    "host_available_bytes",
+    "host_inactive_bytes",
+    "host_wired_bytes",
+    "host_weight_wired_bytes",
+    "host_compressor_bytes",
 )
-VM_STAT_RECLAIMABLE_PAGES = ("File-backed pages", "Pages purgeable")
 
 # The `/status` causes that split checkpoint_publication_failures.
 CHECKPOINT_FAILURE_CAUSES = (
@@ -296,40 +297,6 @@ def read_vm_stat() -> tuple[int, int]:
 
 
 # ------------------------------------------------------------------------------
-def parse_host_available(text: str, physical_bytes: int) -> int:
-    """Return the host's available bytes from `vm_stat` output.
-
-    Physical memory less the used pages, crediting file-backed and purgeable
-    pages; mirrors the page estimate of estimateHostAvailableMemory
-    (runtime/engine/MemoryGovernor.cpp). Keep the two in step. The server
-    also charges its unwired hot weights, which `vm_stat` counts as
-    file-backed and this credits: auto_ballast takes them off. Raises
-    ProbeError when a page category is missing.
-    """
-    page_bytes, _swapouts = parse_vm_stat(text)
-    counts = {}
-    for label in VM_STAT_USED_PAGES + VM_STAT_RECLAIMABLE_PAGES:
-        found = re.search(rf"{label}:\s+(\d+)", text)
-        if not found:
-            raise ProbeError(f"vm_stat output carries no '{label}' count")
-        counts[label] = int(found.group(1))
-    used_pages = sum(counts[label] for label in VM_STAT_USED_PAGES) - sum(
-        counts[label] for label in VM_STAT_RECLAIMABLE_PAGES
-    )
-    if used_pages < 0:
-        return 0
-    return max(0, physical_bytes - used_pages * page_bytes)
-
-
-# ------------------------------------------------------------------------------
-def read_host_available() -> int:
-    """Run `vm_stat` and return the host's available bytes, read now."""
-    output = subprocess.run(["vm_stat"], capture_output=True, text=True, check=True)
-    physical_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    return parse_host_available(output.stdout, physical_bytes)
-
-
-# ------------------------------------------------------------------------------
 def read_os_pressure_level():
     """Return `kern.memorystatus_vm_pressure_level`, or None when unreadable."""
     try:
@@ -416,40 +383,46 @@ def host_warning_margin_bytes(reserve_bytes: int) -> int:
 
 
 # ------------------------------------------------------------------------------
-def auto_ballast(snapshot: dict, host_available_bytes: int) -> dict:
-    """Return how much more `--ballast-mb auto` holds, from a fresh host reading.
+def host_sample_key(snapshot: dict) -> tuple:
+    """Return the `/status` readings that identify the server's host sample."""
+    governor = ("memory_governor",)
+    return tuple(
+        status_reading(snapshot, (*governor, key)) for key in HOST_SAMPLE_READINGS
+    )
 
-    The host headroom is computed as the server does (MemoryGovernor::
-    hostHeadroomBytes): `host_available_bytes`, read from `vm_stat` just now,
-    less the unwired hot weights, host_reserve_bytes and reserved_bytes,
-    floored at 0. The `/status` host_headroom_bytes is not used: the server
-    refreshes its host sample only every few tens of seconds, so a ballast
-    sized from it overshoots by every step taken in between.
 
-    The unwired hot weights are the `/status` host_weight_bytes less
-    host_weight_wired_bytes, floored at 0, as the server charges them
-    (estimateHostAvailableMemory): `vm_stat` already counts the wired part as
-    used, so charging it again would read 0 headroom whenever the GPU holds
-    the weights wired. A server without host_weight_wired_bytes charges the
-    full host_weight_bytes; one without host_weight_bytes charges nothing.
+# ------------------------------------------------------------------------------
+def auto_ballast(snapshot: dict, unsampled_bytes: int) -> dict:
+    """Return how much more `--ballast-mb auto` holds, from the server's own view.
+
+    The host headroom is the `/status` host_headroom_bytes less
+    `unsampled_bytes`, what the ballast grew since the server took its host
+    sample, floored at 0. The server computes that headroom from one sample
+    (MemoryGovernor::hostHeadroomBytes over estimateHostAvailableMemory): its
+    page counts and its hot weights' wiring read at the same instant. The probe
+    cannot read the weights' wiring, which swings by most of the weight size
+    within seconds during a turn, and `vm_stat` counts unwired weights as
+    file-backed, so a fresh `vm_stat` paired with a wiring reading from another
+    moment over-reads the headroom by up to the weight size. The server
+    refreshes its sample only every few to tens of seconds; charging the growth
+    since then stops the ballast at the target in between, so the headroom
+    read here never exceeds the server's.
 
     N = headroom - the warning margin + BALLAST_OVERSHOOT_BYTES, floored at 0,
     so holding N more drops the headroom just past the server's warning
     margin; Ballast.step grows toward it a bounded step at a time. Raises
-    ProbeError when the server exports neither reserve reading.
+    ProbeError when the server exports no host_headroom_bytes or
+    host_reserve_bytes.
     """
     governor = ("memory_governor",)
+    server_headroom = status_reading(snapshot, (*governor, "host_headroom_bytes"))
     reserve = status_reading(snapshot, (*governor, "host_reserve_bytes"))
-    reserved = status_reading(snapshot, (*governor, "reserved_bytes"))
-    if reserve is None or reserved is None:
+    if server_headroom is None or reserve is None:
         raise ProbeError(
-            "/status memory_governor carries no host_reserve_bytes or "
-            "reserved_bytes to size --ballast-mb auto"
+            "/status memory_governor carries no host_headroom_bytes or "
+            "host_reserve_bytes to size --ballast-mb auto"
         )
-    weight = status_reading(snapshot, (*governor, "host_weight_bytes")) or 0
-    wired = status_reading(snapshot, (*governor, "host_weight_wired_bytes")) or 0
-    unwired_weight = weight - min(weight, wired)
-    headroom = max(0, host_available_bytes - unwired_weight - reserve - reserved)
+    headroom = max(0, server_headroom - unsampled_bytes)
     margin = host_warning_margin_bytes(reserve)
     ballast_bytes = max(0, headroom - margin + BALLAST_OVERSHOOT_BYTES)
     return {
@@ -638,28 +611,29 @@ class Ballast:
     held from; a fixed size is filled there, before the phase's requests. An
     `auto` ballast is driven by `tend`, which run_phase calls about every
     SWAP_POLL_SECONDS: it engages once the server holds a request in prefill or
-    decode, then each tick re-reads the host with `read_host_available()` and
-    grows the ballast toward the auto_ballast target by at most one
-    auto_step_bytes step, checking swapouts before every step and stopping
+    decode, then each tick re-reads `/status`, charges what it grew since the
+    server's host sample (note_host_sample), and grows the ballast toward the
+    auto_ballast target by at most one auto_step_bytes step, checking swapouts before every step and stopping
     short of the swap guard. `start_child()` returns an object offering
     `resize(command, byte_count, stop)` and `close()`. `arm` and `release` are
     idempotent, so phase edges, guard trips and `main` may all release.
     """
 
     # --------------------------------------------------------------------------
-    def __init__(self, request, client, start_child, read_host_available):
-        """`request` is None (no ballast), BALLAST_AUTO, or a size in MB.
-
-        `read_host_available()` returns the host's available bytes, read now.
-        """
+    def __init__(self, request, client, start_child):
+        """`request` is None (no ballast), BALLAST_AUTO, or a size in MB."""
         self.request = request
         self.client = client
         self.start_child = start_child
-        self.read_host_available = read_host_available
         self.child = None
         self.record = None
         self.armed_at = 0.0
         self.held_bytes = 0
+        # The server host sample last seen, and the bytes held at the `/status`
+        # read before it: no more than that sample counted.
+        self.sample_key = None
+        self.sampled_held_bytes = 0
+        self.read_held_bytes = 0
         self.swap_seen_bytes = 0
         self.is_engaged = False
         self.has_failed = False
@@ -691,7 +665,7 @@ class Ballast:
 
     # --------------------------------------------------------------------------
     def tend(self, guard: SwapGuard) -> None:
-        """Take one `auto` step from a fresh `/status` and host reading.
+        """Take one `auto` step from a fresh `/status` reading.
 
         A no-op for a fixed or no ballast. Before engaging, waits for
         lanes_resident and then records the engage-time readings. A failed
@@ -706,9 +680,11 @@ class Ballast:
         except ProbeError as error:
             print(f"pressure_probe: ballast step skipped: {error}", file=sys.stderr)
             return
+        self.note_host_sample(status)
         if not self.is_engaged and not lanes_resident(status):
             return
-        sizing = auto_ballast(status, self.read_host_available())
+        unsampled_bytes = max(0, self.held_bytes - self.sampled_held_bytes)
+        sizing = auto_ballast(status, unsampled_bytes)
         if not self.is_engaged:
             self.is_engaged = True
             engaged = {key: value for key, value in sizing.items() if key != "mb"}
@@ -716,6 +692,21 @@ class Ballast:
             self.record.update(engaged)
             self.swap_seen_bytes = guard.grown_bytes
         self.step(sizing["mb"] * BYTES_PER_MB, guard)
+
+    # --------------------------------------------------------------------------
+    def note_host_sample(self, status: dict) -> None:
+        """Track how much the server's current host sample counts as held.
+
+        A sample that changed since the previous `/status` read was taken after
+        it, so it counts at least what was held at that read; the growth since
+        then is charged in full. That under-reads the headroom by at most the
+        one step taken after that read, and never over-reads it.
+        """
+        key = host_sample_key(status)
+        if key != self.sample_key:
+            self.sample_key = key
+            self.sampled_held_bytes = self.read_held_bytes
+        self.read_held_bytes = self.held_bytes
 
     # --------------------------------------------------------------------------
     def step(self, target_bytes: int, guard: SwapGuard) -> None:
@@ -1142,8 +1133,8 @@ def parse_args(argv=None):
         type=ballast_request,
         help="hold this much incompressible host memory during the burst (with "
         f"--agent-turns, from the second turn on); {BALLAST_AUTO} grows it in "
-        "steps once a request is in prefill or decode, from fresh vm_stat "
-        "readings, to keep the host past the server's warning margin, stopping "
+        "steps once a request is in prefill or decode, from the server's host "
+        "headroom, to keep the host past the server's warning margin, stopping "
         "short of the swap guard",
     )
     parser.add_argument(
@@ -1220,7 +1211,7 @@ def main(argv=None) -> int:
     """
     args = parse_args(argv)
     client = ProbeClient(args.base_url, args.api_key)
-    ballast = Ballast(args.ballast_mb, client, BallastChild, read_host_available)
+    ballast = Ballast(args.ballast_mb, client, BallastChild)
     stop = threading.Event()
     sink = open(args.samples, "a") if args.samples else None
     threads = []
