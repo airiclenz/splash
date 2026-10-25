@@ -227,6 +227,34 @@ class DecodeSuspensionMetricsTests(unittest.TestCase):
             "splash_cache_resource_queued_prefix_evictions_total 2",
         )
 
+    def test_prefill_split_renders_after_prefill_rate(self):
+        lines = prometheus_metrics(
+            {
+                "metrics": {
+                    "prefill_tokens_per_second": 2500,
+                    "prefill_cold_tokens": 3000,
+                    "prefill_cold_wall_ms": 1500,
+                    "prefill_cold_tokens_per_second": 2000,
+                    "prefill_cached_tokens": 1096,
+                    "prefill_cached_wall_ms": 274,
+                    "prefill_cached_tokens_per_second": 4000,
+                }
+            }
+        ).splitlines()
+
+        start = lines.index("splash_prefill_tokens_per_second 2500")
+        self.assertEqual(
+            lines[start + 1 : start + 7],
+            [
+                "splash_prefill_cold_tokens_total 3000",
+                "splash_prefill_cold_wall_milliseconds_total 1500",
+                "splash_prefill_cold_tokens_per_second 2000",
+                "splash_prefill_cached_tokens_total 1096",
+                "splash_prefill_cached_wall_milliseconds_total 274",
+                "splash_prefill_cached_tokens_per_second 4000",
+            ],
+        )
+
     def test_missing_decode_suspension_counters_render_no_lines(self):
         text = prometheus_metrics({"cache": {"resource_replay_tokens": 1}})
 

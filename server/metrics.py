@@ -242,6 +242,24 @@ _STATUS_METRICS = {
         "metrics",
         "prefill_tokens_per_second",
     ),
+    "splash_prefill_cold_tokens_total": ("metrics", "prefill_cold_tokens"),
+    "splash_prefill_cold_wall_milliseconds_total": (
+        "metrics",
+        "prefill_cold_wall_ms",
+    ),
+    "splash_prefill_cold_tokens_per_second": (
+        "metrics",
+        "prefill_cold_tokens_per_second",
+    ),
+    "splash_prefill_cached_tokens_total": ("metrics", "prefill_cached_tokens"),
+    "splash_prefill_cached_wall_milliseconds_total": (
+        "metrics",
+        "prefill_cached_wall_ms",
+    ),
+    "splash_prefill_cached_tokens_per_second": (
+        "metrics",
+        "prefill_cached_tokens_per_second",
+    ),
     "splash_decode_output_tokens_total": ("metrics", "decode_output_tokens"),
     "splash_decode_wall_milliseconds_total": ("metrics", "decode_wall_ms"),
     "splash_decode_tokens_per_second": (

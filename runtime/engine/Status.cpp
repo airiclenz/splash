@@ -55,6 +55,23 @@ constexpr std::array<const char *, kPublicationFailureCauses>
     kPublicationFailureKeys = {"missed_boundary", "retire_blocked",
                                "snapshot_denied", "decode_overshoot", "error"};
 
+constexpr double kMicrosPerMillisecond = 1000.0;
+constexpr double kMicrosPerSecond = 1'000'000.0;
+
+// One prefill split's token and wall counters and its rate, keyed
+// prefill_<split>_...; the rate is 0 while the split has no wall.
+void appendPrefillSplit(std::ostringstream &out, const char *split,
+                        uint64_t tokens, uint64_t wallMicros) {
+  const double tokensPerSecond =
+      wallMicros ? double(tokens) * kMicrosPerSecond / double(wallMicros)
+                 : 0.0;
+  out << ",\"prefill_" << split << "_tokens\":" << tokens
+      << ",\"prefill_" << split
+      << "_wall_ms\":" << double(wallMicros) / kMicrosPerMillisecond
+      << ",\"prefill_" << split
+      << "_tokens_per_second\":" << tokensPerSecond;
+}
+
 // checkpoint_publication_failures split by cause, every key always present.
 void appendCheckpointFailureCauses(std::ostringstream &out,
                                    const EngineSnapshot &core) {
@@ -317,8 +334,12 @@ std::string runtimeStatusJson(
       << ",\"samples\":" << metrics.itlSamples
       << "},\"prefill_input_tokens\":" << metrics.prefillInputTokens
       << ",\"prefill_wall_ms\":" << metrics.prefillWallMilliseconds
-      << ",\"prefill_tokens_per_second\":" << metrics.prefillTokensPerSecond
-      << ",\"decode_output_tokens\":" << metrics.decodeOutputTokens
+      << ",\"prefill_tokens_per_second\":" << metrics.prefillTokensPerSecond;
+  appendPrefillSplit(out, "cold", core.coldPrefillTokens,
+                     core.coldPrefillWallMicros);
+  appendPrefillSplit(out, "cached", core.cachedPrefillTokens,
+                     core.cachedPrefillWallMicros);
+  out << ",\"decode_output_tokens\":" << metrics.decodeOutputTokens
       << ",\"decode_wall_ms\":" << metrics.decodeWallMilliseconds
       << ",\"decode_tokens_per_second\":" << metrics.decodeTokensPerSecond
       << ",\"speculative_decoding\":"

@@ -77,6 +77,10 @@ void testCleanRuntimeStatus() {
   engine.resourceResumeRestoredTokens = 4321;
   engine.resourceResumeStateEvictions = 2;
   engine.resourceQueuedPrefixEvictions = 3;
+  engine.coldPrefillTokens = 3000;
+  engine.coldPrefillWallMicros = 1'500'000;
+  engine.cachedPrefillTokens = 1096;
+  engine.cachedPrefillWallMicros = 274'000;
   engine.deduplicatedStatePublications = 2;
   engine.recycledStatePublications = 1;
   engine.scheduler.waitingPrefix = 3;
@@ -263,6 +267,26 @@ void testCleanRuntimeStatus() {
   require(json.find("\"decode_mixed_greedy_sampling_batches\":2}") !=
               std::string::npos,
           "status lost the mixed greedy/sampling decode count");
+  require(json.find("\"prefill_tokens_per_second\":0,"
+                    "\"prefill_cold_tokens\":3000,"
+                    "\"prefill_cold_wall_ms\":1500,"
+                    "\"prefill_cold_tokens_per_second\":2000,"
+                    "\"prefill_cached_tokens\":1096,"
+                    "\"prefill_cached_wall_ms\":274,"
+                    "\"prefill_cached_tokens_per_second\":4000,"
+                    "\"decode_output_tokens\":") != std::string::npos,
+          "status lost the cold and cached-tail prefill split");
+  auto coldOnlyEngine = engine;
+  coldOnlyEngine.cachedPrefillTokens = 0;
+  coldOnlyEngine.cachedPrefillWallMicros = 0;
+  const auto coldOnlyJson = runtimeStatusJson(
+      memoryPlan, coldOnlyEngine, metal, warmup, audit(memoryPlan), metrics,
+      executorTelemetry, identity, governor, true);
+  require(coldOnlyJson.find("\"prefill_cached_tokens\":0,"
+                            "\"prefill_cached_wall_ms\":0,"
+                            "\"prefill_cached_tokens_per_second\":0,") !=
+              std::string::npos,
+          "a prefill split without wall reported a nonzero rate");
   auto idleEngine = engine;
   idleEngine.scheduler = {};
   const auto idleJson = runtimeStatusJson(
