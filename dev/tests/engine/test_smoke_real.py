@@ -87,6 +87,41 @@ class SmokeRealTests(unittest.TestCase):
                         finally:
                             server.close()
 
+    def test_server_runs_from_the_binary_tree_when_it_has_one(self):
+        with TemporaryDirectory() as directory:
+            checkout = Path(directory).resolve() / "baseline checkout"
+            (checkout / "server").mkdir(parents=True)
+            (checkout / "server/server.py").touch()
+            bare = Path(directory).resolve() / "retained/bin"
+            for binary, tree in (
+                (checkout / "build/splash", checkout),
+                (bare / "splash", smoke_real.ROOT),
+            ):
+                with self.subTest(binary=binary):
+                    arguments = SimpleNamespace(
+                        package=Path("package"),
+                        binary=binary,
+                        model="test-model",
+                        max_context=None,
+                        max_memory=None,
+                        kv_format="int8",
+                        no_speculation=False,
+                    )
+                    with (
+                        mock.patch.object(
+                            smoke_real, "available_port", return_value=8000
+                        ),
+                        mock.patch.object(smoke_real.subprocess, "Popen") as popen,
+                    ):
+                        popen.return_value.poll.return_value = 0
+                        server = smoke_real.RealServer(arguments)
+                        try:
+                            command = popen.call_args.args[0]
+                            self.assertEqual(command[1], str(tree / "server/server.py"))
+                            self.assertEqual(popen.call_args.kwargs["cwd"], tree)
+                        finally:
+                            server.close()
+
     @staticmethod
     def timeout_status(**changes):
         status = {

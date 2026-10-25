@@ -59,6 +59,75 @@ def prompts(tokenizer, contexts: list[int], samples: int, nonce: str) -> dict:
 
 
 # ------------------------------------------------------------------------------
+# The long-decode case's exact chat-template prompt length; its rows are keyed
+# on this context with scenario "long-decode", apart from every --contexts row.
+LONG_DECODE_CONTEXT = 256
+
+# The scenarios gated on native decode time per token instead of TTFT.
+DECODE_SCENARIOS = ("decode", "long-decode")
+
+
+# ------------------------------------------------------------------------------
+def chat_template_length(tokenizer, content: str) -> int:
+    """Return the token count of `content` as one user turn ready for a reply."""
+    return len(
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": content}],
+            tokenize=True,
+            return_dict=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    )
+
+
+# ------------------------------------------------------------------------------
+def long_decode_prompt(
+    tokenizer, sample: int, nonce: str, output_tokens: int, context=LONG_DECODE_CONTEXT
+) -> str:
+    """Return an exact `context`-token prompt asking for more than `output_tokens`.
+
+    Built from `live_probe.cold_prompt` (lead nonce, filler, over-long count
+    instruction) with its seed derived from the run nonce and `sample`, so both
+    versions get the same prompt and each sample a different one; the filler is
+    then cut to the token so the chat-template length is exactly `context`.
+    """
+    # Imported here: live_probe imports this module at load time.
+    from dev.benchmarks.live_probe import cold_prompt
+
+    seed = digest([nonce, sample, "long-decode"])
+    lead, filler, instruction = cold_prompt(2 * context, output_tokens, seed).split(
+        "\n"
+    )
+    tokens = tokenizer.encode(filler, add_special_tokens=False)
+    rows = context
+    for _ in range(8):
+        content = f"{lead}\n{tokenizer.decode(tokens[:rows])}\n{instruction}"
+        count = chat_template_length(tokenizer, content)
+        if count == context:
+            return content
+        rows -= count - context
+    raise ValueError(f"cannot construct an exact {context}-token long-decode prompt")
+
+
+# ------------------------------------------------------------------------------
+def round_cases(args) -> list[tuple[int, str, int]]:
+    """Return one sample's `(context, scenario, output_tokens)` cases in order.
+
+    `--decode-tokens N` appends one long-decode case that must reply with
+    exactly N tokens; without it the list is the base decode/cold/exact set.
+    """
+    cases = [(128, "decode", 64)] + [
+        (context, scenario, 1)
+        for context in args.contexts
+        for scenario in ("cold", "exact")
+    ]
+    if args.decode_tokens:
+        cases.append((LONG_DECODE_CONTEXT, "long-decode", args.decode_tokens))
+    return cases
+
+
+# ------------------------------------------------------------------------------
 # The cumulative native counters `measure` diffs around one request; `summarize`
 # reads the decode pair from the resulting `native_delta`.
 NATIVE_DELTA_PATHS = tuple(
@@ -126,7 +195,7 @@ def measure(server, model, content, output_tokens, scenario, context, timeout):
         smoke.require(0 < reused < context and prefill < context, "exact hit missing")
     else:
         smoke.require(reused == 0 and prefill == context, "cold prompt reused cache")
-    if scenario == "decode":
+    if scenario in DECODE_SCENARIOS:
         smoke.require(
             usage["completion_tokens"] == output_tokens,
             "decode sample ended before the requested output length",
@@ -175,7 +244,7 @@ def summarize(records: list[dict], maximum_regression: float) -> list[dict]:
         if paired and next(iter(paired.values())) != output:
             raise ValueError(f"baseline/candidate transcript differs: {key}")
         paired[row["version"]] = output
-        if row["scenario"] == "decode":
+        if row["scenario"] in DECODE_SCENARIOS:
             latency = row["native_delta"]["decode_wall_ms"] / max(
                 1, row["native_delta"]["decode_output_tokens"]
             )
@@ -195,7 +264,9 @@ def summarize(records: list[dict], maximum_regression: float) -> list[dict]:
             {
                 "context": context,
                 "scenario": scenario,
-                "metric": "decode_ms_per_token" if scenario == "decode" else "ttft_ms",
+                "metric": (
+                    "decode_ms_per_token" if scenario in DECODE_SCENARIOS else "ttft_ms"
+                ),
                 "samples_per_binary": len(versions["baseline"]),
                 "baseline_median": baseline,
                 "candidate_median": candidate,
@@ -215,6 +286,13 @@ def parse_args(argv=None):
     parser.add_argument("--maximum-regression", type=float, default=0.02)
     parser.add_argument("--request-timeout", type=float, default=1800)
     parser.add_argument(
+        "--decode-tokens",
+        type=int,
+        default=0,
+        help="add a long-decode case per sample that must reply with exactly "
+        "this many tokens, gated on native decode time per token (0 = off)",
+    )
+    parser.add_argument(
         "--output", type=Path, default=Path("build/release/http-regression.json")
     )
     args = smoke.resolve_server_arguments(parser.parse_args(argv))
@@ -223,6 +301,8 @@ def parse_args(argv=None):
         parser.error("at least two samples and contexts >= 256 are required")
     if args.maximum_regression < 0 or args.request_timeout <= 0:
         parser.error("regression must be nonnegative and timeout positive")
+    if args.decode_tokens < 0:
+        parser.error("--decode-tokens must be nonnegative")
     if len(set(args.contexts)) != len(args.contexts):
         parser.error("contexts must be unique")
     for binary in (args.baseline_binary, args.binary):
@@ -244,6 +324,11 @@ def main(argv=None):
     )
     nonce = uuid.uuid4().hex
     prepared = prompts(tokenizer, [128, *args.contexts], args.samples, nonce)
+    if args.decode_tokens:
+        for sample in range(args.samples):
+            prepared[sample, "long-decode"] = long_decode_prompt(
+                tokenizer, sample, nonce, args.decode_tokens
+            )
     binaries = {"baseline": args.baseline_binary, "candidate": args.binary}
     document = {
         "schema_version": 1,
@@ -288,17 +373,17 @@ def main(argv=None):
                     }
                 )
                 for sample in range(int(round_id >= 2), args.samples, 2):
-                    cases = [(128, "decode", 64)] + [
-                        (context, scenario, 1)
-                        for context in args.contexts
-                        for scenario in ("cold", "exact")
-                    ]
                     cold_outputs = {}
-                    for context, scenario, output_tokens in cases:
+                    for context, scenario, output_tokens in round_cases(args):
+                        prompt = (
+                            prepared[sample, scenario]
+                            if scenario == "long-decode"
+                            else prepared[sample, context]
+                        )
                         row = measure(
                             server,
                             args.model,
-                            prepared[sample, context],
+                            prompt,
                             output_tokens,
                             scenario,
                             context,

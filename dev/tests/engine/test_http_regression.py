@@ -4,6 +4,7 @@ import io
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest import mock
 
 from dev.benchmarks import http_regression as benchmark
@@ -125,6 +126,112 @@ class HttpRegressionTests(unittest.TestCase):
         summary = benchmark.summarize(rows, 0.02)[0]
         self.assertEqual(summary["metric"], "decode_ms_per_token")
         self.assertEqual(summary["baseline_median"], 2)
+
+    def test_round_cases_add_one_long_decode_case_only_with_the_flag(self):
+        base = [
+            (128, "decode", 64),
+            (2048, "cold", 1),
+            (2048, "exact", 1),
+            (10000, "cold", 1),
+            (10000, "exact", 1),
+        ]
+        arguments = SimpleNamespace(contexts=[2048, 10000], decode_tokens=0)
+        self.assertEqual(benchmark.round_cases(arguments), base)
+        arguments.decode_tokens = 30720
+        self.assertEqual(
+            benchmark.round_cases(arguments),
+            base + [(benchmark.LONG_DECODE_CONTEXT, "long-decode", 30720)],
+        )
+
+    def test_long_decode_prompt_is_exact_per_sample_and_version_stable(self):
+        tokenizer = CharacterTokenizer()
+        first = benchmark.long_decode_prompt(tokenizer, 0, "nonce", 30720)
+        self.assertEqual(
+            first, benchmark.long_decode_prompt(tokenizer, 0, "nonce", 30720)
+        )
+        second = benchmark.long_decode_prompt(tokenizer, 1, "nonce", 30720)
+        self.assertNotEqual(first[:32], second[:32])
+        for prompt in (first, second):
+            self.assertEqual(
+                benchmark.chat_template_length(tokenizer, prompt),
+                benchmark.LONG_DECODE_CONTEXT,
+            )
+            self.assertTrue(
+                prompt.endswith("Write the integers from 1 to 61440, one per line.")
+            )
+
+    def test_long_decode_is_gated_on_native_decode_time_per_token(self):
+        for slower, passes in ((1.03, False), (1.01, True)):
+            rows = [self.row("baseline"), self.row("candidate", latency=1)]
+            for row, decode_wall in zip(rows, (1000, 1000 * slower)):
+                row["scenario"] = "long-decode"
+                row["context"] = benchmark.LONG_DECODE_CONTEXT
+                row["native_delta"] = {
+                    "decode_wall_ms": decode_wall,
+                    "decode_output_tokens": 500,
+                }
+            with self.subTest(slower=slower):
+                summary = benchmark.summarize(rows, 0.02)[0]
+                self.assertEqual(summary["scenario"], "long-decode")
+                self.assertEqual(summary["metric"], "decode_ms_per_token")
+                self.assertEqual(summary["pass"], passes)
+
+    def measure_long_decode(self, completion_tokens, metrics):
+        status = {
+            "scheduler": {
+                phase: 0
+                for phase in (
+                    "queued",
+                    "waiting_resources",
+                    "prefilling",
+                    "decoding",
+                    "waiting_mask",
+                )
+            },
+            "state": {"active_cells": 0},
+            "kv": {"pages_active": 0},
+            "metrics": {"decode_wall_ms": 0, "decode_output_tokens": 0},
+        }
+        after = copy.deepcopy(status)
+        after["metrics"].update(decode_wall_ms=900, decode_output_tokens=300)
+        response = {
+            "choices": [{"message": {"role": "assistant", "content": "1\n2"}}],
+            "usage": {
+                "prompt_tokens": benchmark.LONG_DECODE_CONTEXT,
+                "completion_tokens": completion_tokens,
+            },
+            "metrics": metrics,
+        }
+        replies = iter(((200, status), (200, response), (200, after)))
+        with (
+            mock.patch.object(
+                smoke, "request", side_effect=lambda *_a, **_k: next(replies)
+            ),
+            mock.patch.object(smoke, "validate_status"),
+        ):
+            return benchmark.measure(
+                SimpleNamespace(port=8000),
+                "test-model",
+                "prompt",
+                300,
+                "long-decode",
+                benchmark.LONG_DECODE_CONTEXT,
+                60,
+            )
+
+    def test_measure_keeps_the_engine_block_and_requires_the_full_reply(self):
+        metrics = {
+            "cache": {"matched_tokens": 0},
+            "prefill": {"tokens": benchmark.LONG_DECODE_CONTEXT},
+        }
+        row = self.measure_long_decode(300, copy.deepcopy(metrics))
+        self.assertNotIn("engine", row["metrics"])
+        self.assertEqual(row["native_delta"]["decode_wall_ms"], 900)
+        engine = {"prefill_wall_ms": 12, "decode_wall_ms": 900, "decode_suspensions": 0}
+        row = self.measure_long_decode(300, dict(metrics, engine=engine))
+        self.assertEqual(row["metrics"]["engine"], engine)
+        with self.assertRaisesRegex(smoke.SmokeFailure, "requested output length"):
+            self.measure_long_decode(299, copy.deepcopy(metrics))
 
 
 if __name__ == "__main__":

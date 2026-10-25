@@ -432,8 +432,8 @@ It writes `build/release/backend-benchmark.json`. Repeat with the 35B package
 for that model. This characterizes one build; it is not a comparison with
 another engine or a test of agent task quality.
 
-For a same-machine HTTP regression check, retain the previous `splash` binary
-**and its adjacent `splash.metallib`**, then run from the candidate checkout:
+For a same-machine HTTP regression check, build the baseline in its own
+checkout (a worktree is enough), then run from the candidate checkout:
 
 ```sh
 .venv/bin/python -m dev.benchmarks.http_regression \
@@ -442,8 +442,20 @@ For a same-machine HTTP regression check, retain the previous `splash` binary
   --contexts 2048,10000 --samples 5
 ```
 
+Each binary runs the Python server of the checkout it was built in
+(`<checkout>/build/splash` runs `<checkout>/server/server.py`, from that
+checkout), so builds on either side of a protocol change each speak their own
+wire format. A bare retained `splash` and its adjacent `splash.metallib` outside
+a checkout run this checkout's server, which works only while the baseline
+speaks the current protocol.
+
 This starts isolated servers in alternating order, compares matched cold,
 exact-prefix and decode requests, and saves `build/release/http-regression.json`.
+`--decode-tokens N` adds per sample one long-decode request: a short prompt that
+asks for more than N tokens and must return exactly N, gated like the decode
+request on native decode time per token, so `--samples S` makes 2·S N-token
+replies. Its rows keep the response's `metrics` (including `metrics.engine`
+when the server reports it); without the flag the report is unchanged.
 It does not contact your running server. Use the same power mode and charger,
 stop other GPU workloads, and report chip/GPU cores, memory, Splash version,
 model revision, actual input/output token counts, and cache hits with results.

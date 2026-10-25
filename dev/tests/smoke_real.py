@@ -69,17 +69,31 @@ def stream_request(port: int, path: str, body: dict) -> tuple[int, str, bytes]:
         connection.close()
 
 
+def server_tree(binary: Path) -> Path:
+    """Return the source tree whose Python server runs `binary`.
+
+    A binary built inside a checkout (`<tree>/build/splash`) runs that tree's
+    server, so builds on either side of a protocol change each speak their own
+    wire format; a bare retained binary runs this tree's server.
+    """
+    tree = binary.parent.parent
+    if (tree / "server/server.py").is_file():
+        return tree
+    return ROOT
+
+
 class RealServer:
     def __init__(self, arguments):
         package = arguments.package.resolve()
         binary = arguments.binary.resolve()
+        tree = server_tree(binary)
         self.port = available_port()
         self.log = tempfile.NamedTemporaryFile(
             mode="w+", prefix="splash-http-smoke-", suffix=".log"
         )
         command = [
             sys.executable,
-            str(ROOT / "server/server.py"),
+            str(tree / "server/server.py"),
             str(package / "target"),
             str(package / "draft"),
             "--host",
@@ -102,7 +116,7 @@ class RealServer:
             command.append("--no-speculation")
         self.process = subprocess.Popen(
             command,
-            cwd=ROOT,
+            cwd=tree,
             stdout=self.log,
             stderr=subprocess.STDOUT,
             text=True,
