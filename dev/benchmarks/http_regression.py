@@ -68,6 +68,19 @@ DECODE_SCENARIOS = ("decode", "long-decode")
 
 
 # ------------------------------------------------------------------------------
+def long_decode_floor(output_tokens: int) -> int:
+    """Return the shortest EOS-ended long-decode reply that still counts.
+
+    The model ends its count at a nonce-dependent point (seen at 27.5k-29.6k
+    tokens) and nothing forces N tokens, so a reply stopped by EOS at three
+    quarters of N or more is accepted; `summarize` already pairs baseline and
+    candidate on reply text and length and gates each on its own decode time
+    per token, so both versions decode the same tokens.
+    """
+    return (3 * output_tokens + 3) // 4
+
+
+# ------------------------------------------------------------------------------
 def chat_template_length(tokenizer, content: str) -> int:
     """Return the token count of `content` as one user turn ready for a reply."""
     return len(
@@ -114,8 +127,9 @@ def long_decode_prompt(
 def round_cases(args) -> list[tuple[int, str, int]]:
     """Return one sample's `(context, scenario, output_tokens)` cases in order.
 
-    `--decode-tokens N` appends one long-decode case that must reply with
-    exactly N tokens; without it the list is the base decode/cold/exact set.
+    `--decode-tokens N` appends one long-decode case asking for N tokens (an
+    EOS-ended reply counts from `long_decode_floor(N)`); without it the list is
+    the base decode/cold/exact set.
     """
     cases = [(128, "decode", 64)] + [
         (context, scenario, 1)
@@ -195,10 +209,21 @@ def measure(server, model, content, output_tokens, scenario, context, timeout):
         smoke.require(0 < reused < context and prefill < context, "exact hit missing")
     else:
         smoke.require(reused == 0 and prefill == context, "cold prompt reused cache")
-    if scenario in DECODE_SCENARIOS:
+    completion = usage["completion_tokens"]
+    if scenario == "decode":
         smoke.require(
-            usage["completion_tokens"] == output_tokens,
+            completion == output_tokens,
             "decode sample ended before the requested output length",
+        )
+    elif scenario == "long-decode":
+        smoke.require(
+            completion == output_tokens
+            or (
+                response["choices"][0].get("finish_reason") == "stop"
+                and completion >= long_decode_floor(output_tokens)
+            ),
+            "long-decode sample ended before the requested output length "
+            f"and below its EOS floor of {long_decode_floor(output_tokens)}",
         )
     for phase in (
         "queued",
@@ -289,8 +314,9 @@ def parse_args(argv=None):
         "--decode-tokens",
         type=int,
         default=0,
-        help="add a long-decode case per sample that must reply with exactly "
-        "this many tokens, gated on native decode time per token (0 = off)",
+        help="add a long-decode case per sample asking for this many tokens; "
+        "a reply ended by EOS counts from 3/4 of it when both versions match, "
+        "gated on native decode time per token (0 = off)",
     )
     parser.add_argument(
         "--output", type=Path, default=Path("build/release/http-regression.json")

@@ -176,7 +176,9 @@ class HttpRegressionTests(unittest.TestCase):
                 self.assertEqual(summary["metric"], "decode_ms_per_token")
                 self.assertEqual(summary["pass"], passes)
 
-    def measure_long_decode(self, completion_tokens, metrics):
+    def measure_long_decode(
+        self, completion_tokens, metrics, finish_reason=None, scenario="long-decode"
+    ):
         status = {
             "scheduler": {
                 phase: 0
@@ -195,7 +197,12 @@ class HttpRegressionTests(unittest.TestCase):
         after = copy.deepcopy(status)
         after["metrics"].update(decode_wall_ms=900, decode_output_tokens=300)
         response = {
-            "choices": [{"message": {"role": "assistant", "content": "1\n2"}}],
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "1\n2"},
+                    "finish_reason": finish_reason,
+                }
+            ],
             "usage": {
                 "prompt_tokens": benchmark.LONG_DECODE_CONTEXT,
                 "completion_tokens": completion_tokens,
@@ -214,7 +221,7 @@ class HttpRegressionTests(unittest.TestCase):
                 "test-model",
                 "prompt",
                 300,
-                "long-decode",
+                scenario,
                 benchmark.LONG_DECODE_CONTEXT,
                 60,
             )
@@ -232,6 +239,52 @@ class HttpRegressionTests(unittest.TestCase):
         self.assertEqual(row["metrics"]["engine"], engine)
         with self.assertRaisesRegex(smoke.SmokeFailure, "requested output length"):
             self.measure_long_decode(299, copy.deepcopy(metrics))
+
+    def test_long_decode_accepts_an_eos_reply_from_three_quarters(self):
+        metrics = {
+            "cache": {"matched_tokens": 0},
+            "prefill": {"tokens": benchmark.LONG_DECODE_CONTEXT},
+        }
+        self.assertEqual(benchmark.long_decode_floor(300), 225)
+        self.assertEqual(benchmark.long_decode_floor(30720), 23040)
+        row = self.measure_long_decode(225, copy.deepcopy(metrics), "stop")
+        self.assertEqual(row["usage"]["completion_tokens"], 225)
+        for completion, finish in ((224, "stop"), (299, "length"), (299, None)):
+            with self.subTest(completion=completion, finish=finish):
+                with self.assertRaisesRegex(smoke.SmokeFailure, "EOS floor of 225"):
+                    self.measure_long_decode(completion, copy.deepcopy(metrics), finish)
+
+    def test_decode_still_requires_the_exact_reply_length(self):
+        metrics = {
+            "cache": {"matched_tokens": 0},
+            "prefill": {"tokens": benchmark.LONG_DECODE_CONTEXT},
+        }
+        self.measure_long_decode(300, copy.deepcopy(metrics), "length", "decode")
+        with self.assertRaisesRegex(smoke.SmokeFailure, "requested output length"):
+            self.measure_long_decode(299, copy.deepcopy(metrics), "stop", "decode")
+
+    def test_long_decode_pairs_eos_replies_on_length_and_times_each_own(self):
+        rows = []
+        for sample, completion in ((0, 900), (1, 600)):
+            for version, ms_per_token in (("baseline", 2), ("candidate", 2.01)):
+                row = self.row(version, sample=sample)
+                row.update(
+                    scenario="long-decode",
+                    context=benchmark.LONG_DECODE_CONTEXT,
+                    usage={"completion_tokens": completion},
+                    native_delta={
+                        "decode_wall_ms": completion * ms_per_token,
+                        "decode_output_tokens": completion,
+                    },
+                )
+                rows.append(row)
+        summary = benchmark.summarize(rows, 0.02)[0]
+        self.assertEqual(summary["baseline_median"], 2)
+        self.assertTrue(summary["pass"])
+        changed = copy.deepcopy(rows)
+        changed[1]["usage"]["completion_tokens"] = 899
+        with self.assertRaisesRegex(ValueError, "transcript differs"):
+            benchmark.summarize(changed, 0.02)
 
 
 if __name__ == "__main__":

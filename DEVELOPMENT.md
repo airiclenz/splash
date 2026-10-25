@@ -452,9 +452,12 @@ speaks the current protocol.
 This starts isolated servers in alternating order, compares matched cold,
 exact-prefix and decode requests, and saves `build/release/http-regression.json`.
 `--decode-tokens N` adds per sample one long-decode request: a short prompt that
-asks for more than N tokens and must return exactly N, gated like the decode
-request on native decode time per token, so `--samples S` makes 2·S N-token
-replies. Its rows keep the response's `metrics` (including `metrics.engine`
+asks for more than N tokens with `max_completion_tokens = N`, gated like the
+decode request on native decode time per token, so `--samples S` makes 2·S
+replies of up to N tokens. The model may end the count by EOS first (seen at
+27.5k-29.6k tokens), so such a reply counts when it reaches at least 3/4 of N
+and the baseline and candidate replies for that sample match in text and
+length; each is timed over its own length. Its rows keep the response's `metrics` (including `metrics.engine`
 when the server reports it); without the flag the report is unchanged.
 It does not contact your running server. Use the same power mode and charger,
 stop other GPU workloads, and report chip/GPU cores, memory, Splash version,
