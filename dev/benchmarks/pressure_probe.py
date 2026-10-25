@@ -21,16 +21,23 @@ each turn is sent right after the previous one finishes and carries the
 previous prompt, the returned reply and ``--tool-tokens`` filler words, so the
 whole earlier conversation is reusable. Each turn is its own phase, reported
 with its cached tokens, TTFT, counter deltas and OS warn seconds; the probe
-exits AGENT_COLD_TURN_EXIT_CODE when a turn after the first reuses 0 tokens.
+exits AGENT_COLD_TURN_EXIT_CODE when a turn after the first reuses 0 tokens,
+and AGENT_TURN_FAILED_EXIT_CODE when a turn fails, which ends the session.
 
 ``--ballast-mb N`` holds N MB of incompressible host memory in a child process
 from the burst phase's start until it ends (with ``--agent-turns``, from the
 second turn's start until the last turn ends), so the server serves under host
 pressure. ``--ballast-mb auto`` engages only once the server holds a request in
-prefill or decode, then grows the ballast a step at a time, each sized from the
-server's own ``memory_governor`` host headroom less what the ballast grew since
-the server took that host sample, to keep the host just past the server's
-warning margin without ever reading more headroom than the server does. A step never exceeds a
+prefill or decode, then holds the server's own ``memory_governor`` host
+headroom in a band just inside its warning margin. It grows the ballast a step
+at a time, each sized from that headroom less what the ballast grew since the
+server took its host sample, never reading more headroom than the server does,
+until the headroom is BALLAST_OVERSHOOT_BYTES below the margin. When the
+headroom falls below BALLAST_SHED_HEADROOM_SHARE of the margin (say, as the
+server's hot weights unwire), it releases its newest steps until the headroom
+is back at that target, so the server's own reclaim need find only
+BALLAST_OVERSHOOT_BYTES to reach the margin it admits a lane's growth at. A
+step never exceeds a
 quarter of the swap guard's cap nor the swap room left below half of it, and
 swapouts are re-read before each step: growth stops at half the cap and a step
 is shed while swapouts still rise past three quarters of it. The child wires its pages
@@ -93,6 +100,7 @@ SWAP_ABORT_EXIT_CODE = 3
 AGENT_COLD_TURN_EXIT_CODE = 4
 WARNING_SUSPENSION_MISSING_EXIT_CODE = 5
 WAITING_MEMORY_MISSING_EXIT_CODE = 6
+AGENT_TURN_FAILED_EXIT_CODE = 7
 SERVER_WARNING = "warning"
 AGENT_LANE = 0
 # The chat reply path of the server-side TTFT (prefill wall, no network).
@@ -125,8 +133,14 @@ BALLAST_POLL_SECONDS = 0.5
 BALLAST_EXIT_SECONDS = 5.0
 # MemoryPlan.hpp EngineMemoryPolicy::minimumHostWarningMarginBytes.
 MINIMUM_HOST_WARNING_MARGIN_BYTES = 256 * BYTES_PER_MB
-# How far `auto` pushes host headroom below the warning margin.
-BALLAST_OVERSHOOT_BYTES = 256 * BYTES_PER_MB
+# How far below the warning margin `auto` holds the server's host headroom:
+# enough to enter the server's warning latch, which holds until the recovery
+# margin, yet so little that the server's own reclaim lifts the headroom back
+# to the margin it admits a lane's growth at (MemoryGovernor::hostAdmits).
+BALLAST_OVERSHOOT_BYTES = 64 * BYTES_PER_MB
+# Share of the warning margin below which `auto` releases ballast until the
+# server's host headroom is back at its target.
+BALLAST_SHED_HEADROOM_SHARE = 0.5
 # `/status` memory_governor readings taken from one server host sample: any of
 # them changing means the server took a new sample.
 HOST_SAMPLE_READINGS = (
@@ -392,25 +406,30 @@ def host_sample_key(snapshot: dict) -> tuple:
 
 
 # ------------------------------------------------------------------------------
-def auto_ballast(snapshot: dict, unsampled_bytes: int) -> dict:
-    """Return how much more `--ballast-mb auto` holds, from the server's own view.
+def auto_ballast(snapshot: dict, held_bytes: int, sampled_held: tuple) -> dict:
+    """Return how far `--ballast-mb auto` grows or sheds, from the server's own view.
 
-    The host headroom is the `/status` host_headroom_bytes less
-    `unsampled_bytes`, what the ballast grew since the server took its host
-    sample, floored at 0. The server computes that headroom from one sample
+    `held_bytes` is what the ballast holds now and `sampled_held` the (least,
+    most) the server's current host sample can count of it. The server
+    computes its `/status` host_headroom_bytes from one sample
     (MemoryGovernor::hostHeadroomBytes over estimateHostAvailableMemory): its
     page counts and its hot weights' wiring read at the same instant. The probe
     cannot read the weights' wiring, which swings by most of the weight size
     within seconds during a turn, and `vm_stat` counts unwired weights as
     file-backed, so a fresh `vm_stat` paired with a wiring reading from another
     moment over-reads the headroom by up to the weight size. The server
-    refreshes its sample only every few to tens of seconds; charging the growth
-    since then stops the ballast at the target in between, so the headroom
-    read here never exceeds the server's.
+    refreshes its sample only every few to tens of seconds, so the ballast's
+    change since then is applied here: growth decisions take the least the
+    sample counted, so the headroom read never exceeds the server's, and shed
+    decisions the most, so a release the sample has not seen yet is not
+    released twice.
 
-    N = headroom - the warning margin + BALLAST_OVERSHOOT_BYTES, floored at 0,
-    so holding N more drops the headroom just past the server's warning
-    margin; Ballast.step grows toward it a bounded step at a time. Raises
+    The target headroom is the warning margin less BALLAST_OVERSHOOT_BYTES;
+    `mb` is how much more to hold to reach it, floored at 0 (Ballast.step grows
+    toward it a bounded step at a time). `shed_bytes` is how much to release to
+    lift the headroom back to the target once it fell below
+    BALLAST_SHED_HEADROOM_SHARE of the margin, else 0. The warning margin is
+    max(host_reserve_bytes / 4, 256 MiB) from the same sample. Raises
     ProbeError when the server exports no host_headroom_bytes or
     host_reserve_bytes.
     """
@@ -422,14 +441,21 @@ def auto_ballast(snapshot: dict, unsampled_bytes: int) -> dict:
             "/status memory_governor carries no host_headroom_bytes or "
             "host_reserve_bytes to size --ballast-mb auto"
         )
-    headroom = max(0, server_headroom - unsampled_bytes)
+    least_sampled, most_sampled = sampled_held
+    headroom = max(0, server_headroom - (held_bytes - least_sampled))
+    shed_headroom = max(0, server_headroom - (held_bytes - most_sampled))
     margin = host_warning_margin_bytes(reserve)
-    ballast_bytes = max(0, headroom - margin + BALLAST_OVERSHOOT_BYTES)
+    target = margin - BALLAST_OVERSHOOT_BYTES
+    floor = int(margin * BALLAST_SHED_HEADROOM_SHARE)
+    shed_bytes = target - shed_headroom if shed_headroom < floor else 0
     return {
-        "mb": ballast_bytes // BYTES_PER_MB,
+        "mb": max(0, headroom - target) // BYTES_PER_MB,
+        "shed_bytes": shed_bytes,
         "host_headroom_bytes": headroom,
         "host_reserve_bytes": reserve,
         "warning_margin_bytes": margin,
+        "target_headroom_bytes": target,
+        "shed_headroom_bytes": floor,
     }
 
 
@@ -525,14 +551,22 @@ def held_bytes(regions: list) -> tuple[int, int]:
 
 # ------------------------------------------------------------------------------
 def apply_ballast_command(regions: list, command: str, byte_count: int) -> None:
-    """Grow the ballast by `byte_count` filled, wired bytes, or shed its newest region."""
+    """Grow the ballast by `byte_count` filled, wired bytes, or shed regions.
+
+    A shed closes the newest region, then further ones, newest first, until at
+    least `byte_count` bytes are released or none is left.
+    """
     if command == BALLAST_GROW:
         # Anonymous memory is mapped lazily, so the fill touches each page once.
         region = mmap.mmap(-1, byte_count)
         fill_incompressible(region)
         regions.append((region, wire_pages(region)))
-    elif regions:
-        regions.pop()[0].close()
+        return
+    released_bytes = 0
+    while regions and (released_bytes == 0 or released_bytes < byte_count):
+        region, _ = regions.pop()
+        released_bytes += len(region)
+        region.close()
 
 
 # ------------------------------------------------------------------------------
@@ -540,8 +574,8 @@ def hold_ballast(control) -> None:
     """Hold ballast regions as the probe commands, until its pipe closes.
 
     The ballast child's body. `control` is its end of a pipe to the probe,
-    carrying (BALLAST_GROW, byte count) or (BALLAST_SHED, 0) commands; each is
-    answered with (bytes held, bytes wired). Between commands the child touches
+    carrying (BALLAST_GROW, byte count) or (BALLAST_SHED, byte count) commands
+    (apply_ballast_command); each is answered with (bytes held, bytes wired). Between commands the child touches
     the pages it could not wire every BALLAST_TOUCH_SECONDS. It returns once
     the probe closes its end or dies.
     """
@@ -611,10 +645,11 @@ class Ballast:
     held from; a fixed size is filled there, before the phase's requests. An
     `auto` ballast is driven by `tend`, which run_phase calls about every
     SWAP_POLL_SECONDS: it engages once the server holds a request in prefill or
-    decode, then each tick re-reads `/status`, charges what it grew since the
-    server's host sample (note_host_sample), and grows the ballast toward the
-    auto_ballast target by at most one auto_step_bytes step, checking swapouts before every step and stopping
-    short of the swap guard. `start_child()` returns an object offering
+    decode, then each tick re-reads `/status`, applies what it changed since the
+    server's host sample (note_host_sample), and either releases its newest
+    steps when the headroom fell below the auto_ballast band or grows toward
+    its target by at most one auto_step_bytes step, checking swapouts before
+    every step and stopping short of the swap guard. `start_child()` returns an object offering
     `resize(command, byte_count, stop)` and `close()`. `arm` and `release` are
     idempotent, so phase edges, guard trips and `main` may all release.
     """
@@ -629,10 +664,10 @@ class Ballast:
         self.record = None
         self.armed_at = 0.0
         self.held_bytes = 0
-        # The server host sample last seen, and the bytes held at the `/status`
-        # read before it: no more than that sample counted.
+        # The server host sample last seen, the (least, most) of the ballast
+        # it can count, and the bytes held at the last `/status` read.
         self.sample_key = None
-        self.sampled_held_bytes = 0
+        self.sampled_held = (0, 0)
         self.read_held_bytes = 0
         self.swap_seen_bytes = 0
         self.is_engaged = False
@@ -660,6 +695,7 @@ class Ballast:
         self.armed_at = time.monotonic()
         if self.request == BALLAST_AUTO:
             self.record["swap_limited"] = False
+            self.record["shed_mb"] = 0
             return
         self.resize(BALLAST_GROW, self.request * BYTES_PER_MB, guard)
 
@@ -683,40 +719,46 @@ class Ballast:
         self.note_host_sample(status)
         if not self.is_engaged and not lanes_resident(status):
             return
-        unsampled_bytes = max(0, self.held_bytes - self.sampled_held_bytes)
-        sizing = auto_ballast(status, unsampled_bytes)
+        sizing = auto_ballast(status, self.held_bytes, self.sampled_held)
         if not self.is_engaged:
             self.is_engaged = True
-            engaged = {key: value for key, value in sizing.items() if key != "mb"}
+            engaged = {
+                key: value
+                for key, value in sizing.items()
+                if key not in ("mb", "shed_bytes")
+            }
             engaged["engage_s"] = round(time.monotonic() - self.armed_at, 1)
             self.record.update(engaged)
             self.swap_seen_bytes = guard.grown_bytes
-        self.step(sizing["mb"] * BYTES_PER_MB, guard)
+        self.step(sizing, guard)
 
     # --------------------------------------------------------------------------
     def note_host_sample(self, status: dict) -> None:
-        """Track how much the server's current host sample counts as held.
+        """Track the least and most of the ballast the server's host sample counts.
 
-        A sample that changed since the previous `/status` read was taken after
-        it, so it counts at least what was held at that read; the growth since
-        then is charged in full. That under-reads the headroom by at most the
-        one step taken after that read, and never over-reads it.
+        A sample that changed since the previous `/status` read was taken
+        between that read and this one, so it counted what was held at that
+        read, what the one step taken after it left, or a part of that step.
+        Sizing from the least never over-reads the headroom, and shedding from
+        the most never releases twice for one shortfall.
         """
         key = host_sample_key(status)
         if key != self.sample_key:
             self.sample_key = key
-            self.sampled_held_bytes = self.read_held_bytes
+            held = (self.read_held_bytes, self.held_bytes)
+            self.sampled_held = (min(held), max(held))
         self.read_held_bytes = self.held_bytes
 
     # --------------------------------------------------------------------------
-    def step(self, target_bytes: int, guard: SwapGuard) -> None:
-        """Shed, hold or grow the `auto` ballast by one step.
+    def step(self, sizing: dict, guard: SwapGuard) -> None:
+        """Shed, hold or grow the `auto` ballast by one step of an auto_ballast sizing.
 
         Takes a fresh swap reading first. Sheds the newest region while
-        swapouts still rise past BALLAST_SWAP_SHED_SHARE of the guard's cap;
-        grows no more once they reach BALLAST_SWAP_GROW_SHARE; otherwise grows
-        by auto_step_bytes toward `target_bytes`, only while that target
-        reaches BALLAST_CHUNK_BYTES.
+        swapouts still rise past BALLAST_SWAP_SHED_SHARE of the guard's cap.
+        Otherwise releases the sizing's `shed_bytes` when the headroom fell
+        below the band, a release adding no swap; grows no more once swapouts
+        reach BALLAST_SWAP_GROW_SHARE; and otherwise grows by auto_step_bytes
+        toward the sizing's target, only while it reaches BALLAST_CHUNK_BYTES.
         """
         if guard.check():
             return
@@ -728,14 +770,31 @@ class Ballast:
             if is_swap_rising and self.held_bytes > 0:
                 self.resize(BALLAST_SHED, 0, guard)
             return
+        if sizing["shed_bytes"] > 0:
+            self.shed(sizing["shed_bytes"], guard)
+            return
         if grown >= guard.cap_bytes * BALLAST_SWAP_GROW_SHARE:
             self.record["swap_limited"] = True
             return
+        target_bytes = sizing["mb"] * BYTES_PER_MB
         if target_bytes < BALLAST_CHUNK_BYTES:
             return
         step_bytes = auto_step_bytes(target_bytes, grown, guard.cap_bytes)
         if step_bytes > 0:
             self.resize(BALLAST_GROW, step_bytes, guard)
+
+    # --------------------------------------------------------------------------
+    def shed(self, byte_count: int, guard: SwapGuard) -> None:
+        """Release at least `byte_count` held bytes, newest steps first.
+
+        A no-op when nothing is held; the report's `shed_mb` sums the releases.
+        """
+        if self.held_bytes == 0:
+            return
+        held_before = self.held_bytes
+        self.resize(BALLAST_SHED, byte_count, guard)
+        released_bytes = max(0, held_before - self.held_bytes)
+        self.record["shed_mb"] += released_bytes // BYTES_PER_MB
 
     # --------------------------------------------------------------------------
     def resize(self, command: str, byte_count: int, guard: SwapGuard) -> None:
@@ -1020,6 +1079,16 @@ def has_cold_turn(phases: list[dict]) -> bool:
 
 
 # ------------------------------------------------------------------------------
+def has_failed_turn(phases: list[dict]) -> bool:
+    """Return whether an agent turn failed, which ends the session early.
+
+    A turn fails on an HTTP or transport error, or on a reply without content
+    to resend; run_agent stops there, so the later turns never run.
+    """
+    return any(record["error"] for phase in phases for record in phase["lanes"])
+
+
+# ------------------------------------------------------------------------------
 def phase_os_warn_seconds(samples: list[dict], phase: str) -> float:
     """Return the OS warn seconds of the samples taken during `phase`."""
     taken = [sample for sample in samples if sample.get("phase") == phase]
@@ -1107,7 +1176,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--agent-turns",
         type=int,
-        help="drive one conversation for this many back-to-back turns instead",
+        help="drive one conversation for this many back-to-back turns instead; "
+        f"exits {AGENT_TURN_FAILED_EXIT_CODE} when a turn fails",
     )
     parser.add_argument(
         "--tool-tokens",
@@ -1134,8 +1204,9 @@ def parse_args(argv=None):
         help="hold this much incompressible host memory during the burst (with "
         f"--agent-turns, from the second turn on); {BALLAST_AUTO} grows it in "
         "steps once a request is in prefill or decode, from the server's host "
-        "headroom, to keep the host past the server's warning margin, stopping "
-        "short of the swap guard",
+        "headroom, to hold the host just inside the server's warning margin, "
+        "sheds steps when the headroom falls well below it, and stops short of "
+        "the swap guard",
     )
     parser.add_argument(
         "--require-warning-suspension",
@@ -1188,13 +1259,16 @@ def exit_code(args, document: dict, samples: list[dict]) -> int:
 
     SWAP_ABORT_EXIT_CODE when the swap guard stopped the run, else
     AGENT_COLD_TURN_EXIT_CODE when an agent turn after the first reused 0
-    tokens, else WARNING_SUSPENSION_MISSING_EXIT_CODE or
-    WAITING_MEMORY_MISSING_EXIT_CODE when a require-flag's path never ran.
+    tokens, else AGENT_TURN_FAILED_EXIT_CODE when an agent turn failed, else
+    WARNING_SUSPENSION_MISSING_EXIT_CODE or WAITING_MEMORY_MISSING_EXIT_CODE
+    when a require-flag's path never ran.
     """
     if document["swap_aborted"]:
         return SWAP_ABORT_EXIT_CODE
     if args.agent_turns is not None and has_cold_turn(document["phases"]):
         return AGENT_COLD_TURN_EXIT_CODE
+    if args.agent_turns is not None and has_failed_turn(document["phases"]):
+        return AGENT_TURN_FAILED_EXIT_CODE
     if args.require_warning_suspension and not has_warning_suspension(samples):
         return WARNING_SUSPENSION_MISSING_EXIT_CODE
     if args.require_waiting_memory and not has_waiting_memory(samples):

@@ -23,6 +23,12 @@ REPLY_CONTENT = "1\n2\n3"
 TTFT_MS = 412.5
 GIB = 2**30
 MIB = 2**20
+RESOURCE_TIMEOUT_ERROR = {
+    "error": {
+        "type": "resource_timeout",
+        "message": "memory did not become available within the resource wait limit",
+    }
+}
 
 
 def snapshot(pressure="normal", **counters):
@@ -46,11 +52,19 @@ class StubServer:
 
     `status` is a document, or a callable taking the count of chat requests
     received so far and returning one. `cached_tokens` is one count for every
-    reply, or a list read one entry per chat request in arrival order.
+    reply, or a list read one entry per chat request in arrival order. The
+    chat requests whose arrival index is in `failing_requests` are answered
+    with HTTP 503 `resource_timeout`, as the live server times out a request
+    that waited too long for memory.
     """
 
     def __init__(
-        self, status, cached_tokens=0, reply_delay=0.0, reply_content=REPLY_CONTENT
+        self,
+        status,
+        cached_tokens=0,
+        reply_delay=0.0,
+        reply_content=REPLY_CONTENT,
+        failing_requests=(),
     ):
         self.status = status
         self.released = threading.Event()
@@ -61,9 +75,9 @@ class StubServer:
             def log_message(self, *_arguments):
                 pass
 
-            def reply(self, document):
+            def reply(self, document, status_code=200):
                 raw = json.dumps(document).encode()
-                self.send_response(200)
+                self.send_response(status_code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
@@ -83,6 +97,9 @@ class StubServer:
                 stub.chat_bodies.append(json.loads(self.rfile.read(length)))
                 index = len(stub.chat_bodies) - 1
                 stub.released.wait(reply_delay)
+                if index in failing_requests:
+                    self.reply(RESOURCE_TIMEOUT_ERROR, 503)
+                    return
                 cached = (
                     cached_tokens[index]
                     if isinstance(cached_tokens, list)
@@ -532,15 +549,33 @@ class AgentModeTests(unittest.TestCase):
         self.assertIn("os_warn_s", output)
         self.assertIn("turn1", output)
 
-    def test_main_agentReplyWithoutContent_stopsAfterThatTurn(self):
+    def test_main_agentReplyWithoutContent_stopsAndExitsTurnFailedCode(self):
         with StubServer(AGENT_STATUS, reply_content=None) as stub:
             code, output = run_main(agent_arguments(stub, 3, "--json"))
 
-        self.assertEqual(code, 0)
+        self.assertEqual(code, probe.AGENT_TURN_FAILED_EXIT_CODE)
         self.assertEqual(len(stub.chat_bodies), 1)
         self.assertIn(
             "no message content", json.loads(output)["phases"][0]["lanes"][0]["error"]
         )
+
+    def test_main_agentTurnFailsWithHttpError_stopsAndExitsTurnFailedCode(self):
+        # Item 10's run: turn 2 failed HTTP 503 resource_timeout and the probe
+        # still exited 0, as if the session had finished.
+        with StubServer(
+            AGENT_STATUS, cached_tokens=[0, 90, 150, 210], failing_requests={2}
+        ) as stub:
+            code, output = run_main(agent_arguments(stub, 4, "--json"))
+
+        self.assertEqual(code, probe.AGENT_TURN_FAILED_EXIT_CODE)
+        self.assertEqual(len(stub.chat_bodies), 3)
+        self.assertIn("HTTP 503", json.loads(output)["phases"][2]["lanes"][0]["error"])
+
+    def test_main_agentTurnsAllSucceed_exitsZero(self):
+        with StubServer(AGENT_STATUS, cached_tokens=[0, 90, 150]) as stub:
+            code, _output = run_main(agent_arguments(stub, 3))
+
+        self.assertEqual(code, 0)
 
     def test_main_agentSwapGrowthPastCap_stopsWithExitCode3(self):
         grown = 2 * 2**20 // PAGE_BYTES
@@ -588,42 +623,95 @@ class BallastSizingTests(unittest.TestCase):
 
         self.assertEqual(margins, [512 * MIB, 256 * MIB, 256 * MIB])
 
-    def test_autoBallast_isServerHeadroomLessWarningMarginPlusOvershoot(self):
+    def test_autoBallast_isServerHeadroomLessATargetJustInsideTheMargin(self):
         sample = self.governor_sample(2 * GIB, host_headroom_bytes=10 * GIB)
 
-        record = probe.auto_ballast(sample, 0)
+        record = probe.auto_ballast(sample, 0, (0, 0))
 
         self.assertEqual(
             record,
             {
-                "mb": 10 * 1024 - 512 + 256,
+                "mb": 10 * 1024 - 512 + 64,
+                "shed_bytes": 0,
                 "host_headroom_bytes": 10 * GIB,
                 "host_reserve_bytes": 2 * GIB,
                 "warning_margin_bytes": 512 * MIB,
+                "target_headroom_bytes": 448 * MIB,
+                "shed_headroom_bytes": 256 * MIB,
             },
         )
+
+    def test_autoBallast_bandSitsJustInsideTheWarningMargin(self):
+        for reserve_bytes in (0, 512 * MIB, 2 * GIB, 8 * GIB):
+            with self.subTest(reserve_mb=reserve_bytes // MIB):
+                sample = self.governor_sample(reserve_bytes, host_headroom_bytes=0)
+
+                record = probe.auto_ballast(sample, 0, (0, 0))
+
+                margin = record["warning_margin_bytes"]
+                self.assertLess(record["shed_headroom_bytes"], margin)
+                self.assertGreater(record["shed_headroom_bytes"], 0)
+                self.assertEqual(
+                    record["target_headroom_bytes"],
+                    margin - probe.BALLAST_OVERSHOOT_BYTES,
+                )
+                self.assertGreater(
+                    record["target_headroom_bytes"], record["shed_headroom_bytes"]
+                )
 
     def test_autoBallast_chargesTheGrowthSinceTheServersSample(self):
         sample = self.governor_sample(2 * GIB, host_headroom_bytes=10 * GIB)
 
-        record = probe.auto_ballast(sample, 3 * GIB)
+        record = probe.auto_ballast(sample, 3 * GIB, (0, 0))
 
         self.assertEqual(
             (record["host_headroom_bytes"], record["mb"]),
-            (7 * GIB, 7 * 1024 - 512 + 256),
+            (7 * GIB, 7 * 1024 - 512 + 64),
         )
 
     def test_autoBallast_growthPastTheServersHeadroom_readsZero(self):
         sample = self.governor_sample(2 * GIB, host_headroom_bytes=GIB)
 
-        record = probe.auto_ballast(sample, 2 * GIB)
+        record = probe.auto_ballast(sample, 2 * GIB, (0, 0))
 
         self.assertEqual((record["host_headroom_bytes"], record["mb"]), (0, 0))
 
-    def test_autoBallast_headroomBelowTheMargin_floorsAtZero(self):
-        sample = self.governor_sample(2 * GIB, host_headroom_bytes=100 * MIB)
+    def test_autoBallast_headroomBelowTheTarget_growsNothing(self):
+        sample = self.governor_sample(2 * GIB, host_headroom_bytes=400 * MIB)
 
-        self.assertEqual(probe.auto_ballast(sample, 0)["mb"], 0)
+        self.assertEqual(probe.auto_ballast(sample, GIB, (GIB, GIB))["mb"], 0)
+
+    def test_autoBallast_headroomInsideTheBand_neitherGrowsNorSheds(self):
+        for headroom_mb in (256, 300, 448):
+            with self.subTest(headroom_mb=headroom_mb):
+                sample = self.governor_sample(2 * GIB, headroom_mb * MIB)
+
+                record = probe.auto_ballast(sample, GIB, (GIB, GIB))
+
+                self.assertEqual((record["mb"], record["shed_bytes"]), (0, 0))
+
+    def test_autoBallast_item10Turn2HotWeightsUnwired_shedsBackToTheTarget(self):
+        # Item 10's turn 2: the hot weights unwired and the server's host
+        # headroom fell to 0.01 GB against a 0.54 GB margin; the ballast held
+        # 5298 MB and released none, so the sole lane timed out.
+        reserve_bytes = 2_160_000_000
+        sample = self.governor_sample(reserve_bytes, host_headroom_bytes=10_000_000)
+        held_bytes = 5298 * MIB
+
+        record = probe.auto_ballast(sample, held_bytes, (held_bytes, held_bytes))
+
+        target_bytes = reserve_bytes // 4 - probe.BALLAST_OVERSHOOT_BYTES
+        self.assertEqual(record["shed_bytes"], target_bytes - 10_000_000)
+        self.assertEqual(record["mb"], 0)
+
+    def test_autoBallast_releaseTheSampleHasNotSeen_isNotShedTwice(self):
+        # The server sampled while the ballast held 1.5 GiB; it has released
+        # 512 MiB since, which the sample's 10 MiB of headroom does not show.
+        sample = self.governor_sample(2 * GIB, host_headroom_bytes=10 * MIB)
+
+        record = probe.auto_ballast(sample, GIB, (GIB, GIB + 512 * MIB))
+
+        self.assertEqual((record["mb"], record["shed_bytes"]), (0, 0))
 
     def test_autoBallast_item10EngageSample_readsTheServersHeadroom(self):
         # Item 10's agent turn 1 at engage: the server read 2.48 GB of host
@@ -638,11 +726,11 @@ class BallastSizingTests(unittest.TestCase):
             memory_governor__host_weight_wired_bytes=16_425_680_896,
         )
 
-        record = probe.auto_ballast(sample, 0)
+        record = probe.auto_ballast(sample, 0, (0, 0))
 
         self.assertEqual(
             (record["host_headroom_bytes"], record["mb"]),
-            (2_478_669_824, (2_478_669_824 - 512 * MIB) // MIB + 256),
+            (2_478_669_824, (2_478_669_824 - 448 * MIB) // MIB),
         )
 
     def test_autoBallast_weightWiringSwings_sizesOnlyFromTheServersHeadroom(self):
@@ -654,7 +742,7 @@ class BallastSizingTests(unittest.TestCase):
                 memory_governor__host_weight_bytes=16_425_680_896,
                 memory_governor__host_weight_wired_bytes=wired_bytes,
             )
-            records.append(probe.auto_ballast(sample, 0))
+            records.append(probe.auto_ballast(sample, 0, (0, 0)))
 
         self.assertEqual(records[0], records[1])
         self.assertEqual(records[0]["host_headroom_bytes"], 3 * GIB)
@@ -665,7 +753,9 @@ class BallastSizingTests(unittest.TestCase):
             ("no reserve", "host_headroom_bytes"),
         ):
             with self.subTest(name), self.assertRaises(probe.ProbeError):
-                probe.auto_ballast(snapshot(**{f"memory_governor__{reading}": GIB}), 0)
+                probe.auto_ballast(
+                    snapshot(**{f"memory_governor__{reading}": GIB}), 0, (0, 0)
+                )
 
     def test_hostSampleKey_changesWithAnyReadingOfTheSample(self):
         sample = snapshot(
@@ -786,6 +876,15 @@ class BallastChildTests(unittest.TestCase):
 
         self.assertEqual([held for held, _wired in replies], [65536, 98304, 65536])
 
+    def test_holdBallast_shedOfManyBytes_releasesNewestRegionsUntilCovered(self):
+        grows = [(probe.BALLAST_GROW, size * 1024) for size in (64, 32, 16)]
+
+        replies = self.run_child(
+            [*grows, (probe.BALLAST_SHED, 40 * 1024), (probe.BALLAST_SHED, 10**9)]
+        )
+
+        self.assertEqual([held for held, _wired in replies[3:]], [65536, 0])
+
     def test_holdBallast_hostRefusesWiring_holdsThePagesUnwired(self):
         with mock.patch.object(probe, "wire_pages", lambda _region: False):
             replies = self.run_child([(probe.BALLAST_GROW, 64 * 1024)])
@@ -867,8 +966,11 @@ def fake_ballast_child(stub, host=None):
             events.append((command, byte_count, len(stub.chat_bodies)))
             if command == probe.BALLAST_GROW:
                 steps.append(byte_count)
-            elif steps:
-                steps.pop()
+            released_bytes = 0
+            while command == probe.BALLAST_SHED and steps:
+                released_bytes += steps.pop()
+                if released_bytes >= byte_count:
+                    break
             if host is not None:
                 host.hold(sum(steps))
             return sum(steps), sum(steps)
@@ -882,6 +984,10 @@ def fake_ballast_child(stub, host=None):
 BURST_ARGUMENTS = ("--lanes", "2", "--warm-tokens", "80", "--extend-tokens", "20")
 # One `auto` step under the default 512 MB swap guard: a quarter of its cap.
 STEP = 128 * MIB
+# FakeHost's default 1 GiB reserve: a 256 MiB warning margin, so `auto` holds
+# the host headroom at 192 MiB and sheds below 128 MiB.
+TARGET_HEADROOM = 192 * MIB
+SHED_HEADROOM = 128 * MIB
 
 
 def resident_after_first_request(chat_count):
@@ -982,6 +1088,7 @@ class BallastMainTests(unittest.TestCase):
                 "mb": 0,
                 "wired_mb": 0,
                 "swap_limited": False,
+                "shed_mb": 0,
             },
         )
 
@@ -996,14 +1103,16 @@ class BallastMainTests(unittest.TestCase):
             {"held": True, "phase": "burst", "host_headroom_bytes": 2 * GIB},
         )
 
-    def test_main_ballastAuto_growsInStepsUntilPastTheWarningMargin(self):
+    def test_main_ballastAuto_growsInStepsUntilJustInsideTheWarningMargin(self):
         host = FakeHost(constant_headroom(2 * GIB), resident_after_first_request)
 
         _code, ballast, events = self.run_auto(host)
 
         grows = [event[1] for event in events if event[0] == probe.BALLAST_GROW]
-        self.assertEqual(grows, [STEP] * 16)
-        self.assertEqual((ballast["mb"], ballast["wired_mb"]), (2048, 2048))
+        # The step after each new host sample charges the previous step again,
+        # so the last 192 MiB come in 64 MiB steps.
+        self.assertEqual(grows, [STEP] * 13 + [64 * MIB] * 3)
+        self.assertEqual((ballast["mb"], ballast["wired_mb"]), (1856, 1856))
 
     def test_main_ballastAuto_staleHostSample_stopsAtTheServersTarget(self):
         # The server samples the host once and never again: only the growth
@@ -1016,8 +1125,8 @@ class BallastMainTests(unittest.TestCase):
 
         _code, ballast, _events = self.run_auto(host)
 
-        self.assertEqual(host.peak_held_bytes, 2 * GIB)
-        self.assertEqual(ballast["mb"], 2048)
+        self.assertEqual(host.peak_held_bytes, 2 * GIB - TARGET_HEADROOM)
+        self.assertEqual(ballast["mb"], 1856)
 
     def test_main_ballastAuto_sampleRefreshes_neverHoldsPastTheServersTarget(self):
         # The server re-samples every few reads, as live: each fresh sample
@@ -1032,8 +1141,8 @@ class BallastMainTests(unittest.TestCase):
 
                 _code, ballast, _events = self.run_auto(host)
 
-                self.assertLessEqual(host.peak_held_bytes, 2 * GIB)
-                self.assertEqual(ballast["mb"], 2048)
+                self.assertLessEqual(host.peak_held_bytes, 2 * GIB - TARGET_HEADROOM)
+                self.assertEqual(ballast["mb"], 1856)
 
     def test_main_ballastAuto_headroomRisingAfterEngage_topsUp(self):
         def rising(samples):
@@ -1043,7 +1152,37 @@ class BallastMainTests(unittest.TestCase):
 
         _code, ballast, _events = self.run_auto(host)
 
-        self.assertEqual(ballast["mb"], 256 + 1024)
+        self.assertEqual(ballast["mb"], 1280 - 192)
+
+    def test_main_ballastAuto_headroomFallingBelowTheBand_shedsBackIntoIt(self):
+        # Item 10's turn 2: once the ballast held its target the server's hot
+        # weights unwired and took 1.5 GiB of host headroom with them.
+        def unwiring(samples):
+            return 2 * GIB if samples < 30 else GIB // 2
+
+        host = FakeHost(unwiring, resident_after_first_request)
+
+        code, ballast, events = self.run_auto(host)
+
+        headroom = GIB // 2 - host.held_bytes
+        self.assertEqual(code, 0)
+        self.assertEqual(host.peak_held_bytes, 2 * GIB - TARGET_HEADROOM)
+        self.assertIn(probe.BALLAST_SHED, [event[0] for event in events])
+        self.assertGreaterEqual(headroom, SHED_HEADROOM)
+        self.assertLess(headroom, 256 * MIB)
+        self.assertGreaterEqual(ballast["shed_mb"], 1856 - 384)
+
+    def test_main_ballastAuto_headroomInsideTheBand_holdsWithoutShedding(self):
+        def easing(samples):
+            return 2 * GIB if samples < 30 else 2 * GIB - 32 * MIB
+
+        host = FakeHost(easing, resident_after_first_request)
+
+        _code, ballast, events = self.run_auto(host)
+
+        self.assertNotIn(probe.BALLAST_SHED, [event[0] for event in events])
+        self.assertEqual(ballast["shed_mb"], 0)
+        self.assertEqual(host.held_bytes, 2 * GIB - TARGET_HEADROOM)
 
     def test_main_ballastAuto_everyStepSwappedOut_limitsBeforeTheGuardTrips(self):
         for guard_mb in (128, 512):
@@ -1130,7 +1269,7 @@ class BallastMainTests(unittest.TestCase):
                 host=host,
             )
 
-        self.assertRegex(output, r"ballast_mb\s+1024")
+        self.assertRegex(output, r"ballast_mb\s+832")
         self.assertRegex(output, rf"ballast_host_headroom_bytes\s+{GIB}")
 
     def test_main_withoutBallast_reportsNoneAndStartsNoChild(self):
@@ -1192,6 +1331,26 @@ class RequireFlagTests(unittest.TestCase):
         self.assertEqual(
             probe.exit_code(args, document, []), probe.SWAP_ABORT_EXIT_CODE
         )
+
+    def test_exitCode_failedAgentTurn_ranksAfterTheSwapGuardAndBeforeTheFlags(self):
+        args = argparse.Namespace(
+            agent_turns=3,
+            require_warning_suspension=True,
+            require_waiting_memory=True,
+        )
+        failed = {
+            "lanes": [{"cached_tokens": None, "error": "HTTP 503: resource_timeout"}]
+        }
+        warm = {"lanes": [{"cached_tokens": 0, "error": None}]}
+        cases = (
+            ("swap guard tripped", True, probe.SWAP_ABORT_EXIT_CODE),
+            ("turn failed", False, probe.AGENT_TURN_FAILED_EXIT_CODE),
+        )
+        for name, swap_aborted, expected in cases:
+            with self.subTest(name):
+                document = {"swap_aborted": swap_aborted, "phases": [warm, failed]}
+
+                self.assertEqual(probe.exit_code(args, document, []), expected)
 
     def run_required(self, status, flag):
         with StubServer(status, reply_delay=0.1) as stub:
