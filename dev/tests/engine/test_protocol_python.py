@@ -15,22 +15,22 @@ ROOT = Path(__file__).parents[3]
 
 
 REQUEST_GOLDEN = (
-    "53504c480700180001000000540000000000000000000000efcdab8967452301"
+    "53504c480800180001000000540000000000000000000000efcdab8967452301"
     "000201008098281765060040a5ae0200000000008000000500000000000000cd"
     "cc4c3f3333733f200000001032547698badcfe00000000000000000001000000"
     "2a00000000000080ffffffff"
 )
 ERROR_GOLDEN = (
-    "53504c4807001800050100002700000000000000000000000200000000000000"
+    "53504c4808001800050100002700000000000000000000000200000000000000"
     "0000090000000c0000006770755f6661756c744d6574616c206661696c6564"
 )
 STATUS_GOLDEN = (
-    "53504c4807001800070100002d00000000000000000000002803000000000000"
+    "53504c4808001800070100002d00000000000000000000002803000000000000"
     "050000007b22736368656d615f76657273696f6e223a342c227265616479223a"
     "747275657d"
 )
 INITIAL_MASK_GOLDEN = (
-    "53504c4807001800030100001800000000000000000000005b00000000000000"
+    "53504c4808001800030100001800000000000000000000005b00000000000000"
     "06000000000000000400000000000000"
 )
 
@@ -104,6 +104,18 @@ int main() {
     DoneEvent scored{91, FinishReason::Stop, 4096, 0, 1000, 0, 3500};
     scored.optionLogits = {1.5f, -2.25f, 0.5f};
     show(scored);
+    DoneEvent timed{91, FinishReason::Length, 4096, 512, 1000, 2000, 3500};
+    timed.prefillStartTokens = 1024;
+    timed.prefilledTokens = 3072;
+    timed.prefillWallMicros = 0x0102030405060708ULL;
+    timed.decodeWallMicros = 0x1112131415161718ULL;
+    timed.decodeSteps = 480;
+    timed.draftedTokens = 96;
+    timed.acceptedDraftTokens = 32;
+    timed.suspensions = 3;
+    timed.decodeSuspensions = 2;
+    timed.replayTokens = 640;
+    show(timed);
     show(ErrorEvent{FailureClass::RequestError, 91, true,
                     "deadline_exceeded", "request deadline expired"});
     show(ErrorEvent{FailureClass::EngineUnhealthy, 0, false,
@@ -159,6 +171,28 @@ def example_score_request():
     )
 
 
+def example_timed_done():
+    return p.DoneEvent(
+        91,
+        p.FinishReason.LENGTH,
+        4096,
+        512,
+        1000,
+        2000,
+        3500,
+        prefill_start_tokens=1024,
+        prefilled_tokens=3072,
+        prefill_wall_micros=0x0102030405060708,
+        decode_wall_micros=0x1112131415161718,
+        decode_steps=480,
+        drafted_tokens=96,
+        accepted_draft_tokens=32,
+        suspensions=3,
+        decode_suspensions=2,
+        replay_tokens=640,
+    )
+
+
 def all_messages():
     return [
         example_request(),
@@ -195,6 +229,7 @@ def all_messages():
             3500,
             (1.5, -2.25, 0.5),
         ),
+        example_timed_done(),
         p.ErrorEvent(
             p.FailureClass.REQUEST_ERROR,
             91,
@@ -544,36 +579,42 @@ class ProtocolPythonTests(unittest.TestCase):
             91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5)
         )
         wire = p.serialize_message(done)
-        self.assertEqual(struct.unpack_from("<I", wire, 24 + 41)[0], 3)
-        self.assertEqual(struct.unpack_from("<3f", wire, 24 + 45), done.option_logits)
+        self.assertEqual(struct.unpack_from("<I", wire, 24 + 89)[0], 3)
+        self.assertEqual(struct.unpack_from("<3f", wire, 24 + 93), done.option_logits)
         self.assertEqual(p.decode_frame(parse_all(wire)[0]), done)
         # A wrong logit count must fail closed, not truncate.
-        bad = mutate_u32(wire, 24 + 41, 2)
+        bad = mutate_u32(wire, 24 + 89, 2)
         self.assert_protocol_error(
             p.FailureClass.PROTOCOL_FATAL,
             p.IssueCode.INVALID_PAYLOAD_LENGTH,
             lambda: p.decode_frame(parse_all(bad)[0]),
         )
-        # A v5-shaped 41-byte Done payload is below the v6 minimum.
-        short = wire[: 24 + 41]
-        short = mutate_u64(short, 12, 41)
+        # A count-less 89-byte Done payload is below the v8 minimum.
+        short = wire[: 24 + 89]
+        short = mutate_u64(short, 12, 89)
         issue = parser_issue(short)
         self.assertEqual(issue.code, p.IssueCode.INVALID_PAYLOAD_LENGTH)
         # Each scored-done invariant fails closed on the wire: non-stop
-        # finish, completion tokens, decode time, and sub-minimum or
-        # non-finite logits are all INVALID_COUNT.
+        # finish, completion tokens, decode time, any decode field of the
+        # timing record, and sub-minimum or non-finite logits are all
+        # INVALID_COUNT.
         non_stop = bytearray(wire)
         non_stop[24 + 8] = int(p.FinishReason.LENGTH)
         mutations = (
             bytes(non_stop),
             mutate_u32(wire, 24 + 13, 1),
             mutate_u64(wire, 24 + 25, 1),
+            mutate_u64(wire, 24 + 57, 1),
+            mutate_u32(wire, 24 + 65, 1),
+            mutate_u32(wire, 24 + 69, 1),
+            mutate_u32(wire, 24 + 73, 1),
+            mutate_u32(wire, 24 + 81, 1),
         )
         # A wire-consistent count below the score minimum.
-        one_logit = wire[: 24 + 49]
-        one_logit = mutate_u64(one_logit, 12, 49)
-        one_logit = mutate_u32(one_logit, 24 + 41, 1)
-        mutations += (one_logit, mutate_u32(wire, 24 + 45, 0x7FC00000))
+        one_logit = wire[: 24 + 97]
+        one_logit = mutate_u64(one_logit, 12, 97)
+        one_logit = mutate_u32(one_logit, 24 + 89, 1)
+        mutations += (one_logit, mutate_u32(wire, 24 + 93, 0x7FC00000))
         for mutated in mutations:
             with self.subTest(mutated=mutated.hex()):
                 self.assert_protocol_error(
@@ -581,6 +622,50 @@ class ProtocolPythonTests(unittest.TestCase):
                     p.IssueCode.INVALID_COUNT,
                     lambda mutated=mutated: p.decode_frame(parse_all(mutated)[0]),
                 )
+
+    def test_done_timing_record_wire_layout_and_version(self):
+        done = example_timed_done()
+        wire = p.serialize_message(done)
+
+        self.assertEqual(struct.unpack_from("<H", wire, 4)[0], 8)
+        self.assertEqual(len(wire), 24 + 93)
+        self.assertEqual(
+            struct.unpack_from("<IIQQIIIIII", wire, 24 + 41),
+            (
+                1024,
+                3072,
+                0x0102030405060708,
+                0x1112131415161718,
+                480,
+                96,
+                32,
+                3,
+                2,
+                640,
+            ),
+        )
+        self.assertEqual(struct.unpack_from("<I", wire, 24 + 89)[0], 0)
+        self.assertEqual(p.decode_frame(parse_all(wire)[0]), done)
+        # A v7 peer's frame is refused at the header, never misread.
+        issue = parser_issue(mutate_u16(wire, 4, 7))
+        self.assertEqual(issue.code, p.IssueCode.UNSUPPORTED_VERSION)
+        # A scored Done may carry prefill timing; only decode fields are
+        # forbidden.
+        scored = replace(
+            done,
+            reason=p.FinishReason.STOP,
+            completion_tokens=0,
+            decode_micros=0,
+            decode_wall_micros=0,
+            decode_steps=0,
+            drafted_tokens=0,
+            accepted_draft_tokens=0,
+            decode_suspensions=0,
+            option_logits=(1.0, 2.0),
+        )
+        self.assertEqual(
+            p.decode_frame(parse_all(p.serialize_message(scored))[0]), scored
+        )
 
     def test_done_option_logits_validation(self):
         base = dict(
@@ -608,12 +693,18 @@ class ProtocolPythonTests(unittest.TestCase):
                     ),
                 )
         # Each scored-done invariant is independently invalid: a non-stop
-        # finish reason, completion tokens, or decode time.
+        # finish reason, completion tokens, decode time, or any decode field
+        # of the timing record.
         for field, value in (
             ("reason", p.FinishReason.LENGTH),
             ("reason", p.FinishReason.CANCELLED),
             ("completion_tokens", 1),
             ("decode_micros", 1),
+            ("decode_wall_micros", 1),
+            ("decode_steps", 1),
+            ("drafted_tokens", 1),
+            ("accepted_draft_tokens", 1),
+            ("decode_suspensions", 1),
         ):
             with self.subTest(field=field, value=value):
                 self.assert_protocol_error(

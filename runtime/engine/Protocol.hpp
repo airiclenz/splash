@@ -14,7 +14,7 @@
 
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 7;
+inline constexpr uint16_t kProtocolVersion = 8;
 inline constexpr size_t kFrameHeaderBytes = 24;
 inline constexpr uint32_t kStatusSchemaVersion = 5;
 // Image pixels travel inside the request frame; a multi-image agent turn can
@@ -305,6 +305,20 @@ struct DoneEvent {
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> optionLogits{};
+  // The engine's per-request timing record (EngineRequestTiming), field for
+  // field. On the wire these sit before the option logit count; here they
+  // trail optionLogits so positional initializers stay valid. A scored Done
+  // carries zero in every decode field.
+  uint32_t prefillStartTokens = 0;
+  uint32_t prefilledTokens = 0;
+  uint64_t prefillWallMicros = 0;
+  uint64_t decodeWallMicros = 0;
+  uint32_t decodeSteps = 0;
+  uint32_t draftedTokens = 0;
+  uint32_t acceptedDraftTokens = 0;
+  uint32_t suspensions = 0;
+  uint32_t decodeSuspensions = 0;
+  uint32_t replayTokens = 0;
 
   bool operator==(const DoneEvent &) const = default;
 };

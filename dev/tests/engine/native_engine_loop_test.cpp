@@ -841,6 +841,9 @@ void testScoreRequestCompletesAfterFullPrompt() {
       require(done->requestId == 9, "score done id mismatch");
       require(done->completionTokens == 0, "score done emitted completion");
       require(done->decodeMicros == 0, "score done reported decode time");
+      require(done->prefilledTokens == 3000 && done->prefillStartTokens == 0 &&
+                  done->decodeSteps == 0 && done->decodeWallMicros == 0,
+              "score done did not carry its engine timing record");
       require(done->promptTokens == 3000, "score done prompt count mismatch");
       require(done->optionLogits.size() == 3, "score done logit count mismatch");
       require(done->optionLogits[0] == 0.5f && done->optionLogits[1] == 1.5f &&

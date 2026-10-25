@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 FRAME_HEADER_BYTES = 24
 STATUS_SCHEMA_VERSION = 5
 # Largest top-k the native sampler keeps as candidates.
@@ -40,7 +40,9 @@ _START = struct.Struct("<QBiII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
-_DONE = struct.Struct("<QBIIQQQ")
+# The fixed Done head, then the engine timing record (EngineRequestTiming)
+# before the option logit count.
+_DONE = struct.Struct("<QBIIQQQIIQQIIIIII")
 _ERROR = struct.Struct("<BBQII")
 _CAPACITY_EXHAUSTED = struct.Struct("<QIIQ")
 _STATUS_JSON = struct.Struct("<QI")
@@ -54,7 +56,7 @@ assert _HEADER.size == FRAME_HEADER_BYTES
 assert _REQUEST.size == 64
 assert _IMAGE_SPAN.size == 32
 assert _START.size == 21
-assert _DONE.size == 41
+assert _DONE.size == 89
 assert _ERROR.size == 18
 
 REQUEST_FIXED_BYTES = _REQUEST.size
@@ -329,6 +331,18 @@ class DoneEvent:
     # Raw final-position logits for a score-only request, in requested token
     # order; empty for generation and for cancelled or failed scoring.
     option_logits: tuple[float, ...] = ()
+    # The engine's per-request timing record, field for field; zero when the
+    # sender has none. A scored Done carries zero in every decode field.
+    prefill_start_tokens: int = 0
+    prefilled_tokens: int = 0
+    prefill_wall_micros: int = 0
+    decode_wall_micros: int = 0
+    decode_steps: int = 0
+    drafted_tokens: int = 0
+    accepted_draft_tokens: int = 0
+    suspensions: int = 0
+    decode_suspensions: int = 0
+    replay_tokens: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -1009,11 +1023,29 @@ def _done_issue(event: DoneEvent, failure: FailureClass) -> ProtocolIssue | None
         _u64(event.prefill_micros, "prefill microseconds")
         _u64(event.decode_micros, "decode microseconds")
         _u64(event.wall_micros, "wall microseconds")
+        _u32(event.prefill_start_tokens, "done prefill start tokens")
+        _u32(event.prefilled_tokens, "done prefilled tokens")
+        _u64(event.prefill_wall_micros, "done prefill wall microseconds")
+        _u64(event.decode_wall_micros, "done decode wall microseconds")
+        _u32(event.decode_steps, "done decode steps")
+        _u32(event.drafted_tokens, "done drafted tokens")
+        _u32(event.accepted_draft_tokens, "done accepted draft tokens")
+        _u32(event.suspensions, "done suspensions")
+        _u32(event.decode_suspensions, "done decode suspensions")
+        _u32(event.replay_tokens, "done replay tokens")
         logits = _score_logits(event.option_logits, "option logits")
         if logits:
             if reason is not FinishReason.STOP:
                 raise ValueError("scored done events must finish with stop")
-            if event.completion_tokens or event.decode_micros:
+            if (
+                event.completion_tokens
+                or event.decode_micros
+                or event.decode_wall_micros
+                or event.decode_steps
+                or event.drafted_tokens
+                or event.accepted_draft_tokens
+                or event.decode_suspensions
+            ):
                 raise ValueError(
                     "scored done events carry no completion or decode activity"
                 )
@@ -1251,6 +1283,16 @@ def _encode_message(
                 message.prefill_micros,
                 message.decode_micros,
                 message.wall_micros,
+                message.prefill_start_tokens,
+                message.prefilled_tokens,
+                message.prefill_wall_micros,
+                message.decode_wall_micros,
+                message.decode_steps,
+                message.drafted_tokens,
+                message.accepted_draft_tokens,
+                message.suspensions,
+                message.decode_suspensions,
+                message.replay_tokens,
             )
             + struct.pack("<I", len(message.option_logits))
             + _pack_floats(message.option_logits)
@@ -1631,8 +1673,25 @@ def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Me
         _raise_issue(_mask_request_issue(message, limits, FailureClass.PROTOCOL_FATAL))
         return message
     if frame_type is FrameType.DONE:
-        values = _DONE.unpack_from(payload)
-        request_id = values[0]
+        (
+            request_id,
+            reason,
+            prompt_tokens,
+            completion_tokens,
+            prefill_micros,
+            decode_micros,
+            wall_micros,
+            prefill_start_tokens,
+            prefilled_tokens,
+            prefill_wall_micros,
+            decode_wall_micros,
+            decode_steps,
+            drafted_tokens,
+            accepted_draft_tokens,
+            suspensions,
+            decode_suspensions,
+            replay_tokens,
+        ) = _DONE.unpack_from(payload)
         score_count = struct.unpack_from("<I", payload, _DONE.size)[0]
         try:
             logits = _unpack_floats(payload, _DONE.size + 4, score_count)
@@ -1646,14 +1705,28 @@ def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Me
         message = DoneEvent(
             request_id,
             _decode_enum(
-                values[1],
+                reason,
                 FinishReason,
                 "finish reason",
                 FailureClass.PROTOCOL_FATAL,
                 request_id,
             ),
-            *values[2:],
+            prompt_tokens,
+            completion_tokens,
+            prefill_micros,
+            decode_micros,
+            wall_micros,
             logits,
+            prefill_start_tokens=prefill_start_tokens,
+            prefilled_tokens=prefilled_tokens,
+            prefill_wall_micros=prefill_wall_micros,
+            decode_wall_micros=decode_wall_micros,
+            decode_steps=decode_steps,
+            drafted_tokens=drafted_tokens,
+            accepted_draft_tokens=accepted_draft_tokens,
+            suspensions=suspensions,
+            decode_suspensions=decode_suspensions,
+            replay_tokens=replay_tokens,
         )
         _raise_issue(_done_issue(message, FailureClass.PROTOCOL_FATAL))
         return message

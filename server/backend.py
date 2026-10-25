@@ -87,6 +87,42 @@ class CacheInfo:
     slot: int = -1
 
 
+@dataclass(frozen=True)
+class EngineTiming:
+    """One request's engine work, as the Done event reports it.
+
+    Walls are the full wall of every batch the request rode in, not a
+    per-request share; all zero for a request that never reached the engine.
+    """
+
+    prefill_start_tokens: int = 0
+    prefilled_tokens: int = 0
+    prefill_wall_micros: int = 0
+    decode_wall_micros: int = 0
+    decode_steps: int = 0
+    drafted_tokens: int = 0
+    accepted_draft_tokens: int = 0
+    suspensions: int = 0
+    decode_suspensions: int = 0
+    replay_tokens: int = 0
+
+    @classmethod
+    def from_done(cls, done):
+        """Copy the timing record a native Done event carries."""
+        return cls(
+            prefill_start_tokens=done.prefill_start_tokens,
+            prefilled_tokens=done.prefilled_tokens,
+            prefill_wall_micros=done.prefill_wall_micros,
+            decode_wall_micros=done.decode_wall_micros,
+            decode_steps=done.decode_steps,
+            drafted_tokens=done.drafted_tokens,
+            accepted_draft_tokens=done.accepted_draft_tokens,
+            suspensions=done.suspensions,
+            decode_suspensions=done.decode_suspensions,
+            replay_tokens=done.replay_tokens,
+        )
+
+
 @dataclass
 class NativeResult:
     reason: str
@@ -101,6 +137,7 @@ class NativeResult:
     first_token_batch_tokens: int = 0
     # Raw option logits for score-only jobs, in requested token order.
     option_logits: tuple = ()
+    engine_timing: EngineTiming = field(default_factory=EngineTiming)
 
 
 @dataclass
@@ -944,6 +981,7 @@ class NativeBackend:
                 cache=job.cache,
                 stop_sequence=stop_sequence,
                 first_token_batch_tokens=state.first_token_batch_tokens,
+                engine_timing=EngineTiming.from_done(done),
             )
             if job.latency is not None:
                 latency = metrics_dict(result)["request_latency"]

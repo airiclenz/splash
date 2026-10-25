@@ -576,7 +576,7 @@ void NativeRuntime::maskRequested(uint64_t requestId,
 void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
                               uint32_t promptTokens, uint32_t completionTokens,
                               std::span<const float> optionLogits,
-                              const EngineRequestTiming &) {
+                              const EngineRequestTiming &timing) {
   RequestTelemetry &telemetry = telemetry_.at(requestId);
   double now = clocks_.monotonicMilliseconds();
   double started = telemetry.startedMilliseconds > 0.0
@@ -584,11 +584,24 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
                        : telemetry.arrivedMilliseconds;
   double first = telemetry.firstTokenMilliseconds.value_or(now);
   send(protocol::DoneEvent{
-      requestId, mapFinishReason(reason), promptTokens, completionTokens,
+      requestId,
+      mapFinishReason(reason),
+      promptTokens,
+      completionTokens,
       durationMicros(started, first),
       telemetry.firstTokenMilliseconds ? durationMicros(first, now) : 0,
       durationMicros(telemetry.arrivedMilliseconds, now),
-      std::vector<float>(optionLogits.begin(), optionLogits.end())});
+      std::vector<float>(optionLogits.begin(), optionLogits.end()),
+      timing.prefillStartTokens,
+      timing.prefilledTokens,
+      timing.prefillWallMicros,
+      timing.decodeWallMicros,
+      timing.decodeSteps,
+      timing.draftedTokens,
+      timing.acceptedDraftTokens,
+      timing.suspensions,
+      timing.decodeSuspensions,
+      timing.replayTokens});
   pendingMasks_.erase(requestId);
   telemetry_.erase(requestId);
 }

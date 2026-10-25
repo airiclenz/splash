@@ -31,7 +31,7 @@ constexpr uint64_t kStartFixedBytes = 21;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
 constexpr uint64_t kTokensFixedBytes = 16;
 constexpr uint64_t kMaskRequestFixedBytes = 24;
-constexpr uint64_t kDoneFixedBytes = 45;
+constexpr uint64_t kDoneFixedBytes = 93;
 constexpr uint64_t kErrorFixedBytes = 18;
 constexpr uint64_t kCapacityExhaustedFixedBytes = 24;
 constexpr uint64_t kStatusJsonFixedBytes = 12;
@@ -599,7 +599,9 @@ std::optional<ProtocolIssue> validateDone(const DoneEvent &event,
                        "done option logit count must be in [2, 255]");
     }
     if (event.reason != FinishReason::Stop || event.completionTokens != 0 ||
-        event.decodeMicros != 0) {
+        event.decodeMicros != 0 || event.decodeWallMicros != 0 ||
+        event.decodeSteps != 0 || event.draftedTokens != 0 ||
+        event.acceptedDraftTokens != 0 || event.decodeSuspensions != 0) {
       return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
                        "scored done events must stop and carry no completion "
                        "or decode activity");
@@ -853,6 +855,16 @@ ProtocolResult<Frame> encodeDone(const DoneEvent &event) {
   writer.u64(event.prefillMicros);
   writer.u64(event.decodeMicros);
   writer.u64(event.wallMicros);
+  writer.u32(event.prefillStartTokens);
+  writer.u32(event.prefilledTokens);
+  writer.u64(event.prefillWallMicros);
+  writer.u64(event.decodeWallMicros);
+  writer.u32(event.decodeSteps);
+  writer.u32(event.draftedTokens);
+  writer.u32(event.acceptedDraftTokens);
+  writer.u32(event.suspensions);
+  writer.u32(event.decodeSuspensions);
+  writer.u32(event.replayTokens);
   writer.u32(static_cast<uint32_t>(event.optionLogits.size()));
   for (float logit : event.optionLogits)
     writer.f32(logit);
@@ -1179,7 +1191,14 @@ ProtocolResult<Message> decodeDone(const Frame &frame) {
   if (!reader.u64(event.requestId) || !reader.u8(reason) ||
       !reader.u32(event.promptTokens) || !reader.u32(event.completionTokens) ||
       !reader.u64(event.prefillMicros) || !reader.u64(event.decodeMicros) ||
-      !reader.u64(event.wallMicros) || !reader.u32(logitCount)) {
+      !reader.u64(event.wallMicros) || !reader.u32(event.prefillStartTokens) ||
+      !reader.u32(event.prefilledTokens) ||
+      !reader.u64(event.prefillWallMicros) ||
+      !reader.u64(event.decodeWallMicros) || !reader.u32(event.decodeSteps) ||
+      !reader.u32(event.draftedTokens) ||
+      !reader.u32(event.acceptedDraftTokens) ||
+      !reader.u32(event.suspensions) || !reader.u32(event.decodeSuspensions) ||
+      !reader.u32(event.replayTokens) || !reader.u32(logitCount)) {
     return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
                                       IssueCode::InvalidPayloadLength, 0,
                                       "done payload has an invalid length"));

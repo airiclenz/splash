@@ -360,15 +360,21 @@ Score answers are probability-weighted level indices. Measure accuracy and
 calibrate on representative held-out data before using decision thresholds.
 
 Native wire version 6 added score-token IDs to requests and selected f32 logits
-to Done events; a version mismatch is fatal. The current native wire version is
-7, which adds the Stop frame (0x0005): a stop-sequence match or a reasoning-loop
-trip ends the native call with a Stop, finishing as `EngineFinishReason::Stop`
-and counted as completed. Scoring requires 2–255 distinct,
+to Done events; a version mismatch is fatal. Version 7 added the Stop frame
+(0x0005): a stop-sequence match or a reasoning-loop trip ends the native call
+with a Stop, finishing as `EngineFinishReason::Stop` and counted as completed.
+The current native wire version is 8, which adds the engine's per-request timing
+record (`EngineRequestTiming`: prefill start depth, prefilled rows, prefill and
+decode batch walls, decode steps, drafted and accepted draft tokens,
+suspensions, decode suspensions, replayed rows) to Done, between its wall time
+and the option logit count; Python exposes it as `NativeResult.engine_timing`,
+all zero for a request that never reached the engine. Scoring requires 2–255 distinct,
 in-vocabulary tokens, no images or generation constraints, and a zero output budget.
 It may use the full context window because no generated token needs a reserved
 position. The final prefill chunk runs the target head but no sampling policy or
 DFlash decode. Successful scoring emits no Tokens event, finishes with Stop, and
-reports zero decode time. Cancelled requests carry no logits.
+reports zero decode time and no decode activity in its timing record. Cancelled
+requests carry no logits.
 
 A non-finite score logit is a per-request failure, not an engine fault: the
 engine reports `model_result_invalid` for that request alone, before it

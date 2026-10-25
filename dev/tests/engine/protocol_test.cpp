@@ -288,8 +288,8 @@ void testScoreRequestAndDoneLogits() {
   auto encodedDone = serializeMessage(Message{scored});
   CHECK(test, encodedDone);
   if (encodedDone) {
-    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 45 + 12);
-    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 3);
+    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 93 + 12);
+    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 89) == 3);
   }
 
   DoneEvent generation{91, FinishReason::Length, 10, 4, 1, 2, 3, {}};
@@ -334,6 +334,26 @@ void testScoreRequestAndDoneLogits() {
   DoneEvent lengthScored = scored;
   lengthScored.reason = FinishReason::Length;
   expectDoneIssue(lengthScored, IssueCode::InvalidCount);
+
+  // Each decode field of the timing record breaks a scored Done on its own;
+  // the prefill fields stay legal.
+  for (auto field : {&DoneEvent::decodeSteps, &DoneEvent::draftedTokens,
+                     &DoneEvent::acceptedDraftTokens,
+                     &DoneEvent::decodeSuspensions}) {
+    DoneEvent decoded = scored;
+    decoded.*field = 1;
+    expectDoneIssue(decoded, IssueCode::InvalidCount);
+  }
+  DoneEvent decodeWall = scored;
+  decodeWall.decodeWallMicros = 1;
+  expectDoneIssue(decodeWall, IssueCode::InvalidCount);
+  DoneEvent prefillTimed = scored;
+  prefillTimed.prefillStartTokens = 64;
+  prefillTimed.prefilledTokens = 4032;
+  prefillTimed.prefillWallMicros = 900;
+  prefillTimed.suspensions = 1;
+  prefillTimed.replayTokens = 32;
+  CHECK(test, roundTrip(prefillTimed) == prefillTimed);
 
   if (encodedDone) {
     auto truncated = *encodedDone.value;
@@ -636,6 +656,55 @@ Frame decodeSingleFrame(const std::vector<uint8_t> &wire) {
     throw std::runtime_error("expected one frame");
   }
   return std::move(frames.front());
+}
+
+// ============================================================================
+// Wire v8 carries the engine timing record on Done: ten fields between the
+// wall time and the option logit count, each surviving a round trip.
+void testDoneTimingRecordWire() {
+  constexpr std::string_view test = "done timing record wire";
+  DoneEvent timed{91, FinishReason::Length, 4096, 512, 1000, 2000, 3500, {}};
+  timed.prefillStartTokens = 1024;
+  timed.prefilledTokens = 3072;
+  timed.prefillWallMicros = 0x0102030405060708ULL;
+  timed.decodeWallMicros = 0x1112131415161718ULL;
+  timed.decodeSteps = 480;
+  timed.draftedTokens = 96;
+  timed.acceptedDraftTokens = 32;
+  timed.suspensions = 3;
+  timed.decodeSuspensions = 2;
+  timed.replayTokens = 640;
+  CHECK(test, roundTrip(timed) == timed);
+
+  auto encoded = serializeMessage(Message{timed});
+  CHECK(test, encoded);
+  if (!encoded)
+    return;
+  const std::vector<uint8_t> &wire = *encoded.value;
+  CHECK(test, wire.size() == kFrameHeaderBytes + 93);
+  CHECK(test, loadU16(wire, 4) == 8 && kProtocolVersion == 8);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 41) == 1024);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 45) == 3072);
+  CHECK(test, loadU64(wire, kFrameHeaderBytes + 49) == timed.prefillWallMicros);
+  CHECK(test, loadU64(wire, kFrameHeaderBytes + 57) == timed.decodeWallMicros);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 65) == 480);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 69) == 96);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 73) == 32);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 77) == 3);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 81) == 2);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 85) == 640);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 89) == 0);
+
+  // A v7-shaped Done (count right after the wall time) is below the v8
+  // minimum, and a v7 header is refused outright.
+  std::vector<uint8_t> shortWire(wire.begin(),
+                                 wire.begin() + kFrameHeaderBytes + 45);
+  storeU64(shortWire, 12, 45);
+  ProtocolIssue shortIssue = parserIssue(shortWire);
+  CHECK(test, shortIssue.code == IssueCode::InvalidPayloadLength);
+  std::vector<uint8_t> oldVersion = wire;
+  storeU16(oldVersion, 4, 7);
+  CHECK(test, parserIssue(oldVersion).code == IssueCode::UnsupportedVersion);
 }
 
 void testMalformedPayloadClassification() {
@@ -969,6 +1038,7 @@ int main() {
   try {
     testRequestWireAndRoundTrip();
     testScoreRequestAndDoneLogits();
+    testDoneTimingRecordWire();
     testStopFrameWireBesideCancel();
     testEveryMessageAndMultiplexedStream();
     testOneByteIncrementalParsing();

@@ -342,6 +342,57 @@ class NativeBackendContractTests(unittest.TestCase):
         )
         self.assertEqual(self.terminal(job)[0], "done")
 
+    def test_done_timing_record_reaches_native_result(self):
+        factory = FakeFactory()
+        native = runtime.MultiplexedRuntime(
+            process_factory=factory,
+            pending_limit=4,
+        )
+        transport, _runtime = self.make_transport(native)
+        job = make_job(406)
+        self.assertTrue(transport.submit(job))
+        process = factory.processes[0]
+        frame = process.stdin.wait_for(wire.RequestFrame)[0]
+
+        process.send(
+            wire.StartEvent(frame.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
+        )
+        process.send(wire.TokensEvent(frame.request_id, 0, (7,)))
+        process.send(
+            wire.DoneEvent(
+                frame.request_id,
+                wire.FinishReason.STOP,
+                4,
+                1,
+                100,
+                200,
+                350,
+                prefill_start_tokens=2,
+                prefilled_tokens=3,
+                prefill_wall_micros=90,
+                decode_wall_micros=180,
+                decode_steps=4,
+                drafted_tokens=5,
+                accepted_draft_tokens=6,
+                suspensions=7,
+                decode_suspensions=8,
+                replay_tokens=9,
+            )
+        )
+        kind, result = self.terminal(job)
+
+        self.assertEqual(kind, "done")
+        self.assertEqual(
+            result.engine_timing,
+            backend_api.EngineTiming(2, 3, 90, 180, 4, 5, 6, 7, 8, 9),
+        )
+
+    def test_native_result_without_timing_has_all_zero_engine_timing(self):
+        result = backend_api.NativeResult("stop", 4, 1, 1.0, 2.0, 3.0)
+
+        self.assertEqual(result.engine_timing, backend_api.EngineTiming())
+        self.assertFalse(any(vars(result.engine_timing).values()))
+
     def test_score_job_maps_to_score_only_request_and_returns_logits(self):
         factory = FakeFactory()
         native = runtime.MultiplexedRuntime(
