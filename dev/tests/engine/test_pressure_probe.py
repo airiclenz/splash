@@ -170,11 +170,20 @@ class CounterDeltaTests(unittest.TestCase):
         self.assertEqual(delta["resume_restored_tokens"], 8192)
         self.assertEqual(delta["resume_state_evictions"], 2)
 
+    def test_counterDelta_diffsQueuedPrefixEvictions(self):
+        before = snapshot(cache__resource_queued_prefix_evictions=1)
+        after = snapshot(cache__resource_queued_prefix_evictions=4)
+
+        delta = probe.counter_delta(before, after)
+
+        self.assertEqual(delta["queued_prefix_evictions"], 3)
+
     def test_counterDelta_missingCounter_readsAsNoneNotZero(self):
         delta = probe.counter_delta(snapshot(), snapshot(state__evictions=2))
 
         self.assertIsNone(delta["state_evictions"])
         self.assertIsNone(delta["kv_evictions"])
+        self.assertIsNone(delta["queued_prefix_evictions"])
 
     def test_counterDelta_diffsEachCheckpointFailureCause(self):
         before = snapshot()
@@ -1410,6 +1419,13 @@ class ReportTests(unittest.TestCase):
 
         self.assertRegex(output, r"resume_restored_tokens\s+0")
         self.assertRegex(output, r"resume_state_evictions\s+0")
+
+    def test_formatReport_rendersQueuedPrefixEvictionsPerPhase(self):
+        status = snapshot(cache__resource_queued_prefix_evictions=0)
+        with StubServer(status) as stub:
+            _code, output = run_main(["--base-url", stub.base_url, "--nonces", "a"])
+
+        self.assertRegex(output, r"queued_prefix_evictions\s+0")
 
 
 if __name__ == "__main__":

@@ -211,6 +211,22 @@ class DecodeSuspensionMetricsTests(unittest.TestCase):
             ],
         )
 
+    def test_queued_prefix_evictions_render_after_resume_state_evictions(self):
+        lines = prometheus_metrics(
+            {
+                "cache": {
+                    "resource_resume_state_evictions": 1,
+                    "resource_queued_prefix_evictions": 2,
+                }
+            }
+        ).splitlines()
+
+        start = lines.index("splash_cache_resource_resume_state_evictions_total 1")
+        self.assertEqual(
+            lines[start + 1],
+            "splash_cache_resource_queued_prefix_evictions_total 2",
+        )
+
     def test_missing_decode_suspension_counters_render_no_lines(self):
         text = prometheus_metrics({"cache": {"resource_replay_tokens": 1}})
 

@@ -75,6 +75,10 @@ _STATUS_METRICS = {
         "cache",
         "resource_resume_state_evictions",
     ),
+    "splash_cache_resource_queued_prefix_evictions_total": (
+        "cache",
+        "resource_queued_prefix_evictions",
+    ),
     "splash_scheduler_prefilling": ("scheduler", "prefilling"),
     "splash_scheduler_decoding": ("scheduler", "decoding"),
     "splash_scheduler_waiting_mask": ("scheduler", "waiting_mask"),
