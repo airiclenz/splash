@@ -73,9 +73,10 @@ def long_decode_floor(output_tokens: int) -> int:
 
     The model ends its count at a nonce-dependent point (seen at 27.5k-29.6k
     tokens) and nothing forces N tokens, so a reply stopped by EOS at three
-    quarters of N or more is accepted; `summarize` already pairs baseline and
-    candidate on reply text and length and gates each on its own decode time
-    per token, so both versions decode the same tokens.
+    quarters of N or more is accepted; without `--long-decode-self-check`,
+    `summarize` already pairs baseline and candidate on reply text and length
+    and gates each on its own decode time per token, so both versions decode
+    the same tokens.
     """
     return (3 * output_tokens + 3) // 4
 
@@ -139,6 +140,86 @@ def round_cases(args) -> list[tuple[int, str, int]]:
     if args.decode_tokens:
         cases.append((LONG_DECODE_CONTEXT, "long-decode", args.decode_tokens))
     return cases
+
+
+# ------------------------------------------------------------------------------
+def case_prompt(
+    prepared: dict, sample: int, context: int, scenario: str, self_check: bool
+) -> str:
+    """Return the prompt one round case sends.
+
+    A long-decode case takes its sample's long-decode prompt, or sample 0's
+    under `--long-decode-self-check`, so all four rounds decode one prompt and
+    each build answers it twice; every other case takes its sample's exact
+    `context`-token prompt.
+    """
+    if scenario != "long-decode":
+        return prepared[sample, context]
+    return prepared[0 if self_check else sample, "long-decode"]
+
+
+# ------------------------------------------------------------------------------
+def transcript(row: dict) -> tuple:
+    """Return the prompt, reply sha256 and reply token count a row is paired on."""
+    return (
+        row["prompt_sha256"],
+        row["response_sha256"],
+        row["usage"]["completion_tokens"],
+    )
+
+
+# ------------------------------------------------------------------------------
+def long_decode_outcome(records: list[dict], decode_tokens: int) -> dict:
+    """Describe the long-decode rows of a `--long-decode-self-check` run.
+
+    Returns `self_match`, per version, true when its replies (at least two)
+    share one transcript; `builds_diverged`, true when the versions' transcript
+    sets differ; and `length_capped`, true when every reply stopped on length
+    at exactly `decode_tokens`, so none ended by EOS. Pure; raises nothing.
+    """
+    transcripts = defaultdict(list)
+    is_length_capped = True
+    for row in records:
+        if row["scenario"] != "long-decode":
+            continue
+        transcripts[row["version"]].append(transcript(row))
+        is_length_capped = is_length_capped and (
+            row.get("finish_reason") == "length"
+            and row["usage"]["completion_tokens"] == decode_tokens
+        )
+    return {
+        "self_match": {
+            version: len(replies) >= 2 and len(set(replies)) == 1
+            for version, replies in sorted(transcripts.items())
+        },
+        "builds_diverged": set(transcripts["baseline"])
+        != set(transcripts["candidate"]),
+        "length_capped": is_length_capped,
+    }
+
+
+# ------------------------------------------------------------------------------
+def require_long_decode_reproducible(records: list[dict], decode_tokens: int):
+    """Raise ValueError unless the long-decode rows pass the self-check rule.
+
+    Each version must answer its repeated long-decode prompt identically; the
+    versions may disagree only when every reply ran to exactly
+    `decode_tokens` on length, since checkpoints regroup verify rows and can
+    flip a greedy near-tie, while an EOS-ended reply must match across builds.
+    """
+    outcome = long_decode_outcome(records, decode_tokens)
+    unstable = [
+        version for version, match in outcome["self_match"].items() if not match
+    ]
+    if unstable:
+        raise ValueError(
+            f"long-decode transcript differs within one build: {', '.join(unstable)}"
+        )
+    if outcome["builds_diverged"] and not outcome["length_capped"]:
+        raise ValueError(
+            "baseline/candidate long-decode transcript differs and a reply "
+            f"ended before {decode_tokens} tokens"
+        )
 
 
 # ------------------------------------------------------------------------------
@@ -246,6 +327,8 @@ def measure(server, model, content, output_tokens, scenario, context, timeout):
         "context": context,
         "prompt_sha256": digest(content),
         "response_sha256": digest(response["choices"][0]["message"]),
+        "finish_reason": response["choices"][0].get("finish_reason"),
+        "output_tokens": output_tokens,
         "usage": usage,
         "metrics": metrics,
         "native_delta": delta,
@@ -253,20 +336,24 @@ def measure(server, model, content, output_tokens, scenario, context, timeout):
     }
 
 
-def summarize(records: list[dict], maximum_regression: float) -> list[dict]:
+def summarize(
+    records: list[dict],
+    maximum_regression: float,
+    *,
+    long_decode_self_check: bool = False,
+    decode_tokens: int = 0,
+) -> list[dict]:
     groups = defaultdict(lambda: defaultdict(list))
     outputs = {}
     for row in records:
         key = row["sample"], row["context"], row["scenario"]
-        output = (
-            row["prompt_sha256"],
-            row["response_sha256"],
-            row["usage"]["completion_tokens"],
-        )
+        output = transcript(row)
         paired = outputs.setdefault(key, {})
         if row["version"] in paired:
             raise ValueError(f"duplicate performance sample: {key}")
-        if paired and next(iter(paired.values())) != output:
+        # Under the self-check the long-decode rows are judged as a whole below.
+        is_self_checked = long_decode_self_check and row["scenario"] == "long-decode"
+        if paired and not is_self_checked and next(iter(paired.values())) != output:
             raise ValueError(f"baseline/candidate transcript differs: {key}")
         paired[row["version"]] = output
         if row["scenario"] in DECODE_SCENARIOS:
@@ -279,6 +366,8 @@ def summarize(records: list[dict], maximum_regression: float) -> list[dict]:
     results = []
     if any(set(pair) != {"baseline", "candidate"} for pair in outputs.values()):
         raise ValueError("unpaired request samples")
+    if long_decode_self_check:
+        require_long_decode_reproducible(records, decode_tokens)
     for (context, scenario), versions in sorted(groups.items()):
         if len(versions["baseline"]) != len(versions["candidate"]):
             raise ValueError("unpaired performance samples")
@@ -315,8 +404,17 @@ def parse_args(argv=None):
         type=int,
         default=0,
         help="add a long-decode case per sample asking for this many tokens; "
-        "a reply ended by EOS counts from 3/4 of it when both versions match, "
-        "gated on native decode time per token (0 = off)",
+        "a reply ended by EOS counts from 3/4 of it when both versions match "
+        "(without --long-decode-self-check), gated on native decode time per "
+        "token (0 = off)",
+    )
+    parser.add_argument(
+        "--long-decode-self-check",
+        action="store_true",
+        help="send sample 0's long-decode prompt in all four rounds and require "
+        "each version's two replies to match; the versions may differ only when "
+        "every reply ran to exactly --decode-tokens (needs --samples 2 and "
+        "--decode-tokens)",
     )
     parser.add_argument(
         "--output", type=Path, default=Path("build/release/http-regression.json")
@@ -329,6 +427,10 @@ def parse_args(argv=None):
         parser.error("regression must be nonnegative and timeout positive")
     if args.decode_tokens < 0:
         parser.error("--decode-tokens must be nonnegative")
+    if args.long_decode_self_check and (args.samples != 2 or not args.decode_tokens):
+        parser.error(
+            "--long-decode-self-check requires --samples 2 and --decode-tokens"
+        )
     if len(set(args.contexts)) != len(args.contexts):
         parser.error("contexts must be unique")
     for binary in (args.baseline_binary, args.binary):
@@ -401,10 +503,12 @@ def main(argv=None):
                 for sample in range(int(round_id >= 2), args.samples, 2):
                     cold_outputs = {}
                     for context, scenario, output_tokens in round_cases(args):
-                        prompt = (
-                            prepared[sample, scenario]
-                            if scenario == "long-decode"
-                            else prepared[sample, context]
+                        prompt = case_prompt(
+                            prepared,
+                            sample,
+                            context,
+                            scenario,
+                            args.long_decode_self_check,
                         )
                         row = measure(
                             server,
@@ -434,7 +538,16 @@ def main(argv=None):
                 raise
             finally:
                 server.close()
-        document["comparison"] = summarize(document["samples"], args.maximum_regression)
+        if args.long_decode_self_check:
+            document["long_decode_self_check"] = long_decode_outcome(
+                document["samples"], args.decode_tokens
+            )
+        document["comparison"] = summarize(
+            document["samples"],
+            args.maximum_regression,
+            long_decode_self_check=args.long_decode_self_check,
+            decode_tokens=args.decode_tokens,
+        )
         document["correctness_pass"] = True
         document["performance_pass"] = all(
             row["pass"] for row in document["comparison"]

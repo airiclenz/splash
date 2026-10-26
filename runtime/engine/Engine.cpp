@@ -1294,7 +1294,10 @@ void Engine::publishReachedStateBoundaries(Request &active,
 // The verify rows a decode step from storedTokens may retain so that its
 // commit lands on, never past, the next multiple of prefillCheckpointTokens;
 // 0 (no cap) while that boundary is beyond one step or checkpoints are
-// disabled. One division per decode lane per step.
+// disabled. One division per decode lane per step. A capped step groups its
+// verify rows differently than an uncapped one would, which can flip a greedy
+// near-tie vs checkpoints off; the result stays deterministic per
+// configuration.
 uint32_t
 Engine::decodeRetainedTokenLimit(uint64_t storedTokens) const noexcept {
   const uint32_t interval = config_.prefillCheckpointTokens;

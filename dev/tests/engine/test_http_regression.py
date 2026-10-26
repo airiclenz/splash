@@ -286,6 +286,189 @@ class HttpRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "transcript differs"):
             benchmark.summarize(changed, 0.02)
 
+    def benchmark_arguments(self, *extra):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "splash"
+            binary.touch()
+            (root / "splash.metallib").touch()
+            package = root / "package"
+            (package / "tokenizer").mkdir(parents=True)
+            (package / "manifest.json").write_text("{}")
+            return benchmark.parse_args(
+                [
+                    "--model",
+                    "incoai/Qwen3.8-27B-Splash",
+                    "--package",
+                    str(package),
+                    "--binary",
+                    str(binary),
+                    "--baseline-binary",
+                    str(binary),
+                    *extra,
+                ]
+            )
+
+    def test_self_check_requires_two_samples_and_a_long_decode_case(self):
+        arguments = self.benchmark_arguments(
+            "--samples", "2", "--decode-tokens", "20480", "--long-decode-self-check"
+        )
+        self.assertTrue(arguments.long_decode_self_check)
+        self.assertFalse(
+            self.benchmark_arguments("--samples", "2").long_decode_self_check
+        )
+        for extra in (
+            ("--samples", "3", "--decode-tokens", "20480"),
+            ("--samples", "5", "--decode-tokens", "20480"),
+            ("--samples", "2"),
+        ):
+            with (
+                self.subTest(extra=extra),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                self.benchmark_arguments(*extra, "--long-decode-self-check")
+
+    def test_self_check_sends_sample_zero_long_decode_prompt_in_every_round(self):
+        prepared = {
+            (0, 2048): "cold-0",
+            (1, 2048): "cold-1",
+            (0, "long-decode"): "long-0",
+            (1, "long-decode"): "long-1",
+        }
+        context = benchmark.LONG_DECODE_CONTEXT
+        for round_id in range(4):
+            for sample in range(int(round_id >= 2), 2, 2):
+                with self.subTest(round_id=round_id, sample=sample):
+                    self.assertEqual(
+                        benchmark.case_prompt(
+                            prepared, sample, context, "long-decode", True
+                        ),
+                        "long-0",
+                    )
+                    self.assertEqual(
+                        benchmark.case_prompt(prepared, sample, 2048, "cold", True),
+                        f"cold-{sample}",
+                    )
+        self.assertEqual(
+            benchmark.case_prompt(prepared, 1, context, "long-decode", False), "long-1"
+        )
+
+    def test_measure_rows_carry_finish_reason_and_requested_tokens(self):
+        metrics = {
+            "cache": {"matched_tokens": 0},
+            "prefill": {"tokens": benchmark.LONG_DECODE_CONTEXT},
+        }
+
+        row = self.measure_long_decode(300, copy.deepcopy(metrics), "length")
+
+        self.assertEqual(row["finish_reason"], "length")
+        self.assertEqual(row["output_tokens"], 300)
+
+    def self_check_rows(self, replies, finish_reason="length", completion=300):
+        rows = []
+        for (version, sample), response in replies.items():
+            row = self.row(version, sample=sample)
+            row.update(
+                scenario="long-decode",
+                context=benchmark.LONG_DECODE_CONTEXT,
+                response_sha256=response,
+                finish_reason=finish_reason,
+                output_tokens=300,
+                usage={"completion_tokens": completion},
+                native_delta={
+                    "decode_wall_ms": 2 * completion,
+                    "decode_output_tokens": completion,
+                },
+            )
+            rows.append(row)
+        return rows
+
+    def self_check(self, rows):
+        return benchmark.summarize(
+            rows, 0.02, long_decode_self_check=True, decode_tokens=300
+        )
+
+    def test_self_check_accepts_builds_that_diverge_only_at_the_length_cap(self):
+        rows = self.self_check_rows(
+            {
+                ("baseline", 0): "off",
+                ("candidate", 0): "on",
+                ("candidate", 1): "on",
+                ("baseline", 1): "off",
+            }
+        )
+
+        summary = self.self_check(rows)[0]
+
+        self.assertTrue(summary["pass"])
+        self.assertEqual(
+            benchmark.long_decode_outcome(rows, 300),
+            {
+                "self_match": {"baseline": True, "candidate": True},
+                "builds_diverged": True,
+                "length_capped": True,
+            },
+        )
+
+    def test_self_check_fails_a_build_that_answers_its_prompt_twice_differently(self):
+        rows = self.self_check_rows(
+            {
+                ("baseline", 0): "same",
+                ("candidate", 0): "same",
+                ("candidate", 1): "other",
+                ("baseline", 1): "same",
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "within one build: candidate"):
+            self.self_check(rows)
+
+    def test_self_check_fails_a_cross_build_divergence_ended_by_eos(self):
+        rows = self.self_check_rows(
+            {
+                ("baseline", 0): "off",
+                ("candidate", 0): "on",
+                ("candidate", 1): "on",
+                ("baseline", 1): "off",
+            }
+        )
+        rows[0].update(finish_reason="stop", usage={"completion_tokens": 250})
+        rows[3].update(finish_reason="stop", usage={"completion_tokens": 250})
+
+        with self.assertRaisesRegex(ValueError, "ended before 300 tokens"):
+            self.self_check(rows)
+
+    def test_self_check_passes_matching_eos_replies_above_the_floor(self):
+        rows = self.self_check_rows(
+            {
+                ("baseline", 0): "same",
+                ("candidate", 0): "same",
+                ("candidate", 1): "same",
+                ("baseline", 1): "same",
+            },
+            finish_reason="stop",
+            completion=benchmark.long_decode_floor(300),
+        )
+
+        summary = self.self_check(rows)[0]
+
+        self.assertTrue(summary["pass"])
+        self.assertFalse(benchmark.long_decode_outcome(rows, 300)["builds_diverged"])
+
+    def test_without_self_check_a_cross_build_long_decode_mismatch_fails(self):
+        rows = self.self_check_rows(
+            {
+                ("baseline", 0): "off",
+                ("candidate", 0): "on",
+                ("candidate", 1): "on",
+                ("baseline", 1): "off",
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "transcript differs"):
+            benchmark.summarize(rows, 0.02)
+
 
 if __name__ == "__main__":
     unittest.main()

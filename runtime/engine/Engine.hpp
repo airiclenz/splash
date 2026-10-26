@@ -25,7 +25,9 @@ struct EngineConfig final {
   // Two draft windows balance recovery granularity and capture work. Prefill
   // and decode both checkpoint at its multiples; a decode step's retained
   // rows are capped so its commit lands on one. Zero disables progress
-  // checkpoints and the cap without changing reusable end states.
+  // checkpoints and the cap without changing reusable end states. The cap
+  // changes verify-row grouping, so a greedy near-tie can resolve differently
+  // than with checkpoints off; output stays deterministic per configuration.
   uint32_t prefillCheckpointTokens =
       2 * model::ExecutionLimits::draftContextTokens;
   // Patches per image the model's vision scratch covers.

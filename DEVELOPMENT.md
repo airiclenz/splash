@@ -456,9 +456,25 @@ asks for more than N tokens with `max_completion_tokens = N`, gated like the
 decode request on native decode time per token, so `--samples S` makes 2·S
 replies of up to N tokens. The model may end the count by EOS first (seen at
 27.5k-29.6k tokens), so such a reply counts when it reaches at least 3/4 of N
-and the baseline and candidate replies for that sample match in text and
-length; each is timed over its own length. Its rows keep the response's `metrics` (including `metrics.engine`
-when the server reports it); without the flag the report is unchanged.
+and, without `--long-decode-self-check`, the baseline and candidate replies for
+that sample match in text and length; each is timed over its own length. Its rows keep the response's `metrics` (including `metrics.engine`
+when the server reports it) plus `finish_reason` and the requested `output_tokens`;
+without the flag the report is unchanged.
+
+`--long-decode-self-check` (with `--samples 2` and `--decode-tokens N`) sends
+sample 0's long-decode prompt in all four rounds, so each build answers it
+twice. Correctness then requires each build's two replies to be identical (reply
+sha256 and token count); the builds may differ from each other only when every
+long-decode reply ran to exactly N tokens on length, and an EOS-ended reply must
+still match across builds and reach the 3/4 floor. The decode-time gate is
+unchanged, and the report's `long_decode_self_check` object records each build's
+`self_match`, `builds_diverged` and `length_capped`. Use it when comparing
+builds that group verify rows differently, such as checkpoints on vs off:
+greedy speculative decoding is deterministic per configuration, but the decode
+checkpoint cap (`EngineConfig::prefillCheckpointTokens`) shortens the verify
+rows of the step before each boundary, which, like a different batch width,
+changes the GPU's reduction grouping and can flip a greedy near-tie between two
+almost equal logits, after which the texts diverge.
 It does not contact your running server. Use the same power mode and charger,
 stop other GPU workloads, and report chip/GPU cores, memory, Splash version,
 model revision, actual input/output token counts, and cache hits with results.
