@@ -159,6 +159,33 @@ class LauncherTests(unittest.TestCase):
                 argv = execute.call_args.args[1]
                 self.assertEqual("--no-speculation" in argv, is_forwarded)
 
+    def test_record_requests_is_forwarded_as_an_absolute_path_only_when_given(self):
+        for options, expected in (
+            ([], None),
+            (
+                ["--record-requests", "recordings/requests.jsonl"],
+                os.path.abspath("recordings/requests.jsonl"),
+            ),
+        ):
+            with (
+                self.subTest(options=options),
+                tempfile.TemporaryDirectory() as tmp,
+                mock.patch.object(launcher, "RUNTIME_DIR", Path(tmp)),
+                mock.patch.object(launcher.socket, "socket"),
+                mock.patch.object(launcher, "_ensure_installed"),
+                mock.patch.object(launcher.catalog, "spawn_refresh"),
+                mock.patch.object(launcher.os, "execve") as execute,
+            ):
+                launcher.main(["serve", "--model", MODEL_ID, *options])
+
+                argv = execute.call_args.args[1]
+                forwarded = (
+                    argv[argv.index("--record-requests") + 1]
+                    if "--record-requests" in argv
+                    else None
+                )
+                self.assertEqual(forwarded, expected)
+
     def test_contended_prefill_rows_is_forwarded_to_the_server_only_when_given(
         self,
     ):

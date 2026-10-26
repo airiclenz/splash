@@ -212,6 +212,8 @@ def serve(args):
             command.append("--no-webui")
         for host in args.allowed_host:
             command.extend(["--allowed-host", host])
+        if args.record_requests is not None:
+            command.extend(["--record-requests", os.path.abspath(args.record_requests)])
         environment = dict(
             os.environ, PYTHONUNBUFFERED="1", TRANSFORMERS_VERBOSITY="error"
         )
@@ -537,6 +539,12 @@ def parse_args(argv=None):
         help=f"API key: {API_KEY_RULE} (default: SPLASH_API_KEY environment variable)",
     )
     server.add_argument("--no-webui", action="store_true", help="disable the chat page")
+    server.add_argument(
+        "--record-requests",
+        metavar="PATH",
+        help="append each accepted chat, messages and responses request body to "
+        "PATH as one JSON line, file mode 0600 (default: off)",
+    )
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)

@@ -10,6 +10,7 @@ import random
 import signal
 import socket
 import struct
+import tempfile
 import threading
 import time
 import unittest
@@ -574,6 +575,7 @@ class Harness:
         max_request_bytes=api.DEFAULT_MAX_REQUEST_BYTES,
         host="127.0.0.1",
         allowed_hosts=(),
+        request_recording=None,
         **frontend_options,
     ):
         self.tokenizer = tokenizer or FakeTokenizer()
@@ -602,6 +604,7 @@ class Harness:
             webui=webui,
             max_request_bytes=max_request_bytes,
             allowed_hosts=allowed_hosts,
+            request_recording=request_recording,
         )
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
@@ -3661,6 +3664,83 @@ class ServerTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     api.parse_args([*required, option, value])
 
+    def test_parse_args_accepts_record_requests(self):
+        required = [
+            "target",
+            "draft",
+            "--tokenizer",
+            "tokenizer",
+            "--model",
+            "community/custom-splash",
+        ]
+
+        for options, expected in (
+            ([], None),
+            (["--record-requests", "requests.jsonl"], "requests.jsonl"),
+        ):
+            with self.subTest(options=options):
+                args = api.parse_args([*required, *options])
+
+                self.assertEqual(args.record_requests, expected)
+
+    def test_record_requests_appends_generation_bodies_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.jsonl"
+            recording = api.RequestRecording(path)
+            self.addCleanup(recording.close)
+            harness = self.harness(FakeRuntime(), request_recording=recording)
+            chat = self.body()
+            messages = self.anthropic_body()
+
+            statuses = [
+                harness.request("POST", "/v1/chat/completions", chat)[0],
+                harness.request("POST", "/v1/messages", messages)[0],
+                harness.request("POST", "/tokenize", {"content": "hello"})[0],
+            ]
+            recording.close()
+            lines = [json.loads(line) for line in path.read_text().splitlines()]
+
+            self.assertEqual(statuses, [200, 200, 200])
+            self.assertEqual(
+                [(line["path"], line["body"]) for line in lines],
+                [("/v1/chat/completions", chat), ("/v1/messages", messages)],
+            )
+            self.assertTrue(
+                all(isinstance(line["received_unix_ms"], int) for line in lines)
+            )
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_request_recording_restricts_an_existing_file_to_its_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.jsonl"
+            path.write_text("")
+            path.chmod(0o644)
+
+            api.RequestRecording(path).close()
+
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_request_recording_reports_a_failed_write_once(self):
+        failing = mock.Mock()
+        failing.write.side_effect = OSError("disk full")
+
+        def open_failing_file(descriptor, _mode):
+            os.close(descriptor)
+            return failing
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(api.os, "fdopen", side_effect=open_failing_file),
+        ):
+            recording = api.RequestRecording(Path(directory) / "requests.jsonl")
+            self.addCleanup(recording.close)
+
+            with mock.patch.object(api, "print_status") as report:
+                recording.record("/v1/chat/completions", self.body())
+                recording.record("/v1/chat/completions", self.body())
+
+            report.assert_called_once()
+
     def test_native_command_forwards_no_speculation_only_when_given(self):
         required = [
             "target",
@@ -3805,6 +3885,7 @@ class ServerTest(unittest.TestCase):
             no_speculation=False,
             contended_prefill_rows=None,
             reasoning_loop_limit=7,
+            record_requests=None,
         )
         runtime = mock.Mock()
         runtime.readiness = native_wire.ReadyEvent(
@@ -3854,6 +3935,7 @@ class ServerTest(unittest.TestCase):
             mock.patch.object(api, "ConstraintFactory", return_value=object()),
             mock.patch.object(api, "Frontend", return_value=object()) as app_type,
             mock.patch.object(api, "FrontendServer", side_effect=bind),
+            mock.patch.object(api, "RequestRecording") as recording_type,
             mock.patch.object(api.signal, "signal", side_effect=install),
             mock.patch("builtins.print"),
         ):
@@ -3861,6 +3943,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             handlers, {signal.SIGTERM: signal.SIG_IGN, signal.SIGINT: signal.SIG_IGN}
         )
+        recording_type.assert_not_called()
         runtime_type.assert_called_once_with(
             [
                 "splash",

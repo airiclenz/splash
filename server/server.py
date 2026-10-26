@@ -560,6 +560,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         [judgments.detail([], "request body must be an object")]
                     )
                 raise APIError(400, "request body must be an object")
+            recording = self.server.request_recording
+            if recording is not None:
+                recording.record(path, body)
             try:
                 deadline = self.app.request_deadline(body, started_at)
             except APIError as error:
@@ -1719,6 +1722,79 @@ class RequestBodyReservation:
             weakref.finalize(job, self.release)
 
 
+class RequestRecording:
+    """Append accepted generation request bodies to a JSON Lines file.
+
+    Each line is `{"received_unix_ms", "path", "body"}`, with `body` the parsed
+    request object and the time taken once its upload has been read. Lines are
+    written whole and flushed under one lock, so threaded handlers never
+    interleave them. The file is opened once, in append mode, readable by its
+    owner only (0600), because it holds complete prompt content. Opening raises
+    `OSError`; a failed write is reported once and never fails the request it
+    records. After `close`, which is idempotent, records are dropped.
+    """
+
+    PATHS = frozenset(("/v1/chat/completions", "/v1/messages", "/v1/responses"))
+    FILE_MODE = 0o600
+
+    def __init__(self, path):
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, self.FILE_MODE
+        )
+        try:
+            # An existing file, or a permissive umask, must not leave the
+            # recorded prompts readable by other users.
+            os.fchmod(descriptor, self.FILE_MODE)
+            self._file = os.fdopen(descriptor, "ab")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        self._lock = threading.Lock()
+        self._has_reported_failure = False
+
+    def record(self, path, body):
+        """Append one line for `body` when `path` is a generation route."""
+        if path not in self.PATHS:
+            return
+        record = {
+            "received_unix_ms": time.time_ns() // 1_000_000,
+            "path": path,
+            "body": body,
+        }
+        try:
+            line = json_codec.encode(record) + b"\n"
+        except json_codec.JSONEncodingError as error:
+            self._report_failure(error)
+            return
+        with self._lock:
+            if self._file is None:
+                return
+            try:
+                self._file.write(line)
+                self._file.flush()
+            except OSError as error:
+                self._report_failure(error)
+
+    def close(self):
+        """Flush and close the file; later records are dropped."""
+        with self._lock:
+            if self._file is None:
+                return
+            file, self._file = self._file, None
+            file.close()
+
+    def _report_failure(self, error):
+        # One line is enough to show recording is broken; repeating it per
+        # request would flood the server log during an agent session.
+        if self._has_reported_failure:
+            return
+        self._has_reported_failure = True
+        print_status(
+            f"Error · request recording failed: {type(error).__name__}: {error}",
+            error=True,
+        )
+
+
 class FrontendServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1738,6 +1814,7 @@ class FrontendServer(ThreadingHTTPServer):
         api_key=None,
         webui=True,
         max_request_bytes=DEFAULT_MAX_REQUEST_BYTES,
+        request_recording=None,
     ):
         if not is_finite_number(io_timeout) or io_timeout <= 0:
             raise ValueError("io_timeout must be positive and finite")
@@ -1748,6 +1825,7 @@ class FrontendServer(ThreadingHTTPServer):
         ):
             raise ValueError("max_request_bytes must be a positive integer")
         self.max_request_bytes = max_request_bytes
+        self.request_recording = request_recording
         self.request_bodies = HttpAdmission(
             max(DEFAULT_REQUEST_BODY_BUDGET, 2 * max_request_bytes)
         )
@@ -2006,6 +2084,13 @@ def parse_args(argv=None):
         help=f"API key: {API_KEY_RULE} (default: SPLASH_API_KEY environment variable)",
     )
     parser.add_argument("--no-webui", action="store_true")
+    parser.add_argument(
+        "--record-requests",
+        metavar="PATH",
+        default=None,
+        help="append each accepted chat, messages and responses request body to "
+        "PATH as one JSON line, file mode 0600 (default: off)",
+    )
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
     args = parser.parse_args(argv)
@@ -2078,6 +2163,7 @@ def main():
     args = parse_args()
     server = None
     backend = None
+    recording = None
     # A server started in the background from a non-interactive shell inherits
     # SIGINT as ignored and Python then leaves it alone; install both stop
     # signals explicitly so scripts and supervisors can interrupt it.
@@ -2147,6 +2233,16 @@ def main():
             default_reasoning_effort=args.default_reasoning_effort,
             max_reasoning_effort=args.max_reasoning_effort,
         )
+        if args.record_requests is not None:
+            try:
+                recording = RequestRecording(args.record_requests)
+            except OSError as error:
+                print_status(
+                    f"Error · unable to open --record-requests file: {error}",
+                    error=True,
+                )
+                raise SystemExit(1) from None
+            server.request_recording = recording
         server.app = app
         server.server_activate()
         address = f"http://{args.host}:{server.server_port}"
@@ -2175,8 +2271,12 @@ def main():
                 print_status("Stopping · releasing engine resources")
                 backend.close()
         finally:
-            if server is not None:
-                server.server_close()
+            try:
+                if server is not None:
+                    server.server_close()
+            finally:
+                if recording is not None:
+                    recording.close()
 
 
 if __name__ == "__main__":
