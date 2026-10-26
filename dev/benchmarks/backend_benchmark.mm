@@ -5,10 +5,14 @@
 #include "model/Runtime.hpp"
 #include "PrefillWork.hpp"
 
+#include <CommonCrypto/CommonDigest.h>
+
 #include <algorithm>
 #include <iterator>
 #include <array>
+#include <bit>
 #include <chrono>
+#include <cmath>
 #include <thread>
 #include <condition_variable>
 #include <cstdint>
@@ -61,6 +65,9 @@ struct Observation final {
   std::optional<Clock::time_point> firstToken;
   bool completed = false;
   std::string failure;
+  EngineRequestTiming timing;
+  // Raw logits at a score-only request's scoreTokens; empty otherwise.
+  std::vector<float> scoreLogits;
 };
 
 struct BatchObservation final {
@@ -103,9 +110,12 @@ public:
   }
 
   void completed(uint64_t requestId, EngineFinishReason, uint32_t,
-                 uint32_t, std::span<const float>,
-                 const EngineRequestTiming &) override {
-    observations_[requestId].completed = true;
+                 uint32_t, std::span<const float> optionLogits,
+                 const EngineRequestTiming &timing) override {
+    Observation &value = observations_[requestId];
+    value.completed = true;
+    value.timing = timing;
+    value.scoreLogits.assign(optionLogits.begin(), optionLogits.end());
   }
 
   void failed(uint64_t requestId, std::string code, std::string message,
@@ -738,7 +748,15 @@ double decodeWallThroughputMedian(
   return median(std::move(values));
 }
 
-enum class BenchmarkScenario : uint8_t { All, Decode, Partial, Context, Exact };
+// Checkpoints runs only when selected: All never includes it.
+enum class BenchmarkScenario : uint8_t {
+  All,
+  Decode,
+  Partial,
+  Context,
+  Exact,
+  Checkpoints
+};
 
 BenchmarkScenario parseScenario(std::string_view value) {
   if (value == "decode")
@@ -749,7 +767,387 @@ BenchmarkScenario parseScenario(std::string_view value) {
     return BenchmarkScenario::Context;
   if (value == "exact")
     return BenchmarkScenario::Exact;
+  if (value == "checkpoints")
+    return BenchmarkScenario::Checkpoints;
   throw std::invalid_argument("unknown benchmark scenario");
+}
+
+constexpr std::string_view kUsage =
+    "usage: backend-benchmark METALLIB MODEL_ROOT "
+    "[--samples COUNT] [--progress PATH] "
+    "[--scenario decode|partial|context|exact|checkpoints]\n"
+    "  checkpoints only: [--decode-tokens N] [--checkpoint-tokens LIST] "
+    "[--repeat COUNT] [--prompt-tokens-file PATH]\n";
+
+// Greedy determinism of rolling checkpoints: every interval (0 disables them)
+// decodes the same prompt cold, repeatedly, and its transcripts are compared
+// with each other and with the checkpoints-off transcript.
+struct CheckpointOptions final {
+  uint32_t decodeTokens = 8192;
+  std::vector<uint32_t> intervals{0, 2048, 4096};
+  uint32_t repeats = 2;
+  // Empty selects the synthetic prompt.
+  std::vector<uint32_t> promptTokens;
+};
+
+constexpr uint32_t kCheckpointSyntheticPromptTokens = 256;
+constexpr uint64_t kCheckpointSyntheticPromptSalt = 0xC4EC4901;
+constexpr uint32_t kMaximumCheckpointRepeats = 100;
+constexpr uint32_t kMaximumCheckpointIntervals = 16;
+// Two divergent greedy tokens whose checkpoints-off logits differ by at most
+// this are a rounding near-tie, not a checkpoint defect.
+constexpr float kNearTieLogitGap = 0.5F;
+
+uint32_t parseUnsigned(std::string_view value, uint64_t maximum,
+                       const std::string &name) {
+  if (value.empty())
+    throw std::invalid_argument(name + " must be an unsigned integer");
+  uint64_t parsed = 0;
+  for (char character : value) {
+    if (character < '0' || character > '9')
+      throw std::invalid_argument(name + " must be an unsigned integer");
+    parsed = parsed * 10 + static_cast<uint64_t>(character - '0');
+    if (parsed > maximum)
+      throw std::invalid_argument(name + " must not exceed " +
+                                  std::to_string(maximum));
+  }
+  return static_cast<uint32_t>(parsed);
+}
+
+uint32_t parsePositive(std::string_view value, uint64_t maximum,
+                       const std::string &name) {
+  const uint32_t parsed = parseUnsigned(value, maximum, name);
+  if (!parsed)
+    throw std::invalid_argument(name + " must be positive");
+  return parsed;
+}
+
+// Mirrors the Engine constructor's rule so a bad interval fails before the
+// model loads rather than after.
+std::vector<uint32_t> parseCheckpointIntervals(std::string_view value) {
+  std::vector<uint32_t> intervals;
+  for (;;) {
+    const size_t comma = value.find(',');
+    const uint32_t interval =
+        parseUnsigned(value.substr(0, comma), kv::kMaximumLogicalTokens,
+                      "checkpoint interval");
+    if (interval && (interval < model::ExecutionLimits::draftContextTokens ||
+                     interval % kv::kPageTokens))
+      throw std::invalid_argument(
+          "checkpoint interval must be 0 or span a draft window and whole "
+          "KV pages");
+    if (std::find(intervals.begin(), intervals.end(), interval) !=
+        intervals.end())
+      throw std::invalid_argument("checkpoint intervals must be distinct");
+    intervals.push_back(interval);
+    if (intervals.size() > kMaximumCheckpointIntervals)
+      throw std::invalid_argument("too many checkpoint intervals");
+    if (comma == std::string_view::npos)
+      return intervals;
+    value.remove_prefix(comma + 1);
+  }
+}
+
+std::vector<uint32_t> readPromptTokens(const std::filesystem::path &path) {
+  std::ifstream input(path);
+  if (!input)
+    throw std::invalid_argument("cannot read prompt tokens file " +
+                                path.string());
+  std::vector<uint32_t> tokens;
+  std::string word;
+  while (input >> word) {
+    tokens.push_back(parseUnsigned(
+        word, std::numeric_limits<uint32_t>::max(), "prompt token"));
+  }
+  if (input.bad())
+    throw std::invalid_argument("cannot read prompt tokens file " +
+                                path.string());
+  if (tokens.empty())
+    throw std::invalid_argument("prompt tokens file holds no tokens");
+  return tokens;
+}
+
+// Hex SHA-256 of the token ids as little-endian 32-bit words.
+std::string tokensSha256(std::span<const uint32_t> tokens) {
+  static_assert(std::endian::native == std::endian::little);
+  std::array<unsigned char, CC_SHA256_DIGEST_LENGTH> digest{};
+  CC_SHA256(tokens.data(), static_cast<CC_LONG>(tokens.size_bytes()),
+            digest.data());
+  constexpr std::string_view kHexDigits = "0123456789abcdef";
+  std::string hex;
+  hex.reserve(digest.size() * 2);
+  for (unsigned char byte : digest) {
+    hex.push_back(kHexDigits[byte >> 4]);
+    hex.push_back(kHexDigits[byte & 0xF]);
+  }
+  return hex;
+}
+
+struct CheckpointRun final {
+  uint32_t interval = 0;
+  uint32_t repeat = 0;
+  std::vector<uint32_t> outputTokens;
+  std::string outputSha256;
+  uint32_t draftedTokens = 0;
+  uint32_t acceptedDraftTokens = 0;
+  uint64_t checkpointPublications = 0;
+  uint64_t checkpointPublicationFailures = 0;
+  double wallMilliseconds = 0.0;
+};
+
+// The two greedy transcripts' first disagreement, and the checkpoints-off
+// logits of both tokens there. A length-only difference has no tokens to score.
+struct CheckpointDivergence final {
+  uint32_t interval = 0;
+  std::optional<uint32_t> index;
+  bool isScored = false;
+  uint32_t offToken = 0;
+  uint32_t onToken = 0;
+  float offLogit = 0.0F;
+  float onLogit = 0.0F;
+
+  [[nodiscard]] float logitGap() const noexcept {
+    return std::abs(offLogit - onLogit);
+  }
+
+  [[nodiscard]] bool isNearTie() const noexcept {
+    return !index || (isScored && logitGap() <= kNearTieLogitGap);
+  }
+};
+
+// Each run gets its own Engine, so every interval starts from engine counters
+// at zero, and an emptied shared cache, so its prompt never hits a checkpoint
+// an earlier run published.
+CheckpointRun runCheckpointDecode(engine::Cache &cache,
+                                  model::RuntimeModel &executor,
+                                  engine::EngineConfig config,
+                                  ProgressJournal *progress,
+                                  std::span<const uint32_t> promptTokens,
+                                  uint32_t interval, uint32_t repeat,
+                                  uint32_t decodeTokens) {
+  evictAllCache(cache);
+  config.prefillCheckpointTokens = interval;
+  Events events;
+  engine::Engine engine(config, cache, executor, events);
+  Driver driver(engine, events);
+  constexpr uint64_t kRequestId = 1;
+  Measurement measured = runRequest(
+      engine, driver, executor, events, progress, kRequestId,
+      "checkpoints_" + std::to_string(interval), repeat,
+      std::vector<uint32_t>(promptTokens.begin(), promptTokens.end()),
+      decodeTokens);
+  if (measured.matchedTokens)
+    throw std::runtime_error("checkpoint run did not start from a cold cache");
+  const EngineRequestTiming &timing = events.get(kRequestId).timing;
+  const engine::EngineSnapshot snapshot = engine.snapshot();
+
+  CheckpointRun result;
+  result.interval = interval;
+  result.repeat = repeat;
+  result.outputTokens = std::move(measured.outputTokens);
+  result.outputSha256 = tokensSha256(result.outputTokens);
+  result.draftedTokens = timing.draftedTokens;
+  result.acceptedDraftTokens = timing.acceptedDraftTokens;
+  result.checkpointPublications = snapshot.checkpointPublications;
+  result.checkpointPublicationFailures = snapshot.checkpointPublicationFailures;
+  result.wallMilliseconds = measured.wallMilliseconds;
+  return result;
+}
+
+// Raw final-position logits of scoredTokens after promptTokens, from a
+// checkpoints-off Engine over an emptied cache.
+std::vector<float> scoreCheckpointsOff(engine::Cache &cache,
+                                       model::RuntimeModel &executor,
+                                       engine::EngineConfig config,
+                                       std::vector<uint32_t> promptTokens,
+                                       std::vector<uint32_t> scoredTokens) {
+  evictAllCache(cache);
+  config.prefillCheckpointTokens = 0;
+  Events events;
+  engine::Engine engine(config, cache, executor, events);
+  Driver driver(engine, events);
+  constexpr uint64_t kRequestId = 1;
+  const size_t scoredCount = scoredTokens.size();
+  EngineRequest request;
+  request.id = kRequestId;
+  request.prompt = std::move(promptTokens);
+  request.maxNewTokens = 0;
+  request.sampling.temperature = 0.0F;
+  request.sampling.topP = 1.0F;
+  request.deadlineMilliseconds =
+      milliseconds(Clock::now() + std::chrono::hours(2));
+  request.scoreTokens = std::move(scoredTokens);
+  engine.submit(std::move(request));
+  driver.untilIdle();
+  const Observation &observed = events.get(kRequestId);
+  if (!observed.completed || !observed.failure.empty())
+    throw std::runtime_error("score request failed: " + observed.failure);
+  if (observed.matchedTokens)
+    throw std::runtime_error("score request did not start from a cold cache");
+  if (observed.scoreLogits.size() != scoredCount)
+    throw std::runtime_error("score request returned the wrong logit count");
+  return observed.scoreLogits;
+}
+
+CheckpointDivergence findCheckpointDivergence(
+    engine::Cache &cache, model::RuntimeModel &executor,
+    const engine::EngineConfig &config, std::span<const uint32_t> promptTokens,
+    const CheckpointRun &off, const CheckpointRun &on) {
+  CheckpointDivergence result;
+  result.interval = on.interval;
+  const auto [offAt, onAt] =
+      std::mismatch(off.outputTokens.begin(), off.outputTokens.end(),
+                    on.outputTokens.begin(), on.outputTokens.end());
+  if (offAt == off.outputTokens.end() && onAt == on.outputTokens.end())
+    return result;
+  result.index = static_cast<uint32_t>(offAt - off.outputTokens.begin());
+  if (offAt == off.outputTokens.end() || onAt == on.outputTokens.end())
+    return result;
+
+  result.offToken = *offAt;
+  result.onToken = *onAt;
+  std::vector<uint32_t> scoredPrompt(promptTokens.begin(), promptTokens.end());
+  scoredPrompt.insert(scoredPrompt.end(), off.outputTokens.begin(), offAt);
+  const std::vector<float> logits =
+      scoreCheckpointsOff(cache, executor, config, std::move(scoredPrompt),
+                          {result.offToken, result.onToken});
+  result.offLogit = logits[0];
+  result.onLogit = logits[1];
+  result.isScored = true;
+  return result;
+}
+
+void emitCheckpointRun(const CheckpointRun &run, uint32_t promptTokens) {
+  std::cout << "{\"event\":\"checkpoint_run\",\"checkpoint_tokens\":"
+            << run.interval << ",\"repeat\":" << run.repeat
+            << ",\"prompt_tokens\":" << promptTokens
+            << ",\"output_tokens\":" << run.outputTokens.size()
+            << ",\"tokens_sha256\":\"" << run.outputSha256
+            << "\",\"drafted_tokens\":" << run.draftedTokens
+            << ",\"accepted_draft_tokens\":" << run.acceptedDraftTokens
+            << ",\"checkpoint_publications\":" << run.checkpointPublications
+            << ",\"checkpoint_publication_failures\":"
+            << run.checkpointPublicationFailures
+            << ",\"wall_ms\":" << run.wallMilliseconds << "}" << std::endl;
+}
+
+bool areRunsIdentical(const CheckpointRun &left, const CheckpointRun &right) {
+  return left.outputTokens == right.outputTokens &&
+         left.draftedTokens == right.draftedTokens &&
+         left.acceptedDraftTokens == right.acceptedDraftTokens;
+}
+
+// Prints the summary line; returns whether every interval reproduced itself
+// and every divergence from checkpoints off is a scored near-tie.
+bool emitCheckpointSummary(
+    const CheckpointOptions &options, std::span<const uint32_t> promptTokens,
+    std::span<const CheckpointRun> runs,
+    std::span<const CheckpointDivergence> divergences) {
+  bool isPassing = true;
+  std::cout << "{\"event\":\"checkpoint_summary\",\"prompt_tokens\":"
+            << promptTokens.size() << ",\"prompt_sha256\":\""
+            << tokensSha256(promptTokens)
+            << "\",\"decode_tokens\":" << options.decodeTokens
+            << ",\"repeats\":" << options.repeats << ",\"intervals\":[";
+  for (size_t index = 0; index < options.intervals.size(); ++index) {
+    const std::span<const CheckpointRun> repeats =
+        runs.subspan(index * options.repeats, options.repeats);
+    const bool isReproducible =
+        std::all_of(repeats.begin(), repeats.end(),
+                    [&](const CheckpointRun &run) {
+                      return areRunsIdentical(repeats.front(), run);
+                    });
+    const bool areTokensIdentical =
+        std::all_of(repeats.begin(), repeats.end(),
+                    [&](const CheckpointRun &run) {
+                      return run.outputTokens == repeats.front().outputTokens;
+                    });
+    isPassing = isPassing && isReproducible;
+    std::cout << (index ? "," : "")
+              << "{\"checkpoint_tokens\":" << options.intervals[index]
+              << ",\"repeats_identical\":"
+              << (isReproducible ? "true" : "false")
+              << ",\"tokens_identical\":"
+              << (areTokensIdentical ? "true" : "false")
+              << ",\"tokens_sha256\":\"" << repeats.front().outputSha256
+              << "\"}";
+  }
+  std::cout << "],\"versus_off\":[";
+  for (size_t index = 0; index < divergences.size(); ++index) {
+    const CheckpointDivergence &value = divergences[index];
+    isPassing = isPassing && value.isNearTie();
+    std::cout << (index ? "," : "")
+              << "{\"checkpoint_tokens\":" << value.interval
+              << ",\"first_divergent_index\":";
+    if (value.index)
+      std::cout << *value.index;
+    else
+      std::cout << "null";
+    if (value.isScored) {
+      std::cout << ",\"off_token\":" << value.offToken
+                << ",\"on_token\":" << value.onToken
+                << ",\"off_logit\":" << value.offLogit
+                << ",\"on_logit\":" << value.onLogit
+                << ",\"logit_gap\":" << value.logitGap();
+    }
+    std::cout << ",\"near_tie\":" << (value.isNearTie() ? "true" : "false")
+              << '}';
+  }
+  std::cout << "],\"near_tie_logit_gap\":" << kNearTieLogitGap
+            << ",\"pass\":" << (isPassing ? "true" : "false") << '}'
+            << std::endl;
+  return isPassing;
+}
+
+// Runs every interval's repeats, then scores each interval's divergence from
+// the checkpoints-off transcript. Returns the process exit status.
+int runCheckpointScenario(engine::Cache &cache, model::RuntimeModel &executor,
+                          const engine::EngineConfig &config,
+                          ProgressJournal *progress,
+                          CheckpointOptions options) {
+  if (options.promptTokens.empty())
+    options.promptTokens = prompt(kCheckpointSyntheticPromptTokens,
+                                  kCheckpointSyntheticPromptSalt);
+  const std::span<const uint32_t> promptTokens = options.promptTokens;
+  for (uint32_t token : promptTokens) {
+    if (token >= config.vocabularySize)
+      throw std::invalid_argument("prompt token is outside the vocabulary");
+  }
+  if (promptTokens.size() + options.decodeTokens > config.maxContext)
+    throw std::runtime_error("checkpoint prompt plus decode exceeds runtime "
+                             "capacity");
+
+  std::vector<CheckpointRun> runs;
+  runs.reserve(options.intervals.size() * options.repeats);
+  for (uint32_t interval : options.intervals) {
+    for (uint32_t repeat = 0; repeat < options.repeats; ++repeat) {
+      runs.push_back(runCheckpointDecode(cache, executor, config, progress,
+                                         promptTokens, interval, repeat,
+                                         options.decodeTokens));
+      emitCheckpointRun(runs.back(),
+                        static_cast<uint32_t>(promptTokens.size()));
+    }
+  }
+
+  std::vector<CheckpointDivergence> divergences;
+  const auto off =
+      std::find(options.intervals.begin(), options.intervals.end(), 0U);
+  if (off != options.intervals.end()) {
+    const CheckpointRun &offRun =
+        runs[(off - options.intervals.begin()) * options.repeats];
+    for (size_t index = 0; index < options.intervals.size(); ++index) {
+      if (options.intervals[index] == 0)
+        continue;
+      divergences.push_back(findCheckpointDivergence(
+          cache, executor, config, promptTokens, offRun,
+          runs[index * options.repeats]));
+    }
+  }
+  const bool isPassing =
+      emitCheckpointSummary(options, promptTokens, runs, divergences);
+  if (progress)
+    progress->finish(isPassing ? 0 : 1);
+  return isPassing ? 0 : 1;
 }
 
 } // namespace
@@ -758,27 +1156,51 @@ int main(int argc, char **argv) {
   std::unique_ptr<ProgressJournal> progress;
   try {
     if (argc < 3) {
-      std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
-                   "[--samples COUNT] [--progress PATH] "
-                   "[--scenario decode|partial|context|exact]\n";
+      std::cerr << kUsage;
       return 2;
     }
     uint32_t samples = 1;
     BenchmarkScenario selected = BenchmarkScenario::All;
     std::optional<std::filesystem::path> progressPath;
-    for (int index = 3; index < argc; index += 2) {
-      if (index + 1 >= argc)
-        throw std::invalid_argument("benchmark option requires a value");
-      const std::string_view option(argv[index]);
-      if (option == "--samples") {
-        samples = parseSamples(argv[index + 1]);
-      } else if (option == "--progress") {
-        progressPath = std::filesystem::path(argv[index + 1]);
-      } else if (option == "--scenario") {
-        selected = parseScenario(argv[index + 1]);
-      } else {
-        throw std::invalid_argument("unknown benchmark option");
+    CheckpointOptions checkpointOptions;
+    bool hasCheckpointOption = false;
+    try {
+      for (int index = 3; index < argc; index += 2) {
+        if (index + 1 >= argc)
+          throw std::invalid_argument("benchmark option requires a value");
+        const std::string_view option(argv[index]);
+        const std::string_view value(argv[index + 1]);
+        if (option == "--samples") {
+          samples = parseSamples(value);
+        } else if (option == "--progress") {
+          progressPath = std::filesystem::path(value);
+        } else if (option == "--scenario") {
+          selected = parseScenario(value);
+        } else if (option == "--decode-tokens") {
+          checkpointOptions.decodeTokens =
+              parsePositive(value, kv::kMaximumLogicalTokens, "decode tokens");
+          hasCheckpointOption = true;
+        } else if (option == "--checkpoint-tokens") {
+          checkpointOptions.intervals = parseCheckpointIntervals(value);
+          hasCheckpointOption = true;
+        } else if (option == "--repeat") {
+          checkpointOptions.repeats =
+              parsePositive(value, kMaximumCheckpointRepeats, "repeat");
+          hasCheckpointOption = true;
+        } else if (option == "--prompt-tokens-file") {
+          checkpointOptions.promptTokens =
+              readPromptTokens(std::filesystem::path(value));
+          hasCheckpointOption = true;
+        } else {
+          throw std::invalid_argument("unknown benchmark option");
+        }
       }
+      if (hasCheckpointOption && selected != BenchmarkScenario::Checkpoints)
+        throw std::invalid_argument(
+            "checkpoint options require --scenario checkpoints");
+    } catch (const std::invalid_argument &error) {
+      std::cerr << "backend-benchmark: " << error.what() << '\n' << kUsage;
+      return 2;
     }
     if (progressPath)
       progress = std::make_unique<ProgressJournal>(*progressPath, samples);
@@ -793,6 +1215,8 @@ int main(int argc, char **argv) {
     const auto &capabilities = config.model.capabilities;
     const uint32_t maskWordsPerToken = (capabilities.vocabularySize + 31) / 32;
     bootstrapConfig.nativeLoop.maskWordsPerToken = maskWordsPerToken;
+    // 0 selects the memory plan's automatic context ceiling.
+    bootstrapConfig.nativeLoop.engine.maxContext = 0;
     bootstrapConfig.protocolLimits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
     bootstrapConfig.protocolLimits.maxSimulationTokens = capabilities.draftQueryRows;
     bootstrapConfig.protocolLimits.maxMaskWords =
@@ -906,6 +1330,12 @@ int main(int argc, char **argv) {
       governor.observe();
       return !governor.snapshot().hostGrowthAllowed;
     };
+    // Checkpoints prints only its own lines and exits before the other
+    // scenarios' document; the warmup B3 check above does not gate it.
+    if (selected == BenchmarkScenario::Checkpoints)
+      return runCheckpointScenario(resources->cache(), *executor, engineConfig,
+                                   progress.get(),
+                                   std::move(checkpointOptions));
     engine::Engine engine(engineConfig, resources->cache(),
                                   *executor, events);
     Driver driver(engine, events);
