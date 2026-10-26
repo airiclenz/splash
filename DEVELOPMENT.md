@@ -518,6 +518,31 @@ and the native prefill tok/s and average prefill chunk rows diffed from
 raise `--decode-tokens` then. `--api-key`, `--model` and `--json` work as for
 `live_probe`.
 
+To replay real agent traffic, record it with `splash serve --record-requests
+<file>` (keep the file under `build/release/`: it holds real request content),
+then list its conversations and replay one against an idle server:
+
+```sh
+.venv/bin/python -m dev.benchmarks.agent_replay chains --recording build/release/agent.jsonl
+.venv/bin/python -m dev.benchmarks.agent_replay run --recording build/release/agent.jsonl \
+  --chain 0 --base-url http://127.0.0.1:8000 --label head --output head-1.json \
+  --max-tokens 2048
+.venv/bin/python -m dev.benchmarks.agent_replay summarize head-1.json head-2.json
+```
+
+`chains` lists each chain (a run of requests on one path, each extending the
+previous history) with its turns, final size and estimated tokens, largest
+first. `run` streams the chain's turns serially at temperature 0, every other
+field as recorded and `--max-tokens` capping the completion limit; the recorded
+next turn is sent whatever the model replied. A per-run nonce line leads each
+turn's rendered prompt, so turn 1 is cold and runs never share cache. Per turn
+it writes prompt, cached and completion tokens, client TTFT, prefill wall and
+uncached-tail prefill tok/s, decode tok/s, drafted and accepted tokens, and
+`prefix_lost` (cached tokens more than 1024 below the previous turn's prompt).
+It fails when `/status` counts another admission during a turn. `summarize`
+prints per label the per-turn medians and whole-chain totals, refusing runs of
+different chains.
+
 For slow tool-bearing requests, the `latency` section of `/status` separates
 preparation, tokenization, grammar preparation, native queueing and TTFT. Grammar preparation
 includes construction, compilation/cache lookup and per-request cloning;

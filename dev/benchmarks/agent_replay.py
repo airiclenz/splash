@@ -6,7 +6,15 @@ writes, one ``{"received_unix_ms", "path", "body"}`` object per accepted
 generation request. `chains` lists its request chains, largest first: runs of
 requests on one path in which each request's message list starts with the
 previous request's full message list, as an agent sends a growing history.
-Never contacts a server.
+
+``run --recording <file> --chain <i> --base-url <url> --label <name> --output
+<json>`` replays one chain serially and streaming at temperature 0 against an
+otherwise idle server, and writes per turn the usage token counts, the client
+TTFT and the native rates diffed from ``GET /status`` around the turn. A
+per-run nonce line leads every turn's rendered prompt, so turn 1 is cold and no
+run reuses another run's cache. ``summarize <json>...`` prints, per label, the
+per-turn medians and whole-chain totals of those runs. `chains` and `summarize`
+never contact a server.
 """
 
 from __future__ import annotations
@@ -14,10 +22,29 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import statistics
 import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
 from dataclasses import dataclass, field
 
-from dev.benchmarks.live_probe import ProbeError
+from dev.benchmarks.contended_probe import sse_events
+from dev.benchmarks.http_regression import status_delta
+from dev.benchmarks.live_probe import (
+    ACCEPTED,
+    DECODE_TOKENS,
+    DECODE_WALL,
+    DRAFTED,
+    PREFILL_WALL,
+    REUSED,
+    ProbeClient,
+    ProbeError,
+    fresh_status,
+    ratio,
+)
 
 CHAT_PATH = "/v1/chat/completions"
 ANTHROPIC_PATH = "/v1/messages"
@@ -35,6 +62,46 @@ CHARACTERS_PER_TOKEN = 4
 # A lone request is no conversation to replay.
 MINIMUM_CHAIN_TURNS = 2
 NO_DIGEST = b""
+
+REQUEST_TIMEOUT_SECONDS = 1800.0
+API_KEY_ENVIRONMENT = "SPLASH_API_KEY"
+MILLISECONDS_PER_SECOND = 1000.0
+# A follow-up turn has lost its prefix when its cached tokens fall more than
+# this below the previous turn's prompt tokens.
+PREFIX_LOSS_SLACK_TOKENS = 1024
+NONCE_LABEL = "agent-replay run"
+# Requests the native runtime admitted; exactly one per replayed turn.
+ADMISSIONS = ("requests", "submitted")
+TURN_PATHS = (
+    PREFILL_WALL,
+    DECODE_TOKENS,
+    DECODE_WALL,
+    DRAFTED,
+    ACCEPTED,
+    REUSED,
+    ADMISSIONS,
+)
+# The completion-limit fields each path reads, the winning one first: the
+# server prefers chat `max_completion_tokens` over `max_tokens`.
+MAX_TOKEN_FIELDS = {
+    CHAT_PATH: ("max_completion_tokens", "max_tokens"),
+    ANTHROPIC_PATH: ("max_tokens",),
+    RESPONSES_PATH: ("max_output_tokens",),
+}
+# The body field holding a path's system text; chat sends it as a message.
+SYSTEM_FIELDS = {ANTHROPIC_PATH: "system", RESPONSES_PATH: "instructions"}
+CHAT_TOKEN_DELTA_FIELDS = ("content", "reasoning_content", "tool_calls")
+ANTHROPIC_TOKEN_DELTA_FIELDS = ("text", "thinking", "partial_json")
+RESPONSES_TOKEN_EVENTS = frozenset(
+    {
+        "response.output_text.delta",
+        "response.reasoning_summary_text.delta",
+        "response.function_call_arguments.delta",
+    }
+)
+RESPONSES_FINAL_EVENTS = frozenset({"response.completed", "response.incomplete"})
+RESPONSES_FAILED_EVENT = "response.failed"
+UNAVAILABLE = "n/a"
 
 
 @dataclass(frozen=True)
@@ -255,15 +322,21 @@ CHAIN_COLUMNS = (
 
 
 # ------------------------------------------------------------------------------
-def format_chains(documents: list[dict]) -> str:
-    """Render chain documents as a fixed-width table, one row per chain."""
-    rows = [[label for _, label in CHAIN_COLUMNS]]
-    rows += [[str(document[key]) for key, _ in CHAIN_COLUMNS] for document in documents]
+def format_grid(rows: list[list[str]]) -> str:
+    """Render rows of string cells as right-aligned fixed-width columns."""
     widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
     return "\n".join(
         "  ".join(cell.rjust(width) for cell, width in zip(row, widths)).rstrip()
         for row in rows
     )
+
+
+# ------------------------------------------------------------------------------
+def format_chains(documents: list[dict]) -> str:
+    """Render chain documents as a fixed-width table, one row per chain."""
+    rows = [[label for _, label in CHAIN_COLUMNS]]
+    rows += [[str(document[key]) for key, _ in CHAIN_COLUMNS] for document in documents]
+    return format_grid(rows)
 
 
 # ------------------------------------------------------------------------------
@@ -280,6 +353,511 @@ def list_chains(args) -> int:
     return 0
 
 
+@dataclass
+class StreamReading:
+    """What one replayed turn's stream reported, filled as its events arrive."""
+
+    # --------------------------------------------------------------------------
+    # Monotonic seconds of the first event carrying generated output, or None.
+    first_token_at: float | None = None
+    # --------------------------------------------------------------------------
+    # The usage the stream reported; None until its usage event arrives.
+    prompt_tokens: int | None = None
+    cached_tokens: int | None = None
+    completion_tokens: int | None = None
+
+    # --------------------------------------------------------------------------
+    def mark_token(self) -> None:
+        """Record now as the first-token time unless one is already set."""
+        if self.first_token_at is None:
+            self.first_token_at = time.monotonic()
+
+
+# ------------------------------------------------------------------------------
+def observe_chat(event: dict, reading: StreamReading) -> None:
+    """Fold one chat-completions stream chunk into `reading`.
+
+    Usage arrives only in the `stream_options.include_usage` chunk.
+    """
+    for choice in event.get("choices") or ():
+        delta = choice.get("delta") or {}
+        if any(delta.get(name) for name in CHAT_TOKEN_DELTA_FIELDS):
+            reading.mark_token()
+    usage = event.get("usage")
+    if isinstance(usage, dict):
+        reading.prompt_tokens = usage.get("prompt_tokens")
+        details = usage.get("prompt_tokens_details") or {}
+        reading.cached_tokens = details.get("cached_tokens", 0)
+        reading.completion_tokens = usage.get("completion_tokens")
+
+
+# ------------------------------------------------------------------------------
+def observe_anthropic(event: dict, reading: StreamReading) -> None:
+    """Fold one Anthropic `/v1/messages` stream event into `reading`.
+
+    `message_start` usage splits the prompt into uncached `input_tokens` and
+    `cache_read_input_tokens`; `message_delta` carries the output tokens.
+    """
+    kind = event.get("type")
+    if kind == "message_start":
+        usage = (event.get("message") or {}).get("usage") or {}
+        if usage.get("input_tokens") is None:
+            return
+        cached = usage.get("cache_read_input_tokens") or 0
+        reading.prompt_tokens = usage["input_tokens"] + cached
+        reading.cached_tokens = cached
+    elif kind == "content_block_delta":
+        delta = event.get("delta") or {}
+        if any(delta.get(name) for name in ANTHROPIC_TOKEN_DELTA_FIELDS):
+            reading.mark_token()
+    elif kind == "message_delta":
+        reading.completion_tokens = (event.get("usage") or {}).get("output_tokens")
+
+
+# ------------------------------------------------------------------------------
+def observe_responses(event: dict, reading: StreamReading) -> None:
+    """Fold one `/v1/responses` stream event into `reading`.
+
+    Raises ProbeError on `response.failed`, whose error sits inside `response`.
+    """
+    kind = event.get("type")
+    if kind in RESPONSES_TOKEN_EVENTS and event.get("delta"):
+        reading.mark_token()
+    elif kind in RESPONSES_FINAL_EVENTS:
+        usage = (event.get("response") or {}).get("usage") or {}
+        reading.prompt_tokens = usage.get("input_tokens")
+        details = usage.get("input_tokens_details") or {}
+        reading.cached_tokens = details.get("cached_tokens", 0)
+        reading.completion_tokens = usage.get("output_tokens")
+    elif kind == RESPONSES_FAILED_EVENT:
+        error = (event.get("response") or {}).get("error")
+        raise ProbeError(f"stream failed: {json.dumps(error)[:500]}")
+
+
+STREAM_OBSERVERS = {
+    CHAT_PATH: observe_chat,
+    ANTHROPIC_PATH: observe_anthropic,
+    RESPONSES_PATH: observe_responses,
+}
+
+
+# ------------------------------------------------------------------------------
+def prefixed_text(content, line: str):
+    """Return `content` with `line` before its first text; ProbeError if none.
+
+    `content` is a string or a list of parts, one of them holding a "text".
+    """
+    if isinstance(content, str):
+        return line + content
+    for part in content if isinstance(content, list) else ():
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            part["text"] = line + part["text"]
+            return content
+    raise ProbeError("cannot place the run nonce: the leading content has no text")
+
+
+# ------------------------------------------------------------------------------
+def place_nonce(path: str, body: dict, nonce: str) -> None:
+    """Put the nonce line at the earliest text the chat template renders.
+
+    The tool block renders before the system text, so the nonce leads
+    `tools[0]`'s description when tools are sent, else the Anthropic `system`
+    or Responses `instructions`, else the first message's text.
+    """
+    line = f"{nonce}\n"
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools and isinstance(tools[0], dict):
+        function = tools[0].get("function")
+        holder = function if isinstance(function, dict) else tools[0]
+        holder["description"] = line + (holder.get("description") or "")
+        return
+    system_field = SYSTEM_FIELDS.get(path)
+    if system_field and body.get(system_field):
+        body[system_field] = prefixed_text(body[system_field], line)
+        return
+    message_field = MESSAGE_FIELDS[path]
+    messages = body.get(message_field)
+    if isinstance(messages, str):
+        body[message_field] = line + messages
+        return
+    first = messages[0] if isinstance(messages, list) and messages else None
+    if not isinstance(first, dict):
+        raise ProbeError("cannot place the run nonce: the body has no first message")
+    first["content"] = prefixed_text(first.get("content"), line)
+
+
+# ------------------------------------------------------------------------------
+def cap_max_tokens(path: str, body: dict, cap: int | None) -> None:
+    """Cap the completion limit `path` reads at `cap`, setting it when absent.
+
+    Every limit field the body sends is set, so none outranks the cap.
+    """
+    if cap is None:
+        return
+    names = MAX_TOKEN_FIELDS[path]
+    recorded = next((body[name] for name in names if body.get(name)), None)
+    limit = cap if not isinstance(recorded, int) else min(recorded, cap)
+    for name in names:
+        if name == names[0] or name in body:
+            body[name] = limit
+
+
+# ------------------------------------------------------------------------------
+def replay_body(path: str, body: dict, nonce: str, cap: int | None) -> dict:
+    """Turn a recorded body into its replay: greedy, streaming, nonce-led.
+
+    Mutates and returns `body`; every field not named here is sent as recorded.
+    """
+    body["temperature"] = 0
+    body["stream"] = True
+    if path == CHAT_PATH:
+        options = body.get("stream_options")
+        body["stream_options"] = {
+            **(options if isinstance(options, dict) else {}),
+            "include_usage": True,
+        }
+    cap_max_tokens(path, body, cap)
+    place_nonce(path, body, nonce)
+    return body
+
+
+# ------------------------------------------------------------------------------
+def open_stream(client: ProbeClient, path: str, body: dict, timeout: float):
+    """POST a streaming `body` to `path` and return the open HTTP response.
+
+    Raises ProbeError, with the HTTP status when the server refused it.
+    """
+    headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
+    if client.api_key:
+        headers["Authorization"] = f"Bearer {client.api_key}"
+    prepared = urllib.request.Request(
+        client.base_url + path,
+        data=json.dumps(body).encode(),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        return urllib.request.urlopen(prepared, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")[:500]
+        raise ProbeError(
+            f"POST {path}: HTTP {error.code}: {detail}", error.code
+        ) from error
+    except (urllib.error.URLError, OSError) as error:
+        raise ProbeError(f"POST {path}: {error}") from error
+
+
+# ------------------------------------------------------------------------------
+def read_stream(response, observe) -> StreamReading:
+    """Read `response` to its end, folding each event with `observe`.
+
+    The stream is never closed early: closing it would cancel the turn.
+    Raises ProbeError on a stream error or a stream that reported no usage.
+    """
+    reading = StreamReading()
+    with response:
+        try:
+            for event in sse_events(response):
+                observe(event, reading)
+        except OSError as error:
+            raise ProbeError(f"stream: {error}") from error
+    if reading.prompt_tokens is None or reading.completion_tokens is None:
+        raise ProbeError("the stream ended without reporting usage")
+    return reading
+
+
+# ------------------------------------------------------------------------------
+def with_rates(record: dict) -> dict:
+    """Return `record` plus the rates derived from its raw counts.
+
+    The tail prefill rate is uncached prompt tokens over the prefill wall.
+    """
+    uncached = record["prompt_tokens"] - record["cached_tokens"]
+    return {
+        **record,
+        "tail_prefill_tokens_per_second": ratio(
+            uncached * MILLISECONDS_PER_SECOND, record["prefill_wall_ms"]
+        ),
+        "decode_tokens_per_second": ratio(
+            record["decode_tokens"] * MILLISECONDS_PER_SECOND,
+            record["decode_wall_ms"],
+        ),
+        "draft_acceptance": ratio(
+            record["accepted_draft_tokens"], record["drafted_tokens"]
+        ),
+    }
+
+
+# ------------------------------------------------------------------------------
+def turn_record(number, turn, reading, started, ended, delta, previous_prompt):
+    """Build one turn's record from its stream reading and `/status` delta.
+
+    `started`/`ended` bracket the request in monotonic seconds. Raises
+    ProbeError unless the delta counts exactly one admission: another request
+    on the server would corrupt every counter. Turn 1 (`previous_prompt`
+    None) has no `prefix_lost` verdict.
+    """
+    admissions = delta[ADMISSIONS]
+    if admissions != 1:
+        raise ProbeError(
+            f"turn {number}: /status counted {admissions:g} admissions, not 1; "
+            "replay against an otherwise idle server"
+        )
+    ttft_ms = None
+    if reading.first_token_at is not None:
+        ttft_ms = (reading.first_token_at - started) * MILLISECONDS_PER_SECOND
+    prefix_lost = None
+    if previous_prompt is not None:
+        prefix_lost = reading.cached_tokens < previous_prompt - PREFIX_LOSS_SLACK_TOKENS
+    return with_rates(
+        {
+            "turn": number,
+            "line": turn.line,
+            "received_unix_ms": turn.received_unix_ms,
+            "prompt_tokens": reading.prompt_tokens,
+            "cached_tokens": reading.cached_tokens,
+            "completion_tokens": reading.completion_tokens,
+            "ttft_ms": ttft_ms,
+            "http_wall_ms": (ended - started) * MILLISECONDS_PER_SECOND,
+            "prefill_wall_ms": delta[PREFILL_WALL],
+            "decode_tokens": delta[DECODE_TOKENS],
+            "decode_wall_ms": delta[DECODE_WALL],
+            "drafted_tokens": delta[DRAFTED],
+            "accepted_draft_tokens": delta[ACCEPTED],
+            "cache_reused_tokens": delta[REUSED],
+            "prefix_lost": prefix_lost,
+        }
+    )
+
+
+# ------------------------------------------------------------------------------
+def chain_bodies(recording: str, chain: Chain):
+    """Yield the recorded body of each of `chain`'s turns, in turn order.
+
+    Reads the recording once and holds one body at a time.
+    """
+    wanted = {turn.line for turn in chain.turns}
+    try:
+        with open(recording, encoding="utf-8") as stream:
+            for line, text in enumerate(stream, start=1):
+                if line in wanted:
+                    yield json.loads(text)["body"]
+    except (OSError, UnicodeDecodeError, ValueError, KeyError) as error:
+        raise ProbeError(f"cannot read recording {recording}: {error}") from error
+
+
+# ------------------------------------------------------------------------------
+def replay_chain(client: ProbeClient, chain: Chain, bodies, nonce, cap, timeout):
+    """Replay `chain` turn by turn, each bracketed by fresh `/status` reads.
+
+    Generated replies are discarded: each next turn is sent as recorded.
+    Returns the turn records.
+    """
+    records = []
+    previous_prompt = None
+    for number, (turn, body) in enumerate(zip(chain.turns, bodies), start=1):
+        body = replay_body(chain.path, body, nonce, cap)
+        before = fresh_status(client)
+        started = time.monotonic()
+        response = open_stream(client, chain.path, body, timeout)
+        reading = read_stream(response, STREAM_OBSERVERS[chain.path])
+        ended = time.monotonic()
+        after = fresh_status(client)
+        delta = status_delta(before, after, TURN_PATHS)
+        records.append(
+            turn_record(number, turn, reading, started, ended, delta, previous_prompt)
+        )
+        previous_prompt = reading.prompt_tokens
+    return records
+
+
+# ------------------------------------------------------------------------------
+def selected_chain(recording: str, index: int) -> Chain:
+    """Return the chain `chains` lists at `index`; ProbeError when out of range."""
+    chains = find_chains(read_recording(recording))
+    if not 0 <= index < len(chains):
+        raise ProbeError(
+            f"--chain {index} is out of range: {recording} has {len(chains)} chains"
+        )
+    return chains[index]
+
+
+# ------------------------------------------------------------------------------
+def run_replay(args) -> int:
+    """Replay one chain, write its run JSON, print its summary; return 0."""
+    chain = selected_chain(args.recording, args.chain)
+    client = ProbeClient(args.base_url, args.api_key)
+    nonce = f"{NONCE_LABEL} {uuid.uuid4().hex}"
+    records = replay_chain(
+        client,
+        chain,
+        chain_bodies(args.recording, chain),
+        nonce,
+        args.max_tokens,
+        args.request_timeout,
+    )
+    identity = chain_document(args.chain, chain)
+    del identity["turns"]
+    document = {
+        "label": args.label,
+        "recording": args.recording,
+        "base_url": args.base_url,
+        "chain": identity,
+        "nonce": nonce,
+        "max_tokens": args.max_tokens,
+        "first_turn_cold": records[0]["cached_tokens"] == 0,
+        "turns": records,
+    }
+    if not document["first_turn_cold"]:
+        print(
+            f"agent_replay: turn 1 reused {records[0]['cached_tokens']} cached "
+            "tokens; it was not cold",
+            file=sys.stderr,
+        )
+    try:
+        with open(args.output, "w", encoding="utf-8") as stream:
+            json.dump(document, stream, indent=2)
+            stream.write("\n")
+    except OSError as error:
+        raise ProbeError(f"cannot write {args.output}: {error}") from error
+    print(format_summary([document]))
+    return 0
+
+
+# The raw per-turn counts a whole-chain total sums.
+SUMMED_KEYS = (
+    "prompt_tokens",
+    "cached_tokens",
+    "completion_tokens",
+    "ttft_ms",
+    "http_wall_ms",
+    "prefill_wall_ms",
+    "decode_tokens",
+    "decode_wall_ms",
+    "drafted_tokens",
+    "accepted_draft_tokens",
+    "cache_reused_tokens",
+)
+# (record key, table label) in display order.
+SUMMARY_COLUMNS = (
+    ("prompt_tokens", "prompt"),
+    ("cached_tokens", "cached"),
+    ("completion_tokens", "completion"),
+    ("ttft_ms", "TTFT ms"),
+    ("prefill_wall_ms", "prefill ms"),
+    ("tail_prefill_tokens_per_second", "tail prefill tok/s"),
+    ("decode_tokens_per_second", "decode tok/s"),
+    ("drafted_tokens", "drafted"),
+    ("accepted_draft_tokens", "accepted"),
+    ("draft_acceptance", "acceptance"),
+)
+
+
+# ------------------------------------------------------------------------------
+def chain_totals(turns: list[dict]) -> dict:
+    """Sum a run's raw turn counts and derive the whole-chain rates.
+
+    A count no turn reported sums to 0; `prefix_lost` is true when any turn
+    lost its prefix, None for a one-turn run.
+    """
+    totals = {
+        key: sum(turn[key] for turn in turns if turn.get(key) is not None)
+        for key in SUMMED_KEYS
+    }
+    verdicts = [
+        turn["prefix_lost"] for turn in turns if turn["prefix_lost"] is not None
+    ]
+    totals["prefix_lost"] = any(verdicts) if verdicts else None
+    return with_rates(totals)
+
+
+# ------------------------------------------------------------------------------
+def format_cell(value) -> str:
+    """Render one summary cell; None reads as unavailable."""
+    if value is None:
+        return UNAVAILABLE
+    if isinstance(value, float) and not value.is_integer():
+        return f"{value:.3f}" if abs(value) < 10 else f"{value:.1f}"
+    return str(int(value))
+
+
+# ------------------------------------------------------------------------------
+def summary_row(name: str, records: list[dict]) -> list[str]:
+    """Return one table row: the median of each column, then the loss count."""
+    cells = [name]
+    for key, _ in SUMMARY_COLUMNS:
+        values = [record[key] for record in records if record.get(key) is not None]
+        cells.append(format_cell(statistics.median(values) if values else None))
+    verdicts = [record["prefix_lost"] for record in records]
+    judged = [verdict for verdict in verdicts if verdict is not None]
+    cells.append(f"{sum(judged)}/{len(judged)}" if judged else UNAVAILABLE)
+    return cells
+
+
+# ------------------------------------------------------------------------------
+def format_label(label: str, runs: list[dict]) -> str:
+    """Render one label's runs: per-turn medians, then the median chain total."""
+    caps = ", ".join(sorted({str(run.get("max_tokens")) for run in runs}))
+    rows = [["turn", *(name for _, name in SUMMARY_COLUMNS), "prefix lost"]]
+    for index in range(max(len(run["turns"]) for run in runs)):
+        turns = [run["turns"][index] for run in runs if index < len(run["turns"])]
+        rows.append(summary_row(str(index + 1), turns))
+    rows.append(summary_row("total", [chain_totals(run["turns"]) for run in runs]))
+    return f"{label}: {len(runs)} run(s), max tokens {caps}\n{format_grid(rows)}"
+
+
+# ------------------------------------------------------------------------------
+def format_summary(documents: list[dict]) -> str:
+    """Render the run documents grouped by label, in first-seen label order."""
+    labels: dict[str, list[dict]] = {}
+    for document in documents:
+        labels.setdefault(document["label"], []).append(document)
+    return "\n\n".join(format_label(label, runs) for label, runs in labels.items())
+
+
+# ------------------------------------------------------------------------------
+def load_run(path: str) -> dict:
+    """Read one `run` output file; ProbeError when it is not one."""
+    try:
+        with open(path, encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise ProbeError(f"cannot read run {path}: {error}") from error
+    if not (
+        isinstance(document, dict)
+        and isinstance(document.get("label"), str)
+        and isinstance(document.get("chain"), dict)
+        and isinstance(document.get("turns"), list)
+        and document["turns"]
+    ):
+        raise ProbeError(f"{path} is not an agent_replay run")
+    return document
+
+
+# ------------------------------------------------------------------------------
+def summarize_runs(args) -> int:
+    """Print the runs' per-label summary; return the exit code.
+
+    Raises ProbeError when the runs replay different chains, since their
+    turns would then not compare at the same depth.
+    """
+    documents = [load_run(path) for path in args.runs]
+    identities = {
+        (
+            document["chain"].get("path"),
+            document["chain"].get("first_received_unix_ms"),
+            document["chain"].get("turn_count"),
+        )
+        for document in documents
+    }
+    if len(identities) > 1:
+        raise ProbeError(
+            f"the runs replay different chains: {sorted(map(str, identities))}"
+        )
+    print(format_summary(documents))
+    return 0
+
+
 # ------------------------------------------------------------------------------
 def parse_args(argv=None):
     """Parse the command line into a subcommand and its options."""
@@ -289,7 +867,40 @@ def parse_args(argv=None):
     chains.add_argument("--recording", required=True, help="--record-requests file")
     chains.add_argument("--json", action="store_true", help="print the chains as JSON")
     chains.set_defaults(handler=list_chains)
-    return parser.parse_args(argv)
+    run = commands.add_parser("run", help="replay one chain against a server")
+    run.add_argument("--recording", required=True, help="--record-requests file")
+    run.add_argument(
+        "--chain", type=int, required=True, help="chain index as `chains` lists it"
+    )
+    run.add_argument(
+        "--base-url", required=True, help="running server, e.g. http://127.0.0.1:1111"
+    )
+    run.add_argument("--label", required=True, help="the build this run measures")
+    run.add_argument("--output", required=True, help="run JSON to write")
+    run.add_argument(
+        "--max-tokens",
+        type=int,
+        help="cap each turn's completion limit (default: as recorded)",
+    )
+    run.add_argument(
+        "--api-key",
+        default=os.environ.get(API_KEY_ENVIRONMENT),
+        help=f"Bearer key (default: ${API_KEY_ENVIRONMENT})",
+    )
+    run.add_argument("--request-timeout", type=float, default=REQUEST_TIMEOUT_SECONDS)
+    run.set_defaults(handler=run_replay)
+    summarize = commands.add_parser("summarize", help="compare run JSONs by label")
+    summarize.add_argument("runs", nargs="+", help="`run` output files")
+    summarize.set_defaults(handler=summarize_runs)
+    args = parser.parse_args(argv)
+    if args.command == "run":
+        if args.max_tokens is not None and args.max_tokens < 1:
+            parser.error("--max-tokens must be positive")
+        if args.request_timeout <= 0:
+            parser.error("--request-timeout must be positive")
+        if not args.base_url.startswith(("http://", "https://")):
+            parser.error("--base-url must start with http:// or https://")
+    return args
 
 
 # ------------------------------------------------------------------------------
