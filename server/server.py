@@ -197,6 +197,9 @@ def _normalize_path(raw_path):
 
 class FrontendHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # The UTF-8 bytes of the request body being recorded, handed from
+    # `_read_json_body` to the request recording and released right after.
+    _recorded_body = None
 
     def setup(self):
         self._response_started = False
@@ -328,7 +331,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
-    def _read_json_body(self, deadline):
+    def _read_json_body(self, deadline, is_recorded=False):
+        """Read and parse the request body.
+
+        When `is_recorded`, `_recorded_body` is set to the request bytes if they
+        are strict UTF-8 and parse to an object, so the request recording can
+        append them without re-encoding the body; otherwise to `None`. Without
+        `is_recorded` the bytes are released before parsing.
+        """
         if self.headers.get_all("Transfer-Encoding"):
             raise APIError(400, "transfer encoding is not supported")
         encodings = self.headers.get_all("Content-Encoding", [])
@@ -384,9 +394,31 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 payload.extend(chunk)
         finally:
             self.connection.settimeout(self.server.io_timeout)
-        text = payload.decode(json.detect_encoding(payload), "surrogatepass")
+        encoding = json.detect_encoding(payload)
+        if is_recorded:
+            # Reset first, so a keep-alive connection never records the bytes
+            # of an earlier request whose parse failed.
+            self._recorded_body = None
+            if encoding == "utf-8":
+                return self._parse_recorded_body(payload)
+        text = payload.decode(encoding, "surrogatepass")
         payload.clear()
         return json_codec.loads(text)
+
+    def _parse_recorded_body(self, payload):
+        # Lone surrogates, which `surrogatepass` admits, are not valid UTF-8 in
+        # a recording line: drop those bytes and let the recording re-encode
+        # (escape) the parsed body instead.
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            text = payload.decode("utf-8", "surrogatepass")
+            payload.clear()
+            return json_codec.loads(text)
+        body = json_codec.loads(text)
+        if isinstance(body, dict):
+            self._recorded_body = payload
+        return body
 
     def do_HEAD(self):
         self.do_GET()
@@ -551,18 +583,23 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 anthropic,
             )
             return
+        recording = self.server.request_recording
         try:
             with self.app.latencies.measure("upload"):
-                body = self._read_json_body(started_at + self.app.request_timeout)
+                body = self._read_json_body(
+                    started_at + self.app.request_timeout,
+                    recording is not None and path in RequestRecording.PATHS,
+                )
             if not isinstance(body, dict):
                 if systemone:
                     raise judgments.SystemOneError(
                         [judgments.detail([], "request body must be an object")]
                     )
                 raise APIError(400, "request body must be an object")
-            recording = self.server.request_recording
             if recording is not None:
-                recording.record(path, body)
+                recording.record(path, body, self._recorded_body)
+                # Release the body bytes before preparation and generation.
+                self._recorded_body = None
             try:
                 deadline = self.app.request_deadline(body, started_at)
             except APIError as error:
@@ -1725,17 +1762,27 @@ class RequestBodyReservation:
 class RequestRecording:
     """Append accepted generation request bodies to a JSON Lines file.
 
-    Each line is `{"received_unix_ms", "path", "body"}`, with `body` the parsed
-    request object and the time taken once its upload has been read. Lines are
-    written whole and flushed under one lock, so threaded handlers never
-    interleave them. The file is opened once, in append mode, readable by its
-    owner only (0600), because it holds complete prompt content. Opening raises
-    `OSError`; a failed write is reported once and never fails the request it
-    records. After `close`, which is idempotent, records are dropped.
+    Each line is `{"received_unix_ms", "path", "body"}`, with `body` the request
+    object and the time taken once its upload has been read. Given the UTF-8
+    request bytes, the line carries them as received, with CR and LF turned
+    into spaces: in valid JSON a literal line break can only be whitespace
+    between tokens, so the body still parses to the same object and the line
+    ends only at its final LF. Literal U+2028/U+2029/U+0085 inside strings are
+    kept, as JSON Lines allows, so readers split on LF (file iteration), not
+    `str.splitlines`. Without those bytes (a UTF-16/32 body, or one holding
+    lone surrogates) the parsed body is re-encoded. Each line is written and
+    flushed under one lock, so threaded handlers never interleave lines. The
+    file is opened once, in append mode, readable by its owner only (0600),
+    because it holds complete prompt content. Opening raises `OSError`; a
+    failed write is reported once and never fails the request it records.
+    After `close`, which is idempotent, records are dropped.
     """
 
     PATHS = frozenset(("/v1/chat/completions", "/v1/messages", "/v1/responses"))
     FILE_MODE = 0o600
+    # Everything before the raw body; the paths above need no JSON escaping.
+    LINE_HEAD = b'{"received_unix_ms":%d,"path":"%s","body":'
+    LINE_TAIL = b"}\n"
 
     def __init__(self, path):
         descriptor = os.open(
@@ -1752,28 +1799,51 @@ class RequestRecording:
         self._lock = threading.Lock()
         self._has_reported_failure = False
 
-    def record(self, path, body):
-        """Append one line for `body` when `path` is a generation route."""
+    def record(self, path, body, raw_body=None):
+        """Append one line for `body` when `path` is a generation route.
+
+        `raw_body`, when given, is the request's UTF-8 bytes that parsed to
+        `body`, written in place of re-encoding it.
+        """
         if path not in self.PATHS:
             return
-        record = {
-            "received_unix_ms": time.time_ns() // 1_000_000,
-            "path": path,
-            "body": body,
-        }
-        try:
-            line = json_codec.encode(record) + b"\n"
-        except json_codec.JSONEncodingError as error:
-            self._report_failure(error)
-            return
+        received_unix_ms = time.time_ns() // 1_000_000
+        if raw_body is None:
+            parts = self._encoded_line(path, body, received_unix_ms)
+            if parts is None:
+                return
+        else:
+            parts = (
+                self.LINE_HEAD % (received_unix_ms, path.encode()),
+                self._single_line(raw_body),
+                self.LINE_TAIL,
+            )
         with self._lock:
             if self._file is None:
                 return
             try:
-                self._file.write(line)
+                for part in parts:
+                    self._file.write(part)
                 self._file.flush()
             except OSError as error:
                 self._report_failure(error)
+
+    def _encoded_line(self, path, body, received_unix_ms):
+        record = {"received_unix_ms": received_unix_ms, "path": path, "body": body}
+        try:
+            return (json_codec.encode(record) + b"\n",)
+        except json_codec.JSONEncodingError as error:
+            self._report_failure(error)
+            return None
+
+    @staticmethod
+    def _single_line(raw_body):
+        # Each search is a memchr; a copy is made only when a break is present.
+        if b"\n" in raw_body:
+            raw_body = raw_body.replace(b"\n", b" ")
+        if b"\r" in raw_body:
+            raw_body = raw_body.replace(b"\r", b" ")
+        return raw_body
 
     def close(self):
         """Flush and close the file; later records are dropped."""

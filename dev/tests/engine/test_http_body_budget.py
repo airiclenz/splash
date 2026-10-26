@@ -82,7 +82,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
         self.assertEqual(status["request_body_bytes"]["active"], 0)
 
     def test_body_decode_preserves_json_encodings_and_strict_validation(self):
-        def parse(payload):
+        def read(payload, is_recorded=False):
             handler = object.__new__(api.FrontendHandler)
             handler.headers = http.client.HTTPMessage()
             handler.headers["Content-Type"] = "application/json"
@@ -95,10 +95,14 @@ class HttpBodyBudgetTests(unittest.TestCase):
             handler.connection = SimpleNamespace(settimeout=lambda _: None)
             handler.rfile = io.BytesIO(payload)
             try:
-                return handler._read_json_body(time.monotonic() + 1)
+                body = handler._read_json_body(time.monotonic() + 1, is_recorded)
+                return body, handler._recorded_body
             finally:
                 handler._body_reservation.release()
                 self.assertEqual(handler.server.request_bodies.active, 0)
+
+        def parse(payload, is_recorded=False):
+            return read(payload, is_recorded)[0]
 
         values = ({"content": "你好 🦆"}, {"content": "\ud800"})
         for value in values:
@@ -117,6 +121,14 @@ class HttpBodyBudgetTests(unittest.TestCase):
                         encoding, "surrogatepass"
                     )
                     self.assertEqual(parse(payload), json_codec.loads(payload))
+                    # Only strict UTF-8 bytes are kept for the request recording.
+                    is_strict_utf8 = (
+                        encoding == "utf-8" and "\ud800" not in value["content"]
+                    )
+                    kept = payload if is_strict_utf8 else None
+                    self.assertEqual(
+                        read(payload, True), (json_codec.loads(payload), kept)
+                    )
         for payload in (
             b"{",
             b"\xff",
@@ -131,6 +143,8 @@ class HttpBodyBudgetTests(unittest.TestCase):
                     json_codec.loads(payload)
                 with self.assertRaises(ValueError):
                     parse(payload)
+                with self.assertRaises(ValueError):
+                    parse(payload, True)
 
     def test_shared_budget_rejects_before_reading_and_recovers_on_disconnect(self):
         with mock.patch.object(api, "DEFAULT_REQUEST_BODY_BUDGET", 256):

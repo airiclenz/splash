@@ -23,7 +23,7 @@ from tokenizers import Tokenizer, decoders, models
 from tokenizers.decoders import DecodeStream
 
 from dev.tests.engine import test_native_backend as native_fakes
-from server import api_shapes, diagnostics, judgments, tool_schema
+from server import api_shapes, diagnostics, json_codec, judgments, tool_schema
 from server import backend as backend_api
 from server import constraints as generation_constraints
 from server import errors as api_errors
@@ -3698,7 +3698,9 @@ class ServerTest(unittest.TestCase):
                 harness.request("POST", "/tokenize", {"content": "hello"})[0],
             ]
             recording.close()
-            lines = [json.loads(line) for line in path.read_text().splitlines()]
+            lines = [
+                json.loads(line) for line in path.read_text().split("\n") if line
+            ]
 
             self.assertEqual(statuses, [200, 200, 200])
             self.assertEqual(
@@ -3709,6 +3711,65 @@ class ServerTest(unittest.TestCase):
                 all(isinstance(line["received_unix_ms"], int) for line in lines)
             )
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def record_raw_post(self, payload):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.jsonl"
+            recording = api.RequestRecording(path)
+            self.addCleanup(recording.close)
+            harness = self.harness(FakeRuntime(), request_recording=recording)
+
+            status, _ = harness.raw_post(payload, len(payload))
+            recording.close()
+            return status, path.read_bytes()
+
+    def test_request_recording_writes_utf8_request_bytes_on_one_line(self):
+        body = self.body(
+            messages=[{"role": "user", "content": 'line\nbreak\r\n"quoted" \\ café  '}]
+        )
+        # Indented with CRLF, so the request bytes carry literal line breaks
+        # between tokens and escaped ones inside the string.
+        payload = (
+            json.dumps(body, indent=2, ensure_ascii=False)
+            .replace("\n", "\r\n")
+            .encode("utf-8")
+        )
+
+        status, recorded = self.record_raw_post(payload)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(recorded.count(b"\n"), 1)
+        self.assertNotIn(b"\r", recorded)
+        self.assertTrue(
+            recorded.endswith(b'"body":' + payload.replace(b"\r\n", b"  ") + b"}\n")
+        )
+        line = json.loads(recorded.decode("utf-8"))
+        self.assertEqual(line["path"], "/v1/chat/completions")
+        self.assertEqual(line["body"], body)
+        self.assertIsInstance(line["received_unix_ms"], int)
+
+    def test_request_recording_re_encodes_bodies_that_are_not_utf8(self):
+        utf16 = self.body(messages=[{"role": "user", "content": "café"}])
+        surrogate = self.body(messages=[{"role": "user", "content": "\ud800"}])
+
+        for body, payload in (
+            (utf16, json.dumps(utf16).encode("utf-16")),
+            (
+                surrogate,
+                json.dumps(surrogate, ensure_ascii=False).encode(
+                    "utf-8", "surrogatepass"
+                ),
+            ),
+        ):
+            with self.subTest(payload=payload[:8]):
+                _, recorded = self.record_raw_post(payload)
+
+                self.assertEqual(recorded.count(b"\n"), 1)
+                self.assertTrue(
+                    recorded.endswith(b'"body":' + json_codec.encode(body) + b"}\n")
+                )
+                line = json.loads(recorded.decode("utf-8"))
+                self.assertEqual(line["body"], body)
 
     def test_request_recording_restricts_an_existing_file_to_its_owner(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -6712,8 +6773,8 @@ class ServerTest(unittest.TestCase):
         harness = self.harness(runtime)
         original = api.FrontendHandler._read_json_body
 
-        def read_body(handler, deadline):
-            body = original(handler, deadline)
+        def read_body(handler, deadline, *args):
+            body = original(handler, deadline, *args)
             time.sleep(0.05)
             return body
 

@@ -144,7 +144,8 @@ that a long uncached prompt will reach its first token quickly.
 - `--no-webui`: turn off the chat page.
 - `--record-requests`: append every accepted `/v1/chat/completions`,
   `/v1/messages` and `/v1/responses` request to this file, one JSON line each:
-  `received_unix_ms`, `path` and the request `body` as sent. Token counting,
+  `received_unix_ms`, `path` and the request `body` as sent, with its line
+  breaks turned into spaces (split the file on LF only). Token counting,
   `/tokenize`, `/apply-template`, `/v1/judgments` and `/v1/systemone` are not
   recorded. The file holds complete prompts, so it is made readable by its
   owner only (mode 0600). Default: off.
