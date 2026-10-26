@@ -291,6 +291,45 @@ class CheckpointFailureCauseMetricsTests(unittest.TestCase):
                 )
 
 
+STATE_EVICTIONS_METRIC = "splash_state_evictions_total"
+STATE_EVICTIONS_BY_CAUSE_METRIC = "splash_state_evictions_by_cause_total"
+
+
+class StateEvictionCauseMetricsTests(unittest.TestCase):
+    def test_eviction_causes_render_beside_the_unlabelled_total(self):
+        causes = {
+            "pressure_pass": 1,
+            "growth": 2,
+            "paused_backing": 3,
+            "snapshot": 4,
+            "checkpoint_recycle": 5,
+            "logical_pages": 6,
+        }
+        lines = prometheus_metrics(
+            {"state": {"evictions": 21, "eviction_causes": causes}}
+        ).splitlines()
+
+        self.assertIn(f"{STATE_EVICTIONS_METRIC} 21", lines)
+        name = STATE_EVICTIONS_BY_CAUSE_METRIC
+        start = lines.index(f"# TYPE {name} counter")
+        self.assertTrue(lines[start - 1].startswith(f"# HELP {name} "))
+        self.assertEqual(
+            [line for line in lines if line.startswith(f"{name}{{")],
+            [f'{name}{{cause="{cause}"}} {count}' for cause, count in causes.items()],
+        )
+        self.assertEqual(
+            lines[start + 1 : start + 7],
+            [f'{name}{{cause="{cause}"}} {count}' for cause, count in causes.items()],
+        )
+
+    def test_missing_eviction_causes_render_no_lines(self):
+        for status in ({}, {"state": {"evictions": 2}}):
+            with self.subTest(status=status):
+                text = prometheus_metrics(status)
+
+                self.assertNotIn(STATE_EVICTIONS_BY_CAUSE_METRIC, text)
+
+
 DENIED_TOTAL_METRIC = "splash_memory_denied_reservations_total"
 DENIED_BY_CAUSE_METRIC = "splash_memory_denied_reservations_by_cause_total"
 

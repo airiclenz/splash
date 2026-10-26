@@ -97,6 +97,8 @@ void testCleanRuntimeStatus() {
   engine.resources.stateCache.checkpointBytes = 64;
   engine.resources.stateCache.checkpointEvictions = 4;
   engine.resources.stateCache.checkpointRetirements = 3;
+  engine.resources.stateCache.evictions = 21;
+  engine.resources.stateCache.evictionCauses = {1, 2, 3, 4, 5, 6};
   engine.resources.lookup = {3, 128, 64, 1};
   engine.resources.activeRequests = 1;
 
@@ -260,6 +262,12 @@ void testCleanRuntimeStatus() {
                     "\"checkpoint_evictions\":4,\"checkpoint_retirements\":3") !=
               std::string::npos,
           "temporary state occupancy and retirement are missing from status");
+  require(json.find("\"evictions\":21,\"eviction_causes\":{"
+                    "\"pressure_pass\":1,\"growth\":2,"
+                    "\"paused_backing\":3,\"snapshot\":4,"
+                    "\"checkpoint_recycle\":5,\"logical_pages\":6},"
+                    "\"checkpoint_entries\":1") != std::string::npos,
+          "state evictions by cause are missing from status");
   require(json.find("\"block_tokens\":32") != std::string::npos &&
               json.find("\"decode_batches_by_width\":{\"b1\":1,\"b2\":1,\"b3\":"
                         "1,\"b4\":1}") != std::string::npos,

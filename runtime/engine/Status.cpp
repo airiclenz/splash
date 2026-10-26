@@ -55,6 +55,12 @@ constexpr std::array<const char *, kPublicationFailureCauses>
     kPublicationFailureKeys = {"missed_boundary", "retire_blocked",
                                "snapshot_denied", "decode_overshoot", "error"};
 
+// Status key of each StateEvictionCause, in enumerator order.
+constexpr std::array<const char *, kStateEvictionCauses> kStateEvictionKeys = {
+    "pressure_pass", "growth",
+    "paused_backing", "snapshot",
+    "checkpoint_recycle", "logical_pages"};
+
 constexpr double kMicrosPerMillisecond = 1000.0;
 constexpr double kMicrosPerSecond = 1'000'000.0;
 
@@ -79,6 +85,16 @@ void appendCheckpointFailureCauses(std::ostringstream &out,
   for (std::size_t cause = 0; cause < kPublicationFailureCauses; ++cause)
     out << (cause ? "," : "") << '"' << kPublicationFailureKeys[cause]
         << "\":" << core.checkpointPublicationFailureCauses[cause];
+  out << '}';
+}
+
+// state.evictions split by cause, every key always present.
+void appendStateEvictionCauses(std::ostringstream &out,
+                               const StateCacheSnapshot &state) {
+  out << ",\"eviction_causes\":{";
+  for (std::size_t cause = 0; cause < kStateEvictionCauses; ++cause)
+    out << (cause ? "," : "") << '"' << kStateEvictionKeys[cause]
+        << "\":" << state.evictionCauses[cause];
   out << '}';
 }
 
@@ -229,8 +245,9 @@ std::string runtimeStatusJson(
       << ",\"hits\":" << state.hits << ",\"misses\":" << state.misses
       << ",\"publications\":" << state.publications
       << ",\"deduplicated_publications\":" << state.deduplicatedPublications
-      << ",\"evictions\":" << state.evictions
-      << ",\"checkpoint_entries\":" << state.checkpointEntries
+      << ",\"evictions\":" << state.evictions;
+  appendStateEvictionCauses(out, state);
+  out << ",\"checkpoint_entries\":" << state.checkpointEntries
       << ",\"checkpoint_bytes\":" << state.checkpointBytes
       << ",\"checkpoint_evictions\":" << state.checkpointEvictions
       << ",\"checkpoint_retirements\":" << state.checkpointRetirements << "}"

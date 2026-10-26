@@ -139,6 +139,26 @@ _STATUS_METRICS = {
     "splash_state_misses_total": ("state", "misses"),
     "splash_state_publications_total": ("state", "publications"),
     "splash_state_evictions_total": ("state", "evictions"),
+    "splash_state_evictions_by_cause_total": LabelledCounter(
+        help_text=(
+            "State cache evictions by cause: a pressure reclaim pass, growth "
+            "after a budget or KV capacity denial, idle backing reused while "
+            "growth is paused, a denied snapshot, a recycled own checkpoint, "
+            "or KV logical page capacity."
+        ),
+        label="cause",
+        paths={
+            cause: ("state", "eviction_causes", cause)
+            for cause in (
+                "pressure_pass",
+                "growth",
+                "paused_backing",
+                "snapshot",
+                "checkpoint_recycle",
+                "logical_pages",
+            )
+        },
+    ),
     "splash_cache_hits_total": ("cache", "hits"),
     "splash_cache_cold_misses_total": ("cache", "cold_misses"),
     "splash_cache_reused_tokens_total": ("cache", "reused_tokens"),
