@@ -1563,7 +1563,8 @@ bool Engine::reclaimForGrowth(const Request &active, CacheReclaimMode mode) {
   if (growthPaused())
     return false;
   const CacheReclaimResult reclaimed =
-      cache_.reclaimOneForGrowth(mode, !anotherLaneResident(active));
+      cache_.reclaimOneForGrowth(mode, !anotherLaneResident(active),
+                                 StateEvictionCause::Growth);
   if (reclaimed.madeProgress)
     signalResourceProgress();
   return reclaimed.madeProgress;
@@ -1593,7 +1594,8 @@ bool Engine::reuseIdleBackingWhilePaused(const Request &active,
   if (reusable < admission.additionalPages)
     return false;
   const CacheReclaimResult reused = cache_.reclaimOneForGrowth(
-      CacheReclaimMode::ReuseBacking, !anotherLaneResident(active));
+      CacheReclaimMode::ReuseBacking, !anotherLaneResident(active),
+      StateEvictionCause::PausedBacking);
   if (reused.madeProgress) {
     // An evicted state parks its buffers in the model's pool (a live lane's
     // own state refills that lane's short reserve instead); under

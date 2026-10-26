@@ -181,21 +181,26 @@ public:
   // One bounded reclaim step for an allocation retry. Progress is distinct
   // from physical bytes because evicting a KV reference can make a resident
   // page reusable without immediately emptying its extent.
-  // sparing names the protected states it walks past and never takes.
+  // sparing names the protected states it walks past and never takes; an
+  // evicted state counts under cause.
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
       bool keepResumePoint = false, bool keepRunway = false,
-      StateSparing sparing = StateSparing::None);
+      StateSparing sparing = StateSparing::None,
+      StateEvictionCause cause = StateEvictionCause::Growth);
   // One reclaim step for an allocation a request is waiting on: spares
   // protected states while any other state or KV qualifies, then takes the
   // oldest protected state rather than stall, except a suspended request's
   // resume state: that one is taken only with takeResumeStates, which the
   // caller passes when no lane other than the growing one is resident. Costs
   // the protected states at the head of each eviction queue, bounded by
-  // waiting and resident lanes.
+  // waiting and resident lanes. An evicted state counts under cause: Growth
+  // for a denied allocation, PausedBacking for idle backing reused while
+  // growth is paused.
   [[nodiscard]] CacheReclaimResult reclaimOneForGrowth(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking,
-      bool takeResumeStates = false);
+      bool takeResumeStates = false,
+      StateEvictionCause cause = StateEvictionCause::Growth);
   // Recycles an unpinned state, preferring checkpoints, for a required state
   // publication. KV bytes only return once an extent unmaps. A protected
   // state is taken only when no other state qualifies, and a suspended

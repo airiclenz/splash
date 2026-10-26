@@ -325,7 +325,8 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
   while (needsMore() && !releaseDeferred(keepRunway)) {
     const CacheReclaimResult result = reclaimOne(
         CacheReclaimMode::ReleaseBacking, keepResumePoint, keepRunway,
-        evictAll ? StateSparing::None : StateSparing::Protected);
+        evictAll ? StateSparing::None : StateSparing::Protected,
+        StateEvictionCause::PressurePass);
     if (!result.madeProgress)
       break;
     released += result.reclaimedBytes;
@@ -335,7 +336,8 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
 
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
                                      bool keepResumePoint, bool keepRunway,
-                                     StateSparing sparing) {
+                                     StateSparing sparing,
+                                     StateEvictionCause cause) {
   if (mode == CacheReclaimMode::ReleaseBacking) {
     if (releaseDeferred(keepRunway))
       return {};
@@ -351,7 +353,7 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
   if (!state && !kv)
     return {};
   if (state && (!kv || state->lastUsed <= kv->lastUsed)) {
-    const StateEviction eviction = states_.evict(state->id);
+    const StateEviction eviction = states_.evict(state->id, cause);
     if (!eviction.evicted)
       throw std::logic_error("state eviction candidate became pinned");
     return {true, eviction.reclaimedBytes};
@@ -363,14 +365,16 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode,
 }
 
 CacheReclaimResult Cache::reclaimOneForGrowth(CacheReclaimMode mode,
-                                              bool takeResumeStates) {
+                                              bool takeResumeStates,
+                                              StateEvictionCause cause) {
   const CacheReclaimResult spared =
-      reclaimOne(mode, false, false, StateSparing::Protected);
+      reclaimOne(mode, false, false, StateSparing::Protected, cause);
   return spared.madeProgress
              ? spared
              : reclaimOne(mode, false, false,
                           takeResumeStates ? StateSparing::None
-                                           : StateSparing::ResumeStates);
+                                           : StateSparing::ResumeStates,
+                          cause);
 }
 
 StateEviction Cache::reclaimOneState(bool checkpointsOnly,
@@ -386,12 +390,13 @@ StateEviction Cache::reclaimOneState(bool checkpointsOnly,
                                 : StateSparing::ResumeStates);
   if (!state || (checkpointsOnly && !states_.checkpoint(state->id)))
     return {};
-  return states_.evict(state->id);
+  return states_.evict(state->id, StateEvictionCause::Snapshot);
 }
 
 bool Cache::recycleCheckpointState(StateCheckpoint checkpoint,
                                    uint32_t heldProtections) noexcept {
-  return states_.evictCheckpoint(checkpoint, heldProtections);
+  return states_.evictCheckpoint(checkpoint, heldProtections,
+                                 StateEvictionCause::CheckpointRecycle);
 }
 
 StateProtection Cache::protectDeepestState(uint64_t requestId,
@@ -490,7 +495,8 @@ bool Cache::evictOneKvBlock() {
     if (spareResumeStates && states_.isResumeState(candidate->id))
       continue;
     if (states_.contains(candidate->id)) {
-      if (!states_.evict(candidate->id).evicted)
+      if (!states_.evict(candidate->id, StateEvictionCause::LogicalPages)
+               .evicted)
         continue;
     }
     kv_.erase(candidate->id);

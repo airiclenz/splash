@@ -43,6 +43,17 @@ FailureCauses onlyCause(PublicationFailure cause, uint64_t count) {
   return causes;
 }
 
+// True when the state cache counted `count` evictions under `cause` and its
+// causes sum to its eviction total.
+bool countsEvictions(const StateCacheSnapshot &states, StateEvictionCause cause,
+                     uint64_t count) {
+  uint64_t sum = 0;
+  for (const uint64_t evictions : states.evictionCauses)
+    sum += evictions;
+  return states.evictionCauses[static_cast<std::size_t>(cause)] == count &&
+         sum == states.evictions;
+}
+
 void runUntilIdle(engine::Engine &engine) {
   for (uint32_t step = 0; step < 32 && !engine.idle(); ++step) {
     static_cast<void>(engine.tick(step + 1));
@@ -1013,7 +1024,10 @@ void testActiveCellGrowthReclaimsCachedStateAndRetries() {
                   after.stateCache.evictions == cached.stateCache.evictions,
               "host-pressure state admission evicted cache or ignored idle memory");
     } else {
-      require(after.stateCache.entries == 0,
+      require(after.stateCache.entries == 0 &&
+                  countsEvictions(after.stateCache, StateEvictionCause::Growth,
+                                  after.stateCache.evictions) &&
+                  after.stateCache.evictions > cached.stateCache.evictions,
               "active-cell growth did not reclaim cached state");
     }
   }
@@ -1136,6 +1150,9 @@ void testPressureReclaimRespectsStateLifetimes() {
   require(stateEvicted.stateCache.entries == 0 &&
               stateEvicted.kvCache.blocks == 2,
           "cached-state eviction incorrectly removed target KV");
+  require(countsEvictions(stateEvicted.stateCache,
+                          StateEvictionCause::PressurePass, 1),
+          "a Warning pass did not count its eviction as pressure_pass");
 
   static_cast<void>(
       engine.reclaimMemory({.reclaimEmptyKvExtents = true,
@@ -1145,6 +1162,9 @@ void testPressureReclaimRespectsStateLifetimes() {
   require(critical.stateCache.entries == 0 && critical.kvCache.blocks == 0 &&
               critical.pool.residentBackingBytes == 0,
           "critical pressure left evictable cached state or KV backing");
+  require(countsEvictions(critical.stateCache, StateEvictionCause::PressurePass,
+                          1),
+          "a Critical pass miscounted the state eviction causes");
 }
 
 // A cached state whose drop refills its lane's checkpoint reserve frees no

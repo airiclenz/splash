@@ -4,6 +4,8 @@
 #include "engine/KvCache.hpp"
 #include "model/Model.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -86,6 +88,24 @@ private:
   std::shared_ptr<const CompositeState> state_;
 };
 
+// Why a state was evicted: a Warning or Critical reclaim pass (PressurePass),
+// reclaim after an engine-budget or KV physical-capacity denial (Growth),
+// reuse of idle backing while growth is paused or the host is under pressure
+// (PausedBacking), a denied state snapshot allocation in capture (Snapshot),
+// the lane's own checkpoint recycled before capture (CheckpointRecycle), or
+// KV logical page capacity (LogicalPages). Indexes
+// StateCacheSnapshot::evictionCauses.
+enum class StateEvictionCause : uint8_t {
+  PressurePass,
+  Growth,
+  PausedBacking,
+  Snapshot,
+  CheckpointRecycle,
+  LogicalPages,
+};
+inline constexpr std::size_t kStateEvictionCauses =
+    static_cast<std::size_t>(StateEvictionCause::LogicalPages) + 1;
+
 struct StateCacheSnapshot {
   uint32_t entries = 0;
   uint32_t pinned = 0;
@@ -95,6 +115,9 @@ struct StateCacheSnapshot {
   uint64_t publications = 0;
   uint64_t deduplicatedPublications = 0;
   uint64_t evictions = 0;
+  // evictions split by StateEvictionCause; sums to it. Checkpoint
+  // retirements count in neither.
+  std::array<uint64_t, kStateEvictionCauses> evictionCauses{};
   uint32_t checkpointEntries = 0;
   uint64_t checkpointBytes = 0;
   uint64_t checkpointRetirements = 0;
@@ -192,13 +215,15 @@ public:
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   evictionCandidate(bool keepResumePoint = false,
                     StateSparing sparing = StateSparing::None) const noexcept;
-  [[nodiscard]] StateEviction evict(uint64_t kvBlock) noexcept;
+  [[nodiscard]] StateEviction evict(uint64_t kvBlock,
+                                    StateEvictionCause cause) noexcept;
   // Evicts exactly this checkpoint publication, counted as a checkpoint
   // eviction, while no more than allowedProtections protections hold it.
   // False when it is absent, replaced, upgraded to an ordinary state, pinned
   // or held by more protections. O(1).
   [[nodiscard]] bool evictCheckpoint(StateCheckpoint checkpoint,
-                                     uint32_t allowedProtections) noexcept;
+                                     uint32_t allowedProtections,
+                                     StateEvictionCause cause) noexcept;
   [[nodiscard]] StateCacheSnapshot snapshot() const noexcept;
 
 private:
@@ -232,7 +257,10 @@ private:
   // The unpinned publication a follow-up request would resume from: the
   // newest ordinary state, or the newest checkpoint when none exists.
   [[nodiscard]] uint64_t resumePoint() const noexcept;
-  [[nodiscard]] StateEviction erase(uint64_t kvBlock, bool retirement) noexcept;
+  // Counts an eviction under cause, or a checkpoint retirement when cause is
+  // empty. O(1).
+  [[nodiscard]] StateEviction
+  erase(uint64_t kvBlock, std::optional<StateEvictionCause> cause) noexcept;
   void release(uint64_t kvBlock) noexcept;
   [[nodiscard]] std::optional<CompositeStateLease>
   acquireBlock(uint64_t kvBlock);
@@ -251,6 +279,7 @@ private:
   uint64_t publications_ = 0;
   uint64_t deduplicatedPublications_ = 0;
   uint64_t evictions_ = 0;
+  std::array<uint64_t, kStateEvictionCauses> evictionCauses_{};
   uint64_t checkpointEntries_ = 0;
   uint64_t checkpointBytes_ = 0;
   uint64_t checkpointRetirements_ = 0;

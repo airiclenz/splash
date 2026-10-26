@@ -149,7 +149,7 @@ bool StateCache::retireCheckpoint(StateCheckpoint checkpoint) noexcept {
   if (found == entries_.end() || !found->second.checkpoint ||
       found->second.publication != checkpoint.publication)
     return true;
-  return erase(checkpoint.kvBlock, true).evicted;
+  return erase(checkpoint.kvBlock, std::nullopt).evicted;
 }
 
 void StateCache::recordKeptCheckpoint(uint64_t kvBlock,
@@ -233,24 +233,28 @@ StateCache::evictionCandidate(bool keepResumePoint,
   return std::nullopt;
 }
 
-StateEviction StateCache::evict(uint64_t kvBlock) noexcept {
-  return erase(kvBlock, false);
+StateEviction StateCache::evict(uint64_t kvBlock,
+                                StateEvictionCause cause) noexcept {
+  return erase(kvBlock, cause);
 }
 
 // ============================================================================
 // Evicts the checkpoint publication named by checkpoint when at most
 // allowedProtections protections hold it; erase refuses a pinned entry.
 bool StateCache::evictCheckpoint(StateCheckpoint checkpoint,
-                                 uint32_t allowedProtections) noexcept {
+                                 uint32_t allowedProtections,
+                                 StateEvictionCause cause) noexcept {
   const auto found = entries_.find(checkpoint.kvBlock);
   if (found == entries_.end() || !found->second.checkpoint ||
       found->second.publication != checkpoint.publication ||
       found->second.protections > allowedProtections)
     return false;
-  return erase(checkpoint.kvBlock, false).evicted;
+  return erase(checkpoint.kvBlock, cause).evicted;
 }
 
-StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
+StateEviction
+StateCache::erase(uint64_t kvBlock,
+                  std::optional<StateEvictionCause> cause) noexcept {
   auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.pins)
     return {};
@@ -262,15 +266,17 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
   if (found->second.checkpoint) {
     --checkpointEntries_;
     checkpointBytes_ -= stateBytes;
-    if (!retirement)
+    if (cause)
       ++checkpointEvictions_;
   }
   bytes_ -= stateBytes;
   entries_.erase(found);
-  if (retirement)
-    ++checkpointRetirements_;
-  else
+  if (cause) {
     ++evictions_;
+    ++evictionCauses_[static_cast<std::size_t>(*cause)];
+  } else {
+    ++checkpointRetirements_;
+  }
   return {true, reclaimed, stateBytes};
 }
 
@@ -285,6 +291,7 @@ StateCacheSnapshot StateCache::snapshot() const noexcept {
   result.publications = publications_;
   result.deduplicatedPublications = deduplicatedPublications_;
   result.evictions = evictions_;
+  result.evictionCauses = evictionCauses_;
   result.checkpointEntries = static_cast<uint32_t>(std::min<uint64_t>(
       checkpointEntries_, std::numeric_limits<uint32_t>::max()));
   result.checkpointBytes = checkpointBytes_;

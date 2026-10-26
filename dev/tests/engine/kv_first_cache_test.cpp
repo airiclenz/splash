@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <iostream>
@@ -1133,6 +1134,87 @@ void testLogicalPagePressureSparesAResumeStateBesideAPeer() {
   cache.endRequest(20);
 }
 
+// Every Cache entry point that evicts a state counts it under its own cause,
+// and the causes sum to the eviction total.
+void testEachEvictionCountsItsOwnCause() {
+  const auto expectOneEviction = [](const engine::Cache &cache,
+                                    StateEvictionCause cause,
+                                    const char *message) {
+    const StateCacheSnapshot states = cache.snapshot().stateCache;
+    uint64_t sum = 0;
+    for (std::size_t index = 0; index < kStateEvictionCauses; ++index) {
+      const uint64_t expected =
+          index == static_cast<std::size_t>(cause) ? 1 : 0;
+      require(states.evictionCauses[index] == expected, message);
+      sum += states.evictionCauses[index];
+    }
+    require(states.evictions == 1 && sum == states.evictions, message);
+  };
+  {
+    CacheFixture fixture;
+    fixture.publish(3);
+    static_cast<void>(fixture.cache.reclaimCache(1, false));
+    expectOneEviction(fixture.cache, StateEvictionCause::PressurePass,
+                      "a reclaim pass did not count a pressure_pass eviction");
+  }
+  {
+    CacheFixture fixture;
+    fixture.publish(3);
+    require(fixture.cache.reclaimOne().madeProgress,
+            "reclaimOne evicted nothing");
+    expectOneEviction(fixture.cache, StateEvictionCause::Growth,
+                      "reclaimOne did not default to a growth eviction");
+  }
+  {
+    CacheFixture fixture;
+    fixture.publish(3);
+    require(fixture.cache.reclaimOneForGrowth().madeProgress,
+            "growth reclaim evicted nothing");
+    expectOneEviction(fixture.cache, StateEvictionCause::Growth,
+                      "growth reclaim did not count a growth eviction");
+  }
+  {
+    CacheFixture fixture;
+    fixture.publish(3);
+    require(fixture.cache
+                .reclaimOneForGrowth(CacheReclaimMode::ReuseBacking, false,
+                                     StateEvictionCause::PausedBacking)
+                .madeProgress,
+            "paused backing reuse evicted nothing");
+    expectOneEviction(fixture.cache, StateEvictionCause::PausedBacking,
+                      "paused backing reuse did not count its own cause");
+  }
+  {
+    CacheFixture fixture;
+    fixture.publish(3);
+    require(fixture.cache.reclaimOneState().evicted,
+            "state recycling evicted nothing");
+    expectOneEviction(fixture.cache, StateEvictionCause::Snapshot,
+                      "state recycling did not count a snapshot eviction");
+  }
+  {
+    CacheFixture fixture;
+    fixture.cache.publishCompositeState(
+        fixture.blocks[3], std::make_shared<TestState>(100), true);
+    const StateCheckpoint checkpoint =
+        fixture.cache.checkpointState(fixture.blocks[3]);
+    require(fixture.cache.recycleCheckpointState(checkpoint, 0),
+            "checkpoint recycling evicted nothing");
+    expectOneEviction(fixture.cache, StateEvictionCause::CheckpointRecycle,
+                      "checkpoint recycling did not count its own cause");
+  }
+  {
+    CacheFixture fixture;
+    fixture.publish(3);
+    fixture.cache.beginRequest(2);
+    require(fixture.cache.ensureTokens(2, 32).granted(),
+            "logical page pressure did not free a page");
+    expectOneEviction(fixture.cache, StateEvictionCause::LogicalPages,
+                      "logical page pressure did not count its own cause");
+    fixture.cache.endRequest(2);
+  }
+}
+
 int main() {
   try {
     testCheckpointLookupProbeDoesNotPromote();
@@ -1179,6 +1261,7 @@ int main() {
     testSharedResumeStateStaysShieldedUntilTheLastRelease();
     testPeerPublicationRecyclingSparesAResumeState();
     testLogicalPagePressureSparesAResumeStateBesideAPeer();
+    testEachEvictionCountsItsOwnCause();
     std::cout << "KV-first cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {
