@@ -531,8 +531,11 @@ then list its conversations and replay one against an idle server:
 ```
 
 `chains` lists each chain (a run of requests on one path, each extending the
-previous history) with its turns, final size and estimated tokens, largest
-first. `run` streams the chain's turns serially at temperature 0, every other
+previous history; a leading system message rewritten after at least two equal
+conversation messages, or a suffix cut from the previous request's last
+message, does not break it) with its turns, final prompt
+size (messages, system field and tools) and estimated tokens, largest first.
+`run` streams the chain's turns serially at temperature 0, every other
 field as recorded and `--max-tokens` capping the completion limit; the recorded
 next turn is sent whatever the model replied. A per-run nonce line leads each
 turn's rendered prompt, so turn 1 is cold and runs never share cache. Per turn

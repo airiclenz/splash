@@ -6,6 +6,9 @@ writes, one ``{"received_unix_ms", "path", "body"}`` object per accepted
 generation request. `chains` lists its request chains, largest first: runs of
 requests on one path in which each request's message list starts with the
 previous request's full message list, as an agent sends a growing history.
+Two client edits do not break a chain: a rewritten leading system message once
+the conversation holds at least two messages, and a suffix cut from the
+previous request's last message.
 
 ``run --recording <file> --chain <i> --base-url <url> --label <name> --output
 <json>`` replays one chain serially and streaming at temperature 0 against an
@@ -20,6 +23,7 @@ never contact a server.
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import json
 import os
@@ -61,6 +65,17 @@ PREVIOUS_RESPONSE_FIELD = "previous_response_id"
 CHARACTERS_PER_TOKEN = 4
 # A lone request is no conversation to replay.
 MINIMUM_CHAIN_TURNS = 2
+# Roles of the leading messages chain matching ignores, since agents rewrite
+# their system message (task list, delegations) between turns.
+SYSTEM_ROLES = frozenset({"system", "developer"})
+# Exactly equal conversation messages that must precede a trimmed last message,
+# so a conversation whose first message is a prefix of another's stays apart.
+MINIMUM_UNTRIMMED_MESSAGES = 1
+# Exactly equal conversation messages a request must share with a chain's end
+# before a changed system message is ignored, so a side request (a title
+# request) that resends the first user message under another system message
+# does not take the conversation's place.
+MINIMUM_SYSTEM_CHANGE_MESSAGES = 2
 NO_DIGEST = b""
 
 REQUEST_TIMEOUT_SECONDS = 1800.0
@@ -118,7 +133,8 @@ class Turn:
     # Length of the request's message list.
     messages: int
     # --------------------------------------------------------------------------
-    # Characters of every string in the request's message list.
+    # Characters of the request's prompt: every string in its message list and
+    # system field, plus its tools as the JSON the chat template renders.
     characters: int
 
 
@@ -135,7 +151,7 @@ class Chain:
 
     # --------------------------------------------------------------------------
     def final_characters(self) -> int:
-        """Characters of the final turn's message list."""
+        """Characters of the final turn's prompt."""
         return self.turns[-1].characters
 
     # --------------------------------------------------------------------------
@@ -157,6 +173,9 @@ class RecordedRequest:
     # --------------------------------------------------------------------------
     # The request's message list, or None when it cannot join a chain.
     messages: list | None
+    # --------------------------------------------------------------------------
+    # Characters of the request's prompt; 0 when `messages` is None.
+    characters: int
 
 
 # ------------------------------------------------------------------------------
@@ -197,7 +216,9 @@ def parse_line(text: str, line: int) -> RecordedRequest:
             f"recording line {line} needs a string path and an object body"
         )
     path = path.partition("?")[0]
-    return RecordedRequest(path, received, message_list(path, body))
+    messages = message_list(path, body)
+    characters = 0 if messages is None else prompt_characters(path, body, messages)
+    return RecordedRequest(path, received, messages, characters)
 
 
 # ------------------------------------------------------------------------------
@@ -235,6 +256,85 @@ def string_characters(value) -> int:
 
 
 # ------------------------------------------------------------------------------
+def prompt_characters(path: str, body: dict, messages: list) -> int:
+    """Characters `body` puts in the prompt: messages, system field and tools.
+
+    Tools count as their JSON text, keys included, since the chat template
+    renders each tool as JSON; messages and the system field count their
+    string values only.
+    """
+    characters = string_characters(messages)
+    system_field = SYSTEM_FIELDS.get(path)
+    if system_field:
+        characters += string_characters(body.get(system_field))
+    tools = body.get("tools")
+    if tools:
+        characters += len(json.dumps(tools, ensure_ascii=False))
+    return characters
+
+
+# ------------------------------------------------------------------------------
+def split_system(messages: list) -> tuple[list, list]:
+    """Return `messages` split into its leading system messages and the rest."""
+    start = 0
+    while (
+        start < len(messages)
+        and isinstance(messages[start], dict)
+        and messages[start].get("role") in SYSTEM_ROLES
+    ):
+        start += 1
+    return messages[:start], messages[start:]
+
+
+# ------------------------------------------------------------------------------
+def canonical_digest(value) -> bytes:
+    """Return a digest of `value`'s canonical JSON, whatever its key order."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode("ascii")).digest()
+
+
+# ------------------------------------------------------------------------------
+def system_part(system_digest: bytes, untrimmed: int) -> bytes:
+    """Return the system digest an index key holds after `untrimmed` equal messages.
+
+    Below MINIMUM_SYSTEM_CHANGE_MESSAGES the system messages must match too;
+    from there on they are ignored.
+    """
+    if untrimmed < MINIMUM_SYSTEM_CHANGE_MESSAGES:
+        return system_digest
+    return NO_DIGEST
+
+
+# ------------------------------------------------------------------------------
+def message_shape(message) -> bytes:
+    """Return a digest of `message` without its content."""
+    return canonical_digest(
+        {key: value for key, value in message.items() if key != "content"}
+    )
+
+
+# ------------------------------------------------------------------------------
+def is_trimmable(message) -> bool:
+    """Whether `message` has the string content a later request may trim."""
+    return isinstance(message, dict) and isinstance(message.get("content"), str)
+
+
+# ------------------------------------------------------------------------------
+def is_trimmed(earlier, later) -> bool:
+    """Whether `later` is `earlier` with only a suffix cut from its text content."""
+    if not isinstance(earlier, dict) or not isinstance(later, dict):
+        return False
+    content = earlier.get("content")
+    trimmed = later.get("content")
+    if not isinstance(content, str) or not isinstance(trimmed, str):
+        return False
+    if not content.startswith(trimmed):
+        return False
+    return {key: value for key, value in earlier.items() if key != "content"} == {
+        key: value for key, value in later.items() if key != "content"
+    }
+
+
+# ------------------------------------------------------------------------------
 def prefix_digests(messages: list) -> list[bytes]:
     """Return digests[k] identifying `messages[:k]`, for k = 0..len(messages).
 
@@ -248,42 +348,154 @@ def prefix_digests(messages: list) -> list[bytes]:
     return digests
 
 
+class ChainEnds:
+    """The last message list of each chain that a request can still extend.
+
+    Lists are keyed by (path, length, prefix digest) of their conversation
+    messages (leading system messages dropped), plus the system messages'
+    digest while the list is shorter than MINIMUM_SYSTEM_CHANGE_MESSAGES. A
+    list whose last message a later request may have trimmed is also kept
+    under the digest of all but that message and that message's other fields,
+    in a list sorted by its content, so the one candidate a trimmed message
+    can match is found by bisection: memory holds one message per open chain,
+    never a request body.
+    """
+
+    # --------------------------------------------------------------------------
+    def __init__(self):
+        # (path, length, digest of the whole list, system part) -> chain index.
+        self.exact: dict[tuple, int] = {}
+        # (path, length, digest of all but the last message, system part) ->
+        # {shape of the last message: [(its content, chain index, message)]},
+        # each list sorted by content.
+        self.trimmable: dict[tuple, dict[bytes, list[tuple]]] = {}
+        # chain index -> its key in `exact` and its place in `trimmable`
+        # (key, shape, entry), or None if absent.
+        self.keys: dict[int, tuple[tuple, tuple | None]] = {}
+
+    # --------------------------------------------------------------------------
+    def match(self, path, messages, digests, system_digest) -> int | None:
+        """Return the chain `messages` extends, or None.
+
+        The longest previous list wins: one that is a proper prefix of
+        `messages`, or one whose last message `messages` trimmed after at least
+        MINIMUM_UNTRIMMED_MESSAGES exactly equal messages. The system messages
+        must match unless MINIMUM_SYSTEM_CHANGE_MESSAGES exactly equal messages
+        precede the match point. At equal length an exact prefix beats a
+        trimmed one; among trimmed candidates the one whose last content sorts
+        first wins.
+        """
+        for length in range(len(messages) - 1, 0, -1):
+            chain_index = self.exact.get(
+                (path, length, digests[length], system_part(system_digest, length))
+            )
+            if chain_index is not None:
+                return chain_index
+            untrimmed = length - 1
+            if untrimmed < MINIMUM_UNTRIMMED_MESSAGES:
+                continue
+            shapes = self.trimmable.get(
+                (
+                    path,
+                    length,
+                    digests[untrimmed],
+                    system_part(system_digest, untrimmed),
+                )
+            )
+            later = messages[untrimmed]
+            if shapes is None or not is_trimmable(later):
+                continue
+            entries = shapes.get(message_shape(later))
+            if entries is None:
+                continue
+            place = bisect.bisect_left(entries, (later["content"],))
+            if place < len(entries) and is_trimmed(entries[place][2], later):
+                return entries[place][1]
+        return None
+
+    # --------------------------------------------------------------------------
+    def close(self, chain_index: int) -> None:
+        """Forget `chain_index`'s end, so no later request extends it there."""
+        exact_key, trimmable_place = self.keys.pop(chain_index)
+        del self.exact[exact_key]
+        if trimmable_place is None:
+            return
+        key, shape, entry = trimmable_place
+        shapes = self.trimmable[key]
+        entries = shapes[shape]
+        del entries[bisect.bisect_left(entries, entry[:2])]
+        if not entries:
+            del shapes[shape]
+            if not shapes:
+                del self.trimmable[key]
+
+    # --------------------------------------------------------------------------
+    def open(self, chain_index, path, messages, digests, system_digest) -> None:
+        """Record `messages` as `chain_index`'s end.
+
+        A chain already ending in the same list loses its end, so the later
+        chain is the one extended.
+        """
+        length = len(messages)
+        exact_key = (path, length, digests[-1], system_part(system_digest, length))
+        displaced = self.exact.get(exact_key)
+        if displaced is not None:
+            self.close(displaced)
+        self.exact[exact_key] = chain_index
+        trimmable_place = None
+        untrimmed = length - 1
+        if untrimmed >= MINIMUM_UNTRIMMED_MESSAGES and is_trimmable(messages[-1]):
+            last = messages[-1]
+            key = (path, length, digests[-2], system_part(system_digest, untrimmed))
+            shape = message_shape(last)
+            entry = (last["content"], chain_index, last)
+            entries = self.trimmable.setdefault(key, {}).setdefault(shape, [])
+            bisect.insort(entries, entry)
+            trimmable_place = (key, shape, entry)
+        self.keys[chain_index] = (exact_key, trimmable_place)
+
+
 # ------------------------------------------------------------------------------
 def find_chains(requests) -> list[Chain]:
     """Group (line, RecordedRequest) pairs into chains, largest final first.
 
     A request joins the chain on its path whose last message list is the
-    longest proper prefix of its own; otherwise it starts a chain. When two
-    chains end in the same list, the later one is extended. Chains of fewer
-    than MINIMUM_CHAIN_TURNS turns are dropped; ties keep recording order.
-    Cost: one hash per message and one dict probe per proper prefix, so time
-    is linear in the recording and memory holds no request body.
+    longest proper prefix of its own, ignoring leading system messages once
+    MINIMUM_SYSTEM_CHANGE_MESSAGES conversation messages match and allowing a
+    suffix cut from that list's last message (ChainEnds.match); otherwise it
+    starts a chain. When two chains end in the same list, the later one is
+    extended. Chains of fewer than MINIMUM_CHAIN_TURNS turns are dropped; ties
+    keep recording order.
+    Cost: one hash per message, two dict probes per proper prefix, and where
+    all but the last message match exactly, one hash of that message's other
+    fields and a bisection over the chains sharing that history, then one
+    trimmed-message check. Time stays linear in the recording (times the log
+    of the chains sharing one history) and memory holds one message per open
+    chain, never a request body.
     """
     chains: list[Chain] = []
-    # (path, prefix length, prefix digest) of each chain's last message list.
-    chain_ends: dict[tuple[str, int, bytes], int] = {}
+    ends = ChainEnds()
     for line, request in requests:
         if request.messages is None:
             continue
-        digests = prefix_digests(request.messages)
-        chain_index = None
-        for length in range(len(request.messages) - 1, 0, -1):
-            chain_index = chain_ends.get((request.path, length, digests[length]))
-            if chain_index is not None:
-                del chain_ends[(request.path, length, digests[length])]
-                break
+        system, messages = split_system(request.messages)
+        system_digest = canonical_digest(system)
+        digests = prefix_digests(messages)
+        chain_index = ends.match(request.path, messages, digests, system_digest)
         if chain_index is None:
             chain_index = len(chains)
             chains.append(Chain(request.path))
+        else:
+            ends.close(chain_index)
         chains[chain_index].turns.append(
             Turn(
                 line,
                 request.received_unix_ms,
                 len(request.messages),
-                string_characters(request.messages),
+                request.characters,
             )
         )
-        chain_ends[(request.path, len(request.messages), digests[-1])] = chain_index
+        ends.open(chain_index, request.path, messages, digests, system_digest)
     found = [chain for chain in chains if len(chain.turns) >= MINIMUM_CHAIN_TURNS]
     return sorted(found, key=Chain.final_characters, reverse=True)
 

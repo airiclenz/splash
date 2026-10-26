@@ -24,6 +24,41 @@ def assistant(text):
     return {"role": "assistant", "content": text}
 
 
+def system(text):
+    """Return a system message with `text`."""
+    return {"role": "system", "content": text}
+
+
+def tool(text, call_id="call_1"):
+    """Return a tool-result message with `text` answering `call_id`."""
+    return {"role": "tool", "tool_call_id": call_id, "content": text}
+
+
+def edited_by_client():
+    """Three turns of one conversation as an agent client sends them.
+
+    The third turn rewrites the system message and cuts the delegations suffix
+    the second had appended to its last tool result.
+    """
+    return [
+        [system("tasks: none"), user("task")],
+        [
+            system("tasks: none"),
+            user("task"),
+            assistant("call"),
+            tool("result one\n<delegations>a</delegations>"),
+        ],
+        [
+            system("tasks: 1 open"),
+            user("task"),
+            assistant("call"),
+            tool("result one"),
+            assistant("call again"),
+            tool("result two\n<delegations>b</delegations>", "call_2"),
+        ],
+    ]
+
+
 def record(received_unix_ms, path, body):
     """Return one recording line object."""
     return {"received_unix_ms": received_unix_ms, "path": path, "body": body}
@@ -130,7 +165,13 @@ class AgentReplayChainsTests(unittest.TestCase):
                 largest["first_received_unix_ms"],
                 largest["last_received_unix_ms"],
             ),
-            (0, 400 + 3 * len("user") + 2 * len("assistant") + 4, 108, 1100, 1500),
+            (
+                0,
+                400 + 3 * len("user") + 2 * len("assistant") + 4 + len("agent"),
+                109,
+                1100,
+                1500,
+            ),
         )
 
     def test_chains_nonPrefixHistoryEdit_startsANewChain(self):
@@ -157,6 +198,242 @@ class AgentReplayChainsTests(unittest.TestCase):
             [turn["received_unix_ms"] for turn in chain["turns"]] for chain in chains
         ]
         self.assertEqual(sorted(received), [[1, 2], [3, 4]])
+
+    def test_chainsJson_finalSizeCountsSystemAndToolsJson(self):
+        tools = [CHAT_TOOL]
+        body = {"system": "be brief", "tools": tools, "max_tokens": 8}
+        self.write_recording(
+            [
+                record(1, replay.ANTHROPIC_PATH, {**body, "messages": [user("a")]}),
+                record(
+                    2,
+                    replay.ANTHROPIC_PATH,
+                    {**body, "messages": [user("a"), assistant("b"), user("c")]},
+                ),
+            ]
+        )
+
+        largest = self.chains_json()[0]
+
+        self.assertEqual(
+            largest["final_characters"],
+            2 * len("user")
+            + len("assistant")
+            + 3
+            + len("be brief")
+            + len(json.dumps(tools)),
+        )
+
+    def test_chains_rewrittenSystemMessage_staysOneChain(self):
+        self.write_recording(
+            [
+                chat(1, system("plan A"), user("task"), assistant("a")),
+                chat(
+                    2,
+                    system("plan B"),
+                    user("task"),
+                    assistant("a"),
+                    user("b"),
+                    assistant("c"),
+                ),
+                chat(
+                    3,
+                    system("plan A"),
+                    user("task"),
+                    assistant("a"),
+                    user("b"),
+                    assistant("c"),
+                    user("d"),
+                    assistant("e"),
+                ),
+            ]
+        )
+
+        chains = self.chains_json()
+
+        self.assertEqual([chain["turn_count"] for chain in chains], [3])
+
+    def test_chains_titleRequestUnderAnotherSystemMessage_doesNotJoin(self):
+        self.write_recording(
+            [
+                chat(1, SYSTEM, user("task")),
+                chat(2, system("write a title"), user("task")),
+                chat(3, SYSTEM, user("task"), assistant("call"), tool("out")),
+            ]
+        )
+
+        chains = self.chains_json()
+
+        self.assertEqual(
+            [[turn["received_unix_ms"] for turn in chain["turns"]] for chain in chains],
+            [[1, 3]],
+        )
+
+    def test_chains_manyChainsSharingAHistory_checkOneTrimmedCandidatePerRequest(self):
+        conversations = 300
+        openings = [
+            chat(number, SYSTEM, user("task"), tool(f"out {number:04d}\nextra"))
+            for number in range(conversations)
+        ]
+        follow_ups = [
+            chat(
+                conversations + number,
+                SYSTEM,
+                user("task"),
+                tool(f"out {number:04d}"),
+                user("next"),
+            )
+            for number in range(conversations)
+        ]
+        self.write_recording(openings + follow_ups)
+        checks = []
+        is_trimmed = replay.is_trimmed
+
+        def counted(earlier, later):
+            checks.append(later)
+            return is_trimmed(earlier, later)
+
+        replay.is_trimmed = counted
+        try:
+            chains = self.chains_json()
+        finally:
+            replay.is_trimmed = is_trimmed
+
+        self.assertEqual(
+            (
+                len(checks),
+                sorted(
+                    tuple(turn["received_unix_ms"] for turn in chain["turns"])
+                    for chain in chains
+                ),
+            ),
+            (
+                conversations,
+                [(number, conversations + number) for number in range(conversations)],
+            ),
+        )
+
+    def test_chains_suffixCutFromLastMessage_staysOneChain(self):
+        self.write_recording(
+            [
+                chat(1, SYSTEM, user("task"), assistant("call"), tool("out\nextra")),
+                chat(
+                    2,
+                    SYSTEM,
+                    user("task"),
+                    assistant("call"),
+                    tool("out"),
+                    assistant("done"),
+                    user("next"),
+                ),
+            ]
+        )
+
+        chains = self.chains_json()
+
+        self.assertEqual([chain["turn_count"] for chain in chains], [2])
+
+    def test_chains_clientEditedConversation_staysOneChain(self):
+        self.write_recording(
+            [
+                chat(number, *messages)
+                for number, messages in enumerate(edited_by_client(), start=1)
+            ]
+        )
+
+        chains = self.chains_json()
+
+        self.assertEqual(
+            [[turn["received_unix_ms"] for turn in chain["turns"]] for chain in chains],
+            [[1, 2, 3]],
+        )
+
+    def test_chains_conversationsDifferingAfterTheSystemMessage_stayApart(self):
+        self.write_recording(
+            [
+                chat(1, system("plan A"), user("first task"), assistant("a")),
+                chat(2, system("plan A"), user("second task"), assistant("a")),
+                chat(
+                    3,
+                    system("plan B"),
+                    user("first task"),
+                    assistant("a"),
+                    user("b"),
+                    assistant("c"),
+                ),
+                chat(
+                    4,
+                    system("plan B"),
+                    user("second task"),
+                    assistant("a"),
+                    user("b"),
+                    assistant("c"),
+                ),
+            ]
+        )
+
+        chains = self.chains_json()
+
+        received = [
+            [turn["received_unix_ms"] for turn in chain["turns"]] for chain in chains
+        ]
+        self.assertEqual(sorted(received), [[1, 3], [2, 4]])
+
+    def test_chains_firstMessageCutToAnotherConversation_staysApart(self):
+        self.write_recording(
+            [
+                chat(1, SYSTEM, user("fix the parser and its tests")),
+                chat(2, SYSTEM, user("fix the parser"), assistant("ok"), user("go")),
+            ]
+        )
+
+        chains = self.chains_json()
+
+        self.assertEqual(chains, [])
+
+    def test_chains_lastMessageEditedBeyondASuffixCut_startsANewChain(self):
+        self.write_recording(
+            [
+                chat(1, SYSTEM, user("task")),
+                chat(2, SYSTEM, user("task"), assistant("call"), tool("result A")),
+                chat(
+                    3,
+                    SYSTEM,
+                    user("task"),
+                    assistant("call"),
+                    tool("result B"),
+                    assistant("done"),
+                    user("next"),
+                ),
+            ]
+        )
+
+        chains = self.chains_json()
+
+        self.assertEqual(
+            [[turn["received_unix_ms"] for turn in chain["turns"]] for chain in chains],
+            [[1, 2]],
+        )
+
+    def test_chains_cutMessageAnsweringAnotherToolCall_startsANewChain(self):
+        self.write_recording(
+            [
+                chat(1, SYSTEM, user("task"), assistant("call"), tool("out\nextra")),
+                chat(
+                    2,
+                    SYSTEM,
+                    user("task"),
+                    assistant("call"),
+                    tool("out", "call_9"),
+                    assistant("done"),
+                    user("next"),
+                ),
+            ]
+        )
+
+        chains = self.chains_json()
+
+        self.assertEqual(chains, [])
 
     def test_chains_requestJoinsLongestProperPrefix(self):
         self.write_recording(
@@ -234,7 +511,7 @@ class AgentReplayChainsTests(unittest.TestCase):
         lines = stdout.splitlines()
         self.assertEqual(
             (code, len(lines), lines[1].split()),
-            (0, 3, ["0", "3", replay.ANTHROPIC_PATH, "434", "108", "1100", "1500"]),
+            (0, 3, ["0", "3", replay.ANTHROPIC_PATH, "439", "109", "1100", "1500"]),
         )
 
     def test_chains_noChains_saysSo(self):
@@ -522,6 +799,23 @@ class AgentReplayRunTests(unittest.TestCase):
                 (6000, 3990, 20, 1000, 2010.0, 50.0, 0.75, False),
             ],
         )
+
+    def test_run_clientEditedChain_sendsEachRecordedHistoryAsRecorded(self):
+        histories = edited_by_client()
+        self.write_recording(
+            [
+                record(
+                    number,
+                    replay.CHAT_PATH,
+                    {"model": "m", "tools": [CHAT_TOOL], "messages": messages},
+                )
+                for number, messages in enumerate(histories, start=1)
+            ]
+        )
+
+        _, bodies = self.replay_against([turn_script(100, 0)])
+
+        self.assertEqual([body["messages"] for body in bodies], histories)
 
     def test_run_everyBody_isGreedyAndStreaming(self):
         self.write_recording(growing(replay.CHAT_PATH, {"temperature": 0.7}, "a", "c"))
