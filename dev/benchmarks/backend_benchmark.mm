@@ -1037,13 +1037,41 @@ bool areRunsIdentical(const CheckpointRun &left, const CheckpointRun &right) {
          left.acceptedDraftTokens == right.acceptedDraftTokens;
 }
 
-// Prints the summary line; returns whether every interval reproduced itself
-// and every divergence from checkpoints off is a scored near-tie.
+// Intervals count stored tokens, prompt plus output, so a run whose total
+// falls short of an interval published no checkpoint at it.
+bool reachesInterval(const CheckpointRun &run, size_t promptTokens,
+                     uint32_t interval) noexcept {
+  return promptTokens + run.outputTokens.size() >= interval;
+}
+
+// The smallest non-zero interval; none when every interval disables
+// checkpoints.
+std::optional<uint32_t>
+smallestCheckpointInterval(std::span<const uint32_t> intervals) noexcept {
+  std::optional<uint32_t> smallest;
+  for (uint32_t interval : intervals) {
+    if (interval && (!smallest || interval < *smallest))
+      smallest = interval;
+  }
+  return smallest;
+}
+
+// Prints the summary line; returns whether every run reached the smallest
+// non-zero interval, every interval reproduced itself, and every divergence
+// from checkpoints off is a scored near-tie. A run that reached no interval
+// exercised no checkpoint, so its identical transcripts prove nothing.
 bool emitCheckpointSummary(
     const CheckpointOptions &options, std::span<const uint32_t> promptTokens,
     std::span<const CheckpointRun> runs,
     std::span<const CheckpointDivergence> divergences) {
-  bool isPassing = true;
+  const std::optional<uint32_t> smallestInterval =
+      smallestCheckpointInterval(options.intervals);
+  const bool isIntervalReached =
+      !smallestInterval ||
+      std::all_of(runs.begin(), runs.end(), [&](const CheckpointRun &run) {
+        return reachesInterval(run, promptTokens.size(), *smallestInterval);
+      });
+  bool isPassing = isIntervalReached;
   std::cout << "{\"event\":\"checkpoint_summary\",\"prompt_tokens\":"
             << promptTokens.size() << ",\"prompt_sha256\":\""
             << tokensSha256(promptTokens)
@@ -1070,7 +1098,21 @@ bool emitCheckpointSummary(
               << ",\"tokens_identical\":"
               << (areTokensIdentical ? "true" : "false")
               << ",\"tokens_sha256\":\"" << repeats.front().outputSha256
-              << "\"}";
+              << "\",\"output_tokens\":[";
+    for (size_t repeat = 0; repeat < repeats.size(); ++repeat) {
+      std::cout << (repeat ? "," : "") << repeats[repeat].outputTokens.size();
+    }
+    std::cout << ']';
+    if (options.intervals[index]) {
+      const bool isReached =
+          std::all_of(repeats.begin(), repeats.end(),
+                      [&](const CheckpointRun &run) {
+                        return reachesInterval(run, promptTokens.size(),
+                                               options.intervals[index]);
+                      });
+      std::cout << ",\"interval_reached\":" << (isReached ? "true" : "false");
+    }
+    std::cout << '}';
   }
   std::cout << "],\"versus_off\":[";
   for (size_t index = 0; index < divergences.size(); ++index) {
@@ -1094,8 +1136,20 @@ bool emitCheckpointSummary(
               << '}';
   }
   std::cout << "],\"near_tie_logit_gap\":" << kNearTieLogitGap
-            << ",\"pass\":" << (isPassing ? "true" : "false") << '}'
+            << ",\"smallest_checkpoint_tokens\":";
+  if (smallestInterval)
+    std::cout << *smallestInterval;
+  else
+    std::cout << "null";
+  if (!isIntervalReached)
+    std::cout << ",\"reason\":\"no checkpoint interval reached\"";
+  std::cout << ",\"pass\":" << (isPassing ? "true" : "false") << '}'
             << std::endl;
+  if (!isIntervalReached) {
+    std::cerr << "checkpoints scenario failed: no checkpoint interval reached "
+                 "(a run's prompt plus output tokens stayed below "
+              << *smallestInterval << ")\n";
+  }
   return isPassing;
 }
 
