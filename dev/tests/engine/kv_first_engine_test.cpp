@@ -3131,7 +3131,8 @@ void testRecoveryDrainDoesNotConsumeResourceWaitBudget() {
 // The live three-lane run's failure: a new request denied for host pressure
 // while a peer stays resident timed out with resource_timeout, although the
 // peer's finish would return the memory. Beside a resident lane the wait
-// holds no deadline; once no lane is resident it takes a fresh one.
+// holds no deadline; once no lane is resident it resumes the held one, here
+// the whole limit, since no denial of another kind ever ran it down.
 void testHostPressureWaitBesideAResidentLaneHoldsItsDeadline() {
   constexpr uint64_t peerId = 290;
   constexpr uint64_t waiterId = 291;
@@ -3191,7 +3192,7 @@ void testHostPressureWaitBesideAResidentLaneHoldsItsDeadline() {
       continue;
     }
     // The peer finishes under persistent pressure: the waiter now has no
-    // lane to wait for, takes a fresh deadline and times out on it.
+    // lane to wait for, resumes its held deadline and times out on it.
     executor.decodeFinishes = true;
     const double peerDone = now;
     for (; now < peerDone + timeout / 2; ++now)
@@ -3204,6 +3205,113 @@ void testHostPressureWaitBesideAResidentLaneHoldsItsDeadline() {
                 events.failures == std::vector<std::string>{"resource_timeout"},
             "a wait with no lane resident ignored the resource wait limit");
   }
+}
+
+// A lane suspended beside a resident peer waits through the recovery drain:
+// while the peer runs, the drain holds the resuming wait with no deadline,
+// however far past the resource wait limit, and the lane resumes once the
+// peer finishes.
+void testResumingWaitBesideAResidentLaneHoldsItsDeadline() {
+  constexpr double timeout = 100.0;
+  Backing backing(2);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  EngineConfig config;
+  config.resourceWaitTimeoutMilliseconds = timeout;
+  engine::Engine engine(config, resources, executor, events);
+  for (uint64_t id : {292, 293}) {
+    auto value = request(id, std::vector<uint32_t>(24, id));
+    value.maxNewTokens = 4;
+    value.deadlineMilliseconds = 1'000'000;
+    engine.submit(std::move(value));
+  }
+  double now = 1.0;
+  for (; now <= 5.0; ++now)
+    require(engine.tick(now), "resuming-wait fixture made no progress");
+  require(executor.suspensions == 1,
+          "resuming-wait fixture did not preempt a lane");
+  executor.holdDecodeUntil = std::make_shared<bool>(false);
+  require(engine.tick(now) && engine.commandInFlight(),
+          "resident peer did not start its command");
+
+  for (const double drained = ++now; now < drained + 3 * timeout; ++now)
+    static_cast<void>(engine.tick(now));
+
+  require(executor.resumeAttempts == 0 && events.failedCount == 0 &&
+              engine.resourceWaitSnapshot(now).suspended == 1,
+          "the drain let a resuming wait beside a resident lane time out");
+  *executor.holdDecodeUntil = true;
+  for (const double released = now; now < released + 100.0 && !engine.idle();
+       ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() && events.completedCount == 2 &&
+              events.failedCount == 0 && executor.resumptions == 1,
+          "the held resuming lane did not resume after its peer finished");
+}
+
+// A wait denied for the engine budget, then for host pressure beside a
+// resident lane, then for the engine budget again: the host-pressure denials
+// pause the engine-budget deadline, which runs out nowhere while held, and the
+// next engine-budget denial resumes its remaining time instead of arming a
+// fresh limit. Ticks step 10 ms so the peer stays resident throughout; the
+// bounds allow one retry backoff of slack at each switch.
+void testHostPressureDenialPausesTheEngineBudgetDeadline() {
+  constexpr uint64_t peerId = 294;
+  constexpr uint64_t waiterId = 295;
+  constexpr double timeout = 1000.0;
+  constexpr double step = 10.0;
+  constexpr double budgetSpent = 300.0;
+  Backing backing(32);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  bool blocked = false;
+  executor.beginGrowthBlocked = [&] { return blocked; };
+  executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
+  Events events;
+  EngineConfig config;
+  config.resourceWaitTimeoutMilliseconds = timeout;
+  engine::Engine engine(config, resources, executor, events);
+  auto peer = request(peerId, std::vector<uint32_t>(24, peerId));
+  peer.maxNewTokens = 1000;
+  peer.deadlineMilliseconds = 1'000'000;
+  engine.submit(std::move(peer));
+  double now = 1.0;
+  for (; now < 10.0; ++now)
+    static_cast<void>(engine.tick(now));
+  require(events.emitted > 0, "paused-deadline fixture did not start decoding");
+  blocked = true;
+  auto waiter = request(waiterId, std::vector<uint32_t>(24, waiterId));
+  waiter.deadlineMilliseconds = 1'000'000;
+  engine.submit(std::move(waiter));
+
+  for (const double denied = now; now < denied + budgetSpent; now += step)
+    static_cast<void>(engine.tick(now));
+  require(events.failedCount == 0 &&
+              engine.snapshot().scheduler.waitingResources == 1,
+          "an engine-budget wait beside a resident lane did not wait");
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  for (const double held = now; now < held + 2 * timeout; now += step)
+    static_cast<void>(engine.tick(now));
+  require(events.failedCount == 0 &&
+              engine.snapshot().scheduler.waitingResources == 1,
+          "a held engine-budget deadline still ran out");
+  executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
+  const double resumed = now;
+  for (; now < resumed + timeout / 2; now += step)
+    static_cast<void>(engine.tick(now));
+  require(events.failedCount == 0,
+          "the resumed deadline lost more than the time it had left");
+  for (; now < resumed + timeout - step * 10; now += step)
+    static_cast<void>(engine.tick(now));
+
+  require(events.completedCount == 0 &&
+              events.failures == std::vector<std::string>{"resource_timeout"},
+          "the engine-budget deadline restarted instead of resuming");
 }
 
 void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
@@ -6852,6 +6960,8 @@ int main() {
     testPhysicalKvPressureSuspendsInsteadOfKillingActiveWork();
     testRecoveryDrainDoesNotConsumeResourceWaitBudget();
     testHostPressureWaitBesideAResidentLaneHoldsItsDeadline();
+    testResumingWaitBesideAResidentLaneHoldsItsDeadline();
+    testHostPressureDenialPausesTheEngineBudgetDeadline();
     testPhysicalPressureRetryIsBackedOffWithoutProgress();
     testRecoveryWakeupIgnoresWaitersItDoesNotRetry();
     testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput();

@@ -23,7 +23,8 @@ constexpr double kMicrosecondsPerMillisecond = 1000.0;
 // ============================================================================
 // True while a resource wait has more than kColdFallbackWaitFraction of its
 // timeout left, or has no deadline yet (deferResourceRetry sets it only after
-// a first denial). The margin covers peer steps longer than the retry
+// a first denial). A held deadline is passed as now plus its remaining time,
+// so its age stays frozen while held. The margin covers peer steps longer than the retry
 // backoff, so the cold-admission fallback still runs before resource_timeout.
 bool isResourceWaitYoung(double deadlineMilliseconds,
                          double timeoutMilliseconds,
@@ -245,6 +246,7 @@ bool Engine::tick(double now) {
     // fresh resource wait only if admission still fails after that drain.
     if (draining) {
       active.resourceWait.deadlineMilliseconds = 0.0;
+      active.resourceWait.heldRemainingMilliseconds.reset();
       continue;
     }
     if (!active.finalized && active.resourceWait.deadlineMilliseconds > 0.0 &&
@@ -583,9 +585,13 @@ bool Engine::admit(Request &active, double now) {
       // cold recomputation over waiting forever for our own cache lease.
       // With a peer resident, its retirement may free the room instead, so
       // a young wait keeps the found state rather than evict it.
+      const std::optional<double> held =
+          active.resourceWait.heldRemainingMilliseconds;
+      const double waitDeadline =
+          held ? now + *held : active.resourceWait.deadlineMilliseconds;
       if (!growthPaused() && lookup.state &&
           !(anotherResident &&
-            isResourceWaitYoung(active.resourceWait.deadlineMilliseconds,
+            isResourceWaitYoung(waitDeadline,
                                 config_.resourceWaitTimeoutMilliseconds,
                                 now))) {
         lookup = {};
@@ -614,11 +620,16 @@ bool Engine::admit(Request &active, double now) {
       // Denied for host pressure beside a resident lane, the wait holds no
       // deadline, as a recovery drain does: that lane's progress or finish
       // returns the memory, so timing out would fail the request only for
-      // waiting its turn. The first denial with no lane resident starts a
-      // fresh deadline.
-      if (anotherResident && admission.allocationFailure ==
-                                 metal::AllocationFailure::HostPressure)
-        active.resourceWait.deadlineMilliseconds = 0.0;
+      // waiting its turn. The deadline is paused, not cleared: the next
+      // denial of another kind, or a host-pressure denial with no lane
+      // resident, resumes its remaining time rather than start a fresh one.
+      auto &wait = active.resourceWait;
+      if (anotherResident &&
+          admission.allocationFailure ==
+              metal::AllocationFailure::HostPressure &&
+          wait.deadlineMilliseconds > 0.0)
+        wait.heldRemainingMilliseconds =
+            std::exchange(wait.deadlineMilliseconds, 0.0) - now;
       return false;
     }
     executorStarted = true;
@@ -742,10 +753,14 @@ void Engine::deferResourceRetry(Request &active, double now,
   if (!wait.startedMilliseconds)
     wait.startedMilliseconds = now;
   wait.reason = reason;
-  if (reason == StateFailure::ConcurrencyLimit)
+  if (reason == StateFailure::ConcurrencyLimit) {
     wait.deadlineMilliseconds = 0.0;
-  else if (wait.deadlineMilliseconds <= 0.0)
-    wait.deadlineMilliseconds = now + config_.resourceWaitTimeoutMilliseconds;
+  } else if (wait.deadlineMilliseconds <= 0.0) {
+    wait.deadlineMilliseconds =
+        now + wait.heldRemainingMilliseconds.value_or(
+                  config_.resourceWaitTimeoutMilliseconds);
+    wait.heldRemainingMilliseconds.reset();
+  }
   wait.epoch = resourceEpoch_;
   wait.retryMilliseconds = now + kResourceRetryBackoffMilliseconds;
 }

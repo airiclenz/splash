@@ -189,6 +189,10 @@ private:
     StateFailure reason = StateFailure::None;
     std::optional<double> startedMilliseconds;
     double deadlineMilliseconds = 0.0;
+    // The engine-budget deadline's remaining time, paused by a host-pressure
+    // denial beside a resident lane; deadlineMilliseconds is 0 while it is
+    // set. The next deadline deferResourceRetry arms resumes it.
+    std::optional<double> heldRemainingMilliseconds;
     double retryMilliseconds = 0.0;
     uint64_t epoch = 0;
   };
