@@ -35,6 +35,9 @@ from server import server as api
 from server.api_shapes import _namespace_alias, normalize_responses_input
 from server.tool_schema import MAX_JSON_NESTING, _grammar_compatible_schema
 
+# The build identity a test server publishes when startup did not resolve one.
+UNRESOLVED_BUILD = api.release_identity.UNRESOLVED.as_dict()
+
 
 def _byte_alphabet():
     byte_values = [
@@ -1222,6 +1225,7 @@ class ServerTest(unittest.TestCase):
                     "model": "test-model",
                     "ready": False,
                     "memory_pressure": None,
+                    "build": UNRESOLVED_BUILD,
                 },
             ),
         )
@@ -1237,6 +1241,7 @@ class ServerTest(unittest.TestCase):
                     "model": "test-model",
                     "ready": True,
                     "memory_pressure": "normal",
+                    "build": UNRESOLVED_BUILD,
                 },
             ),
         )
@@ -2882,6 +2887,7 @@ class ServerTest(unittest.TestCase):
                     "model": "test-model",
                     "ready": False,
                     "memory_pressure": None,
+                    "build": UNRESOLVED_BUILD,
                 },
             ),
         )
@@ -2891,6 +2897,73 @@ class ServerTest(unittest.TestCase):
         )
         status, _, payload = harness.request("GET", "/status")
         self.assertFalse(json.loads(payload)["ready"])
+
+    def test_build_identity_is_served_without_resolving_per_request(self):
+        runtime = FakeRuntime()
+        native_identity = {"cache": {"build_id": "engine-build-1"}}
+        runtime.status_event = native_wire.StatusJsonEvent(
+            1,
+            native_wire.STATUS_SCHEMA_VERSION,
+            json.dumps(
+                {
+                    "schema_version": native_wire.STATUS_SCHEMA_VERSION,
+                    "ready": True,
+                    "memory_pressure": "normal",
+                    "metal": {"healthy": True},
+                    "identity": native_identity,
+                }
+            ),
+        )
+        harness = self.harness(runtime)
+        harness.server.build_identity = api.release_identity.BuildIdentity(
+            "source", "abc1234-dirty", "engine-build-1"
+        )
+        expected = {
+            "version": "source",
+            "commit": "abc1234-dirty",
+            "build_id": "engine-build-1",
+        }
+
+        with mock.patch.object(
+            api.release_identity,
+            "resolve",
+            side_effect=AssertionError("resolved per request"),
+        ) as resolve:
+            health = json.loads(harness.request("GET", "/health")[2])
+            status = json.loads(harness.request("GET", "/status")[2])
+            version_code, _, version = harness.request("GET", "/version")
+            connection = http.client.HTTPConnection(
+                *harness.server.server_address, timeout=3
+            )
+            connection.request("GET", "/ready")
+            response = connection.getresponse()
+            response.read()
+            server_header = response.getheader("Server")
+            connection.close()
+
+        resolve.assert_not_called()
+        self.assertEqual(health["build"], expected)
+        self.assertEqual(status["build"], expected)
+        self.assertEqual(status["identity"], native_identity)
+        self.assertEqual((version_code, json.loads(version)), (200, expected))
+        self.assertEqual(server_header, "Splash/source-abc1234-dirty")
+
+    def test_startup_build_id_is_unknown_when_the_status_read_fails(self):
+        backend = mock.Mock()
+        backend.status.side_effect = RuntimeError("native status failed")
+
+        with mock.patch("builtins.print"):
+            build_id = api._startup_build_id(backend)
+
+        self.assertEqual(build_id, "unknown")
+
+    def test_startup_build_id_comes_from_the_native_status_identity(self):
+        backend = mock.Mock()
+        backend.status.return_value = {"identity": {"cache": {"build_id": "b-42"}}}
+
+        build_id = api._startup_build_id(backend)
+
+        self.assertEqual(build_id, "b-42")
 
     def test_health_reads_the_cached_snapshot_without_a_native_call(self):
         runtime = FakeRuntime()
@@ -2916,6 +2989,7 @@ class ServerTest(unittest.TestCase):
                     "model": "test-model",
                     "ready": True,
                     "memory_pressure": "normal",
+                    "build": UNRESOLVED_BUILD,
                 },
             ),
         )
@@ -2926,6 +3000,7 @@ class ServerTest(unittest.TestCase):
                 "model": "test-model",
                 "ready": False,
                 "memory_pressure": "normal",
+                "build": UNRESOLVED_BUILD,
             },
         )
 
@@ -3996,9 +4071,13 @@ class ServerTest(unittest.TestCase):
             mock.patch.object(api, "FrontendServer", side_effect=bind),
             mock.patch.object(api, "RequestRecording") as recording_type,
             mock.patch.object(api.signal, "signal", side_effect=install),
+            mock.patch.object(api.release_identity, "resolve") as resolve,
             mock.patch("builtins.print"),
         ):
             api.main()
+        # The mock backend's status is no native status dict: build id unknown.
+        resolve.assert_called_once_with("unknown")
+        self.assertIs(server.build_identity, resolve.return_value)
         self.assertEqual(
             handlers, {signal.SIGTERM: signal.SIG_IGN, signal.SIGINT: signal.SIG_IGN}
         )

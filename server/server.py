@@ -23,7 +23,7 @@ from transformers import AutoTokenizer
 
 if __package__:
     from . import images as image_input
-    from . import json_codec, judgments
+    from . import json_codec, judgments, release_identity
     from . import runtime as engine_runtime
     from .api_shapes import (
         anthropic_response,
@@ -79,6 +79,7 @@ else:
     import images as image_input
     import json_codec
     import judgments
+    import release_identity
     from api_shapes import (
         anthropic_response,
         anthropic_stop,
@@ -431,7 +432,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def version_string(self):
-        return "Splash"
+        return self.server.build_identity.server_header
 
     def do_GET(self):
         path = self.path.partition("?")[0]
@@ -444,7 +445,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self._json(
                 200,
-                {"status": "ok", "model": self.app.model, **self.app.backend.health()},
+                {
+                    "status": "ok",
+                    "model": self.app.model,
+                    **self.app.backend.health(),
+                    "build": self.server.build_identity.as_dict(),
+                },
             )
             return
         if path == "/ready":
@@ -456,6 +462,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         if path == "/status":
             self._json(200, self.server.status())
+            return
+        if path == "/version":
+            self._json(200, self.server.build_identity.as_dict())
             return
         if path == "/metrics":
             self._send(
@@ -1885,6 +1894,7 @@ class FrontendServer(ThreadingHTTPServer):
         webui=True,
         max_request_bytes=DEFAULT_MAX_REQUEST_BYTES,
         request_recording=None,
+        build_identity=release_identity.UNRESOLVED,
     ):
         if not is_finite_number(io_timeout) or io_timeout <= 0:
             raise ValueError("io_timeout must be positive and finite")
@@ -1896,6 +1906,8 @@ class FrontendServer(ThreadingHTTPServer):
             raise ValueError("max_request_bytes must be a positive integer")
         self.max_request_bytes = max_request_bytes
         self.request_recording = request_recording
+        # Resolved once at startup; requests only read it.
+        self.build_identity = build_identity
         self.request_bodies = HttpAdmission(
             max(DEFAULT_REQUEST_BODY_BUDGET, 2 * max_request_bytes)
         )
@@ -1927,6 +1939,7 @@ class FrontendServer(ThreadingHTTPServer):
             "port": self.server_address[1],
             "started_at": self.started_at,
         }
+        status["build"] = self.build_identity.as_dict()
         status["http"] = {
             "requests": self.requests.stats(),
             "request_body_bytes": self.request_bodies.stats(),
@@ -2229,6 +2242,16 @@ def _interrupt(_signum, _frame):
     raise KeyboardInterrupt
 
 
+def _startup_build_id(backend):
+    """Read the engine build id from one native status, `unknown` on any failure."""
+    try:
+        status = backend.status()
+    except Exception as error:  # noqa: BLE001 - any failure means `unknown`
+        print_status(f"Warning · startup status unavailable: {error}", error=True)
+        return release_identity.UNKNOWN
+    return release_identity.native_build_id(status)
+
+
 def main():
     args = parse_args()
     server = None
@@ -2287,6 +2310,9 @@ def main():
                 "native runtime reported an invalid context window"
             )
         effective_context = readiness.max_context_tokens
+        # The server is bound before git runs or the engine reports its build
+        # id, so the identity is handed over here, before activation.
+        server.build_identity = release_identity.resolve(_startup_build_id(backend))
         constraint_factory = ConstraintFactory(tokenizer)
         app = Frontend(
             tokenizer,

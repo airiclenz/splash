@@ -14,6 +14,7 @@ from unittest import mock
 
 from dev.tools import package
 from install import paths
+from server import release_identity
 
 
 class PackageTests(unittest.TestCase):
@@ -135,6 +136,37 @@ class PackageTests(unittest.TestCase):
             self.assertNotIn(
                 "catalog_sha256", json.loads((stage / "release.json").read_text())
             )
+
+    def test_packaged_layout_ships_the_release_identity_it_resolves_from(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "source"
+            stage = Path(temporary) / "stage"
+            stage.mkdir()
+            for folder, names in (
+                ("install", package.INSTALL_FILES),
+                ("install/completions", package.COMPLETION_FILES),
+                ("server", package.SERVER_FILES),
+                ("build", ("splash", "splash.metallib")),
+            ):
+                (root / folder).mkdir(parents=True)
+                for name in names:
+                    (root / folder / name).write_text("fixture")
+            (root / "LICENSE").write_text("license")
+            with mock.patch.object(package, "ROOT", root):
+                package.stage_runtime(stage, "9.8.7")
+
+            is_shipped = (stage / "server/release_identity.py").is_file()
+            identity = release_identity.resolve(
+                "engine-build",
+                root=stage,
+                run=mock.Mock(side_effect=AssertionError("git in a release")),
+            )
+
+        self.assertTrue(is_shipped)
+        self.assertEqual(
+            (identity.version, identity.commit, identity.server_header),
+            ("9.8.7", "unknown", "Splash/9.8.7"),
+        )
 
     def test_packaged_paths_keep_user_data_outside_versioned_prefix(self):
         source = Path(paths.__file__).read_text()

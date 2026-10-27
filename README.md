@@ -72,12 +72,18 @@ is configured. `"reasoning_effort": "none"` turns it off, and
 Qwen3.8-27B also takes `low`, `medium`, and `xhigh`. `--max-reasoning-effort`
 lowers any request above it to that effort.
 
-`GET /health` always answers 200 and names the served model, for example
-`{"status":"ok","model":"incoai/Qwen3.8-27B-Splash","ready":true,"memory_pressure":"normal"}`.
+`GET /health` always answers 200 and names the served model and build, for example
+`{"status":"ok","model":"incoai/Qwen3.8-27B-Splash","ready":true,"memory_pressure":"normal","build":{"version":"source","commit":"6d20e86","build_id":"..."}}`.
 `ready` and `memory_pressure` come from the last status snapshot: `false` and
 `null` until the first one arrives. `/health` never waits on the engine; a snapshot a
 second old is refreshed in the background for the next poll. `/ready` answers 503 while
 requests would be refused.
+
+`build` is resolved once at startup: a release reports its version, a source checkout
+reports `source` and its short commit (`-dirty` when tracked files are modified), and
+`build_id` is the native engine's build id. `GET /version` returns the same object,
+`/status` carries it under `build`, and every response has a `Server: Splash/<version>`
+header (`Splash/source-<commit>` in a source checkout).
 
 `/v1/judgments` and `/v1/systemone` provide scoring without generation.
 See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.

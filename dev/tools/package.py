@@ -53,6 +53,7 @@ SERVER_FILES = (
     "thinking.py",
     "schema_validation.py",
     "crash_trace.py",
+    "release_identity.py",
     "chat.html",
 )
 
