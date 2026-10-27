@@ -441,5 +441,38 @@ class StatusMetricsRenderingTests(unittest.TestCase):
         )
 
 
+BUILD_STATUS = {
+    "build": {"version": "source", "commit": "ebbc670-dirty", "build_id": "src-1"}
+}
+
+
+class BuildInfoMetricsTests(unittest.TestCase):
+    def test_build_identity_renders_as_an_info_gauge_after_splash_info(self):
+        lines = prometheus_metrics(BUILD_STATUS).splitlines()
+
+        self.assertEqual(
+            lines[3:6],
+            [
+                "# HELP splash_build_info The build this server runs.",
+                "# TYPE splash_build_info gauge",
+                'splash_build_info{version="source",commit="ebbc670-dirty",'
+                'build_id="src-1"} 1',
+            ],
+        )
+
+    def test_label_values_are_escaped(self):
+        status = {"build": {"version": 'a"b\\c\nd', "commit": "x", "build_id": "y"}}
+
+        self.assertIn(
+            'splash_build_info{version="a\\"b\\\\c\\nd",commit="x",build_id="y"} 1',
+            prometheus_metrics(status),
+        )
+
+    def test_missing_or_partial_build_renders_no_lines(self):
+        for status in ({}, {"build": None}, {"build": {"version": "1.0"}}):
+            with self.subTest(status=status):
+                self.assertNotIn("splash_build_info", prometheus_metrics(status))
+
+
 if __name__ == "__main__":
     unittest.main()

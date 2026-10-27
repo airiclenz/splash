@@ -805,6 +805,68 @@ class LauncherTests(unittest.TestCase):
                 with (runtime / "build.lock").open("a+") as probe:
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
+    def test_packaged_version_prints_the_release_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "release.json").write_text(json.dumps({"version": "1.4.0"}))
+            run = mock.Mock(side_effect=AssertionError("a release runs no git"))
+
+            self.assertEqual(launcher._version(root, run), "Splash 1.4.0")
+
+    def test_source_version_prints_the_commit_and_stamped_build_id(self):
+        def run(command, **kwargs):
+            stdout = "ebbc670\n" if "rev-parse" in command else " M server/metrics.py\n"
+            return subprocess.CompletedProcess(command, 0, stdout=stdout)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stamp = root / launcher.BUILD_IDENTITY_STAMP
+            stamp.parent.mkdir(parents=True)
+            stamp.write_text(json.dumps({"build_id": "src-1", "schema_version": 1}))
+
+            self.assertEqual(
+                launcher._version(root, run),
+                "Splash source (commit ebbc670-dirty, build src-1)",
+            )
+
+    def test_unbuilt_source_version_omits_the_build_id(self):
+        def run(command, **kwargs):
+            stdout = "ebbc670\n" if "rev-parse" in command else ""
+            return subprocess.CompletedProcess(command, 0, stdout=stdout)
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                launcher._version(Path(directory), run),
+                "Splash source (commit ebbc670)",
+            )
+
+    def test_building_the_parser_never_resolves_the_build_identity(self):
+        with mock.patch.object(
+            launcher.release_identity,
+            "resolve",
+            side_effect=AssertionError("resolved while building the parser"),
+        ):
+            arguments = launcher.parse_args(["serve", "--model", MODEL_ID])
+
+        self.assertEqual(arguments.model, MODEL_ID)
+
+    def test_version_flag_prints_the_resolved_identity_and_exits(self):
+        identity = launcher.release_identity.BuildIdentity("source", "ebbc670", "src-1")
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                launcher.release_identity, "resolve", return_value=identity
+            ),
+            mock.patch("sys.stdout", stdout),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            launcher.parse_args(["--version"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(
+            stdout.getvalue(), "Splash source (commit ebbc670, build src-1)\n"
+        )
+
     def test_packaged_serve_never_invokes_make_or_system_python(self):
         with (
             mock.patch.object(launcher.paths, "PACKAGED", True),

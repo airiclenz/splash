@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 
 try:
+    from server import release_identity
     from server.http_security import API_KEY_RULE, validate_api_key
 
     from . import catalog, clients, paths
@@ -24,6 +25,7 @@ except ImportError:  # Executed directly by the source or packaged entry point.
     import paths
 
     sys.path.insert(0, str(paths.ROOT))
+    from server import release_identity
     from server.http_security import API_KEY_RULE, validate_api_key
 
 ROOT = paths.ROOT
@@ -33,6 +35,8 @@ REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 REASONING_LOOP_LIMIT = 24
 MIN_CONTENDED_PREFILL_ROWS = 64
 MAX_CONTENDED_PREFILL_ROWS = 2048
+# The native build id `make` stamps into a source checkout, as agent_real reads it.
+BUILD_IDENTITY_STAMP = "build/engine/build-identity.json"
 BASE_URL = f"http://127.0.0.1:{PORT}"
 
 
@@ -338,12 +342,59 @@ def _parse_max_context(value):
     return result
 
 
-def _version():
-    if not paths.PACKAGED:
-        return "Splash (source checkout)"
-    return "Splash " + str(
-        json.loads((paths.ROOT / "release.json").read_text())["version"]
-    )
+def _version(root=ROOT, run=subprocess.run):
+    """Return the `--version` line: the build identity `GET /version` serves.
+
+    A release prints `Splash <version>`; a source checkout prints
+    `Splash source (commit <commit>, build <build_id>)`. A field that resolves
+    to `unknown` is left out. `run` is the `subprocess.run` the resolver uses.
+    """
+    identity = release_identity.resolve(_stamped_build_id(root), root, run)
+    details = [
+        f"{label} {value}"
+        for label, value in (("commit", identity.commit), ("build", identity.build_id))
+        if value != release_identity.UNKNOWN
+    ]
+    suffix = f" ({', '.join(details)})" if details else ""
+    return f"Splash {identity.version}{suffix}"
+
+
+def _stamped_build_id(root):
+    """Return the native build id `make` stamped under `root`, or `unknown`.
+
+    A release and an unbuilt checkout carry no stamp, so its absence is normal.
+    """
+    stamp = root / BUILD_IDENTITY_STAMP
+    try:
+        build_id = json.loads(stamp.read_text())["build_id"]
+    except FileNotFoundError:
+        return release_identity.UNKNOWN
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"Warning · build identity: {stamp}: {error}", file=sys.stderr)
+        return release_identity.UNKNOWN
+    if isinstance(build_id, str) and build_id:
+        return build_id
+    return release_identity.UNKNOWN
+
+
+class _VersionAction(argparse.Action):
+    """`--version` that resolves the build identity only when it is given.
+
+    Resolving runs git, so it never happens while the parser is built.
+    """
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS):
+        super().__init__(
+            option_strings,
+            dest,
+            default=argparse.SUPPRESS,
+            nargs=0,
+            help="show the build identity and exit",
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(_version(), flush=True)
+        parser.exit()
 
 
 def _parse_served_model_name(value):
@@ -420,7 +471,7 @@ def parse_args(argv=None):
             "including --help, are passed through to the installed agent."
         ),
     )
-    parser.add_argument("--version", action="version", version=_version())
+    parser.add_argument("--version", action=_VersionAction)
     commands = parser.add_subparsers(dest="command", required=True)
     server = commands.add_parser(
         "serve",

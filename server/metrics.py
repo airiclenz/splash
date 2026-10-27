@@ -341,6 +341,36 @@ def _labelled_counter_lines(name, family, status):
     return [f"# HELP {name} {family.help_text}", f"# TYPE {name} counter", *samples]
 
 
+# The `/status` `build` fields `splash_build_info` labels, in label order.
+_BUILD_IDENTITY_FIELDS = ("version", "commit", "build_id")
+
+
+def _label_value(text):
+    """Escape a Prometheus label value: backslash, double quote and newline."""
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _build_info_lines(status):
+    """HELP, TYPE and one `splash_build_info` sample; nothing without `build`.
+
+    Statuses that predate the server's `build` key render exactly as before.
+    """
+    build = status.get("build")
+    if not isinstance(build, dict):
+        return []
+    labels = []
+    for field in _BUILD_IDENTITY_FIELDS:
+        value = build.get(field)
+        if not isinstance(value, str):
+            return []
+        labels.append(f'{field}="{_label_value(value)}"')
+    return [
+        "# HELP splash_build_info The build this server runs.",
+        "# TYPE splash_build_info gauge",
+        f"splash_build_info{{{','.join(labels)}}} 1",
+    ]
+
+
 def prometheus_metrics(status):
     """Render low-cardinality metrics directly from the native status."""
     lines = [
@@ -348,6 +378,7 @@ def prometheus_metrics(status):
         "# TYPE splash_info gauge",
         'splash_info{runtime="native"} 1',
     ]
+    lines.extend(_build_info_lines(status))
     pressure = status.get("memory_pressure")
     for state in MEMORY_PRESSURE_STATES:
         lines.append(

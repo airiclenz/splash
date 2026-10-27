@@ -83,7 +83,10 @@ requests would be refused.
 reports `source` and its short commit (`-dirty` when tracked files are modified), and
 `build_id` is the native engine's build id. `GET /version` returns the same object,
 `/status` carries it under `build`, and every response has a `Server: Splash/<version>`
-header (`Splash/source-<commit>` in a source checkout).
+header (`Splash/source-<commit>` in a source checkout). `/metrics` carries it as
+`splash_build_info{version="...",commit="...",build_id="..."} 1`, and `splash --version`
+prints it without a running server: `Splash <version>` for a release,
+`Splash source (commit <commit>, build <build_id>)` in a source checkout.
 
 `/v1/judgments` and `/v1/systemone` provide scoring without generation.
 See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
