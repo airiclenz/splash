@@ -269,6 +269,44 @@ class AgentReplayChainsTests(unittest.TestCase):
             [[1, 3]],
         )
 
+    def test_chains_titleRequestUnderAnotherSystemField_doesNotJoin(self):
+        for path, system_field, message_field in (
+            (replay.ANTHROPIC_PATH, "system", "messages"),
+            (replay.RESPONSES_PATH, "instructions", "input"),
+        ):
+            with self.subTest(path=path):
+
+                def request(received_unix_ms, system_text, *messages):
+                    return record(
+                        received_unix_ms,
+                        path,
+                        {system_field: system_text, message_field: list(messages)},
+                    )
+
+                self.write_recording(
+                    [
+                        request(1, "You are a coding agent.", user("task")),
+                        request(2, "write a title", user("task")),
+                        request(
+                            3,
+                            "You are a coding agent.",
+                            user("task"),
+                            assistant("call"),
+                            user("out"),
+                        ),
+                    ]
+                )
+
+                chains = self.chains_json()
+
+                self.assertEqual(
+                    [
+                        [turn["received_unix_ms"] for turn in chain["turns"]]
+                        for chain in chains
+                    ],
+                    [[1, 3]],
+                )
+
     def test_chains_sideRequestUnderAnotherSystemMessage_yieldsToTheConversation(self):
         self.write_recording(
             [

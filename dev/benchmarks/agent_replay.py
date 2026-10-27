@@ -6,9 +6,9 @@ writes, one ``{"received_unix_ms", "path", "body"}`` object per accepted
 generation request. `chains` lists its request chains, largest first: runs of
 requests on one path in which each request's message list starts with the
 previous request's full message list, as an agent sends a growing history.
-Two client edits do not break a chain: a rewritten leading system message once
-the conversation holds at least two messages, and a suffix cut from the
-previous request's last message.
+Two client edits do not break a chain: a rewritten system prompt (leading
+system messages and the path's system field) once the conversation holds at
+least two messages, and a suffix cut from the previous request's last message.
 
 ``run --recording <file> --chain <i> --base-url <url> --label <name> --output
 <json>`` replays one chain serially and streaming at temperature 0 against an
@@ -72,9 +72,10 @@ SYSTEM_ROLES = frozenset({"system", "developer"})
 # so a conversation whose first message is a prefix of another's stays apart.
 MINIMUM_UNTRIMMED_MESSAGES = 1
 # Exactly equal conversation messages a request must share with a chain's end
-# before a changed system message is ignored, so a side request (a title
-# request) that resends the first user message under another system message
-# does not take the conversation's place.
+# before a changed system prompt (leading system messages and the path's system
+# field) is ignored, so a side request (a title request) that resends the first
+# user message under another system prompt does not take the conversation's
+# place.
 MINIMUM_SYSTEM_CHANGE_MESSAGES = 2
 NO_DIGEST = b""
 
@@ -176,6 +177,10 @@ class RecordedRequest:
     # --------------------------------------------------------------------------
     # Characters of the request's prompt; 0 when `messages` is None.
     characters: int
+    # --------------------------------------------------------------------------
+    # canonical_digest of the path's SYSTEM_FIELDS value, never the value
+    # itself; NO_DIGEST when `messages` is None or the path has no such field.
+    system_field_digest: bytes
 
 
 # ------------------------------------------------------------------------------
@@ -217,8 +222,15 @@ def parse_line(text: str, line: int) -> RecordedRequest:
         )
     path = path.partition("?")[0]
     messages = message_list(path, body)
-    characters = 0 if messages is None else prompt_characters(path, body, messages)
-    return RecordedRequest(path, received, messages, characters)
+    if messages is None:
+        return RecordedRequest(path, received, None, 0, NO_DIGEST)
+    return RecordedRequest(
+        path,
+        received,
+        messages,
+        prompt_characters(path, body, messages),
+        system_field_digest(path, body),
+    )
 
 
 # ------------------------------------------------------------------------------
@@ -293,11 +305,39 @@ def canonical_digest(value) -> bytes:
 
 
 # ------------------------------------------------------------------------------
+def system_field_digest(path: str, body: dict) -> bytes:
+    """Return canonical_digest of `body`'s system field on `path`.
+
+    NO_DIGEST on a path that sends its system text as a message (chat), so
+    a chat request's system digest stays that of its system messages alone.
+    """
+    system_field = SYSTEM_FIELDS.get(path)
+    if system_field is None:
+        return NO_DIGEST
+    return canonical_digest(body.get(system_field))
+
+
+# ------------------------------------------------------------------------------
+def system_prompt_digest(system: list, field_digest: bytes) -> bytes:
+    """Return the digest of a system prompt: leading messages and system field.
+
+    `system` is the request's leading system messages and `field_digest` its
+    RecordedRequest.system_field_digest; with NO_DIGEST the result is
+    canonical_digest(system).
+    """
+    digest = canonical_digest(system)
+    if field_digest == NO_DIGEST:
+        return digest
+    return hashlib.sha256(digest + field_digest).digest()
+
+
+# ------------------------------------------------------------------------------
 def system_part(system_digest: bytes, untrimmed: int) -> bytes:
     """Return the system digest an index key holds after `untrimmed` equal messages.
 
-    Below MINIMUM_SYSTEM_CHANGE_MESSAGES the system messages must match too;
-    from there on they are ignored.
+    Below MINIMUM_SYSTEM_CHANGE_MESSAGES the system prompts (leading system
+    messages and the path's system field) must match too; from there on they
+    are ignored.
     """
     if untrimmed < MINIMUM_SYSTEM_CHANGE_MESSAGES:
         return system_digest
@@ -363,7 +403,8 @@ class End:
     digest: bytes
     head_digest: bytes
     # --------------------------------------------------------------------------
-    # canonical_digest of the leading system messages.
+    # system_prompt_digest of the leading system messages and the path's
+    # system field.
     system_digest: bytes
     # --------------------------------------------------------------------------
     # The last message when a later request may trim it, else None.
@@ -391,9 +432,10 @@ class ChainEnds:
     """The last message list of each chain that a request can still extend.
 
     Lists are keyed by (path, length, prefix digest) of their conversation
-    messages (leading system messages dropped), plus the system messages'
-    digest while the list is shorter than MINIMUM_SYSTEM_CHANGE_MESSAGES, or
-    always when built with `exact_system`. A list whose last message a later
+    messages (leading system messages dropped), plus the system prompt's
+    digest (leading system messages and the path's system field) while the
+    list is shorter than MINIMUM_SYSTEM_CHANGE_MESSAGES, or always when built
+    with `exact_system`. A list whose last message a later
     request may have trimmed is also kept under the digest of all but that
     message and that message's other fields, in a list sorted by its content,
     so the one candidate a trimmed message can match is found by bisection:
@@ -402,7 +444,7 @@ class ChainEnds:
 
     # --------------------------------------------------------------------------
     def __init__(self, exact_system: bool = False):
-        # Whether the system messages are part of every key.
+        # Whether the system prompt's digest is part of every key.
         self.exact_system = exact_system
         # (path, length, digest of the whole list, system part) -> chain index.
         self.exact: dict[tuple, int] = {}
@@ -427,9 +469,10 @@ class ChainEnds:
 
         The longest previous list wins: one that is a proper prefix of
         `messages`, or one whose last message `messages` trimmed after at least
-        MINIMUM_UNTRIMMED_MESSAGES exactly equal messages. The system messages
-        must match unless MINIMUM_SYSTEM_CHANGE_MESSAGES exactly equal messages
-        precede the match point (and `exact_system` is off). At equal length an
+        MINIMUM_UNTRIMMED_MESSAGES exactly equal messages. The system prompts
+        (leading system messages and the path's system field) must match
+        unless MINIMUM_SYSTEM_CHANGE_MESSAGES exactly equal messages precede
+        the match point (and `exact_system` is off). At equal length an
         exact prefix beats a trimmed one; among trimmed candidates the one
         whose last content sorts first wins. None when no list matches.
         """
@@ -535,22 +578,23 @@ def find_chains(requests) -> list[Chain]:
     """Group (line, RecordedRequest) pairs into chains, largest final first.
 
     A request joins the chain on its path whose last message list is the
-    longest proper prefix of its own, ignoring leading system messages once
+    longest proper prefix of its own, ignoring its system prompt (leading system
+    messages and the path's system field) once
     MINIMUM_SYSTEM_CHANGE_MESSAGES conversation messages match and allowing a
     suffix cut from that list's last message (ChainEnds.match); otherwise it
     starts a chain. When two chains end in the same list, the later one is
     extended.
-    A turn that joined only by ignoring a changed system message stays
+    A turn that joined only by ignoring a changed system prompt stays
     provisional: the chain's end before it is kept, matched only under its own
-    system messages, until the chain continues under those system messages
-    again. A request that continues that earlier end further than any chain
+    system prompt, until the chain continues under that system prompt again. A request that continues that earlier end further than any chain
     end reaches shows the provisional turns were a side request (a summary or
     title request resending the conversation, and any follow-ups to it): every
     turn after the kept end moves to a chain of its own and the request
     extends the conversation.
     Chains of fewer than MINIMUM_CHAIN_TURNS turns are dropped; ties keep
     recording order.
-    Cost: one hash per message, four dict probes per proper prefix (chain
+    Cost: one hash per message (plus, in parse_line, one of the path's
+    system field and here one folding it in, per request), four dict probes per proper prefix (chain
     ends, and ends kept before a system change), and where all but the last
     message match exactly, one hash of that message's other fields and a
     bisection over the chains sharing that history, then one trimmed-message
@@ -560,7 +604,7 @@ def find_chains(requests) -> list[Chain]:
     """
     chains: list[Chain] = []
     ends = ChainEnds()
-    # chain index -> its end before a turn that changed its system messages.
+    # chain index -> its end before a turn that changed its system prompt.
     before_system_change = ChainEnds(exact_system=True)
     # chain index -> its turn count when that end was kept.
     turns_before_system_change: dict[int, int] = {}
@@ -568,7 +612,7 @@ def find_chains(requests) -> list[Chain]:
         if request.messages is None:
             continue
         system, messages = split_system(request.messages)
-        system_digest = canonical_digest(system)
+        system_digest = system_prompt_digest(system, request.system_field_digest)
         digests = prefix_digests(messages)
         found = ends.match(request.path, messages, digests, system_digest)
         kept = before_system_change.match(
