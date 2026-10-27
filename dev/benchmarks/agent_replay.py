@@ -438,7 +438,8 @@ class ChainEnds:
     with `exact_system`. A list whose last message a later
     request may have trimmed is also kept under the digest of all but that
     message and that message's other fields, in a list sorted by its content,
-    so the one candidate a trimmed message can match is found by bisection:
+    so the candidates a trimmed message can match are the contiguous run that
+    bisection finds, and the most recently opened of them is the one checked:
     memory holds one message per chain, never a request body.
     """
 
@@ -449,9 +450,12 @@ class ChainEnds:
         # (path, length, digest of the whole list, system part) -> chain index.
         self.exact: dict[tuple, int] = {}
         # (path, length, digest of all but the last message, system part) ->
-        # {shape of the last message: [(its content, chain index, message)]},
-        # each list sorted by content.
+        # {shape of the last message: [(its content, chain index, message,
+        # open order)]}, each list sorted by content (then chain index, which
+        # is unique within a list, so the message is never compared).
         self.trimmable: dict[tuple, dict[bytes, list[tuple]]] = {}
+        # Number of ends opened so far: the open order of the next one.
+        self.opened = 0
         # chain index -> its End, its key in `exact` and its place in
         # `trimmable` (key, shape, entry), or None if absent.
         self.keys: dict[int, tuple[End, tuple, tuple | None]] = {}
@@ -473,8 +477,10 @@ class ChainEnds:
         (leading system messages and the path's system field) must match
         unless MINIMUM_SYSTEM_CHANGE_MESSAGES exactly equal messages precede
         the match point (and `exact_system` is off). At equal length an
-        exact prefix beats a trimmed one; among trimmed candidates the one
-        whose last content sorts first wins. None when no list matches.
+        exact prefix beats a trimmed one; among trimmed candidates the most
+        recently opened end wins (not the highest chain index: `rename` hands
+        an older end to a new, higher index), as an exact end opened later
+        displaces an earlier one. None when no list matches.
         """
         for length in range(len(messages) - 1, 0, -1):
             chain_index = self.exact.get(
@@ -499,9 +505,16 @@ class ChainEnds:
             entries = shapes.get(message_shape(later))
             if entries is None:
                 continue
-            place = bisect.bisect_left(entries, (later["content"],))
-            if place < len(entries) and is_trimmed(entries[place][2], later):
-                return length, entries[place][1]
+            trimmed = later["content"]
+            latest = None
+            for place in range(bisect.bisect_left(entries, (trimmed,)), len(entries)):
+                entry = entries[place]
+                if not entry[0].startswith(trimmed):
+                    break
+                if latest is None or entry[3] > latest[3]:
+                    latest = entry
+            if latest is not None and is_trimmed(latest[2], later):
+                return length, latest[1]
         return None
 
     # --------------------------------------------------------------------------
@@ -560,7 +573,8 @@ class ChainEnds:
                 self.system_key(end.system_digest, untrimmed),
             )
             shape = message_shape(end.last)
-            entry = (end.last["content"], chain_index, end.last)
+            entry = (end.last["content"], chain_index, end.last, self.opened)
+            self.opened += 1
             entries = self.trimmable.setdefault(key, {}).setdefault(shape, [])
             bisect.insort(entries, entry)
             trimmable_place = (key, shape, entry)
@@ -596,11 +610,13 @@ def find_chains(requests) -> list[Chain]:
     Cost: one hash per message (plus, in parse_line, one of the path's
     system field and here one folding it in, per request), four dict probes per proper prefix (chain
     ends, and ends kept before a system change), and where all but the last
-    message match exactly, one hash of that message's other fields and a
-    bisection over the chains sharing that history, then one trimmed-message
-    check per index. Time stays linear in the recording (times the log of the
-    chains sharing one history) and memory holds at most two messages per open
-    chain, never a request body. A split moves the provisional turns once.
+    message match exactly, one hash of that message's other fields, a
+    bisection over the chains sharing that history and one prefix test per
+    chain end the trimmed text prefixes (to pick the most recently opened),
+    then one trimmed-message check per index; where one candidate matches,
+    that is one is_trimmed check per request. Memory holds at most two
+    messages per open chain, never a request body. A split moves the
+    provisional turns once.
     """
     chains: list[Chain] = []
     ends = ChainEnds()

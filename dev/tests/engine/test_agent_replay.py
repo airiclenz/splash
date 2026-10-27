@@ -425,6 +425,23 @@ class AgentReplayChainsTests(unittest.TestCase):
             ),
         )
 
+    def test_chains_twoChainsTrimmedToTheSameText_joinTheLatestChain(self):
+        self.write_recording(
+            [
+                chat(1, SYSTEM, user("task"), tool("out\nalpha")),
+                chat(2, SYSTEM, user("task"), tool("out\nbeta")),
+                chat(3, SYSTEM, user("task"), tool("out"), user("next")),
+                chat(4, SYSTEM, user("task"), tool("out"), user("more")),
+            ]
+        )
+
+        chains = self.chains_json()
+
+        self.assertEqual(
+            [[turn["received_unix_ms"] for turn in chain["turns"]] for chain in chains],
+            [[1, 4], [2, 3]],
+        )
+
     def test_chains_suffixCutFromLastMessage_staysOneChain(self):
         self.write_recording(
             [
