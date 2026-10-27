@@ -283,7 +283,11 @@ std::string runtimeStatusJson(
       << ",\"resource_resume_state_evictions\":"
       << core.resourceResumeStateEvictions
       << ",\"resource_queued_prefix_evictions\":"
-      << core.resourceQueuedPrefixEvictions << "}"
+      << core.resourceQueuedPrefixEvictions
+      << ",\"resource_queued_depth_losses\":"
+      << core.resourceQueuedDepthLosses
+      << ",\"resource_queued_depth_lost_tokens\":"
+      << core.resourceQueuedDepthLostTokens << "}"
       << ",\"draft_context\":{\"target_prefill_rows\":"
       << executorTelemetry.targetPrefillRows
       << ",\"active_rows\":" << executorTelemetry.draftContextRowsActive

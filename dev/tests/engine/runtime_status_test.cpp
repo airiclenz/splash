@@ -77,6 +77,8 @@ void testCleanRuntimeStatus() {
   engine.resourceResumeRestoredTokens = 4321;
   engine.resourceResumeStateEvictions = 2;
   engine.resourceQueuedPrefixEvictions = 3;
+  engine.resourceQueuedDepthLosses = 2;
+  engine.resourceQueuedDepthLostTokens = 3712;
   engine.coldPrefillTokens = 3000;
   engine.coldPrefillWallMicros = 1'500'000;
   engine.cachedPrefillTokens = 1096;
@@ -310,7 +312,9 @@ void testCleanRuntimeStatus() {
                     "\"resource_decode_replay_tokens\":678,"
                     "\"resource_resume_restored_tokens\":4321,"
                     "\"resource_resume_state_evictions\":2,"
-                    "\"resource_queued_prefix_evictions\":3}") !=
+                    "\"resource_queued_prefix_evictions\":3,"
+                    "\"resource_queued_depth_losses\":2,"
+                    "\"resource_queued_depth_lost_tokens\":3712}") !=
               std::string::npos &&
           json.find("\"waiting_prefix\":3") != std::string::npos &&
           json.find("\"deduplicated_state_publications\":2,"

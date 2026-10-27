@@ -139,6 +139,11 @@ void Engine::submit(EngineRequest value) {
   }
   Request requestState;
   requestState.promptTokens = static_cast<uint32_t>(value.prompt.size());
+  // A state evicted before the first admission lookup still counts as lost
+  // depth. One O(prompt tokens) hash walk per request; no pin, recency touch
+  // or hit.
+  requestState.deepestFoundTokens =
+      cache_.cachedTokens(value.prompt, value.images);
   requestState.replayTokens = requestState.promptTokens;
   requestState.request = std::move(value);
   auto [entry, inserted] = requests_.emplace(id, std::move(requestState));
@@ -529,6 +534,12 @@ bool Engine::admit(Request &active, double now) {
       modelRequest.prompt, active.request.images,
       active.admissionProbe ? &*active.admissionProbe : nullptr);
   active.admissionProbe.reset();
+  // Read before restorable shallowing: only a lost state, never a walk past
+  // a target-only one, makes the restore shallower than the deepest found.
+  uint32_t restoredTokens = lookup.resumeBoundary();
+  if (!resuming)
+    active.deepestFoundTokens =
+        std::max(active.deepestFoundTokens, restoredTokens);
   // Decided before any restore pins the chain: a target-only state too close
   // to its first planned boundary gives way to the next shallower state.
   while (!restorable(active, lookup))
@@ -595,6 +606,7 @@ bool Engine::admit(Request &active, double now) {
                                 config_.resourceWaitTimeoutMilliseconds,
                                 now))) {
         lookup = {};
+        restoredTokens = 0;
         continue;
       }
       break;
@@ -663,6 +675,8 @@ bool Engine::admit(Request &active, double now) {
     // Admitted: the wait, and the queued prefix's protection, end here.
     countEvictedQueuedPrefix(active);
     cache_.unprotectState(std::exchange(active.queuedProtection, {}));
+    if (!resuming)
+      countQueuedDepthLoss(active, restoredTokens);
     if (resuming)
       scheduler_.resumeFromResources(active.request.id, resumeBoundary,
                                      active.replayTokens);
@@ -2168,6 +2182,19 @@ void Engine::countEvictedQueuedPrefix(Request &active) noexcept {
     return;
   active.queuedPrefixLossCounted = true;
   ++counters_.resourceQueuedPrefixEvictions;
+}
+
+// ============================================================================
+// Counts an unstarted request admitted at restoredTokens below the deepest
+// state found for it since submit, adding the gap to the lost tokens. O(1);
+// called once, at the request's first admission.
+void Engine::countQueuedDepthLoss(const Request &active,
+                                  uint32_t restoredTokens) noexcept {
+  if (restoredTokens >= active.deepestFoundTokens)
+    return;
+  ++counters_.resourceQueuedDepthLosses;
+  counters_.resourceQueuedDepthLostTokens +=
+      active.deepestFoundTokens - restoredTokens;
 }
 
 void Engine::sweepTerminal() {

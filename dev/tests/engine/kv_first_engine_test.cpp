@@ -4335,6 +4335,10 @@ void testQueuedRequestAdmittedColdDropsItsProtection() {
   require(fixture.events.starts.back().first == EngineCacheStatus::Miss &&
               fixture.resources.cachedTokens(fixture.prompt) == 64,
           "the queued request did not start cold beside its found state");
+  // The cold fallback restores nothing: the found depth counts as lost.
+  require(fixture.engine.snapshot().resourceQueuedDepthLosses == 1 &&
+              fixture.engine.snapshot().resourceQueuedDepthLostTokens == 64,
+          "a cold fallback did not count the depth it gave up");
 
   static_cast<void>(fixture.engine.reclaimMemory(
       warningReclaim(std::numeric_limits<uint64_t>::max())));
@@ -4367,6 +4371,83 @@ void testGrowthReclaimTakesAQueuedPrefixRatherThanStall() {
   require(fixture.events.completedCount == 2 &&
               fixture.events.failedCount == 0,
           "the queued request did not complete after growth reclaim");
+}
+
+// Request 301 loses its state at 64, finds and protects one at 32 on a
+// denied retry, then finds one at 64 again on a second denied retry before
+// Critical reclaim takes both: admitted cold, it counts one loss of the 64
+// tokens its deepest lookup found.
+void testQueuedRequestCountsTheDeepestDepthItLost() {
+  QueuedPrefixFixture fixture;
+  const uint32_t attempts = fixture.executor.beginAttempts;
+  constexpr uint64_t everything = std::numeric_limits<uint64_t>::max();
+  static_cast<void>(fixture.resources.reclaimCache(everything, true));
+  cachePrefix(fixture.resources, 999, std::span(fixture.prompt).first(32), 32);
+  double now = 2;
+  for (; now < 1000 && fixture.executor.beginAttempts == attempts; ++now)
+    static_cast<void>(fixture.engine.tick(now));
+  cachePrefix(fixture.resources, 998, std::span(fixture.prompt).first(64), 64);
+  for (; now < 1000 && fixture.executor.beginAttempts == attempts + 1; ++now)
+    static_cast<void>(fixture.engine.tick(now));
+  require(fixture.executor.beginAttempts == attempts + 2 &&
+              fixture.engine.resourceWaitSnapshot(now).memory == 1 &&
+              fixture.resources.cachedTokens(fixture.prompt) == 64,
+          "the queued request was not denied again beside a state at 64");
+
+  static_cast<void>(fixture.resources.reclaimCache(everything, true));
+  fixture.blocked = false;
+  for (; now < 2000 && fixture.events.starts.size() < 2; ++now)
+    static_cast<void>(fixture.engine.tick(now));
+
+  require(fixture.events.starts.size() == 2 &&
+              fixture.events.starts.back().second == 0 &&
+              fixture.engine.snapshot().resourceQueuedDepthLosses == 1 &&
+              fixture.engine.snapshot().resourceQueuedDepthLostTokens == 64,
+          "a queued request did not count the deepest depth it lost");
+}
+
+// Request 302 is submitted while the state at 64 is cached and loses it
+// before any admission lookup runs: the submit probe's depth counts.
+void testStateLostBeforeTheFirstLookupCountsAsLostDepth() {
+  QueuedPrefixFixture fixture;
+  fixture.engine.cancel(301);
+  fixture.engine.submit(request(302, fixture.prompt));
+
+  static_cast<void>(fixture.resources.reclaimCache(
+      std::numeric_limits<uint64_t>::max(), true));
+  fixture.blocked = false;
+  fixture.admit();
+
+  require(fixture.events.starts.back().first == EngineCacheStatus::Miss &&
+              fixture.engine.snapshot().resourceQueuedDepthLosses == 1 &&
+              fixture.engine.snapshot().resourceQueuedDepthLostTokens == 64,
+          "a state lost before the first admission lookup was not counted");
+}
+
+void testQueuedRequestRestoringItsFoundStateLosesNoDepth() {
+  QueuedPrefixFixture fixture;
+
+  fixture.blocked = false;
+  fixture.admit();
+
+  require(fixture.events.starts.back().second == 64 &&
+              fixture.engine.snapshot().resourceQueuedDepthLosses == 0 &&
+              fixture.engine.snapshot().resourceQueuedDepthLostTokens == 0,
+          "a queued request restoring its found state counted lost depth");
+}
+
+// Admission walks past the target-only state at 64 to the full one at 32
+// with nothing evicted: restorable shallowing is no lost depth.
+void testShallowedRestoreLosesNoDepth() {
+  TargetOnlyFixture fixture;
+
+  fixture.engine.submit(request(3, fixture.extended(200)));
+  runUntilIdle(fixture.engine);
+
+  require(fixture.executor.restoredLengths.at(3) == 32 &&
+              fixture.engine.snapshot().resourceQueuedDepthLosses == 0 &&
+              fixture.engine.snapshot().resourceQueuedDepthLostTokens == 0,
+          "restorable shallowing counted as lost depth");
 }
 
 // A sole request is denied by the engine budget while its lookup pins the
@@ -6987,6 +7068,10 @@ int main() {
     testQueuedPrefixLostTwiceAcrossARetriedWaitCountsOnce();
     testQueuedRequestAdmittedColdDropsItsProtection();
     testGrowthReclaimTakesAQueuedPrefixRatherThanStall();
+    testQueuedRequestCountsTheDeepestDepthItLost();
+    testStateLostBeforeTheFirstLookupCountsAsLostDepth();
+    testQueuedRequestRestoringItsFoundStateLosesNoDepth();
+    testShallowedRestoreLosesNoDepth();
     testGrowthReclaimSparesAFoundStateForCachedKv();
     testQueuedRequestKeepsItsFoundStateWhileAPeerIsResident();
     testQueuedRequestOutlivedByAPeerAdmitsCold();

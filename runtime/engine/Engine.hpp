@@ -119,6 +119,12 @@ struct EngineSnapshot final {
   // evicted or retired before the request was admitted or ended, each
   // counted once.
   uint64_t resourceQueuedPrefixEvictions = 0;
+  // Unstarted requests admitted with a restore boundary below the deepest
+  // state found for them since submit (the submit probe and every admission
+  // lookup, each read before restorable shallowing), and the sum of those
+  // gaps in tokens. A cold fallback admits at 0.
+  uint64_t resourceQueuedDepthLosses = 0;
+  uint64_t resourceQueuedDepthLostTokens = 0;
   // Counted prefill rows split by their lane's start depth at its current
   // admission: 0 is cold, deeper is a cached tail (a resume counts by its
   // restore depth). Each lane takes wall x lane rows / batch rows of its
@@ -322,6 +328,10 @@ private:
     // Set once this request's queued prefix loss is counted, so a retried
     // wait that loses a re-protected shallower state does not count again.
     bool queuedPrefixLossCounted = false;
+    // The deepest cached state found for this request before its first
+    // admission: the submit probe, then every admission lookup before
+    // restorable shallowing. Admission compares it with its restore depth.
+    uint32_t deepestFoundTokens = 0;
     // The scheduler owns the terminal phase; this flag records that the
     // corresponding event was emitted and model/resource ownership ended.
     bool finalized = false;
@@ -454,6 +464,8 @@ private:
   void release(Request &request);
   void countEvictedResumeState(const Request &request) noexcept;
   void countEvictedQueuedPrefix(Request &request) noexcept;
+  void countQueuedDepthLoss(const Request &request,
+                            uint32_t restoredTokens) noexcept;
   void sweepTerminal();
 
   EngineConfig config_;
