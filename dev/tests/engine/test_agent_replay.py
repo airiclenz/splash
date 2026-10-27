@@ -1018,6 +1018,33 @@ class AgentReplayRunTests(unittest.TestCase):
 
         self.assertEqual((code, "out of range" in stderr, stub.posts), (1, True, []))
 
+    def test_run_turnLimit_replaysOnlyTheLeadingTurnsAsRecorded(self):
+        self.write_recording(
+            growing(replay.CHAT_PATH, {"tools": [CHAT_TOOL]}, "a", "c", "e")
+        )
+        with open(self.recording, encoding="utf-8") as stream:
+            recorded = [json.loads(line)["body"]["messages"] for line in stream]
+
+        document, bodies = self.replay_against([turn_script(100, 0)], "--turns", "2")
+
+        self.assertEqual(
+            (
+                [body["messages"] for body in bodies],
+                len(document["turns"]),
+                document["turn_limit"],
+                document["chain"]["turn_count"],
+            ),
+            (recorded[:2], 2, 2, 3),
+        )
+
+    def test_run_turnLimitBeyondTheChain_failsBeforeSending(self):
+        self.write_recording(growing(replay.CHAT_PATH, {}, "a", "c"))
+
+        with ReplayStubServer([turn_script(100, 0)]) as stub:
+            code, _, stderr, _ = self.run_replay(stub, "head", "--turns", "3")
+
+        self.assertEqual((code, "exceeds" in stderr, stub.posts), (1, True, []))
+
     def test_summarize_twoLabels_printsBothWithPerTurnAndTotalRows(self):
         self.write_recording(growing(replay.CHAT_PATH, {}, "a", "c"))
         outputs = []
@@ -1071,6 +1098,37 @@ class AgentReplayRunTests(unittest.TestCase):
             code = replay.main(["summarize", first, second])
 
         self.assertEqual((code, "different chains" in stderr.getvalue()), (1, True))
+
+    def test_summarize_runsOfDifferentTurnCounts_fails(self):
+        self.write_recording(growing(replay.CHAT_PATH, {}, "a", "c", "e"))
+        with ReplayStubServer([turn_script(100, 0)]) as stub:
+            whole = self.run_replay(stub)[3]
+            leading = self.run_replay(stub, "head", "--turns", "2")[3]
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            code = replay.main(["summarize", whole, leading])
+
+        self.assertEqual(
+            (code, "different turn counts" in stderr.getvalue()), (1, True)
+        )
+
+    def test_summarize_turnLimitedRuns_nameTheReplayedTurns(self):
+        self.write_recording(growing(replay.CHAT_PATH, {}, "a", "c", "e"))
+        with ReplayStubServer([turn_script(100, 0)]) as stub:
+            outputs = [
+                self.run_replay(stub, label, "--turns", "2")[3]
+                for label in ("cutover", "head")
+            ]
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            code = replay.main(["summarize", *outputs])
+
+        self.assertEqual(
+            (code, first_line(stdout.getvalue())),
+            (0, "cutover: 1 run(s), turns 2 of 3, max tokens None"),
+        )
 
 
 if __name__ == "__main__":

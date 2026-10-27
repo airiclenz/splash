@@ -895,15 +895,31 @@ def selected_chain(recording: str, index: int) -> Chain:
 
 
 # ------------------------------------------------------------------------------
+def leading_turns(chain: Chain, turn_limit: int | None) -> Chain:
+    """Return `chain` cut to its first `turn_limit` turns (all when None).
+
+    Raises ProbeError when the chain has fewer turns than the limit.
+    """
+    if turn_limit is None:
+        return chain
+    if turn_limit > len(chain.turns):
+        raise ProbeError(
+            f"--turns {turn_limit} exceeds the chain's {len(chain.turns)} turns"
+        )
+    return Chain(chain.path, chain.turns[:turn_limit])
+
+
+# ------------------------------------------------------------------------------
 def run_replay(args) -> int:
     """Replay one chain, write its run JSON, print its summary; return 0."""
     chain = selected_chain(args.recording, args.chain)
+    replayed = leading_turns(chain, args.turns)
     client = ProbeClient(args.base_url, args.api_key)
     nonce = f"{NONCE_LABEL} {uuid.uuid4().hex}"
     records = replay_chain(
         client,
-        chain,
-        chain_bodies(args.recording, chain),
+        replayed,
+        chain_bodies(args.recording, replayed),
         nonce,
         args.max_tokens,
         args.request_timeout,
@@ -917,6 +933,7 @@ def run_replay(args) -> int:
         "chain": identity,
         "nonce": nonce,
         "max_tokens": args.max_tokens,
+        "turn_limit": args.turns,
         "first_turn_cold": records[0]["cached_tokens"] == 0,
         "turns": records,
     }
@@ -1010,12 +1027,15 @@ def summary_row(name: str, records: list[dict]) -> list[str]:
 def format_label(label: str, runs: list[dict]) -> str:
     """Render one label's runs: per-turn medians, then the median chain total."""
     caps = ", ".join(sorted({str(run.get("max_tokens")) for run in runs}))
+    replayed = len(runs[0]["turns"])
+    chain_turns = runs[0]["chain"].get("turn_count")
+    scope = f", turns {replayed} of {chain_turns}" if replayed != chain_turns else ""
     rows = [["turn", *(name for _, name in SUMMARY_COLUMNS), "prefix lost"]]
     for index in range(max(len(run["turns"]) for run in runs)):
         turns = [run["turns"][index] for run in runs if index < len(run["turns"])]
         rows.append(summary_row(str(index + 1), turns))
     rows.append(summary_row("total", [chain_totals(run["turns"]) for run in runs]))
-    return f"{label}: {len(runs)} run(s), max tokens {caps}\n{format_grid(rows)}"
+    return f"{label}: {len(runs)} run(s){scope}, max tokens {caps}\n{format_grid(rows)}"
 
 
 # ------------------------------------------------------------------------------
@@ -1050,8 +1070,9 @@ def load_run(path: str) -> dict:
 def summarize_runs(args) -> int:
     """Print the runs' per-label summary; return the exit code.
 
-    Raises ProbeError when the runs replay different chains, since their
-    turns would then not compare at the same depth.
+    Raises ProbeError when the runs replay different chains or different
+    numbers of turns, since their totals would then not compare at the same
+    depth.
     """
     documents = [load_run(path) for path in args.runs]
     identities = {
@@ -1065,6 +1086,11 @@ def summarize_runs(args) -> int:
     if len(identities) > 1:
         raise ProbeError(
             f"the runs replay different chains: {sorted(map(str, identities))}"
+        )
+    turn_counts = {len(document["turns"]) for document in documents}
+    if len(turn_counts) > 1:
+        raise ProbeError(
+            f"the runs replay different turn counts: {sorted(turn_counts)}"
         )
     print(format_summary(documents))
     return 0
@@ -1095,6 +1121,11 @@ def parse_args(argv=None):
         help="cap each turn's completion limit (default: as recorded)",
     )
     run.add_argument(
+        "--turns",
+        type=int,
+        help="replay only turns 1..N of the chain (default: every turn)",
+    )
+    run.add_argument(
         "--api-key",
         default=os.environ.get(API_KEY_ENVIRONMENT),
         help=f"Bearer key (default: ${API_KEY_ENVIRONMENT})",
@@ -1108,6 +1139,8 @@ def parse_args(argv=None):
     if args.command == "run":
         if args.max_tokens is not None and args.max_tokens < 1:
             parser.error("--max-tokens must be positive")
+        if args.turns is not None and args.turns < 1:
+            parser.error("--turns must be positive")
         if args.request_timeout <= 0:
             parser.error("--request-timeout must be positive")
         if not args.base_url.startswith(("http://", "https://")):

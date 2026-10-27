@@ -536,15 +536,16 @@ conversation messages, or a suffix cut from the previous request's last
 message, does not break it) with its turns, final prompt
 size (messages, system field and tools) and estimated tokens, largest first.
 `run` streams the chain's turns serially at temperature 0, every other
-field as recorded and `--max-tokens` capping the completion limit; the recorded
-next turn is sent whatever the model replied. A per-run nonce line leads each
+field as recorded and `--max-tokens` capping the completion limit; `--turns N`
+replays only turns 1..N. The recorded next turn is sent whatever the model
+replied. A per-run nonce line leads each
 turn's rendered prompt, so turn 1 is cold and runs never share cache. Per turn
 it writes prompt, cached and completion tokens, client TTFT, prefill wall and
 uncached-tail prefill tok/s, decode tok/s, drafted and accepted tokens, and
 `prefix_lost` (cached tokens more than 1024 below the previous turn's prompt).
 It fails when `/status` counts another admission during a turn. `summarize`
 prints per label the per-turn medians and whole-chain totals, refusing runs of
-different chains.
+different chains or of different turn counts.
 
 For slow tool-bearing requests, the `latency` section of `/status` separates
 preparation, tokenization, grammar preparation, native queueing and TTFT. Grammar preparation
