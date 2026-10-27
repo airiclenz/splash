@@ -1,6 +1,7 @@
 #include "TestFakeHost.hpp"
 #include "engine/MemoryGovernor.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -742,6 +743,102 @@ void testQueryHostAvailableMemory_withSampler_reportsWeightResidency() {
           "a host sample without a sampler reported weight bytes");
 }
 
+// A scripted host for sampleHostAvailableMemory: each page read and each
+// weight sample takes the next entry of its script, repeating the last one
+// once the script runs out, and counts the calls.
+struct ScriptedHostReads final {
+  std::vector<HostMemoryPages> pages;
+  std::vector<WeightResidency> residencies;
+  std::size_t pageReads = 0;
+  std::size_t weightSamples = 0;
+
+  std::optional<HostMemorySample> sample() {
+    return sampleHostAvailableMemory(
+        [this] {
+          const HostMemoryPages &read =
+              pages[std::min(pageReads, pages.size() - 1)];
+          ++pageReads;
+          return std::optional<HostPageReading>{
+              HostPageReading{read, kHostPageBytes}};
+        },
+        [this] {
+          const WeightResidency residency = residencies[std::min(
+              weightSamples, residencies.size() - 1)];
+          ++weightSamples;
+          return residency;
+        },
+        kHostPhysicalBytes);
+  }
+};
+
+constexpr WeightResidency kHotWeightsUnwired{kHotWeightBytes, 0};
+constexpr WeightResidency kHotWeightsWired{kHotWeightBytes, kHotWeightBytes};
+
+void testSampleHostAvailableMemory_steadyWeights_takesOnePageRead() {
+  ScriptedHostReads host{.pages = {kIdleWiredPages},
+                         .residencies = {kHotWeightsWired}};
+
+  const std::optional<HostMemorySample> sample = host.sample();
+
+  require(sample && sample->availableBytes == kIdleHonestAvailableBytes,
+          "a steady sample did not read the honest estimate");
+  require(host.pageReads == 1 && host.weightSamples == 2,
+          "a steady sample spent more than one page read and two samples");
+}
+
+// The live skew: the page read sees the weights pageable, the sample after it
+// sees them wired, and one unbracketed reading credited them as available.
+void testSampleHostAvailableMemory_weightsWireBetweenReads_readsUnskewed() {
+  ScriptedHostReads host{
+      .pages = {kIdleUnwiredPages, kIdleWiredPages},
+      .residencies = {kHotWeightsUnwired, kHotWeightsWired}};
+  const uint64_t skewed = measuredEstimate(kIdleUnwiredPages, kHotWeightsWired);
+
+  const std::optional<HostMemorySample> sample = host.sample();
+
+  require(skewed == kIdleRawAvailableBytes,
+          "the skewed pairing no longer reproduces the live high reading");
+  require(sample && sample->availableBytes == kIdleHonestAvailableBytes &&
+              sample->weightWiredBytes == kHotWeightBytes,
+          "weights wiring between reads skewed the estimate");
+  require(host.pageReads == 2 && host.weightSamples == 3,
+          "a disagreeing bracket was not retried exactly once");
+}
+
+// The weights never settle: after two retries the last bracket charges the
+// residency that reads lower, never the unwired pages credited as wired.
+void testSampleHostAvailableMemory_weightsKeepChanging_readsLowerAfterTwoRetries() {
+  ScriptedHostReads host{
+      .pages = {kIdleUnwiredPages},
+      .residencies = {kHotWeightsUnwired, kHotWeightsWired,
+                      kHotWeightsUnwired, kHotWeightsWired}};
+
+  const std::optional<HostMemorySample> sample = host.sample();
+
+  require(sample && sample->availableBytes == kIdleHonestAvailableBytes &&
+              sample->weightWiredBytes == 0,
+          "an unsettled bracket did not charge the lower estimate");
+  require(host.pageReads ==
+                  static_cast<std::size_t>(kHostPageReadAttempts) &&
+              host.weightSamples == host.pageReads + 1,
+          "an unsettled bracket was not retried exactly twice");
+}
+
+void testSampleHostAvailableMemory_pageReadFails_readsNothing() {
+  std::size_t weightSamples = 0;
+
+  const std::optional<HostMemorySample> sample = sampleHostAvailableMemory(
+      [] { return std::optional<HostPageReading>{}; },
+      [&weightSamples] {
+        ++weightSamples;
+        return kHotWeightsWired;
+      },
+      kHostPhysicalBytes);
+
+  require(!sample && weightSamples == 1,
+          "a refused page read still produced a host sample");
+}
+
 } // namespace
 
 int main() {
@@ -772,6 +869,10 @@ int main() {
     testWeightWiringSampler_largeRangeHalfLocked_readsAboutHalf();
     testWeightWiringSampler_noRanges_readsNothing();
     testQueryHostAvailableMemory_withSampler_reportsWeightResidency();
+    testSampleHostAvailableMemory_steadyWeights_takesOnePageRead();
+    testSampleHostAvailableMemory_weightsWireBetweenReads_readsUnskewed();
+    testSampleHostAvailableMemory_weightsKeepChanging_readsLowerAfterTwoRetries();
+    testSampleHostAvailableMemory_pageReadFails_readsNothing();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

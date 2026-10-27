@@ -56,6 +56,26 @@ uint64_t weightSampleCount(uint64_t bytes, uint64_t totalBytes,
   return std::clamp<uint64_t>(share, 1, rangePages);
 }
 
+// One host_statistics64 reading; empty when the host refuses it.
+std::optional<HostPageReading> readHostPages(mach_port_t host,
+                                             uint64_t pageSize) noexcept {
+  vm_statistics64_data_t statistics{};
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  if (host_statistics64(host, HOST_VM_INFO64,
+                        reinterpret_cast<host_info64_t>(&statistics),
+                        &count) != KERN_SUCCESS)
+    return std::nullopt;
+  return HostPageReading{
+      .pages = {.active = statistics.active_count,
+                .inactive = statistics.inactive_count,
+                .speculative = statistics.speculative_count,
+                .wired = statistics.wire_count,
+                .compressor = statistics.compressor_page_count,
+                .fileBacked = statistics.external_page_count,
+                .purgeable = statistics.purgeable_count},
+      .pageSize = pageSize};
+}
+
 } // namespace
 
 uint64_t estimateHostAvailableMemory(const HostMemoryPages &statistics,
@@ -121,6 +141,26 @@ WeightResidency WeightWiringSampler::sample() const noexcept {
   return {bytes_, wiredBytes};
 }
 
+HostMemorySample bracketedHostSample(const HostPageReading &reading,
+                                     uint64_t physicalMemoryBytes,
+                                     WeightResidency before,
+                                     WeightResidency after) noexcept {
+  const uint64_t beforeBytes = estimateHostAvailableMemory(
+      reading.pages, reading.pageSize, physicalMemoryBytes, before);
+  const uint64_t afterBytes = estimateHostAvailableMemory(
+      reading.pages, reading.pageSize, physicalMemoryBytes, after);
+  const bool chargesBefore = beforeBytes < afterBytes;
+  const WeightResidency residency = chargesBefore ? before : after;
+  // Mach page counts are 32-bit, so their byte sizes cannot overflow.
+  return HostMemorySample{
+      .availableBytes = chargesBefore ? beforeBytes : afterBytes,
+      .inactiveBytes = reading.pages.inactive * reading.pageSize,
+      .wiredBytes = reading.pages.wired * reading.pageSize,
+      .compressorBytes = reading.pages.compressor * reading.pageSize,
+      .weightBytes = residency.bytes,
+      .weightWiredBytes = residency.wiredBytes};
+}
+
 std::optional<HostMemorySample>
 queryHostAvailableMemory(const WeightWiringSampler *weights) noexcept {
   // Physical capacity is immutable; don't add a sysctl to every allocation.
@@ -131,38 +171,19 @@ queryHostAvailableMemory(const WeightWiringSampler *weights) noexcept {
                    size == sizeof(bytes) ? bytes : uint64_t{0};
   }();
   if (!physicalMemoryBytes) return std::nullopt;
-  mach_port_t host = mach_host_self();
+  const mach_port_t host = mach_host_self();
   vm_size_t pageSize = 0;
-  vm_statistics64_data_t statistics{};
-  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-  kern_return_t pageResult = host_page_size(host, &pageSize);
-  kern_return_t statisticsResult = pageResult == KERN_SUCCESS
-      ? host_statistics64(host, HOST_VM_INFO64,
-                          reinterpret_cast<host_info64_t>(&statistics),
-                          &count)
-      : pageResult;
+  std::optional<HostMemorySample> sample;
+  if (host_page_size(host, &pageSize) == KERN_SUCCESS && pageSize) {
+    sample = sampleHostAvailableMemory(
+        [host, pageSize] { return readHostPages(host, pageSize); },
+        [weights] {
+          return weights ? weights->sample() : WeightResidency{};
+        },
+        physicalMemoryBytes);
+  }
   mach_port_deallocate(mach_task_self(), host);
-  if (statisticsResult != KERN_SUCCESS || !pageSize) return std::nullopt;
-
-  const HostMemoryPages pages{
-      .active = statistics.active_count,
-      .inactive = statistics.inactive_count,
-      .speculative = statistics.speculative_count,
-      .wired = statistics.wire_count,
-      .compressor = statistics.compressor_page_count,
-      .fileBacked = statistics.external_page_count,
-      .purgeable = statistics.purgeable_count};
-  const WeightResidency residency = weights ? weights->sample()
-                                            : WeightResidency{};
-  // Mach page counts are 32-bit, so their byte sizes cannot overflow.
-  return HostMemorySample{
-      .availableBytes = estimateHostAvailableMemory(
-          pages, pageSize, physicalMemoryBytes, residency),
-      .inactiveBytes = pages.inactive * pageSize,
-      .wiredBytes = pages.wired * pageSize,
-      .compressorBytes = pages.compressor * pageSize,
-      .weightBytes = residency.bytes,
-      .weightWiredBytes = residency.wiredBytes};
+  return sample;
 }
 
 std::optional<MemoryPressure> querySystemMemoryPressure() noexcept {

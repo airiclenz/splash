@@ -94,9 +94,55 @@ struct HostMemorySample {
   uint64_t weightWiredBytes = 0;
 };
 
-// One host_statistics64 call, plus one weights->sample() when weights is
-// given (the serving governor, once the model is mapped); empty when the host
-// cannot be measured.
+// One host page reading: the page counts and the host page size in bytes.
+struct HostPageReading {
+  HostMemoryPages pages;
+  uint64_t pageSize = 0;
+};
+
+// The page reads one host sample may spend: the first, then at most two
+// retries while the weight samples around a read disagree.
+inline constexpr int kHostPageReadAttempts = 3;
+
+// The sample for one page reading taken between two weight samples. When the
+// weights wired or unwired around the read, the page counts may match either
+// residency, so the one that gives the lower available estimate is charged:
+// a skewed reading never reads high.
+[[nodiscard]] HostMemorySample
+bracketedHostSample(const HostPageReading &reading,
+                    uint64_t physicalMemoryBytes, WeightResidency before,
+                    WeightResidency after) noexcept;
+
+// Samples the weights before and after each page read. While the two samples
+// disagree the read is retried, the later sample bracketing the next read, up
+// to kHostPageReadAttempts reads; the last pair is then resolved by
+// bracketedHostSample. A steady residency spends one read and two samples.
+// readPages returns std::optional<HostPageReading>, empty when the host
+// cannot be measured; sampleWeights returns WeightResidency. Both must not
+// throw.
+template <typename ReadPages, typename SampleWeights>
+[[nodiscard]] std::optional<HostMemorySample>
+sampleHostAvailableMemory(ReadPages &&readPages, SampleWeights &&sampleWeights,
+                          uint64_t physicalMemoryBytes) noexcept {
+  WeightResidency before = sampleWeights();
+  for (int attempt = 1;; ++attempt) {
+    const std::optional<HostPageReading> reading = readPages();
+    if (!reading)
+      return std::nullopt;
+    const WeightResidency after = sampleWeights();
+    const bool isSteady = after.bytes == before.bytes &&
+                          after.wiredBytes == before.wiredBytes;
+    if (isSteady || attempt == kHostPageReadAttempts)
+      return bracketedHostSample(*reading, physicalMemoryBytes, before, after);
+    before = after;
+  }
+}
+
+// Up to kHostPageReadAttempts host_statistics64 calls, bracketed by 2-4
+// weights->sample() calls when weights is given (the serving governor, once
+// the model is mapped); empty when the host cannot be measured.
+// MemoryGovernor::tryReserve runs it under the governor mutex, so a retry
+// holds that mutex for one more read and sample.
 [[nodiscard]] std::optional<HostMemorySample>
 queryHostAvailableMemory(const WeightWiringSampler *weights = nullptr) noexcept;
 
