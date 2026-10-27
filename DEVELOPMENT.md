@@ -533,7 +533,11 @@ then list its conversations and replay one against an idle server:
 `chains` lists each chain (a run of requests on one path, each extending the
 previous history; a leading system message rewritten after at least two equal
 conversation messages, or a suffix cut from the previous request's last
-message, does not break it) with its turns, final prompt
+message, does not break it; a request under another system message that a
+later request skips, continuing the history before it under the unchanged
+system message, is a side request and starts its own chain with any
+follow-ups to it) with its turns,
+final prompt
 size (messages, system field and tools) and estimated tokens, largest first.
 `run` streams the chain's turns serially at temperature 0, every other
 field as recorded and `--max-tokens` capping the completion limit; `--turns N`

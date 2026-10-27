@@ -269,6 +269,80 @@ class AgentReplayChainsTests(unittest.TestCase):
             [[1, 3]],
         )
 
+    def test_chains_sideRequestUnderAnotherSystemMessage_yieldsToTheConversation(self):
+        self.write_recording(
+            [
+                chat(1, SYSTEM, user("task")),
+                chat(2, SYSTEM, user("task"), assistant("call"), tool("out")),
+                chat(
+                    3,
+                    system("summarize"),
+                    user("task"),
+                    assistant("call"),
+                    tool("out"),
+                    user("summarize this"),
+                ),
+                chat(
+                    4,
+                    SYSTEM,
+                    user("task"),
+                    assistant("call"),
+                    tool("out"),
+                    assistant("done"),
+                    user("next"),
+                ),
+            ]
+        )
+
+        chains = self.chains_json()
+
+        self.assertEqual(
+            [[turn["received_unix_ms"] for turn in chain["turns"]] for chain in chains],
+            [[1, 2, 4]],
+        )
+
+    def test_chains_sideRequestWithAFollowUp_bothYieldToTheConversation(self):
+        self.write_recording(
+            [
+                chat(1, SYSTEM, user("task")),
+                chat(2, SYSTEM, user("task"), assistant("call"), tool("out")),
+                chat(
+                    3,
+                    system("summarize"),
+                    user("task"),
+                    assistant("call"),
+                    tool("out"),
+                    user("summarize this"),
+                ),
+                chat(
+                    4,
+                    system("summarize"),
+                    user("task"),
+                    assistant("call"),
+                    tool("out"),
+                    user("summarize this"),
+                    assistant("summary"),
+                    user("shorter"),
+                ),
+                chat(
+                    5,
+                    SYSTEM,
+                    user("task"),
+                    assistant("call"),
+                    tool("out"),
+                    assistant("done"),
+                    user("next"),
+                ),
+            ]
+        )
+
+        chains = self.chains_json()
+
+        self.assertEqual(
+            [[turn["received_unix_ms"] for turn in chain["turns"]] for chain in chains],
+            [[3, 4], [1, 2, 5]],
+        )
+
     def test_chains_manyChainsSharingAHistory_checkOneTrimmedCandidatePerRequest(self):
         conversations = 300
         openings = [
