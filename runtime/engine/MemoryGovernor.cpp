@@ -472,13 +472,16 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // OS warn means the kernel is already compressing and swapping, whatever
   // the governor's own headroom reads: each pass sheds at least one extent
   // of cache that no lane, waiting request or conversation end protects.
-  if (snapshot.systemPressure == MemoryPressure::Warning)
-    desired = std::max(desired, osWarningPassBytes_);
+  // The floor travels apart from the headroom target, so a runway extent
+  // the pass keeps mapped cannot cancel it.
+  const uint64_t osWarningFloor =
+      snapshot.systemPressure == MemoryPressure::Warning ? osWarningPassBytes_
+                                                         : 0;
   // Recovering the last stretch to the recovery margin is worth far less
   // than the resume point it would otherwise discard, so a pass with nothing
   // waiting keeps that publication and takes the rest. A waiting request
   // outranks it.
-  return {true, false, desired, !requestWaiting};
+  return {true, false, desired, !requestWaiting, osWarningFloor};
 }
 
 } // namespace splash::engine

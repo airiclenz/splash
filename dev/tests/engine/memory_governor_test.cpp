@@ -352,6 +352,35 @@ void testSystemPressureReadsWithoutSampling() {
   require(host.samples == 1, "system pressure forced a host sample");
 }
 
+// OS warn adds a floor of one KV extent that travels apart from the
+// headroom target, so a kept runway extent offsets only the target.
+void testPolicy_osWarning_carriesFloorApartFromHeadroomTarget() {
+  constexpr uint64_t kFloorBytes = 64 * 1024 * 1024;
+  MemoryPressurePolicy policy(kFloorBytes);
+  MemoryGovernorSnapshot snapshot;
+  snapshot.pressure = MemoryPressure::Warning;
+  snapshot.systemPressure = MemoryPressure::Warning;
+  snapshot.hostMeasurementValid = true;
+  snapshot.hostWarningMarginBytes = kCushion.warningMarginBytes;
+  snapshot.hostRecoveryMarginBytes = kCushion.recoveryMarginBytes;
+  snapshot.hostHeadroomBytes = kCushion.recoveryMarginBytes;
+  const MemoryReclaimDirective recovered = policy.update(snapshot, 0.0, false);
+  require(recovered.reclaimEmptyKvExtents && recovered.targetBytes == 0 &&
+              recovered.osWarningFloorBytes == kFloorBytes,
+          "OS warn folded its floor into the headroom target");
+
+  snapshot.hostHeadroomBytes = kCushion.recoveryMarginBytes - kGiB / 4;
+  const MemoryReclaimDirective deficit = policy.update(snapshot, 1000.0, false);
+  require(deficit.targetBytes == kGiB / 4 &&
+              deficit.osWarningFloorBytes == kFloorBytes,
+          "OS warn changed the headroom target or dropped its floor");
+
+  snapshot.systemPressure = MemoryPressure::Normal;
+  const MemoryReclaimDirective hostOnly = policy.update(snapshot, 2000.0, false);
+  require(hostOnly.targetBytes == kGiB / 4 &&
+              hostOnly.osWarningFloorBytes == 0,
+          "a floor applied without OS warn");
+}
 
 // Host page sets measured on a 32 GiB, 16 KiB-page host serving a 27B model
 // whose hot (target + draft) weights are kHotWeightBytes. The same state is
@@ -728,6 +757,7 @@ int main() {
     testCushionScalesWithPhysicalMemory();
     testInvalidCushionRejected();
     testSystemPressureReadsWithoutSampling();
+    testPolicy_osWarning_carriesFloorApartFromHeadroomTarget();
     testObserveStoresPageBreakdown();
     testEstimate_swapFloorWithUnwiredWeights_readsNoHeadroom();
     testEstimate_idleWithUnwiredWeights_chargesThem();

@@ -162,6 +162,10 @@ struct MemoryReclaimDirective {
   // Keep the newest state publication, the point a follow-up request resumes
   // from. Only a shrink that nothing is waiting for can afford to.
   bool keepResumePoint = false;
+  // The least the pass sheds while the OS itself reports warn, carried apart
+  // from targetBytes (the governor-headroom part): a runway extent the pass
+  // keeps mapped offsets targetBytes, never this floor.
+  uint64_t osWarningFloorBytes = 0;
 };
 
 // Bounded shrink passes separated by a telemetry settling interval. New host

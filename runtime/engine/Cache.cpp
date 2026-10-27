@@ -307,7 +307,8 @@ KeptCheckpoints Cache::keptCheckpoint(uint64_t kvBlock) const noexcept {
 }
 
 uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
-                             bool keepResumePoint, bool keepRunway) {
+                             bool keepResumePoint, bool keepRunway,
+                             uint64_t floorBytes) {
   // Empty backing that is waiting behind an in-flight release will satisfy
   // part of the target by itself; evicting more cache now would only
   // discard reusable prefixes without returning memory any sooner.
@@ -315,12 +316,15 @@ uint64_t Cache::reclaimCache(uint64_t targetBytes, bool evictAll,
     return 0;
   uint64_t released = reclaimEmptyExtents(keepRunway);
   // Evicting cache to cover the runway this pass chose to keep mapped would
-  // discard prefixes without returning any more memory.
+  // discard prefixes without returning any more memory, so the kept bytes
+  // offset the headroom target. They never offset the OS-warn floor: with
+  // the OS at warn the pass still sheds that much unprotected cache.
   const uint64_t keptBytes =
       keepRunway && pool_.reclaimableExtentCount() == 1
           ? pool_.snapshot().reclaimableBackingBytes
           : 0;
-  const uint64_t target = targetBytes > keptBytes ? targetBytes - keptBytes : 0;
+  const uint64_t target = std::max(
+      targetBytes > keptBytes ? targetBytes - keptBytes : 0, floorBytes);
   auto needsMore = [&] { return evictAll || released < target; };
   while (needsMore() && !releaseDeferred(keepRunway)) {
     const CacheReclaimResult result = reclaimOne(

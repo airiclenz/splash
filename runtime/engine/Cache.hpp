@@ -168,8 +168,10 @@ public:
   // keepRunway leaves one empty extent mapped: the free resident runway a
   // running request's next chunk, or a waiting request's admission, takes
   // without asking for a new mapping. Its bytes count toward targetBytes, so
-  // no cache is evicted to make up for them. Without it every empty extent is
-  // released.
+  // no cache is evicted to make up for them, but never toward floorBytes:
+  // the OS-warn floor is shed from unprotected cache even with the runway
+  // kept. Without keepRunway every empty extent is released.
+  // floorBytes is the least the pass releases whatever the runway offsets.
   // A pass without evictAll (Warning pressure) spares every protected state
   // (a suspended request's resume state, a queued request's prefix, a
   // resident lane's latest checkpoint, a conversation end's prompt-end state,
@@ -178,7 +180,8 @@ public:
   // states included.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
                                       bool keepResumePoint = false,
-                                      bool keepRunway = false);
+                                      bool keepRunway = false,
+                                      uint64_t floorBytes = 0);
   // One bounded reclaim step for an allocation retry. Progress is distinct
   // from physical bytes because evicting a KV reference can make a resident
   // page reusable without immediately emptying its extent.

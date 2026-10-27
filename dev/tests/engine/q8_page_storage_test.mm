@@ -311,11 +311,11 @@ void run(const std::string &metallib) {
     const auto osWarning = policy.update(policySnapshot, 4101.0, false);
     require(osWarning.reclaimEmptyKvExtents &&
                 !osWarning.evictAllUnpinnedPrefixes &&
-                osWarning.targetBytes == osWarningPassBytes &&
+                osWarning.osWarningFloorBytes == osWarningPassBytes &&
                 osWarning.keepResumePoint,
             "OS warn above the recovery margin kept idle cache resident");
     policySnapshot.hostHeadroomBytes = 2 * giB - osWarningPassBytes / 2;
-    require(policy.update(policySnapshot, 5101.0, false).targetBytes ==
+    require(policy.update(policySnapshot, 5101.0, false).osWarningFloorBytes ==
                 osWarningPassBytes,
             "OS warn reclaimed less than one extent per pass");
     // The newest publication is what a follow-up resumes from; rebuilding it

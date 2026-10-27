@@ -1311,6 +1311,57 @@ void testPressureReclaimKeepsRunwayOnlyForWarning() {
           "warning reclaim kept a runway no request needs");
 }
 
+// OS warn beside a running lane that keeps one empty extent as its runway,
+// with an earlier conversation's idle cache resident: the pass still sheds
+// the OS-warn floor (one extent) of that idle cache, and the runway stays
+// mapped. The kept runway offsets only the headroom target, here zero.
+void testOsWarningPassShedsFloorBesideKeptRunway() {
+  Backing backing(256);
+  KvPool pool(mapLeadingPages(backing, 80));
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  // Request 43's end is pushed out of the conversation-end ring by four
+  // later conversations, so its cache is idle and unprotected.
+  engine.submit(request(43, std::vector<uint32_t>(257, 43)));
+  runUntilIdle(engine);
+  for (uint32_t id = 45; id <= 48; ++id) {
+    engine.submit(request(id, std::vector<uint32_t>(33, id)));
+    runUntilIdle(engine);
+  }
+  engine.submit(request(44, std::vector<uint32_t>(4097, 44)));
+  for (uint32_t step = 1;
+       step <= 8 && (resources.snapshot().pool.pagesActive == 0 ||
+                     engine.commandInFlight());
+       ++step) {
+    static_cast<void>(engine.tick(step));
+  }
+  const KvPoolSnapshot running = resources.snapshot().pool;
+  require(running.pagesActive == 64 && running.pagesFreeResident == 4 &&
+              running.reclaimableExtents == 1 && !engine.commandInFlight(),
+          "OS-warn setup did not leave a running lane beside one empty extent");
+  const uint64_t extentBytes = running.reclaimableBackingBytes;
+  const uint32_t idlePages = running.pagesPrefix - running.pagesActive;
+  require(idlePages >= 8, "OS-warn setup left too little idle cache");
+
+  const MemoryReclaimDirective osWarning{.reclaimEmptyKvExtents = true,
+                                         .osWarningFloorBytes = extentBytes};
+  const uint64_t released = engine.reclaimMemory(osWarning);
+
+  const KvPoolSnapshot after = resources.snapshot().pool;
+  require(released >= extentBytes &&
+              after.residentBackingBytes + extentBytes <=
+                  running.residentBackingBytes &&
+              after.pagesPrefix - after.pagesActive < idlePages,
+          "OS warn shed no idle cache because a runway extent was kept");
+  require(after.pagesActive == 64 && after.pagesFreeResident == 4 &&
+              after.reclaimableExtents == 1,
+          "OS warn unmapped the runway a running lane's chunk needs");
+  engine.cancel(44);
+  runUntilIdle(engine);
+}
+
 void testConcurrencyLimitDoesNotEvictCache() {
   Backing backing(256);
   KvPool pool(backing);
@@ -6755,6 +6806,7 @@ int main() {
     testPressureReclaimRespectsStateLifetimes();
     testPressureReclaimCreditsNoBytesForAReserveRefill();
     testPressureReclaimKeepsRunwayOnlyForWarning();
+    testOsWarningPassShedsFloorBesideKeptRunway();
     testConcurrencyLimitDoesNotEvictCache();
     testHostPressureDoesNotDrainCacheOnStateAdmission();
     testHostPressureStillRecyclesLruStateForDeniedSnapshot();

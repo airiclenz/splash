@@ -1824,6 +1824,11 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
     released += idle;
   const uint64_t remaining =
       released >= directive.targetBytes ? 0 : directive.targetBytes - released;
+  // Idle state returned above counts toward the OS-warn floor as well.
+  const uint64_t remainingFloor =
+      released >= directive.osWarningFloorBytes
+      ? 0
+      : directive.osWarningFloorBytes - released;
   // Critical pressure releases every empty KV extent. A warning pass, even a
   // zero-byte one, releases them too, except one kept mapped while a running
   // lane's next chunk or a waiting request's admission needs it; each check
@@ -1837,7 +1842,7 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
                                      waitingRequestNeedsKvRunway());
   released += cache_.reclaimCache(remaining, directive.evictAllUnpinnedPrefixes,
                                  directive.keepResumePoint,
-                                 reclaimKeptKvRunway_);
+                                 reclaimKeptKvRunway_, remainingFloor);
   // Evicted states park their buffers in the model's pool (a live lane's own
   // state refills that lane's short reserve instead); a pressure pass
   // returns that memory to the host now rather than keeping it warm.
