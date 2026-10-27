@@ -81,6 +81,14 @@ _STATUS_METRICS = {
         "cache",
         "resource_queued_prefix_evictions",
     ),
+    "splash_cache_resource_queued_depth_losses_total": (
+        "cache",
+        "resource_queued_depth_losses",
+    ),
+    "splash_cache_resource_queued_depth_lost_tokens_total": (
+        "cache",
+        "resource_queued_depth_lost_tokens",
+    ),
     "splash_scheduler_prefilling": ("scheduler", "prefilling"),
     "splash_scheduler_decoding": ("scheduler", "decoding"),
     "splash_scheduler_waiting_mask": ("scheduler", "waiting_mask"),

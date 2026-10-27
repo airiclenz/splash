@@ -227,6 +227,26 @@ class DecodeSuspensionMetricsTests(unittest.TestCase):
             "splash_cache_resource_queued_prefix_evictions_total 2",
         )
 
+    def test_queued_depth_loss_renders_after_queued_prefix_evictions(self):
+        lines = prometheus_metrics(
+            {
+                "cache": {
+                    "resource_queued_prefix_evictions": 2,
+                    "resource_queued_depth_losses": 1,
+                    "resource_queued_depth_lost_tokens": 64,
+                }
+            }
+        ).splitlines()
+
+        start = lines.index("splash_cache_resource_queued_prefix_evictions_total 2")
+        self.assertEqual(
+            lines[start + 1 : start + 3],
+            [
+                "splash_cache_resource_queued_depth_losses_total 1",
+                "splash_cache_resource_queued_depth_lost_tokens_total 64",
+            ],
+        )
+
     def test_prefill_split_renders_after_prefill_rate(self):
         lines = prometheus_metrics(
             {

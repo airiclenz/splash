@@ -178,6 +178,21 @@ class CounterDeltaTests(unittest.TestCase):
 
         self.assertEqual(delta["queued_prefix_evictions"], 3)
 
+    def test_counterDelta_diffsQueuedDepthLoss(self):
+        before = snapshot(
+            cache__resource_queued_depth_losses=1,
+            cache__resource_queued_depth_lost_tokens=64,
+        )
+        after = snapshot(
+            cache__resource_queued_depth_losses=3,
+            cache__resource_queued_depth_lost_tokens=256,
+        )
+
+        delta = probe.counter_delta(before, after)
+
+        self.assertEqual(delta["queued_depth_losses"], 2)
+        self.assertEqual(delta["queued_depth_lost_tokens"], 192)
+
     def test_counterDelta_missingCounter_readsAsNoneNotZero(self):
         delta = probe.counter_delta(snapshot(), snapshot(state__evictions=2))
 
@@ -1426,6 +1441,17 @@ class ReportTests(unittest.TestCase):
             _code, output = run_main(["--base-url", stub.base_url, "--nonces", "a"])
 
         self.assertRegex(output, r"queued_prefix_evictions\s+0")
+
+    def test_formatReport_rendersQueuedDepthLossPerPhase(self):
+        status = snapshot(
+            cache__resource_queued_depth_losses=0,
+            cache__resource_queued_depth_lost_tokens=0,
+        )
+        with StubServer(status) as stub:
+            _code, output = run_main(["--base-url", stub.base_url, "--nonces", "a"])
+
+        self.assertRegex(output, r"queued_depth_losses\s+0")
+        self.assertRegex(output, r"queued_depth_lost_tokens\s+0")
 
 
 if __name__ == "__main__":
