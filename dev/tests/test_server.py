@@ -3698,9 +3698,7 @@ class ServerTest(unittest.TestCase):
                 harness.request("POST", "/tokenize", {"content": "hello"})[0],
             ]
             recording.close()
-            lines = [
-                json.loads(line) for line in path.read_text().split("\n") if line
-            ]
+            lines = [json.loads(line) for line in path.read_text().split("\n") if line]
 
             self.assertEqual(statuses, [200, 200, 200])
             self.assertEqual(
