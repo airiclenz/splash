@@ -154,7 +154,7 @@ public:
   // One cache reclaimer for memory growth and pressure warnings. After empty
   // backing, disposable checkpoints are reclaimed first, except protected
   // ones such as a resident lane's latest checkpoint or a conversation end's
-  // kept checkpoints. Ordinary states and
+  // kept checkpoints and junction state. Ordinary states and
   // state-free KV leaves retain their shared oldest-first access order.
   // Active requests and pinned restores are never selected. Physical release
   // is paced by the backing: while an earlier release is still being torn
@@ -172,9 +172,10 @@ public:
   // released.
   // A pass without evictAll (Warning pressure) spares every protected state
   // (a suspended request's resume state, a queued request's prefix, a
-  // resident lane's latest checkpoint, a conversation end's prompt-end state
-  // and kept checkpoints) and evicts the next publication instead; evictAll
-  // (Critical pressure) takes protected states too, resume states included.
+  // resident lane's latest checkpoint, a conversation end's prompt-end state,
+  // kept checkpoints and junction state) and evicts the next publication
+  // instead; evictAll (Critical pressure) takes protected states too, resume
+  // states included.
   [[nodiscard]] uint64_t reclaimCache(uint64_t targetBytes, bool evictAll,
                                       bool keepResumePoint = false,
                                       bool keepRunway = false);
@@ -230,7 +231,7 @@ public:
                                                     uint32_t resumeTokens);
   // Protects the state published at kvBlock: the prefix a queued request
   // found and will restore, a resident lane's latest checkpoint, or a
-  // conversation end's prompt-end state or kept checkpoints.
+  // conversation end's prompt-end state, kept checkpoints or junction state.
   // Returns an empty handle when no state is published there.
   [[nodiscard]] StateProtection protectState(uint64_t kvBlock);
   // Ends one protection. No-op once its publication is gone.

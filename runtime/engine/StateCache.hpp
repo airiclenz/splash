@@ -33,7 +33,7 @@ struct KeptCheckpoints final {
 
 // Names one publication a request needs: a suspended request's resume state,
 // a queued request's cached prefix, a resident lane's latest checkpoint, or a
-// conversation end's prompt-end state or kept checkpoints.
+// conversation end's prompt-end state, kept checkpoints or junction state.
 // A handle outlives neither the publication's eviction nor its replacement:
 // releasing a stale handle is a no-op.
 struct StateProtection final {
@@ -234,7 +234,7 @@ private:
     uint32_t pins = 0;
     // Requests that need this publication: suspended, queued, or resident
     // lanes holding it as their latest checkpoint, and conversation ends
-    // holding it as a resume state.
+    // holding it as a resume or junction state.
     uint32_t protections = 0;
     // The subset of protections held as suspended requests' resume states.
     uint32_t resumeProtections = 0;

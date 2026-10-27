@@ -165,8 +165,8 @@ public:
   // ownership and preserves reusable prefixes for as long as possible: idle
   // model state, unused KV backing, disposable checkpoints, then ordinary
   // state/KV in LRU order. A resident lane's latest checkpoint and the resume
-  // states of the newest conversation ends are protected: Warning spares
-  // them and Critical takes them.
+  // and junction states of the newest conversation ends are protected:
+  // Warning spares them and Critical takes them.
   // Live command buffers are never eviction candidates. Physical KV release
   // is paced one extent at a time; reclaimDeferred() reports that the pass
   // stopped behind an in-flight release and should run again shortly.
@@ -197,20 +197,31 @@ private:
   // state and the prefill checkpoint kept beside it, taken at the prompt-end
   // publication and held through suspension, and the reply's decode
   // checkpoint, taken at a Stop or Length finish, which moves the end into
-  // conversationEnds_.
+  // conversationEnds_. Beside them, the conversation's junction state, where
+  // a later prompt branching off the conversation's shared prefix resumes.
   struct ConversationEnd final {
     StateProtection promptEnd;
     StateProtection keptCheckpoint;
     StateProtection decodeCheckpoint;
+    // At most one per conversation, never on a block a resume state above
+    // holds: the state the turn materialized for a junction boundary, else
+    // the state it restored from below the prompt end of the end it
+    // continues, else the junction carried forward from that end. Never
+    // matches a continuation: holds() leaves it out.
+    StateProtection junction;
 
     [[nodiscard]] explicit operator bool() const noexcept {
-      return promptEnd || keptCheckpoint || decodeCheckpoint;
+      return promptEnd || keptCheckpoint || decodeCheckpoint || junction;
     }
     // Whether any resume state sits on kvBlock; never for block 0.
     [[nodiscard]] bool holds(uint64_t kvBlock) const noexcept {
       return kvBlock && (promptEnd.kvBlock == kvBlock ||
                          keptCheckpoint.kvBlock == kvBlock ||
                          decodeCheckpoint.kvBlock == kvBlock);
+    }
+    // Whether the junction state sits on kvBlock; never for block 0.
+    [[nodiscard]] bool holdsJunction(uint64_t kvBlock) const noexcept {
+      return kvBlock && junction.kvBlock == kvBlock;
     }
   };
 
@@ -291,6 +302,10 @@ private:
     // The block of the state the first admission restored, or 0: names the
     // conversationEnds_ entry this request continues.
     uint64_t restoredStateBlock = 0;
+    // The block of the deepest junction state this request materialized,
+    // other than its prompt-end state, or 0: its conversation end's junction
+    // while still cached.
+    uint64_t junctionBlock = 0;
     // The state a suspended request resumes from, spared by Warning reclaim,
     // and by growth and publication reclaim while another lane is resident,
     // until the resume succeeds or the request ends.
@@ -371,6 +386,8 @@ private:
   void recordDecodeCheckpoint(Request &request, StateCheckpoint decode);
   void protectConversationEnd(Request &request, uint64_t promptEndBlock);
   void keepConversationEnd(Request &request);
+  void protectJunction(const Request &request, ConversationEnd &end,
+                       const ConversationEnd *continued);
   void releaseConversationEnd(ConversationEnd &end) noexcept;
   [[nodiscard]] uint32_t ownProtections(const Request &request,
                                         StateCheckpoint checkpoint) const;

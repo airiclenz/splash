@@ -1070,7 +1070,8 @@ void Engine::recordDecodeCheckpoint(Request &active, StateCheckpoint decode) {
 // ============================================================================
 // Protects the conversation's resume states once its prompt-end state at
 // promptEndBlock is published: that state and the checkpoint recorded beside
-// it, while it is still that checkpoint publication. O(1).
+// it, while it is still that checkpoint publication, and the junction state
+// the lane materialized below it. O(1).
 void Engine::protectConversationEnd(Request &active, uint64_t promptEndBlock) {
   releaseConversationEnd(active.conversationEnd);
   active.conversationEnd.promptEnd = cache_.protectState(promptEndBlock);
@@ -1078,6 +1079,7 @@ void Engine::protectConversationEnd(Request &active, uint64_t promptEndBlock) {
   if (kept &&
       cache_.checkpointState(kept.kvBlock).publication == kept.publication)
     active.conversationEnd.keptCheckpoint = cache_.protectState(kept.kvBlock);
+  protectJunction(active, active.conversationEnd, nullptr);
 }
 
 // ============================================================================
@@ -1085,7 +1087,10 @@ void Engine::protectConversationEnd(Request &active, uint64_t promptEndBlock) {
 // entry. The entry of the conversation it continues (holding the state its
 // first admission restored, or its own prompt-end state) is replaced;
 // otherwise a full ring pushes out its oldest entry. A replaced or pushed-out
-// entry loses its protections. O(maximumBatchWidth) per finish.
+// entry loses its protections. The end takes its junction before that: from
+// the replaced entry, else from an entry whose junction alone the first
+// admission restored, which stays in the ring. O(maximumBatchWidth) per
+// finish.
 void Engine::keepConversationEnd(Request &active) {
   ConversationEnd end = std::exchange(active.conversationEnd, {});
   if (!end)
@@ -1096,6 +1101,13 @@ void Engine::keepConversationEnd(Request &active) {
     return entry.holds(active.restoredStateBlock) ||
            entry.holds(end.promptEnd.kvBlock);
   });
+  const auto continued =
+      dropped != last
+          ? dropped
+          : std::find_if(first, last, [&](const ConversationEnd &entry) {
+              return entry.holdsJunction(active.restoredStateBlock);
+            });
+  protectJunction(active, end, continued != last ? &*continued : nullptr);
   if (dropped == last && conversationEndCount_ == conversationEnds_.size())
     dropped = first;
   if (dropped != last) {
@@ -1107,11 +1119,39 @@ void Engine::keepConversationEnd(Request &active) {
 }
 
 // ============================================================================
+// Protects end's junction state when it holds none, on the first candidate
+// still cached that end does not already hold as a resume state: the
+// junction state the lane materialized; the state its first admission
+// restored, when that lies below continued's prompt end (continued's kept
+// checkpoint or junction); continued's junction. continued is the end this
+// request continues, or null. At most three cache protections: O(1).
+void Engine::protectJunction(const Request &active, ConversationEnd &end,
+                             const ConversationEnd *continued) {
+  if (end.junction)
+    return;
+  const uint64_t restored = active.restoredStateBlock;
+  const bool restoredBelowPromptEnd =
+      continued && restored &&
+      (continued->keptCheckpoint.kvBlock == restored ||
+       continued->holdsJunction(restored));
+  for (const uint64_t block :
+       {active.junctionBlock, restoredBelowPromptEnd ? restored : 0,
+        continued ? continued->junction.kvBlock : 0}) {
+    if (!block || end.holds(block))
+      continue;
+    end.junction = cache_.protectState(block);
+    if (end.junction)
+      return;
+  }
+}
+
+// ============================================================================
 // Drops every protection of end and empties it. Stale handles are no-ops.
 void Engine::releaseConversationEnd(ConversationEnd &end) noexcept {
   cache_.unprotectState(std::exchange(end.promptEnd, {}));
   cache_.unprotectState(std::exchange(end.keptCheckpoint, {}));
   cache_.unprotectState(std::exchange(end.decodeCheckpoint, {}));
+  cache_.unprotectState(std::exchange(end.junction, {}));
 }
 
 // Counts one checkpoint publication failure in the total and under its cause,
@@ -1267,6 +1307,8 @@ void Engine::publishReachedStateBoundaries(Request &active,
         cache_.publishCompositeState(block, std::move(state), checkpoint);
         ++publications;
       }
+      if (junction && !promptEnd)
+        active.junctionBlock = block;
       if (promptEnd) {
         recordKeptCheckpoint(active, block);
         protectConversationEnd(active, block);
@@ -1788,8 +1830,8 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
   // walks the request table once per pressure pass, never per token. A
   // warning pass also spares each protected state, a suspended request's
   // resume state, a queued request's prefix, a resident lane's latest
-  // checkpoint or a newest conversation end's resume states; Critical evicts
-  // it.
+  // checkpoint or a newest conversation end's resume and junction states;
+  // Critical evicts it.
   const bool warning = !directive.evictAllUnpinnedPrefixes;
   reclaimKeptKvRunway_ = warning && (residentLaneNeedsKvRunway() ||
                                      waitingRequestNeedsKvRunway());

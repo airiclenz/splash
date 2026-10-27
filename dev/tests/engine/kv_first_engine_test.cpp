@@ -5928,6 +5928,209 @@ void testCancelledOrFailedRequestReleasesItsConversationEnd() {
   }
 }
 
+// A one-lane engine over a 512-page backing. A side request caches a 96-token
+// prefix first; the main conversation's opening turn then shares that prefix,
+// so it materializes its junction state at 96 before its prompt end at 160.
+struct JunctionFixture final {
+  explicit JunctionFixture(uint32_t token)
+      : shared(96, token), side(shared), conversation(shared) {
+    side.resize(129, token + 1);
+    conversation.resize(161, token + 2);
+    finish(token + 1, side);
+    finish(token + 2, conversation);
+    junction = restoredBlock(conversation, 96);
+    require(engine.snapshot().junctionMaterializations == 1 && junction,
+            "the opening turn did not materialize its junction state");
+  }
+
+  // Runs request id over prompt to its Length finish.
+  void finish(uint64_t id, const std::vector<uint32_t> &prompt) {
+    engine.submit(request(id, prompt));
+    runUntilIdle(engine);
+  }
+
+  // A Warning pass with an unbounded target.
+  void warningPass() {
+    static_cast<void>(engine.reclaimMemory(
+        warningReclaim(std::numeric_limits<uint64_t>::max())));
+  }
+
+  // The block of the state a resume of prompt's first tokens + 1 tokens
+  // restores, when it restores exactly tokens; 0 otherwise.
+  uint64_t restoredBlock(const std::vector<uint32_t> &prompt, uint32_t tokens) {
+    const CacheLookup lookup =
+        resources.lookup(std::span(prompt).first(tokens + 1));
+    return lookup.resumeBoundary() == tokens ? lookup.state->kvBlock() : 0;
+  }
+
+  Backing backing{512};
+  KvPool pool{backing};
+  engine::Cache resources{pool, CacheNamespace{}};
+  Executor executor{1};
+  Events events;
+  engine::Engine engine{EngineConfig{}, resources, executor, events};
+  std::vector<uint32_t> shared;
+  std::vector<uint32_t> side;
+  std::vector<uint32_t> conversation;
+  uint64_t junction = 0;
+};
+
+// A follow-up turn carries its conversation's junction forward: a Warning
+// pass keeps the junction state, and a turn diverging just past it resumes
+// there.
+void testWarningReclaimKeepsAConversationsJunction() {
+  JunctionFixture fixture(1900);
+  std::vector<uint32_t> followUp = fixture.conversation;
+  followUp.resize(201, 1903);
+  fixture.finish(1903, followUp);
+  require(fixture.events.starts.back() ==
+              std::pair<EngineCacheStatus, uint32_t>{
+                  EngineCacheStatus::PrefixHit, 160},
+          "the follow-up turn did not continue the conversation's end");
+
+  fixture.warningPass();
+
+  require(fixture.resources.carriesState(fixture.junction),
+          "warning reclaim took the conversation's junction state");
+  std::vector<uint32_t> divergent = fixture.shared;
+  divergent.resize(136, 1904);
+  fixture.finish(1904, divergent);
+  require(fixture.events.starts.back() ==
+              std::pair<EngineCacheStatus, uint32_t>{
+                  EngineCacheStatus::PrefixHit, 96},
+          "a turn diverging past the junction did not resume from it");
+}
+
+// Growth reclaim takes an unprotected state newer than the junction first,
+// and the junction rather than stall once only protected states are left.
+void testGrowthReclaimTakesAJunctionAfterUnprotectedStates() {
+  JunctionFixture fixture(1910);
+  engine::Cache &resources = fixture.resources;
+  const std::vector<uint32_t> idle(129, 1913);
+  cancelAfterPromptEnd(fixture.engine, resources, 1913, idle);
+  const uint64_t unprotected = fixture.restoredBlock(idle, 128);
+  require(unprotected, "fixture did not leave an unprotected state");
+
+  for (uint32_t step = 0; step < 64 && resources.carriesState(unprotected);
+       ++step) {
+    require(resources.carriesState(fixture.junction),
+            "growth reclaim took the junction before an unprotected state");
+    static_cast<void>(resources.reclaimOneForGrowth());
+  }
+  require(!resources.carriesState(unprotected) &&
+              resources.carriesState(fixture.junction),
+          "growth reclaim did not take the unprotected state first");
+  for (uint32_t step = 0;
+       step < 64 && resources.carriesState(fixture.junction); ++step)
+    static_cast<void>(resources.reclaimOneForGrowth());
+
+  require(!resources.carriesState(fixture.junction),
+          "growth reclaim stalled on a conversation's junction state");
+}
+
+// A Critical pass takes a conversation's junction state.
+void testCriticalReclaimTakesAConversationsJunction() {
+  JunctionFixture fixture(1920);
+
+  static_cast<void>(fixture.engine.reclaimMemory(
+      {.reclaimEmptyKvExtents = true,
+       .evictAllUnpinnedPrefixes = true,
+       .targetBytes = std::numeric_limits<uint64_t>::max()}));
+
+  require(!fixture.resources.carriesState(fixture.junction),
+          "critical reclaim spared a conversation's junction state");
+}
+
+// Turns that carry the junction forward leave the conversation one junction
+// protection: once its end leaves the ring, a Warning pass takes the state.
+void testAConversationsEndLeavingTheRingReleasesItsJunction() {
+  JunctionFixture fixture(1930);
+  std::vector<uint32_t> turn = fixture.conversation;
+  for (uint64_t id = 1933; id < 1935; ++id) {
+    turn.resize(turn.size() + 40, static_cast<uint32_t>(id));
+    fixture.finish(id, turn);
+  }
+  fixture.warningPass();
+  require(fixture.resources.carriesState(fixture.junction),
+          "warning reclaim took a carried junction state");
+
+  pushOutConversationEnds(fixture.engine, 1940);
+  fixture.warningPass();
+
+  require(!fixture.resources.carriesState(fixture.junction),
+          "a junction stayed protected after its conversation left the ring");
+}
+
+// A side request that restores the main conversation's junction appends its
+// own end carrying that junction: the main end stays in the ring with every
+// protection, so a Warning pass keeps its prompt-end state and junction.
+void testASideRequestOnTheJunctionKeepsTheMainEnd() {
+  JunctionFixture fixture(1950);
+  std::vector<uint32_t> side = fixture.shared;
+  side.resize(129, 1953);
+  fixture.finish(1953, side);
+  require(fixture.events.starts.back() ==
+              std::pair<EngineCacheStatus, uint32_t>{
+                  EngineCacheStatus::PrefixHit, 96},
+          "the side request did not restore the main junction");
+
+  fixture.warningPass();
+
+  require(fixture.resources.lookup(fixture.conversation).resumeBoundary() ==
+                  160 &&
+              fixture.resources.carriesState(fixture.junction),
+          "a side request on the junction released the main conversation's "
+          "end");
+}
+
+// A turn that restored its conversation's kept checkpoint keeps it as its
+// own kept checkpoint and takes no junction protection on it: a denied
+// prompt-end capture of the next turn still recycles that checkpoint.
+void testDeniedCaptureAfterAKeptCheckpointRestoreRecyclesIt() {
+  Backing backing(2048);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  const uint32_t deepest = 2 * defaultCheckpointTokens;
+  const std::vector<uint32_t> opening(deepest + 200, 1960);
+  engine.submit(request(1960, opening));
+  runUntilIdle(engine);
+  std::vector<uint32_t> divergent(opening.begin(),
+                                  opening.begin() + deepest + 40);
+  std::fill(divergent.begin() + deepest + 12, divergent.end(), 1961);
+  engine.submit(request(1961, divergent));
+  runUntilIdle(engine);
+  require(events.starts.back().second == deepest,
+          "the divergent turn did not restore the kept checkpoint");
+  StateCheckpoint kept;
+  {
+    const CacheLookup lookup =
+        resources.lookup(std::span(opening).first(deepest + 1));
+    if (lookup.resumeBoundary() == deepest)
+      kept = resources.checkpointState(lookup.state->kvBlock());
+  }
+  require(static_cast<bool>(kept),
+          "fixture did not keep the restored checkpoint");
+  const EngineSnapshot before = engine.snapshot();
+
+  divergent.insert(divergent.end(), 40, 1962);
+  executor.deniedSnapshots = 1;
+  engine.submit(request(1962, divergent));
+  runUntilIdle(engine);
+
+  const EngineSnapshot after = engine.snapshot();
+  require(executor.deniedSnapshots == 0 &&
+              after.recycledStatePublications ==
+                  before.recycledStatePublications + 1 &&
+              after.resources.stateCache.checkpointEvictions ==
+                  before.resources.stateCache.checkpointEvictions + 1 &&
+              after.replayStatePublicationFailures == 0 &&
+              !resources.carriesState(kept.kvBlock),
+          "denied capture did not recycle the restored kept checkpoint");
+}
+
 void testShortSuffixContinuesCheckpointDraftState() {
   Backing backing(1024);
   KvPool pool(backing);
@@ -6506,6 +6709,12 @@ int main() {
     testWarningReclaimKeepsAResidentLanesConversationEnd();
     testOsWarningPassKeepsTwoDecodingLanesConversationEnds();
     testCancelledOrFailedRequestReleasesItsConversationEnd();
+    testWarningReclaimKeepsAConversationsJunction();
+    testGrowthReclaimTakesAJunctionAfterUnprotectedStates();
+    testCriticalReclaimTakesAConversationsJunction();
+    testAConversationsEndLeavingTheRingReleasesItsJunction();
+    testASideRequestOnTheJunctionKeepsTheMainEnd();
+    testDeniedCaptureAfterAKeptCheckpointRestoreRecyclesIt();
     testShortSuffixContinuesCheckpointDraftState();
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testCheckpointIntervalValidationAndDisable();
