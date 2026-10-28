@@ -88,7 +88,7 @@ constexpr std::array<const char *, kPublicationFailureCauses>
 constexpr std::array<const char *, kStateEvictionCauses> kStateEvictionKeys = {
     "pressure_pass", "growth",
     "paused_backing", "snapshot",
-    "checkpoint_recycle", "housekeeping"};
+    "housekeeping"};
 
 constexpr double kMicrosPerMillisecond = 1000.0;
 constexpr double kMicrosPerSecond = 1'000'000.0;

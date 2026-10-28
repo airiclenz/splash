@@ -308,14 +308,13 @@ class StateEvictionCauseMetricsTests(unittest.TestCase):
             "growth": 2,
             "paused_backing": 3,
             "snapshot": 4,
-            "checkpoint_recycle": 5,
             "housekeeping": 6,
         }
         lines = prometheus_metrics(
-            {"state": {"evictions": 21, "eviction_causes": causes}}
+            {"state": {"evictions": 16, "eviction_causes": causes}}
         ).splitlines()
 
-        self.assertIn(f"{STATE_EVICTIONS_METRIC} 21", lines)
+        self.assertIn(f"{STATE_EVICTIONS_METRIC} 16", lines)
         name = STATE_EVICTIONS_BY_CAUSE_METRIC
         start = lines.index(f"# TYPE {name} counter")
         self.assertTrue(lines[start - 1].startswith(f"# HELP {name} "))
@@ -324,7 +323,7 @@ class StateEvictionCauseMetricsTests(unittest.TestCase):
             [f'{name}{{cause="{cause}"}} {count}' for cause, count in causes.items()],
         )
         self.assertEqual(
-            lines[start + 1 : start + 7],
+            lines[start + 1 : start + 1 + len(causes)],
             [f'{name}{{cause="{cause}"}} {count}' for cause, count in causes.items()],
         )
 

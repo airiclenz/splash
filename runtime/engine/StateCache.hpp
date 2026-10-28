@@ -30,17 +30,15 @@ struct StateCheckpoint final {
 // KV pages or memory the governor refused a request (Growth); a cached
 // state's buffers or idle cached pages reused while the host refuses growth
 // (PausedBacking); room for a state a command captures or a lane gives up
-// (Snapshot); the lane's own checkpoint recycled before a capture
-// (CheckpointRecycle); or anything else (Housekeeping): the disk quota giving
-// up a state's only copy, an invalidated or unreadable state, or a state on a
-// block that left with its disk subtree or a poisoned one. Indexes
+// (Snapshot); or anything else (Housekeeping): the disk quota giving up a
+// state's only copy, an invalidated or unreadable state, or a state on a block
+// that left with its disk subtree or a poisoned one. Indexes
 // StateCacheSnapshot::evictionCauses.
 enum class StateEvictionCause : uint8_t {
   PressurePass,
   Growth,
   PausedBacking,
   Snapshot,
-  CheckpointRecycle,
   Housekeeping,
 };
 inline constexpr std::size_t kStateEvictionCauses =

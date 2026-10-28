@@ -265,8 +265,8 @@ PROMETHEUS_FAMILIES = {
         help_text=(
             "State cache evictions by cause: a pressure reclaim pass, growth "
             "after a budget or KV capacity denial, idle backing reused while "
-            "growth is paused, a denied snapshot, a recycled own checkpoint, "
-            "or housekeeping (disk quota, invalidation or dropped subtrees)."
+            "growth is paused, a denied snapshot, or housekeeping (disk "
+            "quota, invalidation or dropped subtrees)."
         ),
         label="cause",
         paths={
@@ -276,7 +276,6 @@ PROMETHEUS_FAMILIES = {
                 "growth",
                 "paused_backing",
                 "snapshot",
-                "checkpoint_recycle",
                 "housekeeping",
             )
         },

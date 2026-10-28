@@ -620,8 +620,8 @@ void testEngineCounterStatus() {
   engine.coldPrefillWallMicros = 1'500'000;
   engine.cachedPrefillTokens = 1096;
   engine.cachedPrefillWallMicros = 274'000;
-  engine.resources.stateCache.evictions = 21;
-  engine.resources.stateCache.evictionCauses = {1, 2, 3, 4, 5, 6};
+  engine.resources.stateCache.evictions = 16;
+  engine.resources.stateCache.evictionCauses = {1, 2, 3, 4, 6};
   const auto status = [&](const engine::EngineSnapshot &snapshot) {
     return runtimeStatusJson(memoryPlan, snapshot, {}, {}, {}, {}, {}, {}, {}, true, {}, {},
                              {}, {}, {}, {});
@@ -641,10 +641,10 @@ void testEngineCounterStatus() {
                     "\"resource_queued_depth_losses\":2,"
                     "\"resource_queued_depth_lost_tokens\":3712}") != std::string::npos,
           "suspension, resume or queued-prefix counters are missing from status");
-  require(json.find("\"evictions\":21,\"eviction_causes\":{"
+  require(json.find("\"evictions\":16,\"eviction_causes\":{"
                     "\"pressure_pass\":1,\"growth\":2,"
                     "\"paused_backing\":3,\"snapshot\":4,"
-                    "\"checkpoint_recycle\":5,\"housekeeping\":6},"
+                    "\"housekeeping\":6},"
                     "\"checkpoint_entries\":") != std::string::npos,
           "state evictions by cause are missing from status");
   require(json.find("\"prefill_tokens_per_second\":0,"
