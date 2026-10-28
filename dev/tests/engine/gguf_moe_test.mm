@@ -11,10 +11,13 @@
 //   (the QSA indexer's query and key) share a dispatch when they share a tile
 //   and each gives the outputs of its own dispatch bit for bit.
 // - Float segments of a fused GGUF projection (Linear), the 35B's and the
-//   27B's F32 alpha/beta widths, on either float tile: the quantized
+//   27B's F32 alpha/beta widths, at the device's own GPU family and the
+//   forced Apple9/10 families (and their register and neural accelerator
+//   tiles) only where the device's family supports them: the quantized
 //   segments' outputs unchanged, the padding past the segments unwritten.
 // - MoE: every GGUF plan (the staged 8- and 32-row tiles and the Apple9
-//   register tile, whatever GPU runs the test; decode steps and prefill
+//   register tile where the device's family has it, Apple7/8's MMA tiles
+//   otherwise; decode steps and prefill
 //   chunks) for every format the tile takes (the register tile all but F16,
 //   in rows it takes: quant_register_tensor), gate, up and down in three of
 //   those formats and the shared expert in three more, and on the staged
@@ -335,10 +338,12 @@ int floatPairs(MetalBackend &backend) {
 // GDN input (qkv | z | alpha-beta) of a GGUF storing alpha/beta as F32 (64
 // columns on the 35B, 96 on the 27B): the float projection writes the float
 // segment's columns, the quantized kernels the others bit for bit as without
-// it, and the padding past the last segment stays unwritten; decode through
-// both GGUF decode families (register, staged) at one to four lanes, and
-// prefill, where a one-core device takes the neural accelerator float tile
-// from 16 rows.
+// it, and the padding past the last segment stays unwritten; decode at one to
+// four lanes, and prefill. The device's own family runs on Apple7/8 (their
+// MMA plans); Apple9 and Apple10 are forced only where the device's family
+// supports them (a forced family the device lacks can hang its kernels):
+// both GGUF decode families (register, staged), and a one-core device taking
+// the neural accelerator float tile from 16 rows.
 int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
   constexpr uint32_t K = 1024, N = 768, kFloatColumn = 512;
   const uint32_t covered = kFloatColumn + floatColumns;
@@ -348,8 +353,16 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
   Projection full(N, K, splash::ops::BlockWeights{{at(q80.segment, 0),
       at(q4k.segment, 256), at(gates.segment, kFloatColumn)}});
   Projection quantizedOnly(N, K, splash::ops::BlockWeights{{at(q80.segment, 0), at(q4k.segment, 256)}});
+  const uint32_t own = backend.capabilities().appleGpuFamily;
+  std::vector<std::pair<uint32_t, uint32_t>> cases;
+  if (own < 9) cases.emplace_back(own, 0u);
+  for (const auto forced : {std::pair{9u, 0u}, std::pair{10u, 0u}, std::pair{10u, 1u}})
+    if (forced.first <= own) cases.push_back(forced);
+  std::string families;
+  for (const auto &[family, cores] : cases)
+    families += (families.empty() ? "" : ", ") + std::to_string(family) + (cores ? " one-core" : "");
   int failures = 0;
-  for (const auto [family, cores] : {std::pair{9u, 0u}, std::pair{10u, 0u}, std::pair{10u, 1u}}) {
+  for (const auto &[family, cores] : cases) {
     DeviceCapabilities device = backend.capabilities();
     device.appleGpuFamily = family;
     if (cores) device.gpuCoreCount = cores;
@@ -414,22 +427,26 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
             });
     }
   }
-  printf("float segment: fused Q8_0|Q4_K|F32 (%u float columns) decode B1-4 (register, staged) and prefill "
-         "1/24/33/263 rows, both float tiles %s\n", floatColumns, failures ? "FAIL" : "ok");
+  printf("float segment: fused Q8_0|Q4_K|F32 (%u float columns) decode B1-4 and prefill 1/24/33/263 rows at Apple "
+         "family %s (register and neural accelerator tiles only where the family has them) %s\n", floatColumns,
+         families.c_str(), failures ? "FAIL" : "ok");
   return failures;
 }
 
 // A projection of float segments alone runs no quantized kernel, so it leaves
-// the scratch table as it found it: an Apple9 register plan chained after it
-// on the same input (as the draft chains its head and selector) prepares its
-// own table and writes what it writes alone, bit for bit.
+// the scratch table as it found it: a plan chained after it on the same input
+// (as the draft chains its head and selector) prepares its own table and
+// writes what it writes alone, bit for bit. The plan is an Apple9 register
+// plan only where the device's family supports Apple9; Apple7/8 chain their
+// own family's plan (a forced family the device lacks can hang its kernels).
 int floatOnlyChain(MetalBackend &backend) {
   constexpr uint32_t K = 1024, N = 256;
   const Tensor gates = floating(backend, N, K, 0.05f), q4k = quantized(backend, Q4K, N, K);
   const Projection floats(N, K, splash::ops::BlockWeights{{gates.segment}});
   const Projection blocks(N, K, splash::ops::BlockWeights{{q4k.segment}});
   DeviceCapabilities device = backend.capabilities();
-  device.appleGpuFamily = 9;
+  const bool registers = device.appleGpuFamily >= 9;
+  if (registers) device.appleGpuFamily = 9;
   const Linear linear(device);
   int failures = 0;
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
@@ -451,12 +468,13 @@ int floatOnlyChain(MetalBackend &backend) {
     static_cast<void>(linear.add(reference, {.input = input, .output = alone, .scratch = scratch}, blocks, plan));
     static_cast<void>(backend.submitCommandAsync(reference.dispatches()).wait());
     if (std::memcmp(chained.contents(), alone.contents(), bytes)) {
-      printf("  float-only projection B%u: a register plan chained after it read another table FAIL\n", lanes);
+      printf("  float-only projection B%u: a %s plan chained after it read another table FAIL\n", lanes,
+             registers ? "register" : "device-family");
       ++failures;
     }
   }
-  printf("float-only projection: a register plan chained after it prepares its own table, B1-4 %s\n",
-         failures ? "FAIL" : "ok");
+  printf("float-only projection: a %s plan chained after it prepares its own table, B1-4 %s\n",
+         registers ? "register" : "device-family", failures ? "FAIL" : "ok");
   return failures;
 }
 
