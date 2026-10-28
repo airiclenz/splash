@@ -254,15 +254,22 @@ void testVerifyRows() {
           "--verify-rows auto was not the engine's rule");
 }
 
-// --contended-prefill-rows reaches the engine's contended floor as given; the
-// default is the scheduler's.
+// --contended-prefill-rows reaches the engine's contended floor as given, the
+// minimum included; without it the floor is zero, which the bootstrap resolves
+// to the GPU family's default (Scheduler::resolveContendedPrefillRows).
 void testContendedPrefillRows() {
   const ModelDirectory model;
-  require(parse(model, {"auto", "auto"}).contendedPrefillRows ==
-                  engine::Scheduler::kDefaultContendedPrefillRows &&
-              parse(model, {"auto", "auto", "--contended-prefill-rows", "256"})
-                      .contendedPrefillRows == 256,
-          "--contended-prefill-rows did not reach the arguments as given");
+  require(parse(model, {"auto", "auto"}).contendedPrefillRows == 0,
+          "a missing --contended-prefill-rows did not leave the family default");
+  for (const uint32_t rows : {64u, 256u})
+    require(parse(model, {"auto", "auto", "--contended-prefill-rows", std::to_string(rows)})
+                    .contendedPrefillRows == rows,
+            "--contended-prefill-rows did not reach the arguments as given");
+  rejects([&] {
+    static_cast<void>(parse(model, {"auto", "auto", "--contended-prefill-rows", "32"}));
+  },
+          "--contended-prefill-rows requires a power of two in [64, 2048]",
+          "an out-of-range --contended-prefill-rows did not name the valid range");
 }
 
 // --no-speculation takes no value: the options around it read as given.

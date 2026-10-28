@@ -212,7 +212,7 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (!parsePositive(value, result.contendedPrefillRows) ||
           !Scheduler::isValidContendedPrefillRows(result.contendedPrefillRows))
         throw UsageError("--contended-prefill-rows requires a power of two in [" +
-                         std::to_string(Scheduler::kDefaultContendedPrefillRows) + ", " +
+                         std::to_string(Scheduler::kMinimumContendedPrefillRows) + ", " +
                          std::to_string(model::ExecutionLimits::prefillTokenBudget) + "]");
     } else if (option == "--verify-rows") {
       if (value != "auto" && value != "all")

@@ -907,7 +907,8 @@ SERVE_OPTIONS = (
             help="smallest prefill command, in rows, while other requests "
             "decode; a power of two in "
             f"[{MIN_CONTENDED_PREFILL_ROWS}, {MAX_CONTENDED_PREFILL_ROWS}] "
-            f"(default: {MIN_CONTENDED_PREFILL_ROWS})",
+            "(default: 256 on Apple GPU family 7/8 (M1/M2), "
+            f"{MIN_CONTENDED_PREFILL_ROWS} otherwise)",
         ),
     ),
     ServeOption(

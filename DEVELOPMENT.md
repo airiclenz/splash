@@ -120,7 +120,7 @@ access.
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](#neural-engine-prefill). |
 | `--verify-rows` | `auto` | The rows of each draft block decode cycles verify: `auto` lets the verify budget choose a MoE target's rows, which is faster but makes its greedy and seeded outputs vary from run to run, and verifies every row of a dense target; `all` verifies every row the output limit leaves on every target, so those outputs repeat when a request runs alone with the same cached prefixes. See [drafts](#drafts) and [sampling](#sampling). |
 | `--no-speculation` | Off | Decode one token per step without draft proposals. The draft stays loaded but prefill and decode run none of its proposal work; `/status` reports `metrics.speculative_decoding: false` and no draft acceptance rate. |
-| `--contended-prefill-rows` | `64` | Smallest prefill command, in rows, while other requests are decoding: a power of two from `64` to `2048`. A larger floor finishes a long prompt sooner but stalls their tokens longer per command (about 0.85 s at 64 rows and 3.3 s at 256 on an M2 Pro). |
+| `--contended-prefill-rows` | `256` on Apple GPU family 7/8 (M1/M2), `64` otherwise | Smallest prefill command, in rows, while other requests are decoding: a power of two from `64` to `2048`. A larger floor finishes a long prompt sooner but stalls their tokens longer per command (about 0.85 s at 64 rows and 3.3 s at 256 on an M2 Pro). |
 | `--record-requests` | Off | Append every accepted `/v1/chat/completions`, `/v1/messages` and `/v1/responses` request to this file, one JSON line each: `received_unix_ms`, `path` and the request `body` as sent, with its line breaks turned into spaces (split the file on LF only). Token counting, `/tokenize`, `/apply-template`, `/v1/judgments` and `/v1/systemone` are not recorded. The file holds complete prompts, so it is made readable by its owner only (mode 0600). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
@@ -3084,8 +3084,8 @@ request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
 Contended prefill adapts toward a 500 ms slice, keeping
 2048-token chunks for long unopposed work. `--contended-prefill-rows` sets the
-smallest command it shrinks to while other requests decode (64 rows by
-default). A command's estimated cost is a fixed
+smallest command it shrinks to while other requests decode (by default 256
+rows on Apple GPU family 7/8 (M1/M2), 64 otherwise). A command's estimated cost is a fixed
 part, the time its GPU work waited on host steps (a streamed target's expert
 reads), and a part per row; the slice grows to twice the fixed part, so a
 command's rows take at least as long as its reads. Unopposed, a target whose

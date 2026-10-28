@@ -261,6 +261,10 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   } catch (const RuntimeResourcesError &error) {
     throw RuntimeBootstrapError(error);
   }
+  auto &engineConfig = config.nativeLoop.engine;
+  engineConfig.contendedPrefillRows = Scheduler::resolveContendedPrefillRows(
+      engineConfig.contendedPrefillRows,
+      resources->backend().capabilities().appleGpuFamily);
 
   RuntimeBootstrapReport base = reportForPlan(resources->memoryPlan());
   const uint32_t planContext =

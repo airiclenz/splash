@@ -68,8 +68,9 @@ struct NativeArguments final {
   // command buffer or the whole command (EngineConfig::prefillBoundPerBuffer).
   bool prefillBoundPerBuffer = EngineConfig{}.prefillBoundPerBuffer;
   // --contended-prefill-rows ROWS: the rows below which a contended prefill
-  // command never shrinks (EngineConfig::contendedPrefillRows).
-  uint32_t contendedPrefillRows = EngineConfig{}.contendedPrefillRows;
+  // command never shrinks (EngineConfig::contendedPrefillRows). Zero for the
+  // GPU family's default (Scheduler::resolveContendedPrefillRows).
+  uint32_t contendedPrefillRows = 0;
   // --no-speculation, the one option without a value: the target verifies
   // without a draft proposal (RuntimeResourcesConfig::isSpeculationEnabled).
   bool isSpeculationEnabled = true;

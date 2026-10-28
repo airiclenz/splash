@@ -75,8 +75,9 @@ struct EngineConfig final {
   uint64_t maximumPrefillAttentionPairs = std::numeric_limits<uint64_t>::max();
   // Rows below which a contended prefill command never shrinks; a power of
   // two in [64, model::ExecutionLimits::prefillTokenBudget]
-  // (Scheduler::floorContendedPrefill).
-  uint32_t contendedPrefillRows = Scheduler::kDefaultContendedPrefillRows;
+  // (Scheduler::floorContendedPrefill). The bootstrap sets the GPU family's
+  // default (Scheduler::resolveContendedPrefillRows) when serve gives none.
+  uint32_t contendedPrefillRows = Scheduler::kMinimumContendedPrefillRows;
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;

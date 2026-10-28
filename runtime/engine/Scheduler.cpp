@@ -17,12 +17,19 @@ constexpr uint32_t kMaximumOvertakes =
 // priority decode, the budget halves until its estimated cost fits, so they
 // wait about this long between steps. A latency target, not a deadline: the
 // first command has no measurement and the budget stops at the contended
-// floor (Scheduler::kDefaultContendedPrefillRows unless configured). A higher
-// floor trades decode stall for prefill throughput: ~0.85 s per contended
-// command at 64 rows on M2 Pro, ~3.3 s at 256. A command with a fixed cost (a
-// streamed target's expert reads, which any chunk pays in full) gets twice
-// that cost instead, so its rows take at least as long as its fixed part and
-// its peers wait that long, seconds rather than this slice; where its model
+// floor (Scheduler::defaultContendedPrefillRows of the GPU family unless
+// configured). A higher floor trades decode stall for prefill throughput:
+// ~0.85 s per contended command at 64 rows on M2 Pro, ~3.3 s at 256. The
+// 2026-10-28 contended sweep on an M2 Pro (Apple GPU family 8) measured
+// floors of 64 / 256 / 512 rows at 69.5 / 99.9 / 107.7 contended prefill
+// tok/s, with a decode gap p95 of ~160 ms for all three and a max of
+// 1154 / 2980 / 5430 ms. Apple7/8 default to 256: it crosses the 256-row
+// Neural Engine FFN split and keeps +44% of 512's +55% prefill gain at about
+// half its max decode gap. Other families, unmeasured, keep the minimum.
+// A command with a fixed cost (a streamed target's expert reads, which any
+// chunk pays in full) gets twice that cost instead, so its rows take at least
+// as long as its fixed part and its peers wait that long, seconds rather than
+// this slice; where its model
 // runs a command in passes over its layers (Model::prefillPasses), it keeps
 // its rows whatever the contention, and each pass aims for this slice,
 // contended or not, so that decode steps run between passes and a cancel
@@ -32,8 +39,8 @@ constexpr double kContendedPrefillMilliseconds = 500.0;
 // The fewest rows a contended prefill command is cut to, and the fewest whose
 // time measures prefill throughput: below it a command's fixed costs dominate.
 constexpr uint32_t kMinimumPrefillRows = 64;
-static_assert(Scheduler::kDefaultContendedPrefillRows == kMinimumPrefillRows,
-              "the default contended floor is the minimum matrix shape");
+static_assert(Scheduler::kMinimumContendedPrefillRows == kMinimumPrefillRows,
+              "the minimum contended floor is the minimum matrix shape");
 // The most rows past a multiple of the prefill tail alignment that a prompt's
 // last command leaves to one of their own: the decode tiles' rows.
 constexpr uint32_t kPrefillTailRows = 32;

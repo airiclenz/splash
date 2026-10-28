@@ -98,7 +98,9 @@ struct RuntimeBootstrapConfig {
     // A zero engine maxContext is a relaunch's context
     // (RuntimeResourcesConfig::relaunchContext), or else what the memory
     // plan holds, as serve's default; another one larger than the plan
-    // holds fails the bootstrap.
+    // holds fails the bootstrap. A zero engine contendedPrefillRows is the
+    // default floor of this Mac's GPU family
+    // (Scheduler::resolveContendedPrefillRows); another one runs as given.
     NativeLoopConfig nativeLoop;
 };
 
