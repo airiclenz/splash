@@ -1103,7 +1103,9 @@ class BallastMainTests(unittest.TestCase):
         )
 
     def test_main_ballastAuto_growsInStepsUntilJustInsideTheWarningMargin(self):
-        host = FakeHost(constant_headroom(FILLED_HEADROOM), resident_after_first_request)
+        host = FakeHost(
+            constant_headroom(FILLED_HEADROOM), resident_after_first_request
+        )
 
         _code, ballast, events = self.run_auto(host)
 
@@ -1140,7 +1142,9 @@ class BallastMainTests(unittest.TestCase):
 
                 _code, ballast, _events = self.run_auto(host)
 
-                self.assertLessEqual(host.peak_held_bytes, FILLED_HEADROOM - TARGET_HEADROOM)
+                self.assertLessEqual(
+                    host.peak_held_bytes, FILLED_HEADROOM - TARGET_HEADROOM
+                )
                 self.assertEqual(ballast["mb"], 1856)
 
     def test_main_ballastAuto_headroomRisingAfterEngage_topsUp(self):

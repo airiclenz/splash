@@ -8,7 +8,6 @@ from .diagnostics import print_status
 from .errors import APIError
 from .origins import ANY_ORIGIN, DEFAULT_PORTS, parse_authority, parse_origin
 
-
 API_KEY_RULE = "non-empty, visible ASCII 33-126, no spaces"
 
 
