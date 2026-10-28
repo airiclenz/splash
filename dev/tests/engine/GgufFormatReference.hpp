@@ -1,0 +1,740 @@
+#pragma once
+
+// CPU reference for the GGUF image formats (metal/abi/QuantFormat.h): native
+// blocks, their fp32 values with llama.cpp's dequantize_row_* semantics (MIT
+// notice in THIRD_PARTY_NOTICES), MLX's for the affine formats, or those of
+// NVFP4's and FP8's definitions in the kernels' order of operations, and the
+// planes the load-time repack writes,
+// and the fp64 bound a GGUF projection's result lies within. Shared by the
+// GGUF tests.
+
+#include "LinearNumerics.hpp"
+#include "metal/abi/QuantFormat.h"
+#include "metal/abi/QuantTables.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <dlfcn.h>
+#include <iterator>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace gguf_reference {
+
+enum Fmt { Q4K = GGUF_FMT_Q4K, IQ4XS = GGUF_FMT_IQ4XS, IQ4NL = GGUF_FMT_IQ4NL, Q5K = GGUF_FMT_Q5K, Q6K = GGUF_FMT_Q6K,
+           Q3K = GGUF_FMT_Q3K, Q80 = GGUF_FMT_Q80, IQ3S = GGUF_FMT_IQ3S, Q2K = GGUF_FMT_Q2K, IQ3XXS = GGUF_FMT_IQ3XXS,
+           IQ2XXS = GGUF_FMT_IQ2XXS, IQ2XS = GGUF_FMT_IQ2XS, IQ2S = GGUF_FMT_IQ2S, IQ1S = GGUF_FMT_IQ1S,
+           IQ1M = GGUF_FMT_IQ1M, Q40 = GGUF_FMT_Q40, Q41 = GGUF_FMT_Q41, MXFP4 = GGUF_FMT_MXFP4,
+           PQ20 = GGUF_FMT_PQ20, NVFP4 = GGUF_FMT_NVFP4, FP8 = GGUF_FMT_FP8, Q50 = GGUF_FMT_Q50, Q51 = GGUF_FMT_Q51,
+           BF16 = GGUF_FMT_BF16, F16 = GGUF_FMT_F16, Q20 = GGUF_FMT_Q20, FMT_COUNT = GGUF_FMT_COUNT };
+inline const char *fmtName(uint32_t f) { return kQuantFormats[f].name; }
+// The format of kQuantFormats name `name`, FMT_COUNT for none.
+inline Fmt fmtNamed(const std::string &name) {
+  int f = 0;
+  while (f < FMT_COUNT && name != fmtName(f)) ++f;
+  return Fmt(f);
+}
+inline uint16_t f2h(float f) { __fp16 h = (__fp16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
+inline float h2f(uint16_t u) { __fp16 h; memcpy(&h, &u, 2); return (float)h; }
+inline uint32_t rowBytes(Fmt f, uint32_t K) {
+  const QuantFormat &i = kQuantFormats[f];
+  return K / i.block_elements * i.block_bytes;
+}
+[[noreturn]] inline void unknownFormat(Fmt f) {
+  throw std::invalid_argument("no GGUF reference for format " + std::to_string(int(f)));
+}
+
+// Field offsets of the GGML blocks whose half scale d is not their first field:
+// block_q6_K {ql[128], qh[64], scales[16], d}, block_q3_K {hmask[32], qs[64],
+// scales[12], d} and block_q2_K {scales[16], qs[64], d, dmin}; block_iq1_m
+// {qs[32], qh[16], scales[8]} spreads its d over the top nibbles of the four
+// halfwords of its scales.
+constexpr uint32_t kQ6KScales = 128 + 64, kQ6KD = kQ6KScales + 16;
+constexpr uint32_t kQ3KScales = 32 + 64, kQ3KD = kQ3KScales + 12;
+constexpr uint32_t kQ2KD = 16 + 64, kIQ1MScales = 32 + 16;
+
+// llama.cpp's GGML_E8M0_TO_FP32_HALF: 2^(e - 128), subnormal below e = 2.
+inline float e8m0Half(uint8_t e) {
+  const uint32_t bits = e < 2 ? 0x00200000u << e : uint32_t(e - 1) << 23;
+  float value; memcpy(&value, &bits, 4); return value;
+}
+// The value of E4M3 byte b (sign, four exponent bits of bias 7, three mantissa bits; subnormal below exponent 1),
+// which no NaN encoding (0x7F, 0xFF) takes here.
+inline float e4m3(uint8_t b) {
+  const int exponent = (b >> 3) & 15, mantissa = b & 7;
+  const float magnitude = exponent ? std::ldexp(1.0f + mantissa / 8.0f, exponent - 7) : std::ldexp(mantissa / 8.0f, -6);
+  return b & 0x80 ? -magnitude : magnitude;
+}
+// NVFP4's and FP8's native blocks (metal/abi/QuantFormat.h): an NVFP4 block's 16 E4M3 scales, its tensor scale g
+// and its 128 code bytes (element e in bits 4 (e % 2) of byte e / 2); an FP8 block's g and its 256 E4M3 values.
+constexpr uint32_t kNvfp4Scale = QUANT_NVFP4_G, kNvfp4Codes = QUANT_NVFP4_CODES, kFp8Values = QUANT_FP8_VALUES;
+inline float blockScale(const uint8_t *blk, uint32_t at) { float g; memcpy(&g, blk + at, 4); return g; }
+// N native rows of random codes and random positive E4M3 scales (NVFP4) or random E4M3 values (FP8, NaN left out),
+// whose tensor scale g is drawn from `scale`, so the weights take a model's magnitudes (a few hundredths).
+template <class Scale>
+std::vector<uint8_t> makeFloatNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng, Scale scale) {
+  const QuantFormat &fi = kQuantFormats[f];
+  std::vector<uint8_t> v((size_t)N * rowBytes(f, K));
+  for (auto &b : v) b = (uint8_t)rng();
+  std::uniform_int_distribution<int> blockScales(0x38, 0x67);   // 1 to 60
+  const float g = scale();
+  for (size_t b = 0; b < v.size() / fi.block_bytes; ++b) {
+    uint8_t *blk = v.data() + b * fi.block_bytes;
+    if (f == NVFP4) {
+      for (uint32_t i = 0; i < 16; ++i) blk[i] = uint8_t(blockScales(rng));
+      memcpy(blk + kNvfp4Scale, &g, 4);
+    } else {
+      memcpy(blk, &g, 4);
+      for (uint32_t i = 0; i < 256; ++i)
+        if ((blk[kFp8Values + i] & 0x7F) == 0x7F) blk[kFp8Values + i] ^= 1;   // 0x7E or 0xFE: no NaN
+    }
+  }
+  return v;
+}
+// Sets the tensor scale g of each row r of native NVFP4 or FP8 rows of K elements to g(r).
+template <class G> void setTensorScales(std::vector<uint8_t> &native, Fmt f, uint32_t K, G g) {
+  const QuantFormat &fi = kQuantFormats[f];
+  const uint32_t blocks = K / fi.block_elements;
+  for (size_t b = 0; b < native.size() / fi.block_bytes; ++b) {
+    const float value = g(uint32_t(b / blocks));
+    memcpy(native.data() + b * fi.block_bytes + (f == NVFP4 ? kNvfp4Scale : 0), &value, 4);
+  }
+}
+
+// llama.cpp's NVFP4 tensor type (ggml type 40), which the loader converts into NVFP4's native rows
+// (model/GgufPreparation.cpp): block_nvfp4 of 64 elements, the UE4M3 scales of its four 16s, then 32 code bytes,
+// element j of each 16 in the low nibble of the 16's byte j and element j + 8 in its high one.
+constexpr uint32_t kBlockNvfp4Bytes = 36;
+// The block_nvfp4 rows of native NVFP4 rows whose E4M3 scales are positive and below 0x7F, as UE4M3 reads them;
+// their tensor scale g, which a .scale tensor holds in llama.cpp, is left out.
+inline std::vector<uint8_t> blockNvfp4Rows(const std::vector<uint8_t> &native) {
+  std::vector<uint8_t> rows;
+  for (size_t at = 0; at < native.size(); at += kQuantFormats[NVFP4].block_bytes) {
+    const uint8_t *blk = native.data() + at;
+    const auto code = [&](uint32_t e) { return (blk[kNvfp4Codes + e / 2] >> (4 * (e % 2))) & 15; };
+    for (uint32_t q = 0; q < 4; ++q) {
+      rows.insert(rows.end(), blk + 4 * q, blk + 4 * q + 4);
+      for (uint32_t s = 0; s < 4; ++s)
+        for (uint32_t j = 0; j < 8; ++j)
+          rows.push_back(uint8_t(code(64 * q + 16 * s + j) | code(64 * q + 16 * s + j + 8) << 4));
+    }
+  }
+  return rows;
+}
+// The fp32 values of block_nvfp4 rows as dequantize_row_nvfp4 computes them: kvalues_mxfp4[code] (twice the E2M1
+// value) times half the value of its 16's UE4M3 scale, an E4M3 byte read without bit 7, 0x7F read as 0.
+inline std::vector<float> blockNvfp4Values(const std::vector<uint8_t> &rows) {
+  std::vector<float> values(rows.size() / kBlockNvfp4Bytes * 64);
+  for (size_t b = 0; b < rows.size() / kBlockNvfp4Bytes; ++b) {
+    const uint8_t *blk = rows.data() + b * kBlockNvfp4Bytes;
+    for (uint32_t s = 0; s < 4; ++s) {
+      const float d = blk[s] == 0x7F ? 0.0f : e4m3(blk[s] & 0x7F) * 0.5f;
+      for (uint32_t j = 0; j < 8; ++j) {
+        const uint8_t pair = blk[4 + 8 * s + j];
+        values[64 * b + 16 * s + j] = float(kFP4Values[pair & 15]) * d;
+        values[64 * b + 16 * s + j + 8] = float(kFP4Values[pair >> 4]) * d;
+      }
+    }
+  }
+  return values;
+}
+
+// The block_q8_0 rows the reference GGUF quantization of Q8_0 (quantize_row_q8_0_ref) writes from
+// fp32 values, as it computes them: per 32, d = amax / 127 of their largest magnitude, stored by
+// GGML_FP32_TO_FP16, and each q = roundf(x * id) with id = 1 / d of the fp32 d, or 0 when d is 0.
+inline std::vector<uint8_t> quantizeQ8_0(const std::vector<float> &x) {
+  std::vector<uint8_t> blocks(x.size() / 32 * kQuantFormats[Q80].block_bytes);
+  for (size_t i = 0; i < x.size() / 32; ++i) {
+    float amax = 0.0f;
+    for (int j = 0; j < 32; ++j) {
+      const float v = x[i * 32 + j];
+      amax = amax > fabsf(v) ? amax : fabsf(v);
+    }
+    const float d = amax / ((1 << 7) - 1);
+    const float id = d ? 1.0f / d : 0.0f;
+    uint8_t *y = blocks.data() + i * kQuantFormats[Q80].block_bytes;
+    const uint16_t h = f2h(d);
+    memcpy(y, &h, 2);
+    for (int j = 0; j < 32; ++j) y[2 + j] = uint8_t(int8_t(roundf(x[i * 32 + j] * id)));
+  }
+  return blocks;
+}
+
+// Whether a format holds 16-bit float values, BF16 or F16.
+inline bool float16(Fmt f) { return f == BF16 || f == F16; }
+// N native rows of BF16 or F16 values: per 256 a normal draw of deviation 8 h2f(scale()), the magnitudes of a
+// quantized format of that scale, every 61st value of BF16 a ten-thousandth of that, below half's normal range,
+// so the staged tile's half rounds it.
+template <class Scale>
+std::vector<uint8_t> makeFloat16Native(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng, Scale scale) {
+  std::vector<uint8_t> v((size_t)N * rowBytes(f, K));
+  std::normal_distribution<float> unit(0.0f, 1.0f);
+  float deviation = 0;
+  for (size_t i = 0; i < v.size() / 2; ++i) {
+    if (i % 256 == 0) deviation = 8 * h2f(scale());
+    float x = unit(rng) * deviation;
+    if (f == BF16 && i % 61 == 0) x *= 1e-4f;
+    const uint16_t bits = f == BF16 ? splash::test::floatToBf16(x) : f2h(x);
+    memcpy(v.data() + 2 * i, &bits, 2);
+  }
+  return v;
+}
+
+// N native rows of random bytes whose half scales (d, and dmin or m for Q4_K, Q5_K, Q2_K, Q4_1 and Q5_1) are
+// scale(), and MXFP4's exponents the power of two at or below it; BF16's and F16's of makeFloat16Native.
+template <class Scale>
+std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng, Scale scale) {
+  if (float16(f)) return makeFloat16Native(f, N, K, rng, scale);
+  const QuantFormat &fi = kQuantFormats[f];
+  std::vector<uint8_t> v((size_t)N * rowBytes(f, K));
+  for (auto &b : v) b = (uint8_t)rng();
+  const uint32_t off = f == Q6K ? kQ6KD : f == Q3K ? kQ3KD : f == Q2K ? kQ2KD : 0;
+  for (size_t b = 0; b < v.size() / fi.block_bytes; ++b) {
+    uint8_t *blk = v.data() + b * fi.block_bytes;
+    const uint16_t d = scale();
+    if (f == IQ1M) {
+      uint16_t sc[4]; memcpy(sc, blk + kIQ1MScales, 8);
+      for (int k = 0; k < 4; ++k) sc[k] = uint16_t((sc[k] & 0x0FFF) | ((d >> (4 * k)) & 0xF) << 12);
+      memcpy(blk + kIQ1MScales, sc, 8);
+    } else if (f == MXFP4) {
+      blk[0] = uint8_t(std::ilogb(h2f(d)) + 128);
+    } else {
+      memcpy(blk + off, &d, 2);
+    }
+    if (f == Q4K || f == Q5K || f == Q2K || f == Q41 || f == Q51) {
+      const uint16_t m = scale();
+      memcpy(blk + off + 2, &m, 2);
+    }
+  }
+  return v;
+}
+// MLX affine (metal/abi/QuantFormat.h): the loader's native block {bf16 s, bf16 z, codes}, code l of a block at
+// bits [l b, l b + b) of its codes; value = fma(code, s, z), as the kernels compute it in fp32.
+inline bool affine(Fmt f) { return quant_affine_format(f); }
+inline float bf2f(uint16_t u) { const uint32_t v = uint32_t(u) << 16; float f; memcpy(&f, &v, 4); return f; }
+inline uint16_t f2bf(float f) {   // nearest, ties to even
+  uint32_t v; memcpy(&v, &f, 4);
+  return uint16_t((v + 0x7FFF + ((v >> 16) & 1)) >> 16);
+}
+inline uint32_t affineCode(const uint8_t *codes, uint32_t bits, uint32_t l) {
+  const uint32_t at = l * bits, shift = at % 8;
+  uint32_t word = codes[at / 8];
+  if (shift + bits > 8) word |= uint32_t(codes[at / 8 + 1]) << 8;
+  return (word >> shift) & ((1u << bits) - 1);
+}
+// The native rows (metal/abi/QuantFormat.h) of `rows` MLX rows of K weights of format f: codes packed as MLX packs a
+// row's, a little-endian bit string of `bits` bits each, and per group of `group` its scale (bf16, mxfp4's E8M0 byte
+// or nvfp4's E4M3 byte) and an affine tensor's bf16 bias. An affine group is its scale, its bias and its codes; an
+// mxfp4 group a block_mxfp4, its exponent and its codes with element j < 16 in the low nibble of byte j and j + 16 in
+// its high nibble; 256 nvfp4 elements their 16 scales, a tensor scale of 1 and their codes as MLX packs them.
+inline std::vector<uint8_t> mlxNative(Fmt f, uint32_t rows, uint32_t K, const std::vector<uint8_t> &weight,
+                                      const std::vector<uint8_t> &scales, const std::vector<uint8_t> &biases) {
+  std::vector<uint8_t> native;
+  if (f == NVFP4) {
+    const float one = 1.0f;
+    for (uint32_t r = 0; r < rows; ++r)
+      for (uint32_t b = 0; b < K / 256; ++b) {
+        const uint8_t *s = scales.data() + size_t(r) * (K / 16) + 16 * b;
+        const uint8_t *codes = weight.data() + size_t(r) * (K / 2) + 128 * b;
+        const auto *g = reinterpret_cast<const uint8_t *>(&one);
+        native.insert(native.end(), s, s + 16);
+        native.insert(native.end(), g, g + 4);
+        native.insert(native.end(), codes, codes + 128);
+      }
+    return native;
+  }
+  const bool affineMode = affine(f);
+  const uint32_t bits = affineMode ? quant_affine_bits(f) : 4, group = kQuantFormats[f].block_elements;
+  const uint32_t groupBytes = group * bits / 8, rowCodes = K * bits / 8, groups = K / group;
+  for (uint32_t r = 0; r < rows; ++r)
+    for (uint32_t g = 0; g < groups; ++g) {
+      const uint8_t *codes = weight.data() + size_t(r) * rowCodes + g * groupBytes;
+      const size_t parameter = size_t(r) * groups + g;
+      if (!affineMode) {
+        native.push_back(scales[parameter]);
+        for (uint32_t j = 0; j < 16; ++j)
+          native.push_back(uint8_t(affineCode(codes, 4, j) | affineCode(codes, 4, j + 16) << 4));
+        continue;
+      }
+      native.insert(native.end(), scales.begin() + 2 * parameter, scales.begin() + 2 * parameter + 2);
+      native.insert(native.end(), biases.begin() + 2 * parameter, biases.begin() + 2 * parameter + 2);
+      native.insert(native.end(), codes, codes + groupBytes);
+    }
+  return native;
+}
+
+// N native rows of random codes whose scales s are drawn from `scale`, each bias z centering its group's values.
+template <class Scale>
+std::vector<uint8_t> makeAffineNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng, Scale scale) {
+  const QuantFormat &fi = kQuantFormats[f];
+  const uint32_t bits = quant_affine_bits(f);
+  std::vector<uint8_t> v((size_t)N * rowBytes(f, K));
+  for (auto &b : v) b = (uint8_t)rng();
+  std::uniform_real_distribution<float> center(0.4f, 0.6f);
+  for (size_t b = 0; b < v.size() / fi.block_bytes; ++b) {
+    uint8_t *blk = v.data() + b * fi.block_bytes;
+    const float s = scale();
+    const uint16_t sb = f2bf(s), zb = f2bf(-bf2f(sb) * float((1u << bits) - 1) * center(rng));
+    memcpy(blk, &sb, 2); memcpy(blk + 2, &zb, 2);
+  }
+  return v;
+}
+
+// The range of a format's half scales that gives its weights the magnitudes a
+// model's have (a few hundredths), so the GEMM checks see realistic sums; an
+// MLX affine format's, its bf16 scales'.
+inline std::uniform_real_distribution<float> scaleRange(Fmt f) {
+  if (affine(f)) {
+    const float top = 0.064f / float(1u << quant_affine_bits(f));
+    return std::uniform_real_distribution<float>(top / 4, top);
+  }
+  switch (f) {
+    case Q4K: case Q5K: case Q3K: case IQ4NL: case Q80: case Q2K: case Q40: case Q41: case Q50: case Q51: case MXFP4:
+      return std::uniform_real_distribution<float>(0.0005f, 0.004f);
+    case IQ4XS: return std::uniform_real_distribution<float>(0.00002f, 0.00015f);
+    case Q6K: return std::uniform_real_distribution<float>(0.00002f, 0.0001f);
+    case IQ3S: case IQ3XXS: return std::uniform_real_distribution<float>(0.0001f, 0.0005f);
+    case IQ2XXS: case IQ2XS: case IQ2S: return std::uniform_real_distribution<float>(0.0002f, 0.001f);
+    case IQ1S: case IQ1M: return std::uniform_real_distribution<float>(0.001f, 0.008f);
+    case PQ20: case Q20: return std::uniform_real_distribution<float>(0.004f, 0.03f);
+    // Tensor scales: an NVFP4 block's scale is 1 to 60 of them, and an E4M3 value at most 448.
+    case NVFP4: return std::uniform_real_distribution<float>(0.000008f, 0.00006f);
+    case FP8: return std::uniform_real_distribution<float>(0.00002f, 0.00012f);
+    // The scale whose quantized values a 16-bit tensor's take (makeFloat16Native).
+    case BF16: case F16: return std::uniform_real_distribution<float>(0.001f, 0.004f);
+    case FMT_COUNT: break;
+  }
+  unknownFormat(f);
+}
+// N native rows with scales in the format's realistic range.
+inline std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng) {
+  std::uniform_real_distribution<float> range = scaleRange(f);
+  if (affine(f)) return makeAffineNative(f, N, K, rng, [&] { return range(rng); });
+  if (f == NVFP4 || f == FP8) return makeFloatNative(f, N, K, rng, [&] { return range(rng); });
+  return makeNative(f, N, K, rng, [&] { return f2h(range(rng)); });
+}
+
+inline void scale_min_k4(const uint8_t *sc, int j, uint8_t &s, uint8_t &m) {
+  if (j < 4) { s = sc[j] & 63; m = sc[j + 4] & 63; }
+  else { s = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4); }
+}
+// Planes in chunk order (metal/abi/QuantFormat.h): 4-bit linear codes pair-interleaved in chunk words, every
+// other field a little-endian bit string over the slots.
+inline void packBits(const uint8_t *slots, uint32_t bits, uint8_t *dst) {
+  for (uint32_t w = 0, per = 32 / bits; w < bits; ++w) {
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < per; ++i) v |= uint32_t(slots[w * per + i]) << (bits * i);
+    memcpy(dst + 4 * w, &v, 4);
+  }
+}
+inline void packPairs(const uint8_t *slots, uint8_t *dst) {
+  for (uint32_t c = 0; c < 4; ++c) {
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < 8; ++i) v |= uint32_t(slots[8 * c + i]) << ((i & 1) * 16 + 4 * (i >> 1));
+    memcpy(dst + 4 * c, &v, 4);
+  }
+}
+// llama.cpp's ksigns_iq2xs: the eight signs of a 7-bit sign index, bit 7 their parity.
+inline uint8_t signs7(uint32_t index) { return uint8_t(index | (__builtin_popcount(index) & 1) << 7); }
+// The grid value (-1, 0 or 1) of element k of a kIQ1SGrid entry.
+inline int iq1Value(uint32_t entry, int k) { return int((entry >> (8 * (k % 4) + 4 * (k / 4))) & 0xF) - 1; }
+// reference values (llama.cpp dequantize_row_* semantics) + plane bytes for group g of one row
+inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uint8_t p0[64], uint8_t p1[8]) {
+  const QuantFormat &fi = kQuantFormats[f];
+  const uint8_t *blk = row + (g * 32 / fi.block_elements) * fi.block_bytes;
+  const uint32_t j = (g * 32 % fi.block_elements) / 32;
+  uint8_t lo[32], hi[32];   // per slot: the (low) code and its high bits
+  if (affine(f)) {   // the codes' low 2 (2, 3 bits) or 4 bits (4, 5, 6) and the rest as Q2_K, Q3_K, Q4_K, Q5_K, Q6_K
+    const uint32_t bits = quant_affine_bits(f), low = bits == 8 ? 8 : bits <= 3 ? 2 : 4;
+    uint16_t sb, zb; memcpy(&sb, blk, 2); memcpy(&zb, blk + 2, 2);
+    for (uint32_t e = 0; e < 32; ++e) {
+      const uint32_t code = affineCode(blk + 4, bits, 32 * j + e);
+      vals[e] = std::fma(float(code), bf2f(sb), bf2f(zb));
+      lo[quant_slot(e)] = uint8_t(code & ((1u << low) - 1));
+      hi[quant_slot(e)] = uint8_t(code >> low);
+    }
+    if (low == 4) packPairs(lo, p0); else packBits(lo, low, p0);
+    if (bits != low) packBits(hi, bits - low, p1);
+    return;
+  }
+  switch (f) {
+    case Q4K: {
+      const uint8_t *q = blk + 16 + (j / 2) * 32;
+      const int sh = (j % 2) * 4;
+      uint16_t d16, m16; memcpy(&d16, blk, 2); memcpy(&m16, blk + 2, 2);
+      uint8_t sc, mn; scale_min_k4(blk + 4, j, sc, mn);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t code = (q[k] >> sh) & 15;
+        lo[quant_slot(k)] = code;
+        vals[k] = h2f(d16) * sc * code - h2f(m16) * mn;
+      }
+      packPairs(lo, p0); return;
+    }
+    case IQ4XS: {
+      const uint8_t *qs = blk + 8 + j * 16, *sl = blk + 4;
+      uint16_t d16, shh; memcpy(&d16, blk, 2); memcpy(&shh, blk + 2, 2);
+      const int ls = ((sl[j / 2] >> 4 * (j % 2)) & 0xf) | (((shh >> 2 * j) & 3) << 4);
+      const float s = h2f(d16) * (ls - 32);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t code = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4);
+        lo[quant_slot(k)] = code;
+        vals[k] = s * kIQ4NLValues[code];
+      }
+      packBits(lo, 4, p0); return;
+    }
+    case IQ4NL: {
+      const uint8_t *qs = blk + 2;
+      uint16_t d16; memcpy(&d16, blk, 2);
+      const float s = h2f(d16);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t code = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4);
+        lo[quant_slot(k)] = code;
+        vals[k] = s * kIQ4NLValues[code];
+      }
+      packBits(lo, 4, p0); return;
+    }
+    case Q5K: {
+      const uint8_t *qh = blk + 16, *ql = blk + 48 + (j / 2) * 32;
+      const int sh = (j % 2) * 4;
+      uint16_t d16, m16; memcpy(&d16, blk, 2); memcpy(&m16, blk + 2, 2);
+      uint8_t sc, mn; scale_min_k4(blk + 4, j, sc, mn);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t l4 = (ql[k] >> sh) & 15, h1 = (qh[k] >> j) & 1;
+        lo[quant_slot(k)] = l4;
+        hi[quant_slot(k)] = h1;
+        vals[k] = h2f(d16) * sc * (l4 + 16 * h1) - h2f(m16) * mn;
+      }
+      packPairs(lo, p0); packBits(hi, 1, p1); return;
+    }
+    case Q6K: {
+      const uint32_t n = j / 4, r = j % 4;
+      const uint8_t *ql = blk + 64 * n, *qh = blk + 128 + 32 * n;
+      const int8_t *sc = (const int8_t *)(blk + kQ6KScales) + 8 * n;
+      uint16_t d16; memcpy(&d16, blk + kQ6KD, 2);
+      const float d = h2f(d16);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t l4 = (ql[k + 32 * (r & 1)] >> (4 * (r >> 1))) & 15, h2 = (qh[k] >> (2 * r)) & 3;
+        const int q6 = (l4 | (h2 << 4)) - 32;
+        lo[quant_slot(k)] = l4;
+        hi[quant_slot(k)] = h2;
+        vals[k] = d * sc[2 * r + k / 16] * q6;
+      }
+      packPairs(lo, p0); packBits(hi, 2, p1); return;
+    }
+    case Q3K: {
+      const uint32_t n = j / 4, jj = j % 4;
+      const uint8_t *hm = blk, *q = blk + 32 + 32 * n;
+      uint32_t aux[4]; memcpy(aux, blk + kQ3KScales, 12);
+      const uint32_t tmp = aux[2], kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
+      aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+      aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+      aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+      aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+      const int8_t *scales = (const int8_t *)aux;
+      uint16_t d16; memcpy(&d16, blk + kQ3KD, 2);
+      const float d = h2f(d16);
+      for (int k = 0; k < 32; ++k) {
+        const int c2 = (q[k] >> (2 * jj)) & 3, hb1 = (hm[k] >> j) & 1;
+        lo[quant_slot(k)] = uint8_t(c2);
+        hi[quant_slot(k)] = uint8_t(hb1);
+        vals[k] = d * (scales[2 * j + k / 16] - 32) * (c2 - (hb1 ? 0 : 4));
+      }
+      packBits(lo, 2, p0); packBits(hi, 1, p1); return;
+    }
+    case Q80: {
+      uint16_t d16; memcpy(&d16, blk, 2);
+      const int8_t *qs = (const int8_t *)(blk + 2);
+      for (int k = 0; k < 32; ++k) { vals[k] = h2f(d16) * qs[k]; lo[quant_slot(k)] = uint8_t(qs[k]); }
+      packBits(lo, 8, p0); return;
+    }
+    case IQ3S: {
+      const uint8_t *qs = blk + 2 + 8 * j, *qh = blk + 66, *signs = blk + 74 + 4 * j, *scales = blk + 106;
+      uint16_t d16; memcpy(&d16, blk, 2);
+      const uint32_t sc = (scales[j / 2] >> (4 * (j % 2))) & 0xf;
+      const float db = h2f(d16) * (1 + 2 * sc);
+      for (int l = 0; l < 4; ++l) {
+        const uint8_t *g1 = (const uint8_t *)(kIQ3SGrid + (qs[2 * l] | ((qh[j] << (8 - 2 * l)) & 256)));
+        const uint8_t *g2 = (const uint8_t *)(kIQ3SGrid + (qs[2 * l + 1] | ((qh[j] << (7 - 2 * l)) & 256)));
+        for (int k = 0; k < 4; ++k) {
+          vals[8 * l + k] = db * g1[k] * ((signs[l] & (1 << k)) ? -1.f : 1.f);
+          vals[8 * l + 4 + k] = db * g2[k] * ((signs[l] & (1 << (4 + k))) ? -1.f : 1.f);
+        }
+      }
+      // word c: grid indices of elements 4c.. and 16+4c.. (qs[c], qs[4 + c]), chunk c's signs, their ninth bits,
+      // the scale
+      for (int k = 0; k < 32; ++k) hi[quant_slot(k)] = (signs[k / 8] >> (k % 8)) & 1;
+      uint8_t sign[4]; packBits(hi, 1, sign);
+      for (int c = 0; c < 4; ++c) {
+        const uint32_t v = qs[c] | uint32_t(qs[4 + c]) << 8 | uint32_t(sign[c]) << 16 | ((qh[j] >> c) & 1u) << 24 |
+                           ((qh[j] >> (4 + c)) & 1u) << 25 | sc << 26;
+        memcpy(p0 + 4 * c, &v, 4);
+      }
+      return;
+    }
+    case Q2K: {
+      const uint8_t *q = blk + 16 + 32 * (j / 4), *sc = blk + 2 * j;
+      uint16_t d16, m16; memcpy(&d16, blk + kQ2KD, 2); memcpy(&m16, blk + kQ2KD + 2, 2);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t code = (q[k] >> (2 * (j % 4))) & 3, s = sc[k / 16];
+        lo[quant_slot(k)] = code;
+        vals[k] = h2f(d16) * (s & 0xF) * code - h2f(m16) * (s >> 4);
+      }
+      packBits(lo, 2, p0); return;
+    }
+    case PQ20: case Q20: {   // block_pq2_0 {d, qs[32]}, block_q2_0 {d, qs[16]}: element 32 j + k is bits 2 (k % 4)
+                             // of qs[8 j + k / 4]
+      uint16_t d16; memcpy(&d16, blk, 2);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t code = (blk[2 + 8 * j + k / 4] >> (2 * (k % 4))) & 3;
+        lo[quant_slot(k)] = code;
+        vals[k] = (int(code) - 1) * h2f(d16);
+      }
+      packBits(lo, 2, p0); return;
+    }
+    case NVFP4: {   // kFP4Values (twice E2M1) times (e4m3 / 2^8) (128 g), as the kernels round them
+      const float g = blockScale(blk, kNvfp4Scale);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t code = (blk[kNvfp4Codes + 16 * j + k / 2] >> (4 * (k % 2))) & 15;
+        lo[quant_slot(k)] = code;
+        vals[k] = float(kFP4Values[code]) * (e4m3(blk[2 * j + k / 16]) / 256.0f * (128.0f * g));
+      }
+      packBits(lo, 4, p0); return;
+    }
+    case FP8: {   // (e4m3 / 2^8) (256 g)
+      const float g = blockScale(blk, 0);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t value = blk[kFp8Values + 32 * j + k];
+        lo[quant_slot(k)] = value;
+        vals[k] = e4m3(value) / 256.0f * (256.0f * g);
+      }
+      packBits(lo, 8, p0); return;
+    }
+    case BF16: case F16: {   // value 32 j + k of the block, times g = 1
+      for (int k = 0; k < 32; ++k) {
+        uint16_t x; memcpy(&x, blk + 2 * (32 * j + k), 2);
+        vals[k] = f == BF16 ? splash::test::bf16ToFloat(x) : h2f(x);
+        memcpy(p0 + 2 * quant_slot(k), &x, 2);
+      }
+      return;
+    }
+    case Q40: case Q41: case MXFP4: {
+      const uint8_t *qs = blk + fi.meta_bytes;
+      uint16_t d16, m16 = 0; memcpy(&d16, blk, 2); if (f == Q41) memcpy(&m16, blk + 2, 2);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t code = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4);
+        lo[quant_slot(k)] = code;
+        vals[k] = f == Q40 ? (code - 8) * h2f(d16) : f == Q41 ? code * h2f(d16) + h2f(m16) : kFP4Values[code] * e8m0Half(blk[0]);
+      }
+      if (f == MXFP4) packBits(lo, 4, p0); else packPairs(lo, p0);
+      return;
+    }
+    case Q50: case Q51: {   // the meta unit, qh[4], then qs[16]: element k's fifth bit is bit k of qh
+      const uint8_t *qh = blk + fi.meta_bytes, *qs = qh + 4;
+      uint16_t d16, m16 = 0; memcpy(&d16, blk, 2); if (f == Q51) memcpy(&m16, blk + 2, 2);
+      for (int k = 0; k < 32; ++k) {
+        const uint8_t l4 = k < 16 ? (qs[k] & 15) : (qs[k - 16] >> 4), h1 = (qh[k / 8] >> (k % 8)) & 1;
+        const int code = l4 | h1 << 4;
+        lo[quant_slot(k)] = l4;
+        hi[quant_slot(k)] = h1;
+        vals[k] = f == Q50 ? (code - 16) * h2f(d16) : code * h2f(d16) + h2f(m16);
+      }
+      packPairs(lo, p0); packBits(hi, 1, p1); return;
+    }
+    // The IQ3_XXS, IQ2 and IQ1 planes are the group's native bytes (metal/abi/QuantFormat.h).
+    case IQ3XXS: {
+      const uint8_t *qs = blk + 2 + 8 * j;
+      uint16_t d16; memcpy(&d16, blk, 2);
+      uint32_t aux; memcpy(&aux, blk + 66 + 4 * j, 4);
+      const float db = h2f(d16) * (0.5f + (aux >> 28)) * 0.5f;
+      for (int l = 0; l < 4; ++l) {
+        const uint8_t signs = signs7((aux >> 7 * l) & 127);
+        const uint8_t *g1 = (const uint8_t *)(kIQ3XXSGrid + qs[2 * l]), *g2 = (const uint8_t *)(kIQ3XXSGrid + qs[2 * l + 1]);
+        for (int k = 0; k < 4; ++k) {
+          vals[8 * l + k] = db * g1[k] * (signs & (1 << k) ? -1.f : 1.f);
+          vals[8 * l + 4 + k] = db * g2[k] * (signs & (1 << (4 + k)) ? -1.f : 1.f);
+        }
+      }
+      memcpy(p0, qs, 8); memcpy(p1, &aux, 4); return;
+    }
+    case IQ2XXS: {
+      uint16_t d16; memcpy(&d16, blk, 2);
+      uint32_t aux[2]; memcpy(aux, blk + 2 + 8 * j, 8);
+      const float db = h2f(d16) * (0.5f + (aux[1] >> 28)) * 0.25f;
+      for (int l = 0; l < 4; ++l) {
+        const uint8_t *grid = (const uint8_t *)(kIQ2XXSGrid + ((aux[0] >> 8 * l) & 0xFF));
+        const uint8_t signs = signs7((aux[1] >> 7 * l) & 127);
+        for (int k = 0; k < 8; ++k) vals[8 * l + k] = db * grid[k] * (signs & (1 << k) ? -1.f : 1.f);
+      }
+      memcpy(p0, aux, 8); return;
+    }
+    case IQ2XS: case IQ2S: {
+      uint16_t d16; memcpy(&d16, blk, 2);
+      const uint8_t sc = blk[(f == IQ2XS ? 66 : 74) + j];
+      const float db[2] = {h2f(d16) * (0.5f + (sc & 0xf)) * 0.25f, h2f(d16) * (0.5f + (sc >> 4)) * 0.25f};
+      uint16_t qs[4]; memcpy(qs, blk + 2 + 8 * j, 8);   // IQ2_XS
+      const uint8_t *qs8 = blk + 2 + 4 * j, *signs = qs8 + 32, qh = blk[66 + j];   // IQ2_S
+      for (int l = 0; l < 4; ++l) {
+        const uint8_t *grid = f == IQ2XS ? (const uint8_t *)(kIQ2XSGrid + (qs[l] & 511))
+                                         : (const uint8_t *)(kIQ2SGrid + (qs8[l] | (qh << (8 - 2 * l) & 0x300)));
+        const uint8_t sign = f == IQ2XS ? signs7(qs[l] >> 9) : signs[l];
+        for (int k = 0; k < 8; ++k) vals[8 * l + k] = db[l / 2] * grid[k] * (sign & (1 << k) ? -1.f : 1.f);
+      }
+      if (f == IQ2XS) { memcpy(p0, qs, 8); p1[0] = sc; }
+      else { memcpy(p0, qs8, 4); memcpy(p0 + 4, signs, 4); p1[0] = qh; p1[1] = sc; }
+      return;
+    }
+    case IQ1S: {
+      const uint8_t *qs = blk + 2 + 4 * j;
+      uint16_t d16, qh; memcpy(&d16, blk, 2); memcpy(&qh, blk + 34 + 2 * j, 2);
+      const float dl = h2f(d16) * (2 * ((qh >> 12) & 7) + 1), delta = qh & 0x8000 ? -0.125f : 0.125f;
+      for (int l = 0; l < 4; ++l) {
+        const uint32_t entry = kIQ1SGrid[qs[l] | (((qh >> 3 * l) & 7) << 8)];
+        for (int k = 0; k < 8; ++k) vals[8 * l + k] = dl * (iq1Value(entry, k) + delta);
+      }
+      memcpy(p0, qs, 4); memcpy(p1, &qh, 2); return;
+    }
+    case IQ1M: {
+      const uint8_t *qs = blk + 4 * j, *qh = blk + 32 + 2 * j;
+      uint16_t sc[4]; memcpy(sc, blk + kIQ1MScales, 8);
+      const uint16_t d16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+      const float dl[2] = {h2f(d16) * (2 * ((sc[j / 2] >> (6 * (j % 2))) & 7) + 1),
+                           h2f(d16) * (2 * ((sc[j / 2] >> (6 * (j % 2) + 3)) & 7) + 1)};
+      for (int l = 0; l < 4; ++l) {
+        const uint8_t h = qh[l / 2] >> (4 * (l % 2));
+        const uint32_t entry = kIQ1SGrid[qs[l] | ((h & 7) << 8)];
+        const float delta = h & 8 ? -0.125f : 0.125f;
+        for (int k = 0; k < 8; ++k) vals[8 * l + k] = dl[l / 2] * (iq1Value(entry, k) + delta);
+      }
+      memcpy(p0, qs, 4); memcpy(p1, qh, 2); return;
+    }
+    case FMT_COUNT: break;
+  }
+  unknownFormat(f);
+}
+inline void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
+  const QuantFormat &fi = kQuantFormats[f];
+  const uint8_t *blk = row + unit * fi.block_bytes;
+  if (affine(f)) { memcpy(dst, blk, fi.meta_bytes); return; }   // s, z
+  switch (f) {
+    // The block's leading fields.
+    case Q4K: case Q5K: case IQ4XS: case IQ4NL: case Q80: case IQ3S: case IQ3XXS: case IQ2XXS: case IQ2XS: case IQ2S:
+    case IQ1S: case Q40: case Q41: case Q50: case Q51: case MXFP4: case PQ20: case Q20:
+      memcpy(dst, blk, fi.meta_bytes); return;
+    case Q6K: memcpy(dst, blk + kQ6KScales, 16); memcpy(dst + 16, blk + kQ6KD, 2); dst[18] = dst[19] = 0; return;
+    case NVFP4: case FP8: memcpy(dst, blk, fi.meta_bytes); return;   // the scales and g, or g
+    case Q3K: memcpy(dst, blk + kQ3KD, 2); dst[2] = dst[3] = 0; memcpy(dst + 4, blk + kQ3KScales, 12); return;
+    case Q2K: memcpy(dst, blk + kQ2KD, 4); memcpy(dst + 4, blk, 16); return;
+    case IQ1M: memcpy(dst, blk + kIQ1MScales, 8); return;
+    case BF16: case F16: { const float g = 1.0f; memcpy(dst, &g, 4); return; }   // the repack's g
+    case FMT_COUNT: break;
+  }
+  unknownFormat(f);
+}
+// GGML's fp32 values of one native row of K weights.
+inline void rowValues(Fmt f, const uint8_t *row, uint32_t K, float *values) {
+  uint8_t p0[64], p1[8];
+  for (uint32_t g = 0; g < K / 32; ++g) groupPack(f, row, g, values + g * 32, p0, p1);
+}
+struct Packed { std::vector<uint8_t> w0, w1, meta; };
+inline Packed repack(Fmt f, const std::vector<uint8_t> &native, uint32_t N, uint32_t K, std::vector<float> *Wf,
+                     std::vector<float> *Ws = nullptr) {
+  const QuantFormat &fi = kQuantFormats[f];
+  const uint32_t G = K / 32, rb = rowBytes(f, K), units = G / fi.meta_groups;
+  Packed p;
+  p.w0.assign((size_t)N * G * fi.plane0_bytes, 0);
+  p.w1.assign(fi.plane1_bytes ? (size_t)N * G * fi.plane1_bytes : 16, 0);
+  p.meta.assign((size_t)N * units * fi.meta_bytes, 0);
+  if (Wf) Wf->assign((size_t)N * K, 0.f);
+  if (Ws) Ws->assign((size_t)N * K, 0.f);
+  for (uint32_t n = 0; n < N; ++n) {
+    const uint8_t *row = native.data() + (size_t)n * rb;
+    for (uint32_t g = 0; g < G; ++g) {
+      float vals[32]; uint8_t p0[64], p1[8];
+      groupPack(f, row, g, vals, p0, p1);
+      memcpy(p.w0.data() + quant_tile_index(n, g, G) * fi.plane0_bytes, p0, fi.plane0_bytes);
+      if (fi.plane1_bytes) memcpy(p.w1.data() + quant_tile_index(n, g, G) * fi.plane1_bytes, p1, fi.plane1_bytes);
+      if (Wf) for (int k = 0; k < 32; ++k) (*Wf)[(size_t)n * K + g * 32 + k] = vals[k];
+      if (Ws) for (int k = 0; k < 32; ++k) (*Ws)[(size_t)n * K + g * 32 + k] = h2f(f2h(vals[k]));
+    }
+    for (uint32_t u = 0; u < units; ++u)
+      metaPack(f, row, u, p.meta.data() + quant_tile_index(n, u, units) * fi.meta_bytes);
+  }
+  return p;
+}
+// Upstream GGML's fp32 dequantization of native rows from an unmodified libggml-base (for example
+// llama.cpp 7ab4ee7) loaded with dlopen; false and a message when it lacks the format's symbol, as for every MLX
+// affine format. PQ2_0's symbol needs PrismML-Eng/llama.cpp 01ae597's libggml.
+// GGML's fp32 values of the first `elements` elements of blocks, through its function `symbol`
+// (dequantize_row_<type>).
+inline bool ggmlDequantizeRows(void *ggml, const char *symbol, const std::vector<uint8_t> &blocks, size_t elements,
+                               std::vector<float> &values, std::string &error) {
+  using Dequantize = void (*)(const void *, float *, int64_t);
+  auto decode = reinterpret_cast<Dequantize>(dlsym(ggml, symbol));
+  if (!decode) { error = dlerror(); return false; }
+  values.assign(elements, 0.f);
+  decode(blocks.data(), values.data(), (int64_t)values.size());
+  return true;
+}
+// GGML's fp32 values of each GGUF format: its dequantize_row_*, or BF16's and F16's row conversions.
+constexpr std::pair<Fmt, const char *> kGgmlSymbols[] = {
+    {Q4K, "dequantize_row_q4_K"},     {IQ4XS, "dequantize_row_iq4_xs"},   {IQ4NL, "dequantize_row_iq4_nl"},
+    {Q5K, "dequantize_row_q5_K"},     {Q6K, "dequantize_row_q6_K"},       {Q3K, "dequantize_row_q3_K"},
+    {Q80, "dequantize_row_q8_0"},     {IQ3S, "dequantize_row_iq3_s"},     {Q2K, "dequantize_row_q2_K"},
+    {IQ3XXS, "dequantize_row_iq3_xxs"}, {IQ2XXS, "dequantize_row_iq2_xxs"}, {IQ2XS, "dequantize_row_iq2_xs"},
+    {IQ2S, "dequantize_row_iq2_s"},   {IQ1S, "dequantize_row_iq1_s"},     {IQ1M, "dequantize_row_iq1_m"},
+    {Q40, "dequantize_row_q4_0"},     {Q41, "dequantize_row_q4_1"},       {MXFP4, "dequantize_row_mxfp4"},
+    {PQ20, "dequantize_row_pq2_0"},   {Q50, "dequantize_row_q5_0"},       {Q51, "dequantize_row_q5_1"},
+    {BF16, "ggml_bf16_to_fp32_row"},  {F16, "ggml_fp16_to_fp32_row"},     {Q20, "dequantize_row_q2_0"}};
+static_assert([] {
+  uint32_t formats = 0;
+  for (uint32_t f = 0; f < GGUF_FMT_COUNT; ++f) formats += !quant_loader_format(f);
+  return std::size(kGgmlSymbols) == formats;
+}(), "a GGML symbol per GGUF format");
+inline bool ggmlDequantize(void *ggml, Fmt f, const std::vector<uint8_t> &native, std::vector<float> &values,
+                           std::string &error) {
+  const auto symbol = std::find_if(std::begin(kGgmlSymbols), std::end(kGgmlSymbols),
+                                   [f](const auto &entry) { return entry.first == f; });
+  if (symbol == std::end(kGgmlSymbols)) { error = std::string("GGML has no ") + fmtName(f); return false; }
+  return ggmlDequantizeRows(ggml, symbol->second, native,
+                            native.size() / kQuantFormats[f].block_bytes * kQuantFormats[f].block_elements, values,
+                            error);
+}
+
+// The fp64 dot product of a bf16 row with a weight row and the magnitudes its
+// error bounds scale with.
+struct Dot {
+  double value = 0, magnitude = 0, inputs = 0, largest = 0;
+};
+inline Dot dot(const float *x, const float *w, uint32_t K) {
+  Dot d;
+  for (uint32_t k = 0; k < K; ++k) {
+    d.value += double(x[k]) * w[k];
+    d.magnitude += std::fabs(double(x[k]) * w[k]);
+    d.inputs += std::fabs(x[k]);
+    d.largest = std::max(d.largest, double(std::fabs(w[k])));
+  }
+  return d;
+}
+
+// The distance from the fp64 dot product within which a GGUF projection's
+// fp32 result lies, before its epilogue and bf16 rounding. Both tiles
+// multiply bf16 inputs by exactly represented weight operands and accumulate
+// in fp32: 2^-16 sum|x| max|w| = 256 u sum|x| max|w| (u = 2^-24) bounds a
+// chain of 256 fp32 additions over sum|x w| <= sum|x| max|w|; the longer
+// chains of a large K round independently, so their error grows with the
+// square root of their length. The register tile (Apple9) is exact up to that
+// accumulation, but for Q2_K's mins, which it adds as m / -160 times the seed
+// (-160 times the sum of 16 inputs): two more roundings of |m| sum|x| <=
+// max|w| sum|x|. The staged tile rounds every weight once to half: 2^-11 of
+// each product, and 2^-25 of each |x| for weights below half's normal range.
+inline double projectionBound(const Dot &d, bool staged) {
+  const double accumulation = std::ldexp(d.inputs * d.largest, -16);
+  return staged ? accumulation + std::ldexp(d.magnitude, -11) + std::ldexp(d.inputs, -25) : accumulation;
+}
+
+} // namespace gguf_reference

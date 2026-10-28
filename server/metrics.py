@@ -7,10 +7,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass
 
-if __package__:
-    from .latency import prometheus_latency
-else:
-    from latency import prometheus_latency
+from .latency import prometheus_latency
 
 
 def is_finite_number(value):
@@ -40,8 +37,9 @@ class LabelledCounter:
     paths: dict
 
 
-# Metric name -> native status path (or labelled family), rendered in order.
-_STATUS_METRICS = {
+# Each gauge or counter Prometheus reads from the status, by the path of
+# keys to its value.
+PROMETHEUS_SERIES = {
     "splash_ready": ("ready",),
     "splash_metal_healthy": ("metal", "healthy"),
     "splash_transport_pending": ("transport", "pending"),
@@ -56,6 +54,7 @@ _STATUS_METRICS = {
     "splash_scheduler_waiting_resources": ("scheduler", "waiting_resources"),
     "splash_scheduler_waiting_prefix": ("scheduler", "waiting_prefix"),
     "splash_cache_resource_suspensions_total": ("cache", "resource_suspensions"),
+    "splash_cache_priority_suspensions_total": ("cache", "priority_suspensions"),
     "splash_cache_resource_resumptions_total": ("cache", "resource_resumptions"),
     "splash_cache_resource_replay_tokens_total": (
         "cache",
@@ -95,10 +94,6 @@ _STATUS_METRICS = {
     "splash_scheduler_prefill_batches_total": ("scheduler", "prefill_batches"),
     "splash_scheduler_prefill_rows_total": ("scheduler", "prefill_rows"),
     "splash_scheduler_decode_batches_total": ("scheduler", "decode_batches"),
-    "splash_scheduler_decode_mixed_greedy_sampling_batches_total": (
-        "scheduler",
-        "decode_mixed_greedy_sampling_batches",
-    ),
     "splash_scheduler_decode_b1_total": (
         "scheduler",
         "decode_batches_by_width",
@@ -119,83 +114,56 @@ _STATUS_METRICS = {
         "decode_batches_by_width",
         "b4",
     ),
-    "splash_kv_blocks": ("kv", "blocks"),
+    "splash_kv_pages_allocated": ("kv", "pages_allocated"),
     "splash_kv_evictions_total": ("kv", "evictions"),
-    "splash_kv_pages_total": ("kv", "pages_total"),
-    "splash_kv_pages_free": ("kv", "pages_free"),
     "splash_kv_pages_active": ("kv", "pages_active"),
     "splash_kv_pages_cache": ("kv", "pages_cache"),
-    "splash_kv_pages_resident": ("kv", "pages_resident"),
-    "splash_kv_pages_free_resident": ("kv", "pages_free_resident"),
-    "splash_kv_resident_backing_bytes": ("kv", "resident_backing_bytes"),
-    "splash_kv_reclaimable_backing_bytes": ("kv", "reclaimable_backing_bytes"),
-    "splash_kv_sparse_tile_bytes": ("kv", "sparse_tile_bytes"),
-    "splash_kv_pending_unmaps": ("kv", "pending_unmaps"),
-    "splash_kv_pending_unmap_ms": ("kv", "pending_unmap_ms"),
-    "splash_kv_unmaps_completed": ("kv", "unmaps_completed"),
-    "splash_kv_unmap_last_ms": ("kv", "unmap_last_ms"),
-    "splash_kv_unmap_max_ms": ("kv", "unmap_max_ms"),
-    "splash_kv_map_wait_event": ("kv", "map_wait_event"),
-    "splash_kv_pending_map_wait_ms": ("kv", "pending_map_wait_ms"),
-    "splash_kv_map_wait_last_ms": ("kv", "map_wait_last_ms"),
-    "splash_kv_map_wait_max_ms": ("kv", "map_wait_max_ms"),
+    "splash_kv_free_allocated_pages": ("kv", "pages_free"),
+    "splash_kv_allocated_bytes": ("kv", "allocated_bytes"),
+    "splash_kv_reclaimable_bytes": ("kv", "reclaimable_bytes"),
+    "splash_kv_extent_allocations_total": ("kv", "extent_allocations"),
+    "splash_kv_extent_releases_total": ("kv", "extent_releases"),
+    "splash_kv_extent_allocate_max_milliseconds": (
+        "kv",
+        "extent_allocate_max_ms",
+    ),
+    "splash_kv_extent_release_max_milliseconds": (
+        "kv",
+        "extent_release_max_ms",
+    ),
+    "splash_kv_extent_compactions_total": ("kv", "extent_compactions"),
+    "splash_kv_pages_moved_total": ("kv", "pages_moved"),
+    "splash_kv_extent_compact_max_milliseconds": (
+        "kv",
+        "extent_compact_max_ms",
+    ),
     "splash_state_entries": ("state", "entries"),
     "splash_state_pinned": ("state", "pinned"),
+    "splash_state_in_use": ("state", "in_use"),
+    "splash_state_in_use_evictions_total": ("state", "in_use_evictions"),
     "splash_state_bytes": ("state", "bytes"),
-    "splash_state_active_cells": ("state", "active_cells"),
-    "splash_state_hits_total": ("state", "hits"),
-    "splash_state_misses_total": ("state", "misses"),
+    "splash_state_active_lanes": ("state", "active_lanes"),
     "splash_state_publications_total": ("state", "publications"),
     "splash_state_evictions_total": ("state", "evictions"),
-    "splash_state_evictions_by_cause_total": LabelledCounter(
-        help_text=(
-            "State cache evictions by cause: a pressure reclaim pass, growth "
-            "after a budget or KV capacity denial, idle backing reused while "
-            "growth is paused, a denied snapshot, a recycled own checkpoint, "
-            "or KV logical page capacity."
-        ),
-        label="cause",
-        paths={
-            cause: ("state", "eviction_causes", cause)
-            for cause in (
-                "pressure_pass",
-                "growth",
-                "paused_backing",
-                "snapshot",
-                "checkpoint_recycle",
-                "logical_pages",
-            )
-        },
-    ),
+    "splash_disk_capacity_bytes": ("disk", "capacity_bytes"),
+    "splash_disk_limit_bytes": ("disk", "limit_bytes"),
+    "splash_disk_used_bytes": ("disk", "used_bytes"),
+    "splash_disk_volume_available_bytes": ("disk", "volume_available_bytes"),
+    "splash_disk_write_budget_bytes": ("disk", "write_budget_bytes"),
+    "splash_disk_read_bytes_total": ("disk", "read_bytes"),
+    "splash_disk_written_bytes_total": ("disk", "written_bytes"),
     "splash_cache_hits_total": ("cache", "hits"),
     "splash_cache_cold_misses_total": ("cache", "cold_misses"),
     "splash_cache_reused_tokens_total": ("cache", "reused_tokens"),
+    "splash_cache_deduplicated_kv_tokens_total": ("cache", "deduplicated_kv_tokens"),
     "splash_cache_lazy_junctions_total": ("cache", "lazy_junctions"),
-    "splash_cache_checkpoint_publication_failures_total": LabelledCounter(
-        help_text=(
-            "Checkpoint publication failures by cause: a missed prefill "
-            "boundary, a blocked retirement, a denied snapshot, a decode "
-            "overshoot, or an error."
-        ),
-        label="cause",
-        paths={
-            cause: ("cache", "checkpoint_publication_failure_causes", cause)
-            for cause in (
-                "missed_boundary",
-                "retire_blocked",
-                "snapshot_denied",
-                "decode_overshoot",
-                "error",
-            )
-        },
-    ),
     "splash_target_prefill_rows_total": (
         "draft_context",
         "target_prefill_rows",
     ),
-    "splash_draft_context_active_rows_total": (
+    "splash_draft_context_prompt_end_rows_total": (
         "draft_context",
-        "active_rows",
+        "prompt_end_rows",
     ),
     "splash_draft_context_materialization_rows_total": (
         "draft_context",
@@ -209,17 +177,7 @@ _STATUS_METRICS = {
         "draft_context",
         "restore_skipped",
     ),
-    "splash_draft_state_resets_total": LabelledCounter(
-        help_text=(
-            "Draft-state resets: planned starts fresh by design; unplanned "
-            "lost a valid draft context."
-        ),
-        label="kind",
-        paths={
-            "planned": ("draft_context", "planned_resets"),
-            "unplanned": ("draft_context", "unplanned_resets"),
-        },
-    ),
+    "splash_draft_state_resets_total": ("draft_context", "resets"),
     "splash_constraint_mask_overlap_batches_total": (
         "constraint_masks",
         "overlap_batches",
@@ -238,28 +196,22 @@ _STATUS_METRICS = {
     ),
     "splash_image_encodes_total": ("images", "encodes"),
     "splash_image_embedding_reuses_total": ("images", "embedding_reuses"),
+    "splash_image_embedding_evictions_total": ("images", "embedding_evictions"),
+    "splash_image_arena_bytes": ("images", "arena_bytes"),
+    "splash_image_cached_bytes": ("images", "cached_bytes"),
     "splash_memory_current_bytes": ("memory_actual", "current_bytes"),
     "splash_memory_peak_bytes": ("memory_actual", "peak_bytes"),
     "splash_memory_denied_reservations_total": (
         "memory_governor",
         "denied_reservations",
     ),
-    "splash_memory_denied_reservations_by_cause_total": LabelledCounter(
-        help_text=(
-            "Denied memory reservations by the bound that refused them: host "
-            "pressure or the engine budget."
-        ),
-        label="cause",
-        paths={
-            "host": ("memory_governor", "denied_host_reservations"),
-            "engine": ("memory_governor", "denied_engine_reservations"),
-        },
-    ),
     "splash_memory_limit_bytes": ("memory_governor", "limit_bytes"),
     "splash_memory_headroom_bytes": ("memory_governor", "headroom_bytes"),
     "splash_admission_waiting_memory": ("admission", "waiting_memory"),
     "splash_admission_waiting_concurrency": ("admission", "waiting_concurrency"),
     "splash_admission_waiting_schedule": ("admission", "waiting_schedule"),
+    "splash_admission_held_behind_refusal": ("admission", "held_behind_refusal"),
+    "splash_admission_restoring": ("admission", "restoring"),
     "splash_admission_suspended": ("admission", "suspended"),
     "splash_admission_oldest_wait_milliseconds": ("admission", "oldest_wait_ms"),
     "splash_ttft_p50_milliseconds": ("metrics", "ttft_ms", "p50"),
@@ -292,6 +244,7 @@ _STATUS_METRICS = {
     ),
     "splash_decode_output_tokens_total": ("metrics", "decode_output_tokens"),
     "splash_decode_wall_milliseconds_total": ("metrics", "decode_wall_ms"),
+    "splash_decode_cycle_milliseconds_total": ("metrics", "decode_cycle_ms"),
     "splash_decode_tokens_per_second": (
         "metrics",
         "decode_tokens_per_second",
@@ -303,6 +256,56 @@ _STATUS_METRICS = {
     "splash_metal_failures_total": ("metrics", "metal_failures"),
     "splash_response_store_entries": ("response_store", "entries"),
     "splash_response_store_bytes": ("response_store", "bytes"),
+}
+
+
+# Counter families with a label, each sample from its own status path.
+PROMETHEUS_FAMILIES = {
+    "splash_state_evictions_by_cause_total": LabelledCounter(
+        help_text=(
+            "State cache evictions by cause: a pressure reclaim pass, growth "
+            "after a budget or KV capacity denial, idle backing reused while "
+            "growth is paused, a denied snapshot, a recycled own checkpoint, "
+            "or housekeeping (disk quota, invalidation or dropped subtrees)."
+        ),
+        label="cause",
+        paths={
+            cause: ("state", "eviction_causes", cause)
+            for cause in (
+                "pressure_pass",
+                "growth",
+                "paused_backing",
+                "snapshot",
+                "checkpoint_recycle",
+                "housekeeping",
+            )
+        },
+    ),
+    "splash_cache_checkpoint_publication_failures_total": LabelledCounter(
+        help_text=(
+            "Checkpoint publication failures by cause: a blocked retirement "
+            "or a denied snapshot."
+        ),
+        label="cause",
+        paths={
+            cause: ("cache", "checkpoint_publication_failure_causes", cause)
+            for cause in (
+                "retire_blocked",
+                "snapshot_denied",
+            )
+        },
+    ),
+    "splash_memory_denied_reservations_by_cause_total": LabelledCounter(
+        help_text=(
+            "Denied memory reservations by the bound that refused them: host "
+            "pressure or the engine budget."
+        ),
+        label="cause",
+        paths={
+            "host": ("memory_governor", "denied_host_reservations"),
+            "engine": ("memory_governor", "denied_engine_reservations"),
+        },
+    ),
 }
 
 
@@ -330,7 +333,7 @@ def _status_value(status, path):
 
 
 def _labelled_counter_lines(name, family, status):
-    """HELP, TYPE and one sample per present label; nothing when none is."""
+    """HELP, TYPE and one sample per present label; nothing without any."""
     samples = []
     for label_value, path in family.paths.items():
         metric_value = _status_value(status, path)
@@ -351,10 +354,7 @@ def _label_value(text):
 
 
 def _build_info_lines(status):
-    """HELP, TYPE and one `splash_build_info` sample; nothing without `build`.
-
-    Statuses that predate the server's `build` key render exactly as before.
-    """
+    """HELP, TYPE and one `splash_build_info` sample; nothing without `build`."""
     build = status.get("build")
     if not isinstance(build, dict):
         return []
@@ -394,16 +394,25 @@ def prometheus_metrics(status):
             lines.append(
                 f'splash_system_memory_pressure{{state="{state}"}} {gauge_value}'
             )
+    thermal = status.get("thermal_state")
+    for state in ("nominal", "fair", "serious", "critical"):
+        lines.append(
+            f'splash_thermal_state{{state="{state}"}} {1 if thermal == state else 0}'
+        )
+    gated = status.get("disk", {}).get("writes_gated")
+    for state in ("no", "budget", "closed"):
+        lines.append(
+            f'splash_disk_writes_gated{{state="{state}"}} {1 if gated == state else 0}'
+        )
     is_speculation_disabled = _is_speculation_disabled(status)
-    for name, path in _STATUS_METRICS.items():
+    for name, path in PROMETHEUS_SERIES.items():
         if is_speculation_disabled and name in _SPECULATION_METRICS:
-            continue
-        if isinstance(path, LabelledCounter):
-            lines.extend(_labelled_counter_lines(name, path, status))
             continue
         metric_value = _status_value(status, path)
         if metric_value is not None:
             lines.append(f"{name} {metric_value}")
+    for name, family in PROMETHEUS_FAMILIES.items():
+        lines.extend(_labelled_counter_lines(name, family, status))
     if governor.get("host_measurement_valid") is True:
         for name, path in HOST_MEMORY_METRICS.items():
             metric_value = _status_value(status, path)
@@ -430,10 +439,10 @@ def timings_dict(result):
     emission respectively: those tokens precede the intervals being measured.
     These are elapsed request intervals, not isolated GPU execution times.
     """
-    latency = metrics_dict(result)["request_latency"]
+    latency = result.metrics["request_latency"]
     prompt_ms = latency.get("start_to_first_token_ms", 0.0)
     prompt_rate = result.prefill_tokens * 1000.0 / prompt_ms if prompt_ms else 0.0
-    return {
+    timings = {
         "prompt_n": result.prompt_tokens,
         "prompt_ms": prompt_ms,
         "prompt_per_second": prompt_rate if math.isfinite(prompt_rate) else 0.0,
@@ -442,6 +451,12 @@ def timings_dict(result):
         "predicted_per_second": latency.get("stream_tokens_per_second", 0.0),
         "cache_n": result.cache.matched_tokens,
     }
+    if result.drafted_tokens:
+        timings.update(
+            draft_n=result.drafted_tokens,
+            draft_n_accepted=result.accepted_draft_tokens,
+        )
+    return timings
 
 
 def metrics_dict(result):
@@ -484,8 +499,8 @@ def metrics_dict(result):
     cache = {
         "status": cache_info.status,
         "matched_tokens": cache_info.matched_tokens,
-        "capacity": cache_info.capacity,
-        "slot": cache_info.slot if cache_info.slot >= 0 else None,
+        "deduplicated_tokens": cache_info.deduplicated_tokens,
+        "lane": cache_info.lane if cache_info.lane >= 0 else None,
     }
     metrics = {
         "prefill": {"tokens": result.prefill_tokens},
@@ -496,6 +511,12 @@ def metrics_dict(result):
         "cache": cache,
         "engine": engine_dict(result.engine_timing),
     }
+    if result.drafted_tokens:
+        metrics["speculation"] = {
+            "drafted_tokens": result.drafted_tokens,
+            "accepted_draft_tokens": result.accepted_draft_tokens,
+            "cycles": result.draft_cycles,
+        }
     return metrics
 
 
@@ -515,8 +536,6 @@ def engine_dict(timing):
         "prefill_wall_ms": timing.prefill_wall_micros / MICROS_PER_MILLISECOND,
         "decode_wall_ms": timing.decode_wall_micros / MICROS_PER_MILLISECOND,
         "decode_steps": timing.decode_steps,
-        "drafted_tokens": timing.drafted_tokens,
-        "accepted_draft_tokens": timing.accepted_draft_tokens,
         "suspensions": timing.suspensions,
         "decode_suspensions": timing.decode_suspensions,
         "replay_tokens": timing.replay_tokens,

@@ -131,8 +131,9 @@ BALLAST_SHED = "shed"
 BALLAST_TOUCH_SECONDS = 1.0
 BALLAST_POLL_SECONDS = 0.5
 BALLAST_EXIT_SECONDS = 5.0
-# MemoryPlan.hpp EngineMemoryPolicy::minimumHostWarningMarginBytes.
-MINIMUM_HOST_WARNING_MARGIN_BYTES = 256 * BYTES_PER_MB
+# MemoryGovernor.hpp kHostWarningMarginBytes: the host headroom the server
+# keeps free before growth no request in service needs; keep the two in step.
+HOST_WARNING_MARGIN_BYTES = 1024 * BYTES_PER_MB
 # How far below the warning margin `auto` holds the server's host headroom:
 # enough to enter the server's warning latch, which holds until the recovery
 # margin, yet so little that the server's own reclaim lifts the headroom back
@@ -147,17 +148,13 @@ HOST_SAMPLE_READINGS = (
     "host_available_bytes",
     "host_inactive_bytes",
     "host_wired_bytes",
-    "host_weight_wired_bytes",
     "host_compressor_bytes",
 )
 
 # The `/status` causes that split checkpoint_publication_failures.
 CHECKPOINT_FAILURE_CAUSES = (
-    "missed_boundary",
     "retire_blocked",
     "snapshot_denied",
-    "decode_overshoot",
-    "error",
 )
 # (record key, `/status` path) of the cumulative counters diffed per phase.
 PHASE_COUNTERS = (
@@ -212,11 +209,10 @@ SAMPLE_READINGS = (
     ("host_available_bytes", ("memory_governor", "host_available_bytes")),
     ("host_headroom_bytes", ("memory_governor", "host_headroom_bytes")),
     ("host_wired_bytes", ("memory_governor", "host_wired_bytes")),
-    ("host_weight_bytes", ("memory_governor", "host_weight_bytes")),
-    ("host_weight_wired_bytes", ("memory_governor", "host_weight_wired_bytes")),
     ("host_compressor_bytes", ("memory_governor", "host_compressor_bytes")),
     ("kv_pages_cache", ("kv", "pages_cache")),
-    ("kv_pages_resident", ("kv", "pages_resident")),
+    # Pages exist only in allocated extents: every allocated page is resident.
+    ("kv_pages_resident", ("kv", "pages_allocated")),
 )
 # (summary key, sample key) of the readings whose minimum the summary reports.
 MINIMUM_READINGS = (
@@ -390,16 +386,6 @@ class Sampler:
 
 
 # ------------------------------------------------------------------------------
-def host_warning_margin_bytes(reserve_bytes: int) -> int:
-    """Return the host cushion's warning margin for a host reserve.
-
-    Mirrors EngineMemoryPolicy::hostCushionForReserve
-    (runtime/engine/MemoryPlan.hpp); keep the two in step.
-    """
-    return max(reserve_bytes // 4, MINIMUM_HOST_WARNING_MARGIN_BYTES)
-
-
-# ------------------------------------------------------------------------------
 def host_sample_key(snapshot: dict) -> tuple:
     """Return the `/status` readings that identify the server's host sample."""
     governor = ("memory_governor",)
@@ -415,13 +401,10 @@ def auto_ballast(snapshot: dict, held_bytes: int, sampled_held: tuple) -> dict:
     `held_bytes` is what the ballast holds now and `sampled_held` the (least,
     most) the server's current host sample can count of it. The server
     computes its `/status` host_headroom_bytes from one sample
-    (MemoryGovernor::hostHeadroomBytes over estimateHostAvailableMemory): its
-    page counts and its hot weights' wiring read at the same instant. The probe
-    cannot read the weights' wiring, which swings by most of the weight size
-    within seconds during a turn, and `vm_stat` counts unwired weights as
-    file-backed, so a fresh `vm_stat` paired with a wiring reading from another
-    moment over-reads the headroom by up to the weight size. The server
-    refreshes its sample only every few to tens of seconds, so the ballast's
+    (MemoryGovernor::hostHeadroomBytes over queryHostMemory): its page counts
+    read at one instant, less its spare reserve. The probe sizes from that
+    reading rather than its own `vm_stat`, so both act on the same headroom.
+    The server refreshes its sample only every few to tens of seconds, so the ballast's
     change since then is applied here: growth decisions take the least the
     sample counted, so the headroom read never exceeds the server's, and shed
     decisions the most, so a release the sample has not seen yet is not
@@ -432,22 +415,20 @@ def auto_ballast(snapshot: dict, held_bytes: int, sampled_held: tuple) -> dict:
     toward it a bounded step at a time). `shed_bytes` is how much to release to
     lift the headroom back to the target once it fell below
     BALLAST_SHED_HEADROOM_SHARE of the margin, else 0. The warning margin is
-    max(host_reserve_bytes / 4, 256 MiB) from the same sample. Raises
-    ProbeError when the server exports no host_headroom_bytes or
-    host_reserve_bytes.
+    the server's fixed HOST_WARNING_MARGIN_BYTES. Raises ProbeError when the
+    server exports no host_headroom_bytes.
     """
     governor = ("memory_governor",)
     server_headroom = status_reading(snapshot, (*governor, "host_headroom_bytes"))
-    reserve = status_reading(snapshot, (*governor, "host_reserve_bytes"))
-    if server_headroom is None or reserve is None:
+    if server_headroom is None:
         raise ProbeError(
-            "/status memory_governor carries no host_headroom_bytes or "
-            "host_reserve_bytes to size --ballast-mb auto"
+            "/status memory_governor carries no host_headroom_bytes "
+            "to size --ballast-mb auto"
         )
     least_sampled, most_sampled = sampled_held
     headroom = max(0, server_headroom - (held_bytes - least_sampled))
     shed_headroom = max(0, server_headroom - (held_bytes - most_sampled))
-    margin = host_warning_margin_bytes(reserve)
+    margin = HOST_WARNING_MARGIN_BYTES
     target = margin - BALLAST_OVERSHOOT_BYTES
     floor = int(margin * BALLAST_SHED_HEADROOM_SHARE)
     shed_bytes = target - shed_headroom if shed_headroom < floor else 0
@@ -455,7 +436,6 @@ def auto_ballast(snapshot: dict, held_bytes: int, sampled_held: tuple) -> dict:
         "mb": max(0, headroom - target) // BYTES_PER_MB,
         "shed_bytes": shed_bytes,
         "host_headroom_bytes": headroom,
-        "host_reserve_bytes": reserve,
         "warning_margin_bytes": margin,
         "target_headroom_bytes": target,
         "shed_headroom_bytes": floor,

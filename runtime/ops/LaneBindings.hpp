@@ -3,6 +3,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/CommandGraph.hpp"
 
+#include <array>
 #include <span>
 #include <stdexcept>
 
@@ -18,6 +19,17 @@ inline void appendLaneBindings(metal::BufferList &bindings,
     throw std::invalid_argument("lane bindings must cover every lane");
   bindings.insert(bindings.end(), first.begin(), first.end());
   bindings.insert(bindings.end(), second.begin(), second.end());
+}
+
+// A per-lane buffer of each lane of `lanes` (at least one), and lane 0's in
+// every slot past them, as a padded lane binds.
+inline std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH>
+laneBindings(std::span<const metal::MetalBuffer> lanes) {
+  if (lanes.empty() || lanes.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("lane bindings must name 1 to every lane");
+  std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> result;
+  for (size_t lane = 0; lane < result.size(); ++lane) result[lane] = lanes[lane < lanes.size() ? lane : 0];
+  return result;
 }
 
 } // namespace splash::ops

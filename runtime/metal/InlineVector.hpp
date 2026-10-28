@@ -123,6 +123,18 @@ public:
     size_ = 0;
   }
 
+  // Drops the elements past count, or appends value-initialized ones up to it.
+  void resize(size_t count) {
+    if (count <= size_) {
+      std::destroy(data_ + count, data_ + size_);
+      size_ = static_cast<decltype(size_)>(count);
+      return;
+    }
+    reserve(count);
+    while (size_ < count)
+      place();
+  }
+
 private:
   [[nodiscard]] T *inlineData() noexcept { return reinterpret_cast<T *>(storage_); }
   [[nodiscard]] const T *inlineData() const noexcept {

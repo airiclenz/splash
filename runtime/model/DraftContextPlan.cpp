@@ -6,23 +6,9 @@
 namespace splash {
 DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
-                 std::optional<uint32_t> restoredDraftBoundary,
-                 std::span<const uint32_t> materializationBoundaries,
-                 bool targetOnlyRestore) {
+                 std::span<const uint32_t> materializationBoundaries) {
   if (replayEnd < replayBegin) {
     throw std::invalid_argument("draft replay range is reversed");
-  }
-  if (restoredDraftBoundary && *restoredDraftBoundary != replayBegin) {
-    throw std::invalid_argument(
-        "restored draft state must coincide with the replay boundary");
-  }
-  if (!restoredDraftBoundary && replayBegin != 0) {
-    throw std::invalid_argument(
-        "nonzero replay requires a restored composite state");
-  }
-  if (targetOnlyRestore && !restoredDraftBoundary) {
-    throw std::invalid_argument(
-        "target-only restore requires a restored composite state");
   }
 
   uint32_t previousMaterialization = 0;
@@ -43,13 +29,10 @@ planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
   DraftContextPlan result;
   result.replayBegin = replayBegin;
   result.replayEnd = replayEnd;
-  result.restoredDraftBoundary = restoredDraftBoundary;
-  result.targetOnlyRestore = targetOnlyRestore;
-  result.targetPrefillRows = replayEnd - replayBegin;
 
   constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
-  uint32_t stateBoundary = restoredDraftBoundary.value_or(0);
-  bool haveState = restoredDraftBoundary.has_value();
+  uint32_t stateBoundary = replayBegin;
+  bool haveState = replayBegin != 0;
 
   const auto addBoundary = [&](uint32_t boundary,
                                DraftBoundaryPurpose purpose) {
@@ -69,14 +52,6 @@ planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
         result.captureSpans.back().end = boundary;
       } else if (rows != 0) {
         result.captureSpans.push_back({captureBegin, boundary, !continueState});
-        if (!continueState)
-          ++result.draftStateResets;
-      }
-
-      if (purpose == DraftBoundaryPurpose::Active) {
-        result.draftContextRowsActive += rows;
-      } else {
-        result.draftContextRowsMaterialization += rows;
       }
     }
 
@@ -93,25 +68,13 @@ planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
   }
   addBoundary(replayEnd, DraftBoundaryPurpose::Active);
 
-  const uint64_t contextRows = result.draftContextRows();
-  result.draftContextRowsAvoided = result.targetPrefillRows > contextRows
-                                       ? result.targetPrefillRows - contextRows
-                                       : 0;
   const uint32_t firstBoundary =
       !materializationBoundaries.empty() &&
               materializationBoundaries.front() < replayEnd
           ? materializationBoundaries.front()
           : replayEnd;
-  if (restoredDraftBoundary &&
-      firstBoundary - *restoredDraftBoundary >= window) {
-    result.draftStateRestoreSkipped = 1;
-  }
-  // A short first window would continue draft rows the state does not hold.
-  if (targetOnlyRestore && !result.draftStateRestoreSkipped) {
-    throw std::invalid_argument(
-        "target-only state is less than a draft window before its first "
-        "boundary");
-  }
+  result.restoresDraftState =
+      replayBegin != 0 && firstBoundary - replayBegin < window;
   return result;
 }
 
@@ -127,7 +90,7 @@ draftCaptureSpansForDispatch(const DraftContextPlan &plan,
 
   DispatchDraftCapturePlan result;
   uint32_t compactRow = 0;
-  for (const DraftCaptureSpan &span : plan.captures()) {
+  for (const DraftCaptureSpan &span : plan.captureSpans) {
     const uint32_t begin = std::max(span.begin, dispatchBegin);
     const uint32_t end = std::min(span.end, dispatchEnd);
     if (begin >= end)
@@ -139,7 +102,7 @@ draftCaptureSpansForDispatch(const DraftContextPlan &plan,
     DispatchDraftCaptureSpan capture{
         begin, end, compactRow, span.resetDraftState && begin == span.begin,
         0,     0};
-    for (const DraftBoundaryPlan &boundary : plan.plannedBoundaries()) {
+    for (const DraftBoundaryPlan &boundary : plan.boundaries) {
       const uint32_t segmentBegin = std::max(begin, boundary.captureBegin);
       const uint32_t segmentEnd = std::min(end, boundary.boundary);
       if (segmentBegin >= segmentEnd)
@@ -156,17 +119,6 @@ draftCaptureSpansForDispatch(const DraftContextPlan &plan,
     compactRow += end - begin;
   }
   return result;
-}
-
-DraftCaptureContinuity
-classifyDraftCapture(bool draftContextValid, uint64_t draftContextThrough,
-                     const DispatchDraftCaptureSpan &capture) noexcept {
-  if (!draftContextValid || capture.resetDraftState) {
-    return DraftCaptureContinuity::PlannedReset;
-  }
-  return draftContextThrough == capture.absoluteBegin
-             ? DraftCaptureContinuity::Continues
-             : DraftCaptureContinuity::UnplannedReset;
 }
 
 } // namespace splash

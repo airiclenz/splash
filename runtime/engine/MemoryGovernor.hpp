@@ -1,150 +1,62 @@
 #pragma once
 
-#include "engine/MemoryPlan.hpp"
+#include "engine/ReclaimClass.hpp"
 #include "metal/MetalBackend.hpp"
 
-#include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <mutex>
 #include <optional>
-#include <span>
-#include <utility>
-#include <vector>
 
 namespace splash::engine {
 
+struct EngineMemoryBreakdown;
+
 struct HostMemoryPages {
-  uint64_t active = 0;
-  uint64_t inactive = 0;
+  // Mach's free_count, which includes the speculative pages.
+  uint64_t free = 0;
   uint64_t speculative = 0;
-  uint64_t wired = 0;
-  uint64_t compressor = 0;
   uint64_t fileBacked = 0;
   uint64_t purgeable = 0;
+  // Anonymous pages outside the compressor, and the compressor's own pages
+  // and the pages it holds, whose ratio is what compressing them saves.
+  uint64_t anonymous = 0;
+  uint64_t compressor = 0;
+  uint64_t compressed = 0;
+  // Inactive and wired pages: telemetry only, which explains a low reading
+  // (HostMemory); neither estimate reads them.
+  uint64_t inactive = 0;
+  uint64_t wired = 0;
 };
 
-// The server's own hot weights: the bytes mapped and the part of them the
-// host holds wired at the moment of the sample.
-struct WeightResidency {
-  uint64_t bytes = 0;
-  uint64_t wiredBytes = 0;
-};
-
-// Physical memory minus used pages, crediting pageable file-backed and
-// purgeable pages regardless of active/inactive status, then charging the
-// unwired part of weights: those pages are file-backed and would be credited,
-// yet decode must fault them back in. Wired weights already count as used, so
-// the result does not depend on whether the GPU holds them wired at the
-// sample. Saturates at 0. The governor also enforces the engine budget, host
-// reserve and system pressure.
-[[nodiscard]] uint64_t estimateHostAvailableMemory(
-    const HostMemoryPages &pages, uint64_t pageSize,
-    uint64_t physicalMemoryBytes, WeightResidency weights = {}) noexcept;
-
-// One mapped weight file, read-only and owned elsewhere.
-struct MappedWeightRange {
-  const void *address = nullptr;
-  uint64_t bytes = 0;
-};
-
-// The page queries one weight sample spends, at 0.5-1 us each; a range too
-// small for a share still gets one.
-inline constexpr std::size_t kWeightWiringSamplePages = 256;
-
-// Measures how much of the mapped weights is wired by querying the disposition
-// of evenly spaced pages, each standing for an equal share of its range.
-// Ranges get samples in proportion to their bytes, at least one each and at
-// most one per page. The page addresses are fixed at construction, so a
-// sample allocates nothing and takes no lock.
-//
-// The kernel reports an unmapped address as an unwired page, not as an
-// error, so the sampler must not outlive the ranges' mappings: a sample after
-// an unmap would charge those bytes as unwired.
-class WeightWiringSampler final {
-public:
-  // Throws std::invalid_argument for a range with bytes and no address.
-  explicit WeightWiringSampler(std::span<const MappedWeightRange> ranges);
-
-  // bytes is the sum of the ranges' bytes; wiredBytes the share of it whose
-  // sampled pages are wired. A failed query counts its share as wired, so a
-  // host that refuses the query charges nothing, as before this estimate.
-  [[nodiscard]] WeightResidency sample() const noexcept;
-
-private:
-  struct SamplePage {
-    uint64_t address = 0;
-    uint64_t bytes = 0;
-  };
-
-  std::vector<SamplePage> pages_;
-  uint64_t bytes_ = 0;
-};
-
-// One host page reading: the available estimate plus the page categories that
-// explain a low one, in bytes. The breakdown is telemetry only; admission and
-// the latch read availableBytes alone.
-struct HostMemorySample {
-  uint64_t availableBytes = 0;
+// What macOS can hand out without swapping, two ways. Both count the free
+// pages and the pageable file-backed and purgeable pages, regardless of
+// active/inactive status; memory in no VM queue (the firmware carve-out, tag
+// storage) is never counted. With compression, available adds what
+// compressing the anonymous pages frees at the compressor's present ratio,
+// counted at most at 2:1 (half of them; 2:1 also while the compressor holds
+// nothing): what memory a request needs may take, other applications paying
+// with compression. spare adds half of that credit (at most a quarter of the
+// anonymous pages): what memory no request needs, the cache, may take, other
+// applications paying half as much of it in compression.
+struct HostMemory final {
+  uint64_t available = 0;
+  uint64_t spare = 0;
+  // The page categories that explain a low reading, in bytes: inactive,
+  // wired, and the compressor's own pages. Telemetry only; admission and the
+  // hysteresis read available and spare alone.
   uint64_t inactiveBytes = 0;
   uint64_t wiredBytes = 0;
   uint64_t compressorBytes = 0;
-  // The hot weights the estimate charged for, and their wired part.
-  uint64_t weightBytes = 0;
-  uint64_t weightWiredBytes = 0;
 };
-
-// One host page reading: the page counts and the host page size in bytes.
-struct HostPageReading {
-  HostMemoryPages pages;
-  uint64_t pageSize = 0;
-};
-
-// The page reads one host sample may spend: the first, then at most two
-// retries while the weight samples around a read disagree.
-inline constexpr int kHostPageReadAttempts = 3;
-
-// The sample for one page reading taken between two weight samples. When the
-// weights wired or unwired around the read, the page counts may match either
-// residency, so the one that gives the lower available estimate is charged:
-// a skewed reading never reads high.
-[[nodiscard]] HostMemorySample
-bracketedHostSample(const HostPageReading &reading,
-                    uint64_t physicalMemoryBytes, WeightResidency before,
-                    WeightResidency after) noexcept;
-
-// Samples the weights before and after each page read. While the two samples
-// disagree the read is retried, the later sample bracketing the next read, up
-// to kHostPageReadAttempts reads; the last pair is then resolved by
-// bracketedHostSample. A steady residency spends one read and two samples.
-// readPages returns std::optional<HostPageReading>, empty when the host
-// cannot be measured; sampleWeights returns WeightResidency. Both must not
-// throw.
-template <typename ReadPages, typename SampleWeights>
-[[nodiscard]] std::optional<HostMemorySample>
-sampleHostAvailableMemory(ReadPages &&readPages, SampleWeights &&sampleWeights,
-                          uint64_t physicalMemoryBytes) noexcept {
-  WeightResidency before = sampleWeights();
-  for (int attempt = 1;; ++attempt) {
-    const std::optional<HostPageReading> reading = readPages();
-    if (!reading)
-      return std::nullopt;
-    const WeightResidency after = sampleWeights();
-    const bool isSteady = after.bytes == before.bytes &&
-                          after.wiredBytes == before.wiredBytes;
-    if (isSteady || attempt == kHostPageReadAttempts)
-      return bracketedHostSample(*reading, physicalMemoryBytes, before, after);
-    before = after;
-  }
-}
-
-// Up to kHostPageReadAttempts host_statistics64 calls, bracketed by 2-4
-// weights->sample() calls when weights is given (the serving governor, once
-// the model is mapped); empty when the host cannot be measured.
-// MemoryGovernor::tryReserve runs it under the governor mutex, so a retry
-// holds that mutex for one more read and sample.
-[[nodiscard]] std::optional<HostMemorySample>
-queryHostAvailableMemory(const WeightWiringSampler *weights = nullptr) noexcept;
+[[nodiscard]] HostMemory estimateHostMemory(const HostMemoryPages &pages,
+                                            uint64_t pageSize,
+                                            bool compression) noexcept;
+// The live estimate, counting compression unless macOS reports critical
+// memory pressure (or none): a Mac that uses its compressor as designed keeps
+// serving, the credit shrinking as the anonymous pages it counts are
+// compressed, and one in critical pressure falls back to the pages it can
+// hand out as they are.
+[[nodiscard]] std::optional<HostMemory> queryHostMemory() noexcept;
 
 enum class MemoryPressure : uint8_t {
   Normal,
@@ -168,96 +80,198 @@ memoryPressureName(MemoryPressure pressure) noexcept {
 
 [[nodiscard]] std::optional<MemoryPressure> querySystemMemoryPressure() noexcept;
 
+// Growth that no request in service needs leaves the warning margin free
+// above the spare reserve, in the host's spare memory, and the paced reclaim
+// returns cache to keep it so. Once the host has run short, a request that
+// waits for memory has the paced reclaim free toward the recovery margin,
+// and such growth waits for that margin meanwhile, so that what reclaim
+// frees goes to the request; with no request waiting, a pass only restores
+// the warning margin and growth keeps to it. macOS's warning asks caches to
+// give memory back: while it lasts, such growth stops whatever the host's
+// headroom, and every pass returns up to the warning margin's worth of cache
+// until the level is normal again. Unavailable telemetry pauses growth; the
+// OS critical signal causes full eviction of unpinned cache entries and stops
+// all growth.
+inline constexpr uint64_t kHostWarningMarginBytes = 1ULL << 30;
+inline constexpr uint64_t kHostRecoveryMarginBytes = 2ULL << 30;
+
 struct MemoryGovernorSnapshot {
   uint64_t limitBytes = 0;
-  uint64_t observedResidentBytes = 0;
-  uint64_t reservedBytes = 0;
+  // Charged against the limit: the backend's allocated buffers plus the
+  // untracked reserve, or the device's allocation when that is larger.
+  uint64_t chargedBytes = 0;
+  // Room under the limit beside what is charged and reserved: zero once the
+  // engine's limit is reached.
   uint64_t headroomBytes = 0;
   MemoryPressure pressure = MemoryPressure::Normal;
   // Failed reservation attempts, including retries of the same request.
   uint64_t deniedReservations = 0;
-  // The same denials split by the bound that refused them: host pressure or
-  // the engine budget. They sum to deniedReservations.
+  // The same denials split by the cause admission named: the host
+  // (HostPressure) or the engine's limit alone (EngineBudget). They sum to
+  // deniedReservations.
   uint64_t deniedHostReservations = 0;
   uint64_t deniedEngineReservations = 0;
   bool hostMeasurementValid = false;
   uint64_t hostAvailableBytes = 0;
-  // The page breakdown of the same sample, zero while the measurement is
-  // invalid.
+  // The page breakdown of the same sample (HostMemory), zero while the
+  // measurement is invalid.
   uint64_t hostInactiveBytes = 0;
   uint64_t hostWiredBytes = 0;
-  // The hot weights charged against the estimate and their wired part.
-  uint64_t hostWeightBytes = 0;
-  uint64_t hostWeightWiredBytes = 0;
   uint64_t hostCompressorBytes = 0;
   uint64_t hostReserveBytes = 0;
-  // The cushion's margins over the reserve: serving growth needs the warning
-  // margin left after it; a Warning reclaim episode ends at the recovery margin.
-  uint64_t hostWarningMarginBytes = 0;
-  uint64_t hostRecoveryMarginBytes = 0;
+  uint64_t hostSpareBytes = 0;
+  uint64_t hostSpareReserveBytes = 0;
+  // The host's spare memory above its spare reserve, beside what is
+  // reserved: the room growth that no request in service needs takes from.
   uint64_t hostHeadroomBytes = 0;
   MemoryPressure systemPressure = MemoryPressure::Normal;
-  bool growthAllowed = true;
+  // Whether the host has room for growth that no request in service needs
+  // and macOS reports normal pressure. Admission still grants what such a
+  // request needs while this is false, short of critical pressure.
+  // Allocation need not ask: admission names the host as the cause of every
+  // refusal the host shares.
   bool hostGrowthAllowed = true;
 };
 
+// Critical pressure evicts every unpinned entry and takes what a request
+// starts from, one lane's pooled state buffers and the empty KV runway
+// extent, so it has no target. Every other pass keeps those for the growth
+// that follows; targetBytes zero returns only empty extents. keepResumePoint keeps
+// the newest state publication (else the newest checkpoint), the point a
+// follow-up request resumes from; only a shrink nothing waits for can afford
+// to, or one under macOS's warning, which holds a waiting request back too.
+// upTo is the highest class the pass takes. A shrink nothing waits for takes
+// nothing in use, under macOS's warning too: the states the requests in
+// service restore from and publish for their follow-ups, and the KV they
+// restore through. What it would free there goes back to those requests'
+// growth, which neither the host's margin nor the warning holds back, and
+// the replay point it would take is the next resume point.
 struct MemoryReclaimDirective {
-  bool reclaimEmptyKvExtents = false;
-  bool evictAllUnpinnedPrefixes = false;
+  bool critical = false;
   uint64_t targetBytes = 0;
-  // Keep the newest state publication, the point a follow-up request resumes
-  // from. Only a shrink that nothing is waiting for can afford to.
   bool keepResumePoint = false;
-  // The least the pass sheds while the OS itself reports warn, carried apart
-  // from targetBytes (the governor-headroom part): a runway extent the pass
-  // keeps mapped offsets targetBytes, never this floor.
-  uint64_t osWarningFloorBytes = 0;
+  ReclaimClass upTo = ReclaimClass::InUse;
+};
+
+// What a reclaim pass made of its directive's target.
+enum class ReclaimOutcome : uint8_t {
+  // The directive set none; the pass returned only empty extents.
+  Untargeted,
+  // Released, counting the pages whose copies are being written.
+  Met,
+  // Transfers in flight hold back the rest, which a pass can take once they
+  // land.
+  Pending,
+  // Nothing is left to release.
+  Exhausted,
+};
+
+struct MemoryReclaimResult {
+  uint64_t releasedBytes = 0;
+  ReclaimOutcome outcome = ReclaimOutcome::Untargeted;
 };
 
 // Bounded shrink passes separated by a telemetry settling interval. New host
 // pressure is never offset by bytes reclaimed earlier in the same episode.
 class MemoryPressurePolicy final {
 public:
-  // osWarningPassBytes is the least a pass takes while the OS itself reports
-  // warn: one KV extent, the unit cache backing returns to the host in.
-  explicit MemoryPressurePolicy(uint64_t osWarningPassBytes) noexcept
-      : osWarningPassBytes_(osWarningPassBytes ? osWarningPassBytes : 1) {}
-
-  // requestWaiting reports whether a request cannot proceed for want of
-  // memory. Without one the pass is speculative and keeps the resume point.
-  [[nodiscard]] MemoryReclaimDirective
+  // The pass to run now; none under normal pressure. requestWaiting reports
+  // whether a request cannot proceed for want of memory. Without one the
+  // pass is speculative: it keeps the resume point, as every pass under
+  // macOS's warning does, takes nothing in use and, unless macOS warns, only
+  // restores the warning margin.
+  [[nodiscard]] std::optional<MemoryReclaimDirective>
   update(const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
          bool requestWaiting) noexcept;
+  // What the pass of `directive` achieved. The passes up to the next
+  // measurement continue the part of its target that transfers held back:
+  // a KV chain gives up one leaf at a time, each after its copy is written.
+  void reclaimed(const MemoryReclaimDirective &directive,
+                 const MemoryReclaimResult &result) noexcept;
 
 private:
-  uint64_t osWarningPassBytes_;
   double nextReclaimMilliseconds_ = 0.0;
+  std::optional<MemoryReclaimDirective> continued_;
 };
 
-// The sole physical-memory admission ledger. It does not allocate, evict, or
+// The sole memory admission ledger. It does not allocate, evict, or
 // schedule work; it only gives a short-lived byte reservation to a caller that
-// is about to commit a placement heap. That keeps policy out of MetalBackend
-// and makes every growth operation transactional.
+// is about to allocate Metal memory. That keeps policy out of MetalBackend
+// and makes every growth operation transactional. Single-threaded: startup,
+// the engine and the control pass all run on the native loop thread; nothing
+// here is synchronized.
 class MemoryGovernor final {
 public:
-  using HostAvailableMemoryProvider =
-      std::function<std::optional<HostMemorySample>()>;
-  // Reads the Metal footprint: the backend's refreshed device sample when
-  // its argument is true, its cached accounting otherwise. Must not throw.
-  using MetalMemoryStatsProvider =
-      std::function<metal::MetalMemoryStats(bool refreshDevice)>;
+  using HostMemoryProvider = std::function<std::optional<HostMemory>()>;
 
+  // Metal memory outside the backend's buffers (pipelines, driver
+  // allocations) is charged only beyond untrackedReserveBytes, the part of
+  // the limit the caller has set aside for it. The host's available memory
+  // must exceed hostReserveBytes, which macOS keeps; growth that no request
+  // in service needs keeps hostSpareReserveBytes of its spare memory, and
+  // the warning margin above them, for other applications.
+  // hostHeldBytes, host memory held outside Metal (the streamed table's
+  // row cache), is charged in full.
+  MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
+                 uint64_t hostReserveBytes, uint64_t hostSpareReserveBytes,
+                 HostMemoryProvider hostMemory, uint64_t untrackedReserveBytes, uint64_t hostHeldBytes = 0);
+  // The governor of an engine that `budget` plans, as a start builds it: the
+  // hard budget is its limit, the plan's pipeline and runtime reserves are
+  // the untracked reserve, the host keeps the reserves EngineMemoryPolicy
+  // sets for the Mac's memory, and the streamed table's host memory is
+  // charged in full.
+  MemoryGovernor(metal::MetalBackend &backend, const EngineMemoryBreakdown &budget, HostMemoryProvider hostMemory);
+
+  // The only way to reserve memory. Low-level storage/model components
+  // receive only this transactional callback, so allocation stays governed
+  // without introducing a reverse dependency on engine policy. It reserves
+  // the bytes under the limit and the host's headroom while the allocation
+  // runs, or refuses them with the cause: HostPressure when the host refuses,
+  // whether or not the limit does too, and EngineBudget when only the limit
+  // does. The host refuses under critical pressure and, unless a request in
+  // service needs the bytes (setServing), while macOS warns, inside the
+  // warning margin or while it holds for the recovery margin for a waiting
+  // request (setRequestWaiting).
+  [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
+  // Marks the reservations that follow as memory a request in service needs,
+  // until it is cleared, and returns the mark it replaced, which a scope
+  // that sets it restores (Serving). Neither the host's margins nor macOS's
+  // warning refuse those: holding them back would strand the request and
+  // the memory it already has, while the cache it could give up instead is
+  // what the paced reclaim returns. The limit and critical pressure refuse
+  // them like any other. A start marks what it allocates so until serving
+  // begins (RuntimeResources::beginServing).
+  bool setServing(bool serving) noexcept;
+  // Whether a request cannot proceed for want of memory, as each control pass
+  // finds: only then does growth wait for the recovery margin once the host
+  // has run short.
+  void setRequestWaiting(bool waiting) noexcept;
+  void setPressure(MemoryPressure pressure) noexcept;
+  // The outcome of the engine's last reclaim pass with a target. While one
+  // finds nothing left to release, the hold for the recovery margin is
+  // waived: growth proceeds as with no request waiting, since only other
+  // applications could restore the rest, and the paced passes keep looking.
+  // A pass that releases or waits for memory again, or the host's recovery,
+  // ends the waiver. Only a pass while the host is short counts, so no
+  // episode starts waived by a pass that macOS's warning alone asked for.
+  void reclaimed(ReclaimOutcome outcome) noexcept;
+  // What the governor makes of a fresh sample of the host. Reading it
+  // changes nothing: the host's hysteresis moves only with the samples a
+  // reservation or the control pass (evaluate) takes, so /status and the
+  // engine's growth queries do not move admission.
+  [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
+  // The control pass's evaluation: snapshot(), with the host's hysteresis
+  // moved to its sample, as a reservation's moves it.
+  MemoryGovernorSnapshot evaluate() noexcept;
+
+private:
+  // Held while an admitted allocation runs; released when it ends.
   class Reservation final {
   public:
-    Reservation() = default;
     ~Reservation();
     Reservation(const Reservation &) = delete;
     Reservation &operator=(const Reservation &) = delete;
     Reservation(Reservation &&) noexcept;
-    Reservation &operator=(Reservation &&) noexcept;
-
-    [[nodiscard]] explicit operator bool() const noexcept;
-    void commit();
 
   private:
     Reservation(MemoryGovernor *owner, uint64_t bytes);
@@ -269,94 +283,58 @@ public:
     friend class MemoryGovernor;
   };
 
-  // Derives the margins from a bare reserve per EngineMemoryPolicy.
-  MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
-                 uint64_t hostReserveBytes)
-      : MemoryGovernor(backend, limitBytes,
-                       EngineMemoryPolicy::hostCushionForReserve(
-                           hostReserveBytes)) {}
-  MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
-                 HostCushion hostCushion)
-      : MemoryGovernor(backend, limitBytes, hostCushion,
-                       [] { return queryHostAvailableMemory(); }) {}
-  // The backend adapters live here so MemoryGovernor.cpp never calls into
-  // MetalBackend and links without it.
-  MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
-                 HostCushion hostCushion,
-                 HostAvailableMemoryProvider hostAvailableMemory)
-      : MemoryGovernor(
-            [metalBackend = &backend](bool refreshDevice) {
-              return refreshDevice ? metalBackend->refreshMemoryStats()
-                                   : metalBackend->memoryStats();
-            },
-            limitBytes, hostCushion, std::move(hostAvailableMemory)) {}
-  // Samples the host once and stores that sample, and the latch it sets, as
-  // the first state snapshot() reports. Throws std::invalid_argument for a
-  // zero reserve or warning margin, or a recovery margin below the warning
-  // margin.
-  MemoryGovernor(MetalMemoryStatsProvider metalMemoryStats,
-                 uint64_t limitBytes, HostCushion hostCushion,
-                 HostAvailableMemoryProvider hostAvailableMemory);
+  // The host under the hysteresis at one sample of its available memory.
+  struct HostState final {
+    // From when its headroom falls inside the warning margin, or cannot be
+    // measured, until the headroom clears the recovery margin.
+    bool constrained = false;
+    // Reclaim found nothing to release in this episode of host pressure.
+    bool reclaimExhausted = false;
 
-  // Grants while the engine budget fits, the host keeps at least the warning
-  // margin above the reserve after the growth (while bootstrapping: stays
-  // above the reserve), and pressure is not Critical. The Warning latch never
-  // denies on its own.
-  [[nodiscard]] std::optional<Reservation> tryReserve(
-      uint64_t bytes, metal::AllocationFailure *failure = nullptr);
-  // Low-level storage/model components receive only this transactional
-  // callback, so physical allocation stays governed without introducing a
-  // reverse dependency on engine policy.
-  [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
-  void setPressure(MemoryPressure pressure) noexcept;
-  // While set, host admission applies the load guard's floor (the reserve)
-  // instead of the serving floor, so load and warmup allocate as far as the
-  // guard lets them. A new governor applies the serving rule; startup sets
-  // the flag and clears it where serving begins, after which growth stays
-  // paused until headroom reaches the serving floor.
-  void setBootstrapping(bool bootstrapping) noexcept;
-  // Samples host memory, stores the sample and advances the Warning latch,
-  // which drives reported pressure and paced reclaim, never admission. Only
-  // this and tryReserve() move the latch, so reported pressure never depends
-  // on how often anyone reads snapshot().
-  void observe() noexcept;
-  // Reads the stored host sample and latch, plus the backend's cached
-  // accounting: no host sample, no latch write.
-  [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
+    // Short of the recovery margin with reclaim not yet exhausted.
+    [[nodiscard]] bool held() const noexcept {
+      return constrained && !reclaimExhausted;
+    }
+  };
 
-private:
+  // Growth that no request in service needs waits for the recovery margin
+  // while the host holds and a request waits for memory.
+  [[nodiscard]] bool growthHeld(const HostState &host) const noexcept {
+    return requestWaiting_ && host.held();
+  }
+  // allocationAdmission's reservation, or nothing with the cause of the
+  // refusal in failure.
+  [[nodiscard]] std::optional<Reservation>
+  tryReserve(uint64_t bytes, metal::AllocationFailure &failure);
   [[nodiscard]] uint64_t
-  observedResidentBytes(bool refreshDevice = false) const noexcept;
-  [[nodiscard]] std::optional<HostMemorySample>
-  sampleHostAvailable() const noexcept;
-  [[nodiscard]] uint64_t
-  hostHeadroomBytes(const std::optional<HostMemorySample> &hostSample,
-                    uint64_t reservedBytes) const noexcept;
-  // Stores hostSample as the current sample and advances the latch from
-  // it. Callers hold mutex_ (or own the governor exclusively).
-  // The host half of admission, shared by tryReserve() and snapshot() so
-  // hostGrowthAllowed reports exactly what a reservation would be told.
-  [[nodiscard]] bool hostAdmits(uint64_t hostHeadroom,
-                                MemoryPressure pressure) const noexcept;
-  [[nodiscard]] MemoryPressure updateEffectivePressure(
-      const std::optional<HostMemorySample> &hostSample,
-      uint64_t reservedBytes) noexcept;
-  [[nodiscard]] MemoryPressure effectivePressure() const noexcept;
+  chargedBytes(bool refreshDevice = false) const noexcept;
+  [[nodiscard]] std::optional<HostMemory> sampleHost() const noexcept;
+  [[nodiscard]] uint64_t hostHeadroomBytes(const std::optional<HostMemory> &host,
+                                           uint64_t reservedBytes) const noexcept;
+  // The host's state at this sample, from the one it was last evaluated at.
+  [[nodiscard]] HostState hostState(const std::optional<HostMemory> &host) const noexcept;
+  [[nodiscard]] MemoryPressure
+  effectivePressure(const HostState &host) const noexcept;
+  [[nodiscard]] MemoryGovernorSnapshot
+  snapshot(const std::optional<HostMemory> &hostMemory, const HostState &host) const noexcept;
   void release(uint64_t bytes) noexcept;
 
-  MetalMemoryStatsProvider metalMemoryStats_;
+  metal::MetalBackend &backend_;
   uint64_t limitBytes_ = 0;
-  HostCushion hostCushion_;
-  HostAvailableMemoryProvider hostAvailableMemory_;
-  mutable std::mutex mutex_;
+  uint64_t hostReserveBytes_ = 0;
+  uint64_t hostSpareReserveBytes_ = 0;
+  HostMemoryProvider hostMemory_;
+  uint64_t untrackedReserveBytes_ = 0;
+  uint64_t hostHeldBytes_ = 0;
   uint64_t reservedBytes_ = 0;
+  bool serving_ = false;
+  bool requestWaiting_ = false;
   uint64_t deniedReservations_ = 0;
   uint64_t deniedHostReservations_ = 0;
   uint64_t deniedEngineReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
-  std::optional<HostMemorySample> sampledHost_;
-  bool hostConstrained_ = false;
-  bool isBootstrapping_ = false;
+  // As the latest reservation or control pass evaluated it.
+  HostState host_;
 };
 
 } // namespace splash::engine

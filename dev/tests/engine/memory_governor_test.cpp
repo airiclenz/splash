@@ -1,878 +1,887 @@
-#include "TestFakeHost.hpp"
+#include "TestChecks.hpp"
+#include "TestMetalMemory.hpp"
+#include "TestModel.hpp"
 #include "engine/MemoryGovernor.hpp"
+#include "engine/MemoryPlan.hpp"
 
-#include <algorithm>
-#include <cstddef>
-#include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
-#include <vector>
-
-#include <sys/mman.h>
-#include <unistd.h>
+#include <string>
 
 using namespace splash;
 using namespace splash::engine;
 
 namespace {
 
-constexpr HostCushion kCushion{64 * 1024, 1 * kGiB, 2 * kGiB};
-constexpr uint64_t kLimitBytes = 8 * kGiB;
-constexpr uint64_t kResidentBytes = 1 * kGiB;
-constexpr uint64_t kAmpleHostBytes = kCushion.reserveBytes + 3 * kGiB;
-constexpr uint64_t kLowHostBytes =
-    kCushion.reserveBytes + kCushion.warningMarginBytes / 2;
-// Above the warning margin, below the recovery margin: a held latch stays.
-constexpr uint64_t kLatchedHostBytes =
-    kCushion.reserveBytes +
-    (kCushion.warningMarginBytes + kCushion.recoveryMarginBytes) / 2;
-constexpr int kRepeatedSnapshots = 16;
-constexpr uint64_t kInactiveHostBytes = 3 * kGiB;
-constexpr uint64_t kWiredHostBytes = 5 * kGiB;
-constexpr uint64_t kCompressorHostBytes = 1 * kGiB;
+using splash::test::rejects;
+using splash::test::require;
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
+// Admits bytes through the governor's one admission path, running allocate
+// while they are reserved.
+metal::AllocationResult admit(MemoryGovernor &governor, uint64_t bytes,
+                              const std::function<void()> &allocate = [] {}) {
+  return governor.allocationAdmission()(bytes, allocate);
 }
 
-// The shared fake host, starting ample.
-struct FakeHost final : engine::test::FakeHost {
-  FakeHost()
-      : engine::test::FakeHost{kAmpleHostBytes, kInactiveHostBytes,
-                               kWiredHostBytes, kCompressorHostBytes} {}
-};
-
-MemoryGovernor makeGovernor(FakeHost &host,
-                            HostCushion cushion = kCushion) {
-  return MemoryGovernor(
-      [](bool) {
-        metal::MetalMemoryStats stats;
-        stats.allocatedBytes = kResidentBytes;
-        return stats;
-      },
-      kLimitBytes, cushion, host.sampler());
+// A host whose spare memory is all its available memory: no anonymous
+// pages to compress.
+std::optional<HostMemory> hostMemory(std::optional<uint64_t> bytes) {
+  if (!bytes)
+    return std::nullopt;
+  return HostMemory{*bytes, *bytes};
 }
 
-void testSnapshotAfterConstructionUsesStartupSample() {
-  FakeHost host;
-  MemoryGovernor governor = makeGovernor(host);
-  require(host.samples == 1, "construction did not sample the host once");
-
-  const MemoryGovernorSnapshot state = governor.snapshot();
-  require(host.samples == 1, "the first snapshot sampled the host");
-  require(state.hostMeasurementValid &&
-              state.hostAvailableBytes == kAmpleHostBytes,
-          "the startup host sample was not stored");
-  require(state.pressure == MemoryPressure::Normal &&
-              state.hostGrowthAllowed && state.growthAllowed,
-          "a snapshot before any observe() reported growth paused");
-  require(state.observedResidentBytes == kResidentBytes,
-          "the injected Metal stats were not read");
+// Charges bytes to the backend, as an allocation does.
+void allocate(uint64_t bytes) {
+  test::metalStatistics().allocatedBytes += bytes;
+  test::metalStatistics().deviceCurrentAllocatedBytes += bytes;
 }
 
-void testSnapshotNeitherSamplesNorLatches() {
-  FakeHost host;
-  MemoryGovernor governor = makeGovernor(host);
-  host.availableBytes = kLowHostBytes;
-  for (int index = 0; index < kRepeatedSnapshots; ++index) {
-    const MemoryGovernorSnapshot state = governor.snapshot();
-    require(state.pressure == MemoryPressure::Normal &&
-                state.hostAvailableBytes == kAmpleHostBytes,
-            "a snapshot latched a host change it was never told about");
-  }
-  require(host.samples == 1, "repeated snapshots sampled the host");
-
-  governor.observe();
-  require(host.samples == 2, "observe() did not sample the host once");
-  host.availableBytes = kAmpleHostBytes;
-  for (int index = 0; index < kRepeatedSnapshots; ++index) {
-    const MemoryGovernorSnapshot state = governor.snapshot();
-    require(state.pressure == MemoryPressure::Warning &&
-                !state.hostGrowthAllowed,
-            "a snapshot cleared the Warning latch");
-  }
-  require(host.samples == 2, "repeated latched snapshots sampled the host");
-}
-
-void testObserveLatchesWarningAndClearsAtRecovery() {
-  FakeHost host;
-  MemoryGovernor governor = makeGovernor(host);
-
-  host.availableBytes = kLowHostBytes;
-  governor.observe();
-  MemoryGovernorSnapshot state = governor.snapshot();
-  require(state.pressure == MemoryPressure::Warning &&
-              !state.hostGrowthAllowed && !state.growthAllowed,
-          "observe() did not latch Warning below the warning margin");
-
-  host.availableBytes = kLatchedHostBytes;
-  governor.observe();
-  require(governor.snapshot().pressure == MemoryPressure::Warning,
-          "the latch cleared before the recovery margin");
-
-  host.availableBytes = kAmpleHostBytes;
-  governor.observe();
-  state = governor.snapshot();
-  require(state.pressure == MemoryPressure::Normal &&
-              state.hostGrowthAllowed && state.growthAllowed,
-          "observe() did not clear the latch at recovery");
-
-  host.availableBytes.reset();
-  governor.observe();
-  state = governor.snapshot();
-  require(!state.hostMeasurementValid &&
-              state.pressure == MemoryPressure::Warning,
-          "missing host telemetry did not fail closed");
-}
-
-void testTryReserveAdvancesLatch() {
-  FakeHost host;
-  MemoryGovernor governor = makeGovernor(host);
-
-  host.availableBytes = kLowHostBytes;
-  metal::AllocationFailure failure = metal::AllocationFailure::None;
-  require(!governor.tryReserve(1, &failure).has_value() &&
-              failure == metal::AllocationFailure::HostPressure,
-          "low host headroom admitted growth");
-  require(host.samples == 2, "tryReserve() did not sample the host once");
-  require(governor.snapshot().pressure == MemoryPressure::Warning,
-          "tryReserve() did not advance the latch");
-
-  host.availableBytes = kAmpleHostBytes;
-  require(governor.tryReserve(1).has_value() &&
-              governor.snapshot().pressure == MemoryPressure::Normal,
-          "tryReserve() did not clear the latch at recovery");
-}
-
-// Each denial counts once under the bound that refused it and once in the
-// total; a grant counts nowhere.
-void testDenialsAreCountedByCause() {
-  FakeHost host;
-  MemoryGovernor governor = makeGovernor(host);
-
-  metal::AllocationFailure engineFailure = metal::AllocationFailure::None;
-  const bool grantedOverBudget =
-      governor.tryReserve(kLimitBytes, &engineFailure).has_value();
-  const MemoryGovernorSnapshot afterEngine = governor.snapshot();
-  host.availableBytes = kLowHostBytes;
-  metal::AllocationFailure hostFailure = metal::AllocationFailure::None;
-  const bool grantedUnderPressure =
-      governor.tryReserve(1, &hostFailure).has_value();
-  host.availableBytes = kAmpleHostBytes;
-  const bool grantedAtRecovery = governor.tryReserve(1).has_value();
-  const MemoryGovernorSnapshot counted = governor.snapshot();
-
-  require(!grantedOverBudget &&
-              engineFailure == metal::AllocationFailure::EngineBudget &&
-              afterEngine.deniedReservations == 1 &&
-              afterEngine.deniedEngineReservations == 1 &&
-              afterEngine.deniedHostReservations == 0,
-          "an engine-budget denial was not counted under its cause");
-  require(!grantedUnderPressure &&
-              hostFailure == metal::AllocationFailure::HostPressure,
-          "low host headroom admitted growth");
-  require(grantedAtRecovery && counted.deniedReservations == 2 &&
-              counted.deniedHostReservations == 1 &&
-              counted.deniedEngineReservations == 1,
-          "the denial causes do not sum to the total");
-}
-
-void testReservationThatFitsIsGrantedWhileWarningLatched() {
-  FakeHost host;
-  MemoryGovernor governor = makeGovernor(host);
-  host.availableBytes = kLowHostBytes;
-  governor.observe();
-  host.availableBytes = kLatchedHostBytes;
-  governor.observe();
-
-  const MemoryGovernorSnapshot latched = governor.snapshot();
-  auto reservation = governor.tryReserve(1);
-
-  require(latched.pressure == MemoryPressure::Warning &&
-              latched.hostGrowthAllowed && latched.growthAllowed,
-          "a held latch reported host growth paused");
-  require(reservation.has_value() &&
-              governor.snapshot().pressure == MemoryPressure::Warning,
-          "the Warning latch denied a reservation that fits");
-}
-
-// The pre-load check refuses at or below admissionFloorBytes() and a one-byte
-// serving reservation meets the same floor, the snapshot agreeing with it;
-// the load guard passes inside the warning margin and refuses at the reserve.
-void testStartupAndServingShareOneFloor() {
-  FakeHost host;
-  MemoryGovernor governor = makeGovernor(host);
-  const uint64_t floorBytes = kCushion.admissionFloorBytes();
-
-  const bool preLoadAtFloor = hostStandsAboveFloor(floorBytes, floorBytes);
-  const bool preLoadAboveFloor =
-      hostStandsAboveFloor(floorBytes + 1, floorBytes);
-  const bool guardInBand =
-      hostStandsAboveFloor(kLowHostBytes, kCushion.reserveBytes);
-  const bool guardAtReserve =
-      hostStandsAboveFloor(kCushion.reserveBytes, kCushion.reserveBytes);
-  host.availableBytes = floorBytes;
-  metal::AllocationFailure failure = metal::AllocationFailure::None;
-  const bool grantedAtFloor = governor.tryReserve(1, &failure).has_value();
-  const bool reportedAtFloor = governor.snapshot().hostGrowthAllowed;
-  host.availableBytes = floorBytes + 1;
-  const bool grantedAboveFloor = governor.tryReserve(1).has_value();
-  host.availableBytes = floorBytes - 1;
-  governor.observe();
-  const bool reportedBelowFloor = governor.snapshot().hostGrowthAllowed;
-
-  require(!preLoadAtFloor && preLoadAboveFloor,
-          "the pre-load check did not stand on the admission floor");
-  require(guardInBand && !guardAtReserve,
-          "the load guard did not stand on the reserve");
-  require(!grantedAtFloor &&
-              failure == metal::AllocationFailure::HostPressure,
-          "serving admitted growth at the admission floor");
-  require(grantedAboveFloor,
-          "serving refused growth above the admission floor");
-  require(reportedAtFloor && !reportedBelowFloor,
-          "the snapshot's host test differs from the reservation's");
-}
-
-// While bootstrapping, a governor inside the warning margin admits growth
-// that keeps the host above the reserve and denies growth that reaches it;
-// once serving begins the serving floor applies and growth reports paused.
-void testBootstrapPhaseAdmitsAgainstReserve() {
-  FakeHost host;
-  MemoryGovernor governor = makeGovernor(host);
-  governor.setBootstrapping(true);
-
-  host.availableBytes = kLowHostBytes;
-  const bool grantedInBand = governor.tryReserve(1).has_value();
-  const bool reportedInBand = governor.snapshot().hostGrowthAllowed;
-  host.availableBytes = kCushion.reserveBytes + 1;
-  metal::AllocationFailure atReserve = metal::AllocationFailure::None;
-  const bool grantedAtReserve = governor.tryReserve(1, &atReserve).has_value();
-  governor.setBootstrapping(false);
-  host.availableBytes = kLowHostBytes;
-  metal::AllocationFailure serving = metal::AllocationFailure::None;
-  const bool grantedServing = governor.tryReserve(1, &serving).has_value();
-  const MemoryGovernorSnapshot servingSnapshot = governor.snapshot();
-
-  require(grantedInBand && reportedInBand,
-          "bootstrap denied growth that keeps the host above the reserve");
-  require(!grantedAtReserve &&
-              atReserve == metal::AllocationFailure::HostPressure,
-          "bootstrap admitted growth that reaches the reserve");
-  require(!grantedServing &&
-              serving == metal::AllocationFailure::HostPressure &&
-              !servingSnapshot.hostGrowthAllowed &&
-              !servingSnapshot.growthAllowed,
-          "serving inside the warning margin did not pause growth");
-}
-
-void testCushionScalesWithPhysicalMemory() {
-  struct Case {
-    uint64_t physicalBytes;
-    uint64_t reserveBytes;
-    uint64_t warningBytes;
-    uint64_t recoveryBytes;
+// Available host memory is what macOS can hand out without swapping: free
+// pages and pageable file-backed and purgeable pages, and with compression
+// what compressing the anonymous pages frees.
+void testHostAvailabilityCountsReclaimablePages() {
+  constexpr uint64_t pageSize = 16384;
+  auto availablePages = [](const HostMemoryPages &pages) {
+    return estimateHostMemory(pages, pageSize, false).available / pageSize;
   };
-  const uint64_t sixteenGiBReserve = 16 * kGiB / 10;
-  const Case cases[] = {
-      {8 * kGiB, 8 * kGiB / 10, 256 * kMiB, 512 * kMiB},
-      {16 * kGiB, sixteenGiBReserve, sixteenGiBReserve / 4,
-       sixteenGiBReserve / 2},
-      {32 * kGiB, 2 * kGiB, 512 * kMiB, 1 * kGiB},
-      {128 * kGiB, 2 * kGiB, 512 * kMiB, 1 * kGiB},
-  };
+  // free_count includes the speculative pages; they are file-backed too.
+  HostMemoryPages pages{
+      .free = 15, .speculative = 5, .fileBacked = 35, .purgeable = 5};
+  require(availablePages(pages) == 50,
+          "host availability does not match macOS reclaimable accounting");
+  pages.free += 5;
+  pages.speculative += 5;
+  require(availablePages(pages) == 50,
+          "speculative file pages were counted twice");
+  pages.free -= 10;
+  require(availablePages(pages) == 40,
+          "anonymous or compressed pages did not consume capacity");
+  pages.purgeable = 0;
+  require(availablePages(pages) == 35,
+          "non-purgeable backing received reclaimable credit");
+  // Wired file pages leave external_page_count: pinned pages must reduce
+  // available memory rather than count as reclaimable.
+  pages.fileBacked -= 10;
+  require(availablePages(pages) == 25,
+          "wired file pages remained available for new allocations");
 
-  for (const Case &expected : cases) {
-    const HostCushion cushion =
-        EngineMemoryPolicy::hostCushion(expected.physicalBytes);
-    require(cushion.reserveBytes == expected.reserveBytes &&
-                cushion.warningMarginBytes == expected.warningBytes &&
-                cushion.recoveryMarginBytes == expected.recoveryBytes,
-            "the host cushion does not follow the ratified formulas");
-  }
+  // Clean file cache is reclaimable: reading a file takes no capacity from
+  // a later allocation.
+  require(availablePages({.free = 75}) == 75 &&
+              availablePages({.free = 35, .fileBacked = 40}) == 75,
+          "clean file cache reduced allocation capacity");
+  // A 64 GB M5 Pro, whose hw.memsize less its VM queues left 1.2 GiB more
+  // (the firmware carve-out, tag storage) that no allocation can have.
+  require(estimateHostMemory(
+              {.free = 2'349'632, .speculative = 90'428,
+               .fileBacked = 417'802, .purgeable = 23'495},
+              pageSize, false).available == 44'245'008'384ULL,
+          "unexpected available memory for a 64 GB snapshot");
+  const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+  const auto none = [](const HostMemory &host) { return !host.available && !host.spare; };
+  require(none(estimateHostMemory({.free = maximum, .fileBacked = 1}, 1, false)) &&
+              none(estimateHostMemory({.fileBacked = maximum, .purgeable = 1}, 1, false)) &&
+              none(estimateHostMemory({.free = maximum}, pageSize, false)) &&
+              none(estimateHostMemory({.free = 1, .speculative = 2}, 1, false)) &&
+              estimateHostMemory({.free = maximum}, 1, false).available == maximum &&
+              none(estimateHostMemory(pages, 0, false)),
+          "invalid host counters or arithmetic overflow did not fail closed");
+  // With compression (below critical system pressure), compressing the
+  // anonymous pages frees what the compressor would not keep: at its
+  // present ratio, at most 2:1, and 2:1 while it holds nothing. The spare
+  // memory counts half of that credit.
+  const auto compressedPages = [](uint64_t compressor, uint64_t compressed) {
+    return estimateHostMemory({.free = 10, .fileBacked = 20, .anonymous = 40,
+                               .compressor = compressor, .compressed = compressed},
+                              1, true);
+  };
+  const auto both = [](const HostMemory &host, uint64_t available, uint64_t spare) {
+    return host.available == available && host.spare == spare;
+  };
+  require(both(estimateHostMemory({.free = 10, .fileBacked = 20, .anonymous = 40}, 1, false), 30, 30) &&
+              both(compressedPages(0, 0), 50, 40) && both(compressedPages(10, 15), 44, 37) &&
+              both(compressedPages(10, 40), 50, 40) && both(compressedPages(10, 10), 30, 30) &&
+              both(compressedPages(10, 5), 30, 30),
+          "compression credit is not the anonymous pages' savings at the compressor's ratio, at most 2:1, "
+          "and half of it in the spare memory");
+  require(none(estimateHostMemory({.free = maximum, .anonymous = 2}, 1, true)),
+          "compression credit overflowed");
+  require(EngineMemoryPolicy::hostAvailableReserveBytes(16 * kGiB) ==
+                  16 * kGiB / 10 &&
+              EngineMemoryPolicy::hostAvailableReserveBytes(48 * kGiB) ==
+                  2 * kGiB &&
+              EngineMemoryPolicy::hostAvailableReserveBytes(128 * kGiB) ==
+                  2 * kGiB,
+          "the macOS reserve is a tenth of a small machine, 2 GiB above 20 GiB");
+  require(EngineMemoryPolicy::hostSpareReserveBytes(16 * kGiB) == 2 * kGiB &&
+              EngineMemoryPolicy::hostSpareReserveBytes(24 * kGiB) == 2 * kGiB &&
+              EngineMemoryPolicy::hostSpareReserveBytes(64 * kGiB) == 64 * kGiB / 100 * 7 &&
+              EngineMemoryPolicy::hostSpareReserveBytes(128 * kGiB) == 7 * kGiB,
+          "the spare reserve is 7% of the Mac's memory, from 2 to 7 GiB");
 }
 
-void testInvalidCushionRejected() {
-  FakeHost host;
-  const HostCushion invalid[] = {
-      {0, kCushion.warningMarginBytes, kCushion.recoveryMarginBytes},
-      {kCushion.reserveBytes, 0, kCushion.recoveryMarginBytes},
-      {kCushion.reserveBytes, kCushion.recoveryMarginBytes,
-       kCushion.warningMarginBytes},
-  };
+// A Mac whose recommended working set is numerator/denominator of its memory,
+// as Metal reports it (2/3 at 32 GB, 3/4 at 36 GB).
+DeviceCapabilities mac(uint64_t physicalGiB, uint64_t numerator,
+                       uint64_t denominator) {
+  DeviceCapabilities device;
+  device.deviceName = "governor-test";
+  device.appleGpuFamily = 9;
+  device.macosMajor = 26;
+  device.macosMinor = 4;
+  device.physicalMemoryBytes = physicalGiB * kGiB;
+  device.recommendedMaxWorkingSetBytes =
+      device.physicalMemoryBytes / denominator * numerator;
+  device.maxBufferLengthBytes = device.recommendedMaxWorkingSetBytes;
+  device.maxThreadgroupMemoryBytes = 32 * 1024;
+  device.maxThreadgroupWidth = 1024;
+  device.hasUnifiedMemory = true;
+  return device;
+}
 
-  for (const HostCushion &cushion : invalid) {
-    bool rejected = false;
-    try {
-      static_cast<void>(makeGovernor(host, cushion));
-    } catch (const std::invalid_argument &) {
-      rejected = true;
+// Grows one request's KV extent by extent, as PageStorage allocates it, and
+// returns the pages the governor granted.
+uint32_t grantKvPages(MemoryGovernor &governor,
+                      const EngineMemoryBreakdown &budget) {
+  uint32_t granted = 0;
+  while (granted < budget.kvCapacityPages) {
+    const uint32_t pages = budget.kvExtentPages;
+    const uint64_t bytes = uint64_t{pages} * budget.kvPageBytes;
+    if (!admit(governor, bytes, [bytes] { allocate(bytes); }))
+      break;
+    granted += pages;
+  }
+  return granted;
+}
+
+// The plan budgets the memory Metal holds outside the backend's buffers
+// (pipelines, driver allocations) inside its reserves and advertises the
+// context the rest of the budget holds. One request must reach that context
+// through the plan's governor whatever part of the reserves this memory
+// takes; memory beyond them is still charged, and the device never exceeds
+// the hard budget.
+void testAdvertisedContextIsGrantable() {
+  struct Machine {
+    const char *name;
+    uint64_t physicalGiB, numerator, denominator;
+    kv::Format format;
+    uint32_t advertisedTokens;
+  };
+  for (const Machine &machine :
+       {Machine{"32 GB INT8", 32, 2, 3, kv::Format::Int8, 69'625},
+        Machine{"36 GB INT8", 36, 3, 4, kv::Format::Int8, 253'945},
+        Machine{"36 GB BF16", 36, 3, 4, kv::Format::BFloat16, 129'049}}) {
+    // The 27B with its draft and vision tower: 16.2 GiB of weights.
+    ModelMemoryProfile model =
+        test::modelMemoryProfile(15 * kGiB, kGiB / 2, 7 * kGiB / 10);
+    model.targetKvLayout.format = machine.format;
+    const EngineMemoryPlan plan = test::requireMemoryPlan(
+        mac(machine.physicalGiB, machine.numerator, machine.denominator),
+        model);
+    const EngineMemoryBreakdown &budget = plan.breakdown();
+    require(plan.maximumContextTokens() == machine.advertisedTokens,
+            std::string(machine.name) + ": unexpected advertised context");
+    const uint64_t reserves =
+        budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes;
+    for (const uint64_t untracked :
+         {uint64_t{0}, 64 * kMiB, 150 * kMiB, 300 * kMiB, reserves,
+          reserves + 256 * kMiB}) {
+      // After warmup the weights, the arenas and the request's lane state
+      // are the backend's buffers; Metal holds the untracked bytes besides.
+      test::metalStatistics() = {};
+      test::metalStatistics().allocatedBytes =
+          budget.targetWeightsBytes + budget.draftWeightsBytes +
+          budget.visionWeightsBytes + budget.sharedPrefillBytes +
+          budget.sharedDecodeBytes + budget.laneStateBytes;
+      test::metalStatistics().deviceCurrentAllocatedBytes =
+          test::metalStatistics().allocatedBytes + untracked;
+      metal::MetalBackend backend("unused");
+      // The plan's governor, as a start and the runtime oracle build it.
+      MemoryGovernor governor(backend, budget, [] { return hostMemory(200 * kGiB); });
+      const uint32_t granted = grantKvPages(governor, budget);
+      const std::string context = std::string(machine.name) + ", " +
+                                  std::to_string(untracked / kMiB) +
+                                  " MiB untracked: granted " +
+                                  std::to_string(granted) + " of " +
+                                  std::to_string(budget.kvCapacityPages) +
+                                  " KV pages";
+      require(test::metalStatistics().deviceCurrentAllocatedBytes <=
+                  budget.hardBudgetBytes,
+              context + ", beyond the hard budget");
+      if (untracked <= reserves)
+        require(granted == budget.kvCapacityPages,
+                context + ", short of the advertised context");
+      else
+        require(granted < budget.kvCapacityPages,
+                context + ", memory beyond the reserves was not charged");
     }
-    require(rejected, "an incoherent host cushion was accepted");
   }
 }
 
-void testObserveStoresPageBreakdown() {
-  FakeHost host;
-  MemoryGovernor governor = makeGovernor(host);
-  host.wiredBytes = 2 * kWiredHostBytes;
-
-  const MemoryGovernorSnapshot stored = governor.snapshot();
-  require(stored.hostInactiveBytes == kInactiveHostBytes &&
-              stored.hostWiredBytes == kWiredHostBytes &&
-              stored.hostCompressorBytes == kCompressorHostBytes,
-          "the startup page breakdown was not stored");
-
-  governor.observe();
-  const MemoryGovernorSnapshot observed = governor.snapshot();
-  require(observed.hostWiredBytes == 2 * kWiredHostBytes &&
-              observed.hostInactiveBytes == kInactiveHostBytes,
-          "observe() did not store the new page breakdown");
-  require(host.samples == 2, "the page breakdown cost an extra host sample");
-
-  host.availableBytes.reset();
-  governor.observe();
-  const MemoryGovernorSnapshot invalid = governor.snapshot();
-  require(!invalid.hostMeasurementValid && invalid.hostInactiveBytes == 0 &&
-              invalid.hostWiredBytes == 0 && invalid.hostCompressorBytes == 0,
-          "a failed sample kept a stale page breakdown");
+// A reservation holds exactly its bytes under the limit while its
+// allocation runs. An admission whose allocation the driver denies reports
+// that and releases its reservation; a backend defect propagates and
+// releases it too.
+void testReservationsAndAdmissionClasses() {
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 64 * 1024;
+  const uint64_t limit = 64 * 1024;
+  MemoryGovernor governor(backend, limit, hostReserve, hostReserve,
+                          [] { return hostMemory(hostReserve + 3 * kGiB); }, 0);
+  const metal::AllocationResult held = admit(governor, limit - 1, [&] {
+    require(static_cast<bool>(admit(governor, 1)),
+            "memory governor held more than the reserved bytes");
+    const metal::AllocationResult over = admit(governor, 2);
+    require(!over && over.failure == metal::AllocationFailure::EngineBudget &&
+                governor.snapshot().deniedReservations == 1,
+            "memory governor oversold its limit");
+  });
+  require(static_cast<bool>(held), "memory governor refused bytes under its limit");
+  const metal::AllocationResult driverDenied = admit(governor, 1024, [] {
+    throw metal::MetalAllocationError("injected driver allocation denial");
+  });
+  require(!driverDenied &&
+              driverDenied.failure == metal::AllocationFailure::DriverRejected &&
+              admit(governor, limit),
+          "driver allocation denial did not release its reservation");
+  rejects(
+      [&] {
+        static_cast<void>(admit(governor, 1024, [] {
+          throw metal::MetalBackendError("injected backend defect");
+        }));
+      },
+      "injected backend defect", "admission swallowed a backend defect");
+  require(static_cast<bool>(admit(governor, limit)),
+          "a backend defect leaked its reservation");
 }
 
-void testSystemPressureReadsWithoutSampling() {
-  FakeHost host;
-  MemoryGovernor governor = makeGovernor(host);
+// Host memory the engine holds outside Metal (a streamed table's row cache)
+// is charged in full beside the backend's buffers.
+void testHostHeldBytesAreCharged() {
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 64 * 1024;
+  const uint64_t limit = 64 * 1024, held = 16 * 1024;
+  MemoryGovernor governor(backend, limit, hostReserve, hostReserve, [] {
+    return hostMemory(hostReserve + 3 * kGiB);
+  }, 0, held);
+  require(static_cast<bool>(admit(governor, limit - held)) && !admit(governor, limit - held + 1),
+          "memory governor did not charge the host memory the engine holds");
+  require(governor.snapshot().chargedBytes == held, "the host memory the engine holds is not in its charge");
+}
+
+// Critical pressure stops all growth. Host headroom below the warning margin
+// stops it too, as warning pressure, which sheds cache in paced passes and
+// lasts until the headroom crosses the recovery margin; with no request
+// waiting for memory, growth that leaves the warning margin free resumes
+// before then. Exhausting the engine's limit is not host pressure, and
+// missing telemetry fails closed without discarding valid cache.
+void testHostHeadroomHysteresis() {
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 64 * 1024;
+  const uint64_t limit = 64 * 1024;
+  std::optional<uint64_t> available = hostReserve + 3 * kGiB;
+  MemoryGovernor governor(backend, limit, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  // Whether one byte more is admitted.
+  const auto admitsMore = [&governor] { return static_cast<bool>(admit(governor, 1)); };
   governor.setPressure(MemoryPressure::Critical);
-  const MemoryGovernorSnapshot state = governor.snapshot();
-  require(state.pressure == MemoryPressure::Critical &&
-              state.systemPressure == MemoryPressure::Critical &&
-              !state.growthAllowed,
-          "a snapshot hid the system's critical verdict");
-  require(host.samples == 1, "system pressure forced a host sample");
+  require(!admitsMore(), "critical pressure did not stop new growth");
+  governor.setPressure(MemoryPressure::Normal);
+  require(admitsMore(), "normal pressure did not reopen admission");
+  available = hostReserve;
+  require(!admitsMore(), "host reserve did not stop unified-memory growth");
+  // Reaching the reserve is a warning that sheds cache in paced passes;
+  // only the OS critical verdict drops every evictable entry.
+  require(governor.snapshot().pressure == MemoryPressure::Warning,
+          "reaching the host reserve was treated as critical");
+  available = hostReserve / 2;
+  require(governor.snapshot().pressure == MemoryPressure::Warning && !admitsMore(),
+          "low availability escalated to destructive system pressure");
+  available = hostReserve + kGiB / 2;
+  require(governor.snapshot().pressure == MemoryPressure::Warning &&
+              !governor.snapshot().hostGrowthAllowed && !admitsMore(),
+          "low host headroom did not request proactive cache reclaim");
+  available = hostReserve + 3 * kGiB / 2;
+  require(governor.snapshot().pressure == MemoryPressure::Warning,
+          "warning pressure recovered without crossing the hysteresis");
+  available = hostReserve + 3 * kGiB;
+  require(governor.snapshot().pressure == MemoryPressure::Normal &&
+              governor.snapshot().hostGrowthAllowed,
+          "host recovery did not reopen admission");
+  const metal::AllocationResult full = admit(governor, limit, [&] {
+    const MemoryGovernorSnapshot snapshot = governor.snapshot();
+    require(snapshot.headroomBytes == 0 && snapshot.hostGrowthAllowed,
+            "engine budget exhaustion was confused with host pressure");
+  });
+  require(static_cast<bool>(full), "engine capacity reservation failed");
+  available.reset();
+  require(!admitsMore() && !governor.snapshot().hostMeasurementValid,
+          "missing host memory telemetry did not fail closed");
+  MemoryPressurePolicy missingPolicy;
+  const auto missing = governor.snapshot();
+  const auto missingDirective = missingPolicy.update(missing, 0.0, false);
+  require(missing.pressure == MemoryPressure::Warning && missingDirective &&
+              !missingDirective->critical && missingDirective->targetBytes == 0,
+          "missing telemetry discarded valid cache");
+  governor.setPressure(MemoryPressure::Critical);
+  require(missingPolicy.update(governor.snapshot(), 1.0, false).value().critical,
+          "missing telemetry hid critical system pressure");
+  governor.setPressure(MemoryPressure::Normal);
+  available = hostReserve + 3 * kGiB;
+  require(governor.snapshot().hostHeadroomBytes == 3 * kGiB,
+          "host memory headroom accounting is wrong");
 }
 
-// OS warn adds a floor of one KV extent that travels apart from the
-// headroom target, so a kept runway extent offsets only the target.
-void testPolicy_osWarning_carriesFloorApartFromHeadroomTarget() {
-  constexpr uint64_t kFloorBytes = 64 * 1024 * 1024;
-  MemoryPressurePolicy policy(kFloorBytes);
-  MemoryGovernorSnapshot snapshot;
-  snapshot.pressure = MemoryPressure::Warning;
-  snapshot.systemPressure = MemoryPressure::Warning;
-  snapshot.hostMeasurementValid = true;
-  snapshot.hostWarningMarginBytes = kCushion.warningMarginBytes;
-  snapshot.hostRecoveryMarginBytes = kCushion.recoveryMarginBytes;
-  snapshot.hostHeadroomBytes = kCushion.recoveryMarginBytes;
-  const MemoryReclaimDirective recovered = policy.update(snapshot, 0.0, false);
-  require(recovered.reclaimEmptyKvExtents && recovered.targetBytes == 0 &&
-              recovered.osWarningFloorBytes == kFloorBytes,
-          "OS warn folded its floor into the headroom target");
-
-  snapshot.hostHeadroomBytes = kCushion.recoveryMarginBytes - kGiB / 4;
-  const MemoryReclaimDirective deficit = policy.update(snapshot, 1000.0, false);
-  require(deficit.targetBytes == kGiB / 4 &&
-              deficit.osWarningFloorBytes == kFloorBytes,
-          "OS warn changed the headroom target or dropped its floor");
-
-  snapshot.systemPressure = MemoryPressure::Normal;
-  const MemoryReclaimDirective hostOnly = policy.update(snapshot, 2000.0, false);
-  require(hostOnly.targetBytes == kGiB / 4 &&
-              hostOnly.osWarningFloorBytes == 0,
-          "a floor applied without OS warn");
+// Low reclaimable memory must not reopen growth or suppress the pressure
+// reclaimer; reclaimable file cache can reopen it.
+void testReclaimablePagesReopenGrowth() {
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 64 * 1024;
+  const uint64_t limit = 64 * 1024;
+  std::optional<uint64_t> available = hostReserve + 3 * kGiB;
+  MemoryGovernor governor(backend, limit, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  const auto admitsMore = [&governor] { return static_cast<bool>(admit(governor, 1)); };
+  HostMemoryPages pressurePages{.free = hostReserve, .fileBacked = kGiB / 2};
+  available = estimateHostMemory(pressurePages, 1, false).available;
+  MemoryPressurePolicy hostPolicy;
+  const auto hostDirective = hostPolicy.update(governor.snapshot(), 0.0, false);
+  require(!admitsMore() && governor.snapshot().pressure == MemoryPressure::Warning &&
+              hostDirective && !hostDirective->critical &&
+              hostDirective->targetBytes == kGiB / 2,
+          "low reclaimable memory bypassed bounded pressure recovery");
+  pressurePages.fileBacked = 3 * kGiB;
+  available = estimateHostMemory(pressurePages, 1, false).available;
+  require(governor.snapshot().hostGrowthAllowed && admitsMore() &&
+              !hostPolicy.update(governor.snapshot(), 1000.0, false),
+          "reclaimable host recovery did not reopen normal admission");
 }
 
-// Host page sets measured on a 32 GiB, 16 KiB-page host serving a 27B model
-// whose hot (target + draft) weights are kHotWeightBytes. The same state is
-// read with those weights pageable (idleUnwired) and GPU-wired (idleWired):
-// wiring moves exactly kHotWeightBytes of pages from file-backed to wired.
-constexpr uint64_t kHostPageBytes = 16384;
-constexpr uint64_t kHostPhysicalBytes = 34'359'738'368;
-constexpr uint64_t kHotWeightBytes = 16'425'680'896;
-constexpr HostMemoryPages kIdleUnwiredPages{
-    .active = 721'064, .inactive = 793'264, .speculative = 1'554,
-    .wired = 180'029, .compressor = 271'014, .fileBacked = 1'264'808,
-    .purgeable = 8'231};
-constexpr HostMemoryPages kIdleWiredPages{
-    .active = 121'064, .inactive = 390'720, .speculative = 1'554,
-    .wired = 1'182'573, .compressor = 271'014, .fileBacked = 262'264,
-    .purgeable = 8'231};
-// The floor of the run that swapped: 18.4 GB of mlocked ballast, most of the
-// weights evicted, the remaining file-backed pages counted as available.
-constexpr HostMemoryPages kSwapFloorPages{
-    .active = 300'000, .inactive = 153'857, .wired = 1'541'748,
-    .compressor = 68'970, .fileBacked = 250'000};
-// The raw estimate today credits the unwired weights as available.
-constexpr uint64_t kIdleRawAvailableBytes = 22'991'110'144;
-constexpr uint64_t kIdleHonestAvailableBytes = 6'565'429'248;
-constexpr uint64_t kIdleHonestHeadroomBytes = 4'417'945'600;
-constexpr uint64_t kSwapFloorRawAvailableBytes = 4'629'741'568;
-constexpr uint64_t kSwapFloorRawHeadroomBytes = 2'482'257'920;
-
-uint64_t measuredEstimate(const HostMemoryPages &pages,
-                          WeightResidency weights = {}) {
-  return estimateHostAvailableMemory(pages, kHostPageBytes,
-                                     kHostPhysicalBytes, weights);
+// Reading the governor moves nothing: /status and the engine's growth
+// queries see what it would decide, and only a reservation or the control
+// pass moves the host's hysteresis. A recovery that only a read saw leaves
+// growth held for a waiting request once the host falls back inside the
+// recovery margin.
+void testSnapshotLeavesTheHysteresis() {
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 64 * 1024;
+  std::optional<uint64_t> available = hostReserve + kGiB / 2;
+  MemoryGovernor governor(backend, 64 * 1024, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  governor.setRequestWaiting(true);
+  require(!admit(governor, 1), "growth inside the warning margin was admitted");
+  available = hostReserve + 3 * kGiB;
+  require(governor.snapshot().hostGrowthAllowed, "a read did not see the host recover");
+  available = hostReserve + 3 * kGiB / 2;
+  require(!governor.snapshot().hostGrowthAllowed && !admit(governor, 1),
+          "a read moved the host's hysteresis");
+  available = hostReserve + 3 * kGiB;
+  require(governor.evaluate().hostGrowthAllowed,
+          "the control pass did not see the host recover");
+  available = hostReserve + 3 * kGiB / 2;
+  require(governor.snapshot().hostGrowthAllowed && admit(governor, 1),
+          "the control pass did not move the host's hysteresis");
 }
 
-// A governor on the measured host's cushion whose provider returns the
-// corrected sample for pages and weights, which the test may change.
-struct MeasuredHost final {
-  HostMemoryPages pages = kIdleUnwiredPages;
-  WeightResidency weights{kHotWeightBytes, 0};
-
-  [[nodiscard]] MemoryGovernor::HostAvailableMemoryProvider sampler() {
-    return [this]() -> std::optional<HostMemorySample> {
-      return HostMemorySample{.availableBytes = measuredEstimate(pages, weights),
-                              .weightBytes = weights.bytes,
-                              .weightWiredBytes = weights.wiredBytes};
-    };
-  }
-};
-
-MemoryGovernor makeMeasuredGovernor(MeasuredHost &host) {
-  return MemoryGovernor(
-      [](bool) {
-        metal::MetalMemoryStats stats;
-        stats.allocatedBytes = kResidentBytes;
-        return stats;
-      },
-      kLimitBytes, EngineMemoryPolicy::hostCushion(kHostPhysicalBytes),
-      host.sampler());
+// The host's pressure asks, once per settled measurement and for at most the
+// warning margin, for what measured headroom lacks of the warning margin, or
+// of the recovery margin while a request waits for memory; critical pressure
+// evicts everything.
+void testPressurePolicyDirectives() {
+  MemoryPressurePolicy policy;
+  MemoryGovernorSnapshot policySnapshot;
+  policySnapshot.pressure = MemoryPressure::Warning;
+  policySnapshot.hostMeasurementValid = true;
+  policySnapshot.hostHeadroomBytes = kGiB / 2;
+  const auto firstDirective = policy.update(policySnapshot, 0.0, false);
+  require(firstDirective && !firstDirective->critical &&
+              firstDirective->targetBytes == kGiB / 2,
+          "warning pressure ignored measured headroom");
+  require(policy.update(policySnapshot, 500.0, false).value().targetBytes == 0 &&
+              policy.update(policySnapshot, 999.0, false).value().targetBytes == 0,
+          "warning pressure reclaimed again before telemetry settled");
+  // Another application consumed more memory in the SAME warning episode.
+  // Earlier reclaimed bytes must not offset this new deficit.
+  policySnapshot.hostHeadroomBytes = kGiB / 4;
+  require(policy.update(policySnapshot, 1000.0, false).value().targetBytes == 3 * kGiB / 4,
+          "persistent warning did not request a new bounded shrink pass");
+  policySnapshot.hostHeadroomBytes = 3 * kGiB / 4;
+  require(policy.update(policySnapshot, 2000.0, false).value().targetBytes == kGiB / 4,
+          "pressure recovery ignored the current smaller deficit");
+  policySnapshot.pressure = MemoryPressure::Normal;
+  require(!policy.update(policySnapshot, 2100.0, false),
+          "normal pressure requested cache reclaim");
+  policySnapshot.pressure = MemoryPressure::Warning;
+  require(policy.update(policySnapshot, 2101.0, false).value().targetBytes == kGiB / 4,
+          "a new pressure episode inherited an old cooldown");
+  // Past the warning margin the hysteresis still holds the pressure. A pass
+  // nothing waits for then evicts nothing; one a request waits for frees
+  // what the recovery margin lacks.
+  policySnapshot.hostHeadroomBytes = 3 * kGiB / 2;
+  const auto idle = policy.update(policySnapshot, 3101.0, false);
+  require(idle && !idle->critical && idle->targetBytes == 0,
+          "a shrink nothing waited for went past the warning margin");
+  const auto waited = policy.update(policySnapshot, 4101.0, true);
+  require(waited && waited->targetBytes == kGiB / 2,
+          "a waiting request's shrink stopped short of the recovery margin");
+  // The newest publication is what a follow-up resumes from; rebuilding it
+  // costs a whole prefill, so a shrink nothing is waiting for leaves it and
+  // takes the rest short of what is in use, which includes the replay point
+  // a running request publishes for its follow-up. A waiting request
+  // outranks both, and Critical takes all.
+  policySnapshot.hostHeadroomBytes = kGiB / 4;
+  const auto speculative = policy.update(policySnapshot, 6101.0, false);
+  require(speculative && speculative->targetBytes == 3 * kGiB / 4 &&
+              speculative->keepResumePoint && speculative->upTo == ReclaimClass::Ordinary,
+          "a speculative shrink discarded the resume point or took what is in use");
+  const auto demanded = policy.update(policySnapshot, 7101.0, true);
+  require(demanded && demanded->targetBytes == kGiB && !demanded->keepResumePoint &&
+              demanded->upTo == ReclaimClass::InUse,
+          "a waiting request could not reach the resume point or what is in use");
+  policySnapshot.pressure = MemoryPressure::Critical;
+  const auto criticalDirective = policy.update(policySnapshot, 7102.0, false);
+  require(criticalDirective && criticalDirective->critical &&
+              !criticalDirective->keepResumePoint,
+          "critical pressure did not request aggressive reclaim");
 }
 
-// The bug: at the floor of the run that swapped, the raw estimate read
-// 2.48 GB of headroom (Normal) while the unwired hot weights it credited
-// could not be resident. Charging them reads zero and latches Warning.
-void testEstimate_swapFloorWithUnwiredWeights_readsNoHeadroom() {
-  MeasuredHost host;
-  MemoryGovernor governor = makeMeasuredGovernor(host);
-  const uint64_t reserveBytes =
-      EngineMemoryPolicy::hostCushion(kHostPhysicalBytes).reserveBytes;
-
-  const uint64_t raw = measuredEstimate(kSwapFloorPages);
-  const uint64_t charged =
-      measuredEstimate(kSwapFloorPages, {kHotWeightBytes, 0});
-  host.pages = kSwapFloorPages;
-  governor.observe();
-  const MemoryGovernorSnapshot state = governor.snapshot();
-
-  require(raw == kSwapFloorRawAvailableBytes &&
-              raw - reserveBytes == kSwapFloorRawHeadroomBytes,
-          "the swap-floor page set no longer reproduces today's reading");
-  require(charged == 0,
-          "unwired hot weights were credited as available host memory");
-  require(state.pressure == MemoryPressure::Warning &&
-              !state.hostGrowthAllowed && state.hostHeadroomBytes == 0,
-          "the governor read headroom at the floor where the host swapped");
+// A request can need more than the host headroom above the warning margin
+// while the idle headroom still clears it. Its refusal must start the paced
+// reclaim it waits for, after which it fits.
+void testHostRefusalStartsReclaim() {
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 20 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 20 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  const uint64_t laneState = 350'224'384;
+  std::optional<uint64_t> available = hostReserve + 64 * kGiB;
+  MemoryGovernor governor(backend, 40 * kGiB, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  const metal::AllocationResult beyondLimit = admit(governor, 40 * kGiB);
+  require(!beyondLimit && beyondLimit.failure == metal::AllocationFailure::EngineBudget,
+          "an engine budget refusal was taken for host pressure");
+  // The host refuses the same probe once it has 1.2 GiB of room, and that
+  // is the cause reported; a probe beyond the limit holds no host pressure.
+  available = hostReserve + kGiB + 200 * kMiB;
+  const metal::AllocationResult shared = admit(governor, 40 * kGiB);
+  require(!shared && shared.failure == metal::AllocationFailure::HostPressure &&
+              governor.snapshot().pressure == MemoryPressure::Normal,
+          "a refusal the host shares was reported as the engine's");
+  const metal::AllocationResult beyondHost = admit(governor, laneState);
+  require(!beyondHost && beyondHost.failure == metal::AllocationFailure::HostPressure,
+          "a request beyond the host headroom was admitted");
+  // The control pass finds the refused request waiting.
+  governor.setRequestWaiting(true);
+  const MemoryGovernorSnapshot refused = governor.snapshot();
+  MemoryPressurePolicy policy;
+  const std::optional<MemoryReclaimDirective> directive = policy.update(refused, 0.0, true);
+  require(refused.pressure == MemoryPressure::Warning &&
+              !refused.hostGrowthAllowed && directive && !directive->critical &&
+              !directive->keepResumePoint &&
+              directive->targetBytes == kGiB - 200 * kMiB,
+          "a request-sized host refusal did not start the paced reclaim");
+  // The reclaim reaches the recovery margin, and the request fits.
+  *available += directive->targetBytes;
+  require(static_cast<bool>(admit(governor, laneState)) &&
+              governor.snapshot().pressure == MemoryPressure::Normal,
+          "the waiting request did not fit after the reclaim");
 }
 
-// The measured idle state: today's estimate reads 22.99 GB, of which
-// 16.4 GB is the server's own unwired hot weights.
-void testEstimate_idleWithUnwiredWeights_chargesThem() {
-  const uint64_t raw = measuredEstimate(kIdleUnwiredPages);
-
-  const uint64_t charged =
-      measuredEstimate(kIdleUnwiredPages, {kHotWeightBytes, 0});
-
-  require(raw == kIdleRawAvailableBytes,
-          "the idle page set no longer reproduces today's reading");
-  require(charged == kIdleHonestAvailableBytes,
-          "the idle estimate did not charge the unwired hot weights");
+// A refusal the host shares with the engine's limit is the host's: it lifts
+// with the host's pressure, the limit's only once memory is freed. For a
+// request in service the host refuses only under critical pressure.
+void testHostRefusalComesBeforeTheEngineLimit() {
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 14 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 14 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  std::optional<uint64_t> available = hostReserve + kGiB / 2;
+  MemoryGovernor governor(backend, 15 * kGiB, hostReserve, hostReserve, [&available] { return hostMemory(available); }, 0);
+  const metal::AllocationResult shared = admit(governor, 2 * kGiB);
+  require(!shared && shared.failure == metal::AllocationFailure::HostPressure,
+          "a refusal the host shares was reported as the engine's");
+  governor.setServing(true);
+  const metal::AllocationResult inService = admit(governor, 2 * kGiB);
+  require(!inService && inService.failure == metal::AllocationFailure::EngineBudget,
+          "the host's margins refused a request in service");
+  governor.setPressure(MemoryPressure::Critical);
+  const metal::AllocationResult critical = admit(governor, 2 * kGiB);
+  require(!critical && critical.failure == metal::AllocationFailure::HostPressure,
+          "critical pressure was reported as the engine's limit");
 }
 
-// Wired weights already count as used, so the corrected estimate is the
-// same whether the sample lands while the GPU holds them wired or not.
-void testEstimate_sameStateWiredOrUnwired_readsTheSame() {
-  const uint64_t unwired =
-      measuredEstimate(kIdleUnwiredPages, {kHotWeightBytes, 0});
-  const uint64_t wired =
-      measuredEstimate(kIdleWiredPages, {kHotWeightBytes, kHotWeightBytes});
-  const uint64_t wiredWithoutWeights = measuredEstimate(kIdleWiredPages);
-
-  require(unwired == kIdleHonestAvailableBytes &&
-              wired == kIdleHonestAvailableBytes &&
-              wiredWithoutWeights == kIdleHonestAvailableBytes,
-          "the estimate depends on whether the weights happen to be wired");
+// Every denial counts once under the cause admission named: a refusal the
+// host shares and critical pressure under the host, the limit alone under
+// the engine. The two sum to the total.
+void testDenialsAreCountedByCause() {
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 14 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 14 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  std::optional<uint64_t> available = hostReserve + kGiB / 2;
+  MemoryGovernor governor(backend, 15 * kGiB, hostReserve, hostReserve, [&available] { return hostMemory(available); }, 0);
+  static_cast<void>(admit(governor, 2 * kGiB));
+  const MemoryGovernorSnapshot afterHost = governor.snapshot();
+  require(afterHost.deniedReservations == 1 && afterHost.deniedHostReservations == 1 &&
+              afterHost.deniedEngineReservations == 0,
+          "a refusal the host shares was not counted as the host's");
+  governor.setServing(true);
+  static_cast<void>(admit(governor, 2 * kGiB));
+  const MemoryGovernorSnapshot afterEngine = governor.snapshot();
+  require(afterEngine.deniedReservations == 2 && afterEngine.deniedHostReservations == 1 &&
+              afterEngine.deniedEngineReservations == 1,
+          "a refusal by the engine's limit alone was not counted as the engine's");
+  governor.setPressure(MemoryPressure::Critical);
+  static_cast<void>(admit(governor, kGiB / 4));
+  const MemoryGovernorSnapshot counted = governor.snapshot();
+  require(counted.deniedReservations == 3 && counted.deniedHostReservations == 2 &&
+              counted.deniedEngineReservations == 1,
+          "critical pressure was not counted as the host's refusal");
 }
 
-// Only the unwired part of the weights is charged; wired bytes above the
-// weight bytes never credit, and the charge saturates at zero.
-void testEstimate_weightCharge_isUnwiredBytesSaturating() {
-  constexpr uint64_t physicalPages = 100;
-  constexpr HostMemoryPages pages{.active = 20, .wired = 10};
-  const uint64_t raw = estimateHostAvailableMemory(pages, kHostPageBytes,
-                                                   physicalPages * kHostPageBytes);
-  auto withWeights = [&](uint64_t weightPages, uint64_t wiredPages) {
-    return estimateHostAvailableMemory(
-        pages, kHostPageBytes, physicalPages * kHostPageBytes,
-        {weightPages * kHostPageBytes, wiredPages * kHostPageBytes});
-  };
+// The sample's inactive, wired and compressor pages reach the snapshot in
+// bytes, beside estimates they do not change, and read zero while the host
+// cannot be measured.
+void testHostPageBreakdownIsReported() {
+  constexpr uint64_t pageSize = 16384;
+  const HostMemoryPages pages{.free = 10, .fileBacked = 20, .compressor = 3,
+                              .inactive = 7, .wired = 5};
+  const HostMemory host = estimateHostMemory(pages, pageSize, false);
+  require(host.available == 30 * pageSize && host.spare == 30 * pageSize &&
+              host.inactiveBytes == 7 * pageSize && host.wiredBytes == 5 * pageSize &&
+              host.compressorBytes == 3 * pageSize,
+          "the page breakdown changed the estimate or was not reported in bytes");
+  const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+  require(estimateHostMemory({.free = 1, .wired = maximum}, pageSize, false).wiredBytes == maximum,
+          "the page breakdown wrapped instead of saturating");
 
-  const uint64_t defaulted = estimateHostAvailableMemory(
-      pages, kHostPageBytes, physicalPages * kHostPageBytes, {});
-  const uint64_t none = withWeights(0, 0);
-  const uint64_t fullyWired = withWeights(40, 40);
-  const uint64_t fullyUnwired = withWeights(40, 0);
-  const uint64_t partlyWired = withWeights(40, 30);
-  const uint64_t overWired = withWeights(40, 60);
-  const uint64_t aboveAvailable = withWeights(71, 0);
-  const uint64_t atAvailable = withWeights(70, 0);
-
-  require(raw == 70 * kHostPageBytes && defaulted == raw && none == raw,
-          "no weights changed the estimate");
-  require(fullyWired == raw, "fully wired weights were charged twice");
-  require(fullyUnwired == 30 * kHostPageBytes,
-          "fully unwired weights were not charged in full");
-  require(partlyWired == 60 * kHostPageBytes,
-          "partly wired weights were not charged their unwired part");
-  require(overWired == raw,
-          "wired bytes above the weight bytes credited availability");
-  require(aboveAvailable == 0 && atAvailable == 0,
-          "the weight charge did not saturate at zero");
-}
-
-// The idle shape must not raise a false Warning or reclaim at normal
-// pressure, whether the weights are pageable or wired.
-void testGovernor_idleWithHotWeights_staysNormal() {
-  struct Case {
-    HostMemoryPages pages;
-    WeightResidency weights;
-  };
-  const Case cases[] = {
-      {kIdleUnwiredPages, {kHotWeightBytes, 0}},
-      {kIdleWiredPages, {kHotWeightBytes, kHotWeightBytes}},
-  };
-
-  for (const Case &idle : cases) {
-    MeasuredHost host{idle.pages, idle.weights};
-    MemoryGovernor governor = makeMeasuredGovernor(host);
-    MemoryPressurePolicy policy(64 * kMiB);
-    bool reclaimed = false;
-    for (int index = 0; index < kRepeatedSnapshots; ++index) {
-      governor.observe();
-      const MemoryReclaimDirective directive =
-          policy.update(governor.snapshot(), 1000.0 * index, false);
-      reclaimed = reclaimed || directive.reclaimEmptyKvExtents ||
-                  directive.evictAllUnpinnedPrefixes || directive.targetBytes;
-    }
-    const MemoryGovernorSnapshot state = governor.snapshot();
-
-    require(state.hostHeadroomBytes == kIdleHonestHeadroomBytes,
-            "the idle headroom is not the honest 4.42 GB");
-    require(state.pressure == MemoryPressure::Normal &&
-                state.hostGrowthAllowed && state.growthAllowed,
-            "the idle server latched a false Warning");
-    require(!reclaimed, "the idle server reclaimed at normal pressure");
-  }
-}
-
-void testObserve_storesWeightResidency() {
-  MeasuredHost host;
-  host.weights = {kHotWeightBytes, kHotWeightBytes / 4};
-  MemoryGovernor governor = makeMeasuredGovernor(host);
-  const MemoryGovernorSnapshot stored = governor.snapshot();
-
-  host.weights = {kHotWeightBytes, kHotWeightBytes};
-  host.pages = kIdleWiredPages;
-  governor.observe();
-  const MemoryGovernorSnapshot observed = governor.snapshot();
-
-  require(stored.hostWeightBytes == kHotWeightBytes &&
-              stored.hostWeightWiredBytes == kHotWeightBytes / 4,
-          "the startup weight residency was not stored");
-  require(observed.hostWeightBytes == kHotWeightBytes &&
-              observed.hostWeightWiredBytes == kHotWeightBytes,
-          "observe() did not store the new weight residency");
-}
-
-void testObserve_invalidSample_clearsWeightResidency() {
-  bool measurable = true;
-  MemoryGovernor governor(
-      [](bool) {
-        metal::MetalMemoryStats stats;
-        stats.allocatedBytes = kResidentBytes;
-        return stats;
-      },
-      kLimitBytes, kCushion,
-      [&measurable]() -> std::optional<HostMemorySample> {
-        if (!measurable)
-          return std::nullopt;
-        return HostMemorySample{.availableBytes = kAmpleHostBytes,
-                                .weightBytes = kHotWeightBytes,
-                                .weightWiredBytes = kHotWeightBytes / 2};
-      });
-
-  measurable = false;
-  governor.observe();
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 64 * 1024;
+  std::optional<HostMemory> sample = HostMemory{
+      .available = hostReserve + 3 * kGiB, .spare = hostReserve + 3 * kGiB,
+      .inactiveBytes = 7 * kGiB, .wiredBytes = 5 * kGiB, .compressorBytes = 3 * kGiB};
+  MemoryGovernor governor(backend, 64 * 1024, hostReserve, hostReserve, [&sample] { return sample; }, 0);
+  const MemoryGovernorSnapshot reported = governor.snapshot();
+  require(reported.hostInactiveBytes == 7 * kGiB && reported.hostWiredBytes == 5 * kGiB &&
+              reported.hostCompressorBytes == 3 * kGiB,
+          "the snapshot did not report the sample's page breakdown");
+  sample.reset();
   const MemoryGovernorSnapshot invalid = governor.snapshot();
-
-  require(!invalid.hostMeasurementValid && invalid.hostWeightBytes == 0 &&
-              invalid.hostWeightWiredBytes == 0,
-          "a failed sample kept a stale weight residency");
+  require(!invalid.hostMeasurementValid && !invalid.hostInactiveBytes && !invalid.hostWiredBytes &&
+              !invalid.hostCompressorBytes,
+          "an invalid measurement reported a page breakdown");
 }
 
-// An anonymous page-aligned mapping standing in for a weight file, unlocked
-// and unmapped on destruction.
-class TestMapping final {
-public:
-  explicit TestMapping(std::size_t pages)
-      : bytes_(pages * static_cast<std::size_t>(sysconf(_SC_PAGESIZE))) {
-    void *address = mmap(nullptr, bytes_, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANON, -1, 0);
-    require(address != MAP_FAILED, "unable to map test weight pages");
-    address_ = address;
-  }
-  ~TestMapping() {
-    munlock(address_, bytes_);
-    munmap(address_, bytes_);
-  }
-  TestMapping(const TestMapping &) = delete;
-  TestMapping &operator=(const TestMapping &) = delete;
-
-  [[nodiscard]] MappedWeightRange range() const noexcept {
-    return {address_, bytes_};
-  }
-  [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
-  void lock(std::size_t offset, std::size_t bytes) {
-    require(mlock(static_cast<char *>(address_) + offset, bytes) == 0,
-            "unable to mlock test weight pages");
-  }
-  void lock() { lock(0, bytes_); }
-  void unlock() noexcept { munlock(address_, bytes_); }
-
-private:
-  std::size_t bytes_ = 0;
-  void *address_ = nullptr;
-};
-
-constexpr std::size_t kFirstRangePages = 24;
-constexpr std::size_t kSecondRangePages = 40;
-
-void testWeightWiringSampler_nothingLocked_readsNoWiredBytes() {
-  TestMapping first(kFirstRangePages);
-  TestMapping second(kSecondRangePages);
-  const std::vector<MappedWeightRange> ranges{first.range(), second.range()};
-  const WeightWiringSampler sampler(ranges);
-
-  const WeightResidency residency = sampler.sample();
-
-  require(residency.bytes == first.bytes() + second.bytes() &&
-              residency.wiredBytes == 0,
-          "pageable weight pages were read as wired");
+// The paced passes up to the next measurement continue what transfers held
+// back of a pass's target, less what each releases, until it is met. A new
+// measurement replaces it, and every critical pass evicts everything afresh.
+void testPolicyContinuesHeldBackTarget() {
+  MemoryPressurePolicy policy;
+  MemoryGovernorSnapshot pressure{.pressure = MemoryPressure::Warning,
+                                  .hostMeasurementValid = true,
+                                  .hostHeadroomBytes = kHostRecoveryMarginBytes - 300};
+  const auto pass = [&](double now, MemoryReclaimResult result) {
+    const MemoryReclaimDirective directive = policy.update(pressure, now, true).value();
+    policy.reclaimed(directive, result);
+    return directive.targetBytes;
+  };
+  constexpr MemoryReclaimResult none{};
+  require(pass(0.0, {100, ReclaimOutcome::Pending}) == 300 &&
+              pass(100.0, {50, ReclaimOutcome::Pending}) == 200 &&
+              pass(200.0, {0, ReclaimOutcome::Met}) == 150 && pass(300.0, none) == 0,
+          "the paced passes did not continue a held-back target until it was met");
+  require(pass(1000.0, {0, ReclaimOutcome::Pending}) == 300, "the pass was not measured");
+  pressure.hostHeadroomBytes = kHostRecoveryMarginBytes - 100;
+  require(pass(2000.0, none) == 100 && pass(2100.0, none) == 0,
+          "a measurement did not replace the held-back target");
+  pressure.pressure = MemoryPressure::Critical;
+  require(policy.update(pressure, 2150.0, true).value().critical,
+          "critical pressure kept the serving footprint");
+  static_cast<void>(pass(2200.0, {0, ReclaimOutcome::Pending}));
+  pressure.pressure = MemoryPressure::Warning;
+  require(pass(2300.0, none) == 0, "evicting everything was continued after critical pressure");
 }
 
-void testWeightWiringSampler_allLocked_readsAllWired() {
-  TestMapping first(kFirstRangePages);
-  TestMapping second(kSecondRangePages);
-  const std::vector<MappedWeightRange> ranges{first.range(), second.range()};
-  const WeightWiringSampler sampler(ranges);
-  first.lock();
-  second.lock();
-
-  const WeightResidency residency = sampler.sample();
-
-  require(residency.bytes == first.bytes() + second.bytes() &&
-              residency.wiredBytes == residency.bytes,
-          "wired weight pages were not read as wired");
+// With nothing left to reclaim, the hold for the recovery margin could only be
+// lifted by other applications: every request, however small, would wait.
+// While reclaim reports that, growth that clears the warning margin proceeds
+// and a request beyond it holds no other. A pass that finds memory again, or
+// a new episode of host pressure, brings the hold back; a pass that macOS's
+// warning alone asked for, while the host had room, waives nothing.
+void testExhaustedReclaimWaivesTheHold() {
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 12 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 12 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  std::optional<uint64_t> available = hostReserve + kGiB + kGiB / 2;
+  MemoryGovernor governor(backend, 40 * kGiB, hostReserve, hostReserve, [&available] { return hostMemory(available); }, 0);
+  governor.setRequestWaiting(true);
+  const metal::AllocationResult pastMargin = admit(governor, kGiB);
+  require(!pastMargin && pastMargin.failure == metal::AllocationFailure::HostPressure,
+          "growth past the warning margin was admitted");
+  governor.reclaimed(ReclaimOutcome::Untargeted);
+  require(!admit(governor, 100 * kMiB) && !governor.snapshot().hostGrowthAllowed,
+          "the host refusal did not hold growth for the recovery margin");
+  governor.reclaimed(ReclaimOutcome::Exhausted);
+  require(governor.snapshot().hostGrowthAllowed && admit(governor, 100 * kMiB),
+          "growth within the warning margin still waited after reclaim was exhausted");
+  const metal::AllocationResult waived = admit(governor, kGiB);
+  require(!waived && waived.failure == metal::AllocationFailure::HostPressure &&
+              governor.snapshot().pressure == MemoryPressure::Warning &&
+              admit(governor, 100 * kMiB),
+          "a request past the warning margin was admitted or held the others");
+  governor.reclaimed(ReclaimOutcome::Pending);
+  require(!admit(governor, 100 * kMiB), "the hold did not return with memory to reclaim");
+  governor.reclaimed(ReclaimOutcome::Exhausted);
+  available = hostReserve + 3 * kGiB;
+  require(governor.evaluate().pressure == MemoryPressure::Normal, "the host did not recover");
+  available = hostReserve + kGiB + kGiB / 2;
+  require(!admit(governor, kGiB) && !admit(governor, 100 * kMiB),
+          "an earlier episode's exhausted reclaim waived the hold");
+  available = hostReserve + 3 * kGiB;
+  governor.setPressure(MemoryPressure::Warning);
+  require(governor.evaluate().pressure == MemoryPressure::Warning, "macOS's warning was ignored");
+  governor.reclaimed(ReclaimOutcome::Exhausted);
+  governor.setPressure(MemoryPressure::Normal);
+  available = hostReserve + kGiB / 2;
+  require(governor.evaluate().pressure == MemoryPressure::Warning, "the host did not run short");
+  available = hostReserve + kGiB + kGiB / 2;
+  require(!admit(governor, 100 * kMiB),
+          "a pass that only macOS's warning asked for waived the next episode's hold");
 }
 
-void testWeightWiringSampler_oneRangeLocked_readsThatRangeExactly() {
-  TestMapping first(kFirstRangePages);
-  TestMapping second(kSecondRangePages);
-  const std::vector<MappedWeightRange> ranges{first.range(), second.range()};
-  const WeightWiringSampler sampler(ranges);
-  second.lock();
-
-  const WeightResidency residency = sampler.sample();
-  second.unlock();
-  const WeightResidency released = sampler.sample();
-
-  require(residency.wiredBytes == second.bytes(),
-          "a wired range was not read as exactly its own bytes");
-  require(released.wiredBytes == 0, "an unwired range still read as wired");
+// Growth waits for the recovery margin only while a request waits for
+// memory, so that what reclaim frees goes to it. With none waiting, paced
+// reclaim only restores the warning margin, and growth that clears that
+// margin proceeds while the host's headroom sits between the margins.
+void testOnlyAWaitingRequestHoldsGrowth() {
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 12 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 12 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  std::optional<uint64_t> available = hostReserve + kGiB / 2;
+  MemoryGovernor governor(backend, 40 * kGiB, hostReserve, hostReserve, [&available] { return hostMemory(available); }, 0);
+  require(!admit(governor, 100 * kMiB), "growth inside the warning margin was admitted");
+  available = hostReserve + kGiB + kGiB / 2;
+  require(governor.evaluate().pressure == MemoryPressure::Warning &&
+              governor.snapshot().hostGrowthAllowed && admit(governor, 100 * kMiB),
+          "growth that cleared the warning margin waited with no request waiting");
+  governor.setRequestWaiting(true);
+  require(!governor.snapshot().hostGrowthAllowed && !admit(governor, 100 * kMiB),
+          "growth did not wait for the recovery margin while a request waited");
+  governor.setRequestWaiting(false);
+  require(governor.snapshot().hostGrowthAllowed && admit(governor, 100 * kMiB),
+          "the hold outlived the waiting request");
 }
 
-// A range larger than the sample budget is sampled evenly: half of it wired
-// reads half, within the weight of one sample on either side.
-void testWeightWiringSampler_largeRangeHalfLocked_readsAboutHalf() {
-  const std::size_t pages = 4 * kWeightWiringSamplePages;
-  TestMapping mapping(pages);
-  const std::vector<MappedWeightRange> ranges{mapping.range()};
-  const WeightWiringSampler sampler(ranges);
-  mapping.lock(0, static_cast<std::size_t>(mapping.bytes() / 2));
-
-  const WeightResidency residency = sampler.sample();
-
-  const uint64_t sampleBytes = mapping.bytes() / kWeightWiringSamplePages;
-  const uint64_t half = mapping.bytes() / 2;
-  require(residency.bytes == mapping.bytes(),
-          "a large range did not report its bytes");
-  require(residency.wiredBytes + sampleBytes >= half &&
-              residency.wiredBytes <= half + sampleBytes,
-          "a half-wired range was not sampled evenly across its pages");
+// A pass with no target leaves nothing to settle: a request that starts
+// waiting right after it gets its own pass at once, and that one, which has
+// a target, waits for the host's counters before the next.
+void testOnlyATargetedPassWaitsToSettle() {
+  MemoryPressurePolicy policy;
+  const MemoryGovernorSnapshot between{.pressure = MemoryPressure::Warning,
+                                       .hostMeasurementValid = true,
+                                       .hostHeadroomBytes = kGiB + kGiB / 2};
+  const auto idle = policy.update(between, 0.0, false);
+  const auto waited = policy.update(between, 10.0, true);
+  require(idle && idle->targetBytes == 0 && waited && waited->targetBytes == kGiB / 2,
+          "an empty pass made a waiting request wait for its own");
+  require(policy.update(between, 20.0, true).value().targetBytes == 0 &&
+              policy.update(between, 1010.0, true).value().targetBytes == kGiB / 2,
+          "a pass that freed memory did not wait for the host to settle");
 }
 
-void testWeightWiringSampler_noRanges_readsNothing() {
-  const std::vector<MappedWeightRange> ranges;
-  const WeightWiringSampler sampler(ranges);
+// Host pressure holds back growth that nothing in flight depends on. What a
+// request in service needs is granted while the host is short, into its
+// reserve too: holding it back would strand the request and the memory it
+// already has. Only the engine's limit and critical pressure refuse it, and
+// without the mark the margins apply as before.
+void testRequestInServiceGrowsThroughHostPressure() {
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 14 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 14 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  std::optional<uint64_t> available = hostReserve + kGiB / 2;
+  MemoryGovernor governor(backend, 15 * kGiB, hostReserve, hostReserve, [&available] { return hostMemory(available); }, 0);
+  const auto grow = [&](uint64_t bytes) {
+    return admit(governor, bytes, [bytes] { allocate(bytes); });
+  };
+  const metal::AllocationResult idle = grow(400 * kMiB);
+  require(!idle && idle.failure == metal::AllocationFailure::HostPressure &&
+              !governor.snapshot().hostGrowthAllowed,
+          "growth that nothing in service needs cleared no warning margin");
 
-  const WeightResidency residency = sampler.sample();
+  governor.setServing(true);
+  require(grow(400 * kMiB) && !governor.snapshot().hostGrowthAllowed,
+          "a request in service waited for the warning margin");
+  available = hostReserve / 2;
+  require(static_cast<bool>(grow(100 * kMiB)),
+          "a request in service waited for the host's reserve");
+  const metal::AllocationResult pastLimit = grow(kGiB);
+  require(!pastLimit && pastLimit.failure == metal::AllocationFailure::EngineBudget,
+          "a request in service grew past the engine's limit");
+  governor.setPressure(MemoryPressure::Critical);
+  const metal::AllocationResult critical = grow(100 * kMiB);
+  require(!critical && critical.failure == metal::AllocationFailure::HostPressure,
+          "critical pressure admitted a request in service");
+  governor.setPressure(MemoryPressure::Normal);
+  require(static_cast<bool>(grow(100 * kMiB)),
+          "a request in service stayed refused after critical pressure");
 
-  require(residency.bytes == 0 && residency.wiredBytes == 0,
-          "an empty sampler reported weight bytes");
+  governor.setServing(false);
+  available = hostReserve + kGiB / 2;
+  const metal::AllocationResult afterService = grow(100 * kMiB);
+  require(!afterService && afterService.failure == metal::AllocationFailure::HostPressure,
+          "the mark of a request in service outlived it");
 }
 
-void testQueryHostAvailableMemory_withSampler_reportsWeightResidency() {
-  TestMapping mapping(kFirstRangePages);
-  const std::vector<MappedWeightRange> ranges{mapping.range()};
-  const WeightWiringSampler sampler(ranges);
-  mapping.lock();
-
-  const std::optional<HostMemorySample> withWeights =
-      queryHostAvailableMemory(&sampler);
-  const std::optional<HostMemorySample> withoutWeights =
-      queryHostAvailableMemory();
-
-  require(withWeights && withWeights->weightBytes == mapping.bytes() &&
-              withWeights->weightWiredBytes == mapping.bytes(),
-          "the host sample did not report the sampler's weight residency");
-  require(withoutWeights && withoutWeights->weightBytes == 0 &&
-              withoutWeights->weightWiredBytes == 0,
-          "a host sample without a sampler reported weight bytes");
+// A Mac shared with other applications: their anonymous memory makes the
+// available memory, which counts compressing it 2:1, much larger than the
+// spare memory, which counts half of that credit. Growth that no request in
+// service needs keeps the warning margin above the spare reserve of the spare
+// memory, and the paced reclaim returns cache toward it, while memory a
+// request in service needs still grows and the governor starts against the
+// smaller reserve macOS keeps of the available memory.
+void testOptionalGrowthKeepsTheSpareReserve() {
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 20 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 20 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB, spareReserve = 7 * kGiB;
+  // 4 GiB free and file-backed, and 40 GiB of other applications' anonymous
+  // memory: 20 GiB more if compressed 2:1, of which spare counts 10.
+  HostMemory host{24 * kGiB, 14 * kGiB};
+  MemoryGovernor governor(backend, 100 * kGiB, hostReserve, spareReserve, [&host] {
+    return std::optional<HostMemory>(host);
+  }, 0);
+  const auto grow = [&](uint64_t bytes) {
+    return admit(governor, bytes, [bytes] { allocate(bytes); });
+  };
+  MemoryGovernorSnapshot snapshot = governor.snapshot();
+  require(snapshot.hostAvailableBytes == 24 * kGiB && snapshot.hostSpareBytes == 14 * kGiB &&
+              snapshot.hostSpareReserveBytes == spareReserve &&
+              snapshot.hostHeadroomBytes == 7 * kGiB && snapshot.hostGrowthAllowed,
+          "the headroom is not the spare memory above the spare reserve");
+  require(static_cast<bool>(grow(5 * kGiB)), "growth within the spare headroom was refused");
+  // The growth came out of the host's free memory.
+  host = {19 * kGiB, 9 * kGiB};
+  require(!grow(kGiB + kGiB / 2),
+          "growth no request needs did not keep the warning margin above the spare reserve");
+  host = {17 * kGiB + kGiB / 2, 7 * kGiB + kGiB / 2};
+  snapshot = governor.evaluate();
+  MemoryPressurePolicy policy;
+  const auto directive = policy.update(snapshot, 0.0, false);
+  require(snapshot.pressure == MemoryPressure::Warning && !snapshot.hostGrowthAllowed &&
+              directive && directive->targetBytes == kGiB - snapshot.hostHeadroomBytes,
+          "the paced reclaim did not restore the warning margin above the spare reserve");
+  governor.setServing(true);
+  require(static_cast<bool>(grow(4 * kGiB)),
+          "a request in service waited for the spare reserve");
+  governor.setServing(false);
+  // A start needs only the reserve macOS keeps of the available memory.
+  host = {3 * kGiB, 0};
+  MemoryGovernor starting(backend, 100 * kGiB, hostReserve, spareReserve, [&host] {
+    return std::optional<HostMemory>(host);
+  }, 0);
+  host = {hostReserve, 0};
+  rejects([&] { MemoryGovernor refused(backend, 100 * kGiB, hostReserve, spareReserve, [&host] {
+            return std::optional<HostMemory>(host);
+          }, 0); },
+          "host available memory does not satisfy the system reserve",
+          "a start below the reserve macOS keeps was admitted");
 }
 
-// A scripted host for sampleHostAvailableMemory: each page read and each
-// weight sample takes the next entry of its script, repeating the last one
-// once the script runs out, and counts the calls.
-struct ScriptedHostReads final {
-  std::vector<HostMemoryPages> pages;
-  std::vector<WeightResidency> residencies;
-  std::size_t pageReads = 0;
-  std::size_t weightSamples = 0;
+// macOS's warning asks caches to give memory back. While it lasts, growth
+// that no request in service needs stops whatever the host's headroom, and
+// the snapshot says so, while what a request in service needs still grows.
+// Every paced pass returns the warning margin's worth of cache and keeps the
+// resume point, even for a waiting request, which the warning holds back
+// too; only a pass a request waits for takes what is in use. Once the level
+// is normal again, growth resumes and no pass runs.
+void testSystemWarningGivesCacheBack() {
+  test::metalStatistics() = {};
+  test::metalStatistics().allocatedBytes = 12 * kGiB;
+  test::metalStatistics().deviceCurrentAllocatedBytes = 12 * kGiB;
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB;
+  const std::optional<uint64_t> available = hostReserve + 16 * kGiB;
+  MemoryGovernor governor(backend, 40 * kGiB, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  const auto grow = [&](uint64_t bytes) {
+    return admit(governor, bytes, [bytes] { allocate(bytes); });
+  };
+  governor.setPressure(MemoryPressure::Warning);
+  const MemoryGovernorSnapshot warned = governor.evaluate();
+  const metal::AllocationResult cache = grow(100 * kMiB);
+  require(!cache && cache.failure == metal::AllocationFailure::HostPressure &&
+              warned.pressure == MemoryPressure::Warning && !warned.hostGrowthAllowed,
+          "growth that no request in service needs went on while macOS warned");
+  governor.setServing(true);
+  require(static_cast<bool>(grow(100 * kMiB)), "macOS's warning refused a request in service");
+  governor.setServing(false);
 
-  std::optional<HostMemorySample> sample() {
-    return sampleHostAvailableMemory(
-        [this] {
-          const HostMemoryPages &read =
-              pages[std::min(pageReads, pages.size() - 1)];
-          ++pageReads;
-          return std::optional<HostPageReading>{
-              HostPageReading{read, kHostPageBytes}};
-        },
-        [this] {
-          const WeightResidency residency = residencies[std::min(
-              weightSamples, residencies.size() - 1)];
-          ++weightSamples;
-          return residency;
-        },
-        kHostPhysicalBytes);
-  }
-};
+  MemoryPressurePolicy policy;
+  const auto first = policy.update(warned, 0.0, false);
+  require(first && !first->critical && first->targetBytes == kHostWarningMarginBytes &&
+              first->keepResumePoint && first->upTo == ReclaimClass::Ordinary,
+          "a pass under macOS's warning did not return the warning margin's worth of cache, "
+          "keeping the resume point and what is in use");
+  require(policy.update(warned, 500.0, false).value().targetBytes == 0 &&
+              policy.update(warned, 1000.0, false).value().targetBytes == kHostWarningMarginBytes,
+          "the passes under macOS's warning did not keep the pace");
+  const auto waited = policy.update(warned, 2000.0, true);
+  require(waited && waited->targetBytes == kHostWarningMarginBytes && waited->keepResumePoint &&
+              waited->upTo == ReclaimClass::InUse,
+          "a pass under macOS's warning dropped the resume point for a request it holds back, "
+          "or kept what is in use from it");
 
-constexpr WeightResidency kHotWeightsUnwired{kHotWeightBytes, 0};
-constexpr WeightResidency kHotWeightsWired{kHotWeightBytes, kHotWeightBytes};
-
-void testSampleHostAvailableMemory_steadyWeights_takesOnePageRead() {
-  ScriptedHostReads host{.pages = {kIdleWiredPages},
-                         .residencies = {kHotWeightsWired}};
-
-  const std::optional<HostMemorySample> sample = host.sample();
-
-  require(sample && sample->availableBytes == kIdleHonestAvailableBytes,
-          "a steady sample did not read the honest estimate");
-  require(host.pageReads == 1 && host.weightSamples == 2,
-          "a steady sample spent more than one page read and two samples");
-}
-
-// The live skew: the page read sees the weights pageable, the sample after it
-// sees them wired, and one unbracketed reading credited them as available.
-void testSampleHostAvailableMemory_weightsWireBetweenReads_readsUnskewed() {
-  ScriptedHostReads host{
-      .pages = {kIdleUnwiredPages, kIdleWiredPages},
-      .residencies = {kHotWeightsUnwired, kHotWeightsWired}};
-  const uint64_t skewed = measuredEstimate(kIdleUnwiredPages, kHotWeightsWired);
-
-  const std::optional<HostMemorySample> sample = host.sample();
-
-  require(skewed == kIdleRawAvailableBytes,
-          "the skewed pairing no longer reproduces the live high reading");
-  require(sample && sample->availableBytes == kIdleHonestAvailableBytes &&
-              sample->weightWiredBytes == kHotWeightBytes,
-          "weights wiring between reads skewed the estimate");
-  require(host.pageReads == 2 && host.weightSamples == 3,
-          "a disagreeing bracket was not retried exactly once");
-}
-
-// The weights never settle: after two retries the last bracket charges the
-// residency that reads lower, never the unwired pages credited as wired.
-void testSampleHostAvailableMemory_weightsKeepChanging_readsLowerAfterTwoRetries() {
-  ScriptedHostReads host{
-      .pages = {kIdleUnwiredPages},
-      .residencies = {kHotWeightsUnwired, kHotWeightsWired,
-                      kHotWeightsUnwired, kHotWeightsWired}};
-
-  const std::optional<HostMemorySample> sample = host.sample();
-
-  require(sample && sample->availableBytes == kIdleHonestAvailableBytes &&
-              sample->weightWiredBytes == 0,
-          "an unsettled bracket did not charge the lower estimate");
-  require(host.pageReads ==
-                  static_cast<std::size_t>(kHostPageReadAttempts) &&
-              host.weightSamples == host.pageReads + 1,
-          "an unsettled bracket was not retried exactly twice");
-}
-
-void testSampleHostAvailableMemory_pageReadFails_readsNothing() {
-  std::size_t weightSamples = 0;
-
-  const std::optional<HostMemorySample> sample = sampleHostAvailableMemory(
-      [] { return std::optional<HostPageReading>{}; },
-      [&weightSamples] {
-        ++weightSamples;
-        return kHotWeightsWired;
-      },
-      kHostPhysicalBytes);
-
-  require(!sample && weightSamples == 1,
-          "a refused page read still produced a host sample");
+  governor.setPressure(MemoryPressure::Normal);
+  const MemoryGovernorSnapshot normal = governor.evaluate();
+  require(normal.pressure == MemoryPressure::Normal && normal.hostGrowthAllowed &&
+              grow(100 * kMiB) && !policy.update(normal, 3000.0, false),
+          "growth or the passes did not follow macOS back to normal pressure");
 }
 
 } // namespace
 
 int main() {
   try {
-    testSnapshotAfterConstructionUsesStartupSample();
-    testSnapshotNeitherSamplesNorLatches();
-    testObserveLatchesWarningAndClearsAtRecovery();
-    testTryReserveAdvancesLatch();
+    testHostAvailabilityCountsReclaimablePages();
+    testAdvertisedContextIsGrantable();
+    testReservationsAndAdmissionClasses();
+    testHostHeldBytesAreCharged();
+    testHostHeadroomHysteresis();
+    testReclaimablePagesReopenGrowth();
+    testSnapshotLeavesTheHysteresis();
+    testPressurePolicyDirectives();
+    testHostRefusalStartsReclaim();
+    testHostRefusalComesBeforeTheEngineLimit();
     testDenialsAreCountedByCause();
-    testReservationThatFitsIsGrantedWhileWarningLatched();
-    testStartupAndServingShareOneFloor();
-    testBootstrapPhaseAdmitsAgainstReserve();
-    testCushionScalesWithPhysicalMemory();
-    testInvalidCushionRejected();
-    testSystemPressureReadsWithoutSampling();
-    testPolicy_osWarning_carriesFloorApartFromHeadroomTarget();
-    testObserveStoresPageBreakdown();
-    testEstimate_swapFloorWithUnwiredWeights_readsNoHeadroom();
-    testEstimate_idleWithUnwiredWeights_chargesThem();
-    testEstimate_sameStateWiredOrUnwired_readsTheSame();
-    testEstimate_weightCharge_isUnwiredBytesSaturating();
-    testGovernor_idleWithHotWeights_staysNormal();
-    testObserve_storesWeightResidency();
-    testObserve_invalidSample_clearsWeightResidency();
-    testWeightWiringSampler_nothingLocked_readsNoWiredBytes();
-    testWeightWiringSampler_allLocked_readsAllWired();
-    testWeightWiringSampler_oneRangeLocked_readsThatRangeExactly();
-    testWeightWiringSampler_largeRangeHalfLocked_readsAboutHalf();
-    testWeightWiringSampler_noRanges_readsNothing();
-    testQueryHostAvailableMemory_withSampler_reportsWeightResidency();
-    testSampleHostAvailableMemory_steadyWeights_takesOnePageRead();
-    testSampleHostAvailableMemory_weightsWireBetweenReads_readsUnskewed();
-    testSampleHostAvailableMemory_weightsKeepChanging_readsLowerAfterTwoRetries();
-    testSampleHostAvailableMemory_pageReadFails_readsNothing();
+    testHostPageBreakdownIsReported();
+    testPolicyContinuesHeldBackTarget();
+    testExhaustedReclaimWaivesTheHold();
+    testOnlyAWaitingRequestHoldsGrowth();
+    testOnlyATargetedPassWaitsToSettle();
+    testRequestInServiceGrowsThroughHostPressure();
+    testOptionalGrowthKeepsTheSpareReserve();
+    testSystemWarningGivesCacheBack();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

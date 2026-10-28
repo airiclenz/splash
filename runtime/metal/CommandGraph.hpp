@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -21,9 +22,25 @@ namespace splash::metal {
 // maximum, so building one from a braced list allocates nothing.
 using BufferList = InlineVector<MetalBuffer, kInlineBufferBindings>;
 
-// An ordered dispatch list for one command buffer. Buffers bind at indices
-// 0..n-1; an optional parameter struct binds at index n and is copied into
-// graph-owned storage until submission.
+// A dispatch's pipeline name, which the dispatch owns: a std::string the
+// caller built moves in, and a literal or view is copied once.
+struct PipelineName final {
+  PipelineName(std::string name) : value(std::move(name)) {}
+  PipelineName(std::string_view name) : value(name) {}
+  PipelineName(const char *name) : value(name) {}
+
+  std::string value;
+};
+
+// Bindings a caller collected in a std::vector rather than a BufferList.
+template <class Buffers>
+concept BufferVector = std::same_as<std::remove_cvref_t<Buffers>, std::vector<MetalBuffer>>;
+
+// An ordered dispatch list for one command, with the event steps that order
+// it against another agent or the CPU (EventStep); MetalBackend splits a
+// command into Metal command buffers at its event signals and host steps.
+// Buffers bind at indices 0..n-1; an optional parameter struct binds at
+// index n and is copied into graph-owned storage until submission.
 class CommandGraph final {
 public:
   static constexpr uint32_t kDefaultThreads = 256;
@@ -38,15 +55,13 @@ public:
   CommandGraph(CommandGraph &&) noexcept = default;
   CommandGraph &operator=(CommandGraph &&) noexcept = default;
 
-  // The graph keeps the pipeline name as a view: it must name static storage
-  // (a literal or a constant name table), which outlives the submit.
-  void add(std::string_view pipeline, BufferList buffers, DispatchSize groups,
+  void add(PipelineName pipeline, BufferList buffers, DispatchSize groups,
            DispatchSize threads = {kDefaultThreads, 1, 1}) {
-    push(pipeline, std::move(buffers), groups, threads);
+    push(std::move(pipeline), std::move(buffers), groups, threads);
   }
 
   template <class Params>
-  void add(std::string_view pipeline, BufferList buffers, const Params &params,
+  void add(PipelineName pipeline, BufferList buffers, const Params &params,
            DispatchSize groups, DispatchSize threads = {kDefaultThreads, 1, 1}) {
     static_assert(std::is_trivially_copyable_v<Params>,
                   "dispatch parameters must be plain data");
@@ -54,35 +69,96 @@ public:
                   "dispatch parameters exceed the payload chunk alignment");
     void *payload = storePayload(sizeof(Params), alignof(Params));
     std::memcpy(payload, &params, sizeof(Params));
-    ComputeDispatch &dispatch = push(pipeline, std::move(buffers), groups, threads);
+    ComputeDispatch &dispatch =
+        push(std::move(pipeline), std::move(buffers), groups, threads);
     dispatch.bytes.push_back({static_cast<uint32_t>(dispatch.buffers.size()),
                               payload, sizeof(Params)});
   }
 
-  // A std::string name would dangle once the caller's string dies; these
-  // overloads turn that into a compile error.
-  template <class Name>
-    requires std::same_as<std::remove_cvref_t<Name>, std::string>
-  void add(Name &&, BufferList, DispatchSize,
-           DispatchSize = {kDefaultThreads, 1, 1}) = delete;
-  template <class Name, class Params>
-    requires std::same_as<std::remove_cvref_t<Name>, std::string>
-  void add(Name &&, BufferList, const Params &, DispatchSize,
-           DispatchSize = {kDefaultThreads, 1, 1}) = delete;
+  // A dispatch of the grid in `grid`, which an earlier dispatch writes
+  // within `groups` (ComputeDispatch::indirectThreadgroups).
+  template <class Params>
+  void add(PipelineName pipeline, BufferList buffers, const Params &params,
+           DispatchSize groups, IndirectGrid grid, DispatchSize threads) {
+    add(std::move(pipeline), std::move(buffers), params, groups, threads);
+    dispatches_.back().indirectThreadgroups = std::move(grid);
+  }
+
+  // The same dispatches with their bindings in a std::vector, moved or copied
+  // into the inline list; a braced list never deduces these.
+  template <BufferVector Buffers>
+  void add(PipelineName pipeline, Buffers &&buffers, DispatchSize groups,
+           DispatchSize threads = {kDefaultThreads, 1, 1}) {
+    add(std::move(pipeline), bufferList(std::forward<Buffers>(buffers)), groups, threads);
+  }
+
+  template <BufferVector Buffers, class Params>
+  void add(PipelineName pipeline, Buffers &&buffers, const Params &params,
+           DispatchSize groups, DispatchSize threads = {kDefaultThreads, 1, 1}) {
+    add(std::move(pipeline), bufferList(std::forward<Buffers>(buffers)), params, groups,
+        threads);
+  }
+
+  template <BufferVector Buffers, class Params>
+  void add(PipelineName pipeline, Buffers &&buffers, const Params &params,
+           DispatchSize groups, IndirectGrid grid, DispatchSize threads) {
+    add(std::move(pipeline), bufferList(std::forward<Buffers>(buffers)), params, groups,
+        std::move(grid), threads);
+  }
+
+  // Event steps after the dispatches added so far (EventStep): signal once
+  // all earlier work has completed, or hold all later work until the event
+  // reaches value.
+  void signal(SharedEvent event, uint64_t value) {
+    step(std::move(event), value, EventStep::Kind::Signal);
+  }
+  void wait(SharedEvent event, uint64_t value) {
+    step(std::move(event), value, EventStep::Kind::Wait);
+  }
+  // Ends the Metal command buffer after the dispatches added so far; the
+  // next one runs them after it on the same queue (EventStep::Kind::Break).
+  void split() { step({}, 0, EventStep::Kind::Break); }
+  // A host step after the dispatches added so far (EventStep::Kind::Host):
+  // `work` runs on the CPU between the work before and the work after it,
+  // `timed` gets its round trip once the command completed, `gpu` says
+  // whether the GPU spins through it, and `then` runs once the work after it
+  // may go.
+  void host(std::function<void()> work, std::function<void(const HostStepTiming &)> timed = {},
+            HostStepGpu gpu = HostStepGpu::Idle, std::function<void()> then = {}) {
+    events_.push_back({dispatches_.size(), {}, 0, EventStep::Kind::Host, std::move(work), std::move(timed), gpu,
+                       std::move(then)});
+  }
 
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }
+  // The dispatches alone; command() has the event steps too.
   [[nodiscard]] std::span<const ComputeDispatch> dispatches() const noexcept {
     return dispatches_;
+  }
+  [[nodiscard]] Command command() const noexcept {
+    return {dispatches_, events_};
   }
 
 private:
   // One chunk holds the parameter payloads of a few hundred dispatches.
   static constexpr size_t kPayloadChunkBytes = 16 * 1024;
 
-  ComputeDispatch &push(std::string_view pipeline, BufferList buffers,
+  template <BufferVector Buffers>
+  static BufferList bufferList(Buffers &&buffers) {
+    BufferList list;
+    list.reserve(buffers.size());
+    for (auto &buffer : buffers) {
+      if constexpr (std::is_lvalue_reference_v<Buffers>)
+        list.push_back(buffer);
+      else
+        list.push_back(std::move(buffer));
+    }
+    return list;
+  }
+
+  ComputeDispatch &push(PipelineName pipeline, BufferList buffers,
                         DispatchSize groups, DispatchSize threads) {
     ComputeDispatch &dispatch = dispatches_.emplace_back();
-    dispatch.pipelineName = pipeline;
+    dispatch.pipelineName = std::move(pipeline.value);
     dispatch.threadgroups = groups;
     dispatch.threadsPerThreadgroup = threads;
     dispatch.buffers.reserve(buffers.size());
@@ -105,10 +181,15 @@ private:
     return payloadChunks_.back().get() + offset;
   }
 
+  void step(SharedEvent event, uint64_t value, EventStep::Kind kind) {
+    events_.push_back({dispatches_.size(), std::move(event), value, kind});
+  }
+
   std::vector<std::unique_ptr<std::byte[]>> payloadChunks_;
   size_t payloadChunkBytes_ = 0;
   size_t payloadUsed_ = 0;
   std::vector<ComputeDispatch> dispatches_;
+  std::vector<EventStep> events_;
 };
 
 } // namespace splash::metal

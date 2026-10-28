@@ -1,6 +1,7 @@
 #include "engine/MemoryAudit.hpp"
-#include "engine/Checked.hpp"
+#include "Checked.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -33,8 +34,8 @@ std::string_view memoryAuditErrorName(MemoryAuditError error) {
     return "runtime_reserve_exceeded";
   case MemoryAuditError::HardBudgetExceeded:
     return "hard_budget_exceeded";
-  case MemoryAuditError::WarmupEstimateDeviation:
-    return "warmup_estimate_deviation";
+  case MemoryAuditError::DevicePeakDeviation:
+    return "device_peak_deviation";
   case MemoryAuditError::ArithmeticOverflow:
     return "arithmetic_overflow";
   }
@@ -44,30 +45,46 @@ std::string_view memoryAuditErrorName(MemoryAuditError error) {
 MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
                                     ActualMemoryReport actual) {
   const EngineMemoryBreakdown &budget = plan.breakdown();
+  // Vision weights are absent without a vision tower. Loading already
+  // requires them for a model with vision.
   if (!actual.targetWeightsBytes || !actual.draftWeightsBytes ||
-      !actual.visionWeightsBytes || !actual.stateResidentBytes ||
-      !actual.sharedPrefillBytes || !actual.sharedDecodeBytes ||
-      !actual.kvResidentBytes || !actual.backendAllocatedBytes ||
-      !actual.deviceCurrentAllocatedBytes || !actual.devicePeakAllocatedBytes ||
-      !actual.estimatedWarmupPeakBytes) {
+      !actual.stateAllocatedBytes || !actual.sharedPrefillBytes ||
+      !actual.sharedDecodeBytes || !actual.kvAllocatedBytes ||
+      !actual.backendAllocatedBytes || !actual.deviceCurrentAllocatedBytes ||
+      !actual.devicePeakAllocatedBytes || !actual.backendPeakAllocatedBytes) {
     return fail(MemoryAuditError::MissingMeasurement,
                 "warmup memory report is incomplete", actual);
   }
 
+  // The plan takes the weight categories from what loaded, so they are
+  // counted but have no bound of their own. A buffer a loader does not report
+  // is unclassified backend memory, which the pipeline and runtime reserves
+  // bound; only the arenas, KV storage, the readers of spilled KV, the disk
+  // tier's state staging, the Neural Engine split and the streamed table have
+  // planned category bounds.
+  uint64_t categorized = 0;
+  for (const uint64_t weights : {actual.targetWeightsBytes,
+                                 actual.draftWeightsBytes,
+                                 actual.visionWeightsBytes}) {
+    if (!checkedAdd(categorized, weights, categorized)) {
+      return fail(MemoryAuditError::ArithmeticOverflow,
+                  "categorized memory sum overflowed", actual);
+    }
+  }
   struct Category {
     const char *name;
     uint64_t actual;
     uint64_t planned;
   };
   const Category categories[] = {
-      {"target weights", actual.targetWeightsBytes, budget.targetWeightsBytes},
-      {"draft weights", actual.draftWeightsBytes, budget.draftWeightsBytes},
-      {"vision weights", actual.visionWeightsBytes, budget.visionWeightsBytes},
       {"shared prefill", actual.sharedPrefillBytes, budget.sharedPrefillBytes},
       {"shared decode", actual.sharedDecodeBytes, budget.sharedDecodeBytes},
-      {"Q8 virtual storage", actual.kvResidentBytes, budget.kvVirtualBytes},
+      {"KV", actual.kvAllocatedBytes, budget.kvCapacityBytes},
+      {"hot KV block cache", actual.kvBlockCacheBytes, budget.kvSpill.hotLimitBytes},
+      {"KV history staging", actual.kvHistoryStagingBytes, budget.kvSpill.stagingBytes},
+      {"state staging", actual.stateStagingBytes, budget.stateStagingBytes},
+      {"Neural Engine split", actual.aneFfnBytes, budget.aneFfnBytes},
   };
-  uint64_t categorized = 0;
   for (const Category &category : categories) {
     if (category.actual > category.planned) {
       std::ostringstream message;
@@ -80,15 +97,32 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
                   "categorized memory sum overflowed", actual);
     }
   }
+  // The streamed table's row cache is host memory: bounded by its plan like
+  // the categories, but outside Metal's footprint, beside which it takes its
+  // part of the hard budget.
+  if (actual.streamedTableBytes > budget.streamedTableBytes) {
+    std::ostringstream message;
+    message << "streamed table actual bytes " << actual.streamedTableBytes
+            << " exceed planned bytes " << budget.streamedTableBytes;
+    return fail(MemoryAuditError::CategoryExceedsPlan, message.str(), actual);
+  }
+  const uint64_t metalBudget =
+      budget.hardBudgetBytes -
+      std::min(budget.hardBudgetBytes, actual.streamedTableBytes);
   uint64_t dynamic = 0;
-  if (!checkedAdd(actual.stateResidentBytes, actual.kvResidentBytes, dynamic) ||
-      !checkedAdd(categorized, actual.stateResidentBytes, categorized)) {
+  for (const uint64_t bytes : {actual.stateAllocatedBytes, actual.kvAllocatedBytes, actual.kvBlockCacheBytes,
+                               actual.kvHistoryStagingBytes})
+    if (!checkedAdd(dynamic, bytes, dynamic)) {
+      return fail(MemoryAuditError::ArithmeticOverflow,
+                  "elastic memory sum overflowed", actual);
+    }
+  if (!checkedAdd(categorized, actual.stateAllocatedBytes, categorized)) {
     return fail(MemoryAuditError::ArithmeticOverflow,
                 "elastic memory sum overflowed", actual);
   }
   if (dynamic > budget.dynamicBudgetBytes) {
     return fail(MemoryAuditError::CategoryExceedsPlan,
-                "resident state and KV exceed the "
+                "allocated state, KV and the readers of spilled KV exceed the "
                 "unified dynamic budget",
                 actual);
   }
@@ -103,15 +137,22 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   uint64_t backendUnclassified = actual.backendAllocatedBytes - categorized;
   uint64_t deviceUntracked =
       actual.deviceCurrentAllocatedBytes - actual.backendAllocatedBytes;
-  if (actual.deviceCurrentAllocatedBytes > budget.hardBudgetBytes ||
-      actual.devicePeakAllocatedBytes > budget.hardBudgetBytes ||
-      actual.estimatedWarmupPeakBytes > budget.hardBudgetBytes) {
-    return fail(MemoryAuditError::HardBudgetExceeded,
-                "actual or estimated Metal footprint exceeds hard budget",
-                actual);
-  }
   const uint64_t reserves =
       budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes;
+  uint64_t backendPeakWithReserves = 0;
+  if (!checkedAdd(actual.backendPeakAllocatedBytes, reserves,
+                  backendPeakWithReserves)) {
+    return fail(MemoryAuditError::ArithmeticOverflow,
+                "backend peak with the reserves overflowed", actual);
+  }
+  if (actual.deviceCurrentAllocatedBytes > metalBudget ||
+      actual.devicePeakAllocatedBytes > metalBudget ||
+      backendPeakWithReserves > metalBudget) {
+    return fail(MemoryAuditError::HardBudgetExceeded,
+                "actual Metal footprint or the backend's peak with the "
+                "reserves exceeds hard budget",
+                actual);
+  }
   uint64_t unclassified = 0;
   if (!checkedAdd(backendUnclassified, deviceUntracked, unclassified)) {
     return fail(MemoryAuditError::ArithmeticOverflow,
@@ -123,19 +164,24 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
         "pipeline and runtime allocations exceed their explicit reserve",
         actual);
   }
-  uint64_t difference =
-      actual.devicePeakAllocatedBytes > actual.estimatedWarmupPeakBytes
-          ? actual.devicePeakAllocatedBytes - actual.estimatedWarmupPeakBytes
-          : actual.estimatedWarmupPeakBytes - actual.devicePeakAllocatedBytes;
+  // Metal's device peak holds the backend's buffers at their peak and the
+  // memory outside them (pipelines, driver allocations). Predict it from the
+  // backend's own peak and that memory as measured, rather than the reserves
+  // that bound it, so that the rule measures the accounting rather than the
+  // reserves' unused part. Within the reserves, the sum cannot overflow.
+  const uint64_t predicted = actual.backendPeakAllocatedBytes + deviceUntracked;
+  uint64_t difference = actual.devicePeakAllocatedBytes > predicted
+                            ? actual.devicePeakAllocatedBytes - predicted
+                            : predicted - actual.devicePeakAllocatedBytes;
   uint64_t basisPoints =
       difference > std::numeric_limits<uint64_t>::max() / 10'000
           ? std::numeric_limits<uint64_t>::max()
-          : difference * 10'000 / actual.estimatedWarmupPeakBytes;
-  if (basisPoints > kMaximumWarmupDeviationBasisPoints) {
-    return fail(
-        MemoryAuditError::WarmupEstimateDeviation,
-        "actual Metal warmup peak differs from estimate by more than 5%",
-        actual);
+          : difference * 10'000 / predicted;
+  if (basisPoints > kMaximumDevicePeakDeviationBasisPoints) {
+    return fail(MemoryAuditError::DevicePeakDeviation,
+                "Metal's device peak differs by more than 5% from the "
+                "backend's peak plus the memory outside its buffers",
+                actual);
   }
 
   MemoryAuditResult result;
@@ -145,9 +191,8 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   result.categorizedBytes = categorized;
   result.backendUnclassifiedBytes = backendUnclassified;
   result.deviceUntrackedBytes = deviceUntracked;
-  result.warmupPeakDeviationBasisPoints = static_cast<uint32_t>(basisPoints);
-  result.actualHeadroomBytes =
-      budget.hardBudgetBytes - actual.devicePeakAllocatedBytes;
+  result.devicePeakDeviationBasisPoints = static_cast<uint32_t>(basisPoints);
+  result.actualHeadroomBytes = metalBudget - actual.devicePeakAllocatedBytes;
   return result;
 }
 
@@ -159,15 +204,15 @@ std::string MemoryAuditResult::toStatusJson() const {
       << "\"categorized_bytes\":" << categorizedBytes << ','
       << "\"backend_unclassified_bytes\":" << backendUnclassifiedBytes << ','
       << "\"device_untracked_bytes\":" << deviceUntrackedBytes << ','
-      << "\"warmup_peak_deviation_basis_points\":"
-      << warmupPeakDeviationBasisPoints << ','
+      << "\"device_peak_deviation_basis_points\":"
+      << devicePeakDeviationBasisPoints << ','
       << "\"actual_headroom_bytes\":" << actualHeadroomBytes << ','
       << "\"backend_allocated_bytes\":" << actual.backendAllocatedBytes << ','
       << "\"device_current_allocated_bytes\":"
       << actual.deviceCurrentAllocatedBytes << ','
       << "\"device_peak_allocated_bytes\":" << actual.devicePeakAllocatedBytes
       << ','
-      << "\"estimated_warmup_peak_bytes\":" << actual.estimatedWarmupPeakBytes
+      << "\"backend_peak_allocated_bytes\":" << actual.backendPeakAllocatedBytes
       << '}';
   return out.str();
 }
@@ -177,7 +222,7 @@ std::string MemoryAuditResult::describe() const {
   out << (valid ? "memory audit valid" : "memory audit failed") << " ["
       << memoryAuditErrorName(error) << "]: " << message
       << "; peak=" << actual.devicePeakAllocatedBytes
-      << "; estimate=" << actual.estimatedWarmupPeakBytes
+      << "; backend_peak=" << actual.backendPeakAllocatedBytes
       << "; headroom=" << actualHeadroomBytes;
   return out.str();
 }

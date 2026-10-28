@@ -5,25 +5,22 @@ set -eu
 completion_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd -P)
 root=$(CDPATH= cd -P "$completion_dir/../.." && pwd -P)
 if [ -f "$root/release.json" ]; then
-    data_dir="$HOME/Library/Application Support/Splash"
-    models_dir="$data_dir/models"
+    models_dir="$HOME/Library/Application Support/Splash/models"
 else
-    data_dir="$root/build/runtime"
     models_dir="$root/install/models"
 fi
-# Refreshed in the background by `splash serve`; read as a union with the
-# bundled catalog so a missing or stale cache can only fail to add entries.
-cache_file="$data_dir/catalog/official-models.txt"
 
 {
-    for catalog in "$completion_dir/official-models.txt" "$cache_file"; do
-        [ -r "$catalog" ] || continue
-        cat "$catalog"
+    # The upstream models the README starts with.
+    if [ -r "$completion_dir/suggested-models.txt" ]; then
+        cat "$completion_dir/suggested-models.txt"
         printf '\n'
-    done
-    for manifest in "$models_dir"/*/*/manifest.json; do
-        [ -f "$manifest" ] || continue
-        directory=${manifest%/manifest.json}
+    fi
+    # The record models.installation_kind reads, an assembly's model.json; a
+    # GGUF selection's link is repo:VARIANT.
+    for record in "$models_dir"/*/*/model.json; do
+        [ -f "$record" ] || continue
+        directory=${record%/*}
         repository=${directory##*/}
         owner_directory=${directory%/*}
         printf '%s/%s\n' "${owner_directory##*/}" "$repository"
@@ -32,10 +29,12 @@ cache_file="$data_dir/catalog/official-models.txt"
     BEGIN {
         prefix = ENVIRON["SPLASH_COMPLETION_PREFIX"]
         component = "^[A-Za-z0-9_]([A-Za-z0-9._-]*[A-Za-z0-9_])?$"
+        variant = "^[A-Za-z0-9][A-Za-z0-9._-]*$"
     }
-    split($0, parts, "/") == 2 &&
-        parts[1] ~ component && parts[2] ~ component &&
-        length(parts[2]) <= 96 && parts[2] !~ /\.git$/ &&
+    split($0, parts, "/") == 2 && split(parts[2], names, ":") <= 2 &&
+        parts[1] ~ component && names[1] ~ component &&
+        length(names[1]) <= 96 && names[1] !~ /\.git$/ &&
+        (!(2 in names) || (names[2] ~ variant && length(names[2]) <= 64)) &&
         !index($0, "..") && !index($0, "--") &&
         index($0, prefix) == 1 { print }
 ' | LC_ALL=C sort -u

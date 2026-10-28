@@ -1,10 +1,22 @@
 > **Unofficial fork: Splash on M1/M2 Macs.**
 > Splash is built by [Inco](https://github.com/incoai/splash): the engine, the models and the draft
 > models are theirs. This fork only adds support for Apple7/8 GPUs (M1, M2), which upstream Splash
-> does not run on: a kernel policy for those GPUs and register-matrix Metal kernels written for them.
+> does not run on: a kernel policy for those GPUs and Metal kernels written for them.
 > This is a community port, not an official Inco release.
 >
-> - **M1/M2:** source in branch [`apple7-m1-kernels`](https://github.com/paperniuk/splash/tree/apple7-m1-kernels).
+> - **M1/M2:** prebuilt releases on [the releases page](https://github.com/paperniuk/splash/releases);
+>   source in branch [`apple7-m1-1.4`](https://github.com/paperniuk/splash/tree/apple7-m1-1.4)
+>   (upstream 1.4.0 plus the M1/M2 commits).
+> - **On M1/M2 this build runs** the models upstream 1.4.0 loads (GGUF, including Prism ML's Ternary
+>   Bonsai `PQ2_0` and Qwen3.8-Flash-Next, and MLX checkpoints) on its own kernels, the vision
+>   encoder included. Flash-Next `Q2_0` runs on a 64 GB Mac, about 47 tok/s on an M1 Max.
+> - **Neural Engine prefill** runs on M1/M2 too: the 27B processes long prompts about 1.5x faster
+>   on an M1 Max. `--disable-ane` keeps everything on the GPU.
+> - **Decode on an M1 Max** (27B MLX 4-bit): about 61 tok/s on a code prompt, 46-60 across code
+>   and prose prompts; chat prose is slower than code because fewer draft tokens hit.
+> - **Contributors:** Alexander Fedora ([@ghisguth](https://github.com/ghisguth)) tested the port on
+>   an M2 Max and contributed GGUF and MLX decode speedups; [@sady4850](https://github.com/sady4850)
+>   contributed the faster long-context attention.
 > - **M3 and newer:** use official Splash, `brew install incoai/tap/splash`.
 > - **M1/M2 problems:** open an issue here, not upstream.
 >
@@ -19,61 +31,62 @@
 
 **A local inference engine for Apple silicon, built around the model.**
 
-Splash serves a small set of models to coding agents and to any OpenAI or
-Anthropic compatible client, on one Mac. On a 48 GB M5 Pro it decodes
-Qwen3.8-27B at 2× the speed of the next-fastest engine and, with a 32K context
-cached, returns the first token in 282 ms. Its kernels, draft model, and memory
-plan are specialized for each model it serves. That is why it is fast, and why
-there is nothing to configure.
+Splash runs coding agents and OpenAI or Anthropic compatible applications on
+one Mac. It combines [DFlash 2](https://inco.ai/blog/dflash2/) speculative
+decoding, specialized Metal kernels, and automatic memory planning, with
+vision, tool calling, and a built-in chat page.
+It reuses cached prefixes and batches concurrent requests automatically.
 
 ## Quick start
 
-Apple M3 or newer, macOS 26.4 or later, [Homebrew](https://brew.sh), and 36 GB
-of unified memory (48 GB or more recommended).
+Apple M3 or newer, macOS 26.4 or later, and [Homebrew](https://brew.sh).
+The 4-bit examples need at least 36 GB of unified memory (48 GB recommended);
+24 GB Macs can use [smaller GGUF variants](#models).
 
 ```bash
 brew install incoai/tap/splash
-splash serve --model incoai/Qwen3.8-27B-Splash
+splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M
 ```
 
-The first run downloads and verifies the model package, checks available
-memory, and starts serving on `127.0.0.1:8000`.
+The first run downloads the model and its matching draft and starts serving
+on `127.0.0.1:8000`. Later starts reuse the downloads; leave room on disk for
+them ([storage requirements](DEVELOPMENT.md#model-storage)).
 
 Once it prints `Ready`, leave this terminal open. Open <http://127.0.0.1:8000>
 in your browser, or run an installed coding agent from another terminal:
 
 ```bash
-splash opencode    # or: splash claude / splash codex / splash hermes
+splash opencode    # or: splash claude / splash codex / splash hermes / splash pi
 ```
 
+For a server started with another `--port`, pass the same `--port` to the agent.
+
 Press Ctrl+C in the server terminal to stop Splash.
+For LM Studio Bionic, follow its [Splash setup guide](https://lmstudio.ai/blog/splash-engine).
 
 ## Use the API
 
-Splash speaks OpenAI Chat Completions (`/v1/chat/completions`), OpenAI Responses
-(`/v1/responses`), and Anthropic Messages (`/v1/messages`), all with streaming,
-tool calls, JSON Schema output, images, and inline PDFs. `/tokenize` and
-`/apply-template` return token IDs and the rendered prompt without running the
-model.
+OpenAI Chat Completions, Responses and Completions, and Anthropic Messages,
+with streaming, tool calls, JSON Schema output, and base64 images and PDFs:
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "incoai/Qwen3.8-27B-Splash",
+    "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M",
     "messages": [{"role": "user", "content": "Explain speculative decoding in one sentence."}]
   }'
 ```
 
-`model` is optional. If set, use the served package ID or a configured
-[model alias](DEVELOPMENT.md#api-model-aliases).
-Reasoning follows the model default unless a [server default](DEVELOPMENT.md#default-reasoning-effort)
-is configured. `"reasoning_effort": "none"` turns it off, and
-Qwen3.8-27B also takes `low`, `medium`, and `xhigh`. `--max-reasoning-effort`
-lowers any request above it to that effort.
+Reasoning follows the model default; `"reasoning_effort": "none"` turns it off
+in Chat. Anthropic Messages requests reason only when they set `thinking`.
+`--max-reasoning-effort` lowers any request above it to that effort.
+[Reasoning settings](DEVELOPMENT.md#default-reasoning-effort) ·
+[Tool calls](DEVELOPMENT.md#tool-calls) ·
+[API details](DEVELOPMENT.md#api)
 
 `GET /health` always answers 200 and names the served model and build, for example
-`{"status":"ok","model":"incoai/Qwen3.8-27B-Splash","ready":true,"memory_pressure":"normal","build":{"version":"source","commit":"6d20e86","build_id":"..."}}`.
+`{"status":"ok","model":"...","ready":true,"memory_pressure":"normal","build":{"version":"source","commit":"6d20e86","build_id":"..."}}`.
 `ready` and `memory_pressure` come from the last status snapshot: `false` and
 `null` until the first one arrives. `/health` never waits on the engine; a snapshot a
 second old is refreshed in the background for the next poll. `/ready` answers 503 while
@@ -88,142 +101,124 @@ header (`Splash/source-<commit>` in a source checkout). `/metrics` carries it as
 prints it without a running server: `Splash <version>` for a release,
 `Splash source (commit <commit>, build <build_id>)` in a source checkout.
 
-`/v1/judgments` and `/v1/systemone` provide scoring without generation.
-See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
-
 ## Models
 
-| Package (`--model`) | Contents | Download |
-| --- | --- | ---: |
-| [`incoai/Qwen3.8-27B-Splash`](https://huggingface.co/incoai/Qwen3.8-27B-Splash) | Qwen3.8-27B, 4-bit, with its DFlash 2 draft | 17.4 GB |
-| [`incoai/Qwen3.6-35B-A3B-Splash`](https://huggingface.co/incoai/Qwen3.6-35B-A3B-Splash) | Qwen3.6-35B-A3B, 4-bit, with its DFlash 2 draft | 20.9 GB |
+Splash supports these model families, with a matching DFlash2 draft selected
+automatically:
 
-`--model` takes any `owner/repo` that holds a Splash package, a format
-[DEVELOPMENT.md](DEVELOPMENT.md#model-packages) describes. Plain MLX or
-Transformers checkpoints do not work. Private repositories need `HF_TOKEN`.
-Packages download into the Hugging Face cache, and `brew upgrade splash` keeps
-them, along with model links and agent sessions.
+| Model | GGUF example | MLX 4-bit |
+| --- | --- | --- |
+| Qwen3.8-27B | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.8-27B-4bit` |
+| Qwen3.6-35B-A3B | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.6-35B-A3B-4bit` |
+| Qwen3.8-Flash-Next | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` | — |
 
-For LM Studio Bionic, follow its [Splash setup guide](https://lmstudio.ai/blog/splash-engine):
-install the Splash runtime, then paste the full Hugging Face model link into its
-model search. These integrations manage their own runtime and settings.
+Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
+up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are
+not supported: the installer refuses a GGUF whose projections and experts are
+all BF16, F16 or F32.
+[Prism ML Ternary Bonsai 2](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
+is also supported in PQ2_0 (7.2 GB), including vision. Pass `OWNER/REPO:VARIANT`
+to `--model`, as in the quick start. MLX targets can be affine 2–8-bit,
+including mixed precision, mxfp4 or nvfp4. NVIDIA's and unsloth's NVFP4
+checkpoints and NVFP4 GGUFs also load. Smaller variants run on
+[24 GB Macs](docs/performance.md#smaller-ggufs-on-24-gb-macs).
+[27B variants](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/main) ·
+[35B variants](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main) ·
+[Flash-Next variants](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main)
 
-If a client’s model catalog does not list a package, the full repository ID in
-this table still works with `splash serve --model OWNER/REPO`. The browser chat
-and the agent launchers connect to that server without a catalog search.
-
-For a custom model download location, see [model cache](DEVELOPMENT.md#model-cache).
+Vision and the tokenizer come from the target model's source.
+[Model loading and compatibility](DEVELOPMENT.md#upstream-model-loading) ·
+[Supported formats](DEVELOPMENT.md#gguf-targets)
 
 ## Settings
 
-There is no config file. The server binds `127.0.0.1:8000` by default.
-Context supports up to the model’s native 256K window; usable capacity
-depends on available memory. `splash serve --help` lists server options and examples.
-The startup summary and `maximum_context_tokens` in `/status` show the effective
-server limit. `/v1/models` and `/v1/models/{id}` report the same limit as
-`max_model_len` and its compatibility alias `context_length`, including model aliases.
-Clients can impose a smaller limit. With enough memory,
-request the full window using `--max-context 256K`. This is a capacity limit, not a guarantee
-that a long uncached prompt will reach its first token quickly.
+Memory and context are sized automatically, up to the model's native context
+window. To set your own limits or cache options, add these to `splash serve`:
 
-`splash serve` accepts these optional flags:
+| Option | Purpose |
+| --- | --- |
+| `--max-memory 28G` | Cap Metal memory use. |
+| `--idle-release off` | Keep the model in memory while idle (default: release after 10m). |
+| `--max-context 100K` | Set the context limit. Up to `1M` tokens. |
+| `--language-only` | Skip vision; serve text only. |
+| `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
+| `--state-format bf16` | Use BF16 recurrent states, half the size. Default: FP32. |
+| `--prefill-bound-ms 1000` | Longest prefill GPU command buffer. Prefill ends a buffer at every layer, so 2048-token chunks still fit at most context lengths. Default: 2000 (`SPLASH_PREFILL_BOUND_MS`), so macOS does not abort long-context prefill for stalling the display (`ImpactingInteractivity`); after such an abort the restarted engine halves it, down to 500. `--prefill-mode full` always sends whole 2048-token chunks. `/status` reports it as `scheduler.prefill_bound_ms`. |
+| `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
+| `--ane-ffn-share 0.35 --ane-ffn-minimum-rows 520` | Fix the Neural Engine's share of the prefill FFN, and the least chunk rows it splits, instead of calibrating them at start. Default: calibrated; `0` keeps the FFN on the GPU. |
+| `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
+| `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
 
-- `--host`: HTTP bind address. Default: `127.0.0.1`.
-- `--port`: HTTP port. Defaults to `SPLASH_PORT` or `8000`.
-- `--max-memory`: ceiling on Metal allocations, e.g. `28G`. Default: auto.
-- `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
-- `--kv-format`: target KV cache storage, `int8` (default) or `bf16`.
-- `--no-speculation`: decode one token per step without draft proposals. The
-  draft model stays loaded but prefill and decode run none of its work;
-  `/status` reports `speculative_decoding: false`, no draft acceptance rate and
-  zero active or materialization draft context rows. Default: speculative
-  decoding on.
-- `--contended-prefill-rows`: smallest prefill command, in rows, while other
-  requests are decoding: a power of two from `64` to `2048`. A larger floor
-  finishes a long prompt sooner but stalls their tokens longer per command
-  (about 0.85 s at 64 rows and 3.3 s at 256 on an M2 Pro). Default: `64`.
-- `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
-- `--reasoning-loop-limit`: end a reply, with finish reason `length`, once its
-  reasoning repeats one sentence this many times; `0` turns the check off.
-  Defaults to `SPLASH_REASONING_LOOP_LIMIT` or `24`.
-- `--allowed-host`: extra HTTP `Host` name to accept, not a bind address. Repeatable.
-- `--api-key`: require this key on API requests, as a bearer token or
-  `x-api-key`. The key must be non-empty visible ASCII (codes 33-126), with no
-  spaces. Defaults to `SPLASH_API_KEY`.
-- `--no-webui`: turn off the chat page.
-- `--record-requests`: append every accepted `/v1/chat/completions`,
-  `/v1/messages` and `/v1/responses` request to this file, one JSON line each:
-  `received_unix_ms`, `path` and the request `body` as sent, with its line
-  breaks turned into spaces (split the file on LF only). Token counting,
-  `/tokenize`, `/apply-template`, `/v1/judgments` and `/v1/systemone` are not
-  recorded. The file holds complete prompts, so it is made readable by its
-  owner only (mode 0600). Default: off.
-
-To use BF16 target KV, select it when starting the server:
-
-```bash
-splash serve --model incoai/Qwen3.8-27B-Splash --kv-format bf16
-```
-
-BF16 avoids target KV quantization, uses approximately twice the target KV
-memory, and can be slower at long contexts. Model weights are unchanged.
-Restart the server to switch formats. Omit `--kv-format` or use
-`--kv-format int8` for the default INT8 cache.
-
-If the model does not fit in the memory available, startup prints a memory
-budget breakdown and stops.
-
-Authentication is off by default. Set `SPLASH_API_KEY` in the shell that runs
-`splash serve` and in the shell that runs an agent, and both sides use it.
-Health and readiness probes stay public.
-
-For LAN access and multiple servers, see
-[server configuration](DEVELOPMENT.md#server-configuration).
-
-Experimental cache offloading: [PR #3](https://github.com/incoai/splash/pull/3).
+Use `--max-memory` to leave room for other applications.
+The server listens on localhost without authentication by default. For LAN
+access, authentication, browser apps on other origins, and other options, see
+[server configuration](DEVELOPMENT.md#server-configuration) or
+`splash serve --help`. The fork-only options `--no-speculation`,
+`--contended-prefill-rows`, `--reasoning-loop-limit`, `--max-reasoning-effort`
+and `--record-requests` are described there too.
+[KV precision](DEVELOPMENT.md#kv-cache-precision) ·
+[SSD cache](DEVELOPMENT.md#ssd-cache) ·
+[Advanced memory settings](DEVELOPMENT.md#memory-and-context)
 
 ## Performance
 
-Measured on an M5 Pro (16-core GPU, 48 GB): selected SPEED-Bench coding prompts
-over HTTP, a 1,024-token output limit, reasoning on (medium for the 27B). The
-ratio in each cell is against the next-fastest engine we measured.
+Measured with Splash 1.0 on an M5 Pro (16-core GPU, 48 GB), using its model
+packages and selected SPEED-Bench coding prompts over HTTP. Ratios compare
+with the next-fastest engine measured in that benchmark. Qwen3.8-Flash-Next
+(`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0`) was measured the same way
+with this release on an M5 Pro (20-core GPU, 64 GB); its ratios compare with
+Strata serving the same GGUF on that Mac.
 
-| Metric | Qwen3.6-35B-A3B | Qwen3.8-27B |
+| Metric | Qwen3.6-35B-A3B | Qwen3.8-27B | Qwen3.8-Flash-Next |
+| --- | ---: | ---: | ---: |
+| Decode · short prompt | 210 tok/s (1.7×) | 74 tok/s (2.0×) | 95 tok/s (1.3×) |
+| Prefill · 32K prompt | 2,011 tok/s (1.3×) | 363 tok/s (1.2×) | 1,312 tok/s (1.3×) |
+| Cached time to first token · 32K replay | 123 ms (6.6×) | 282 ms (7.3×) | 171 ms (212×) |
+| Aggregate decode · 4 concurrent short prompts | 357 tok/s (2.0×) | 170 tok/s (3.9×) | 171 tok/s (2.4×) |
+
+[Launch benchmarks](https://inco.ai/blog/splash/) ·
+[Measurement details](docs/performance.md#splash-10-launch-benchmarks) ·
+[Run benchmarks locally](DEVELOPMENT.md#local-benchmarks)
+
+### GGUF against llama.cpp
+
+Same Unsloth UD-Q4_K_M weights on Metal. Decode speed in tok/s:
+
+| Model | Engine | M5 Pro, 20-core GPU | M3 Max, 40-core GPU |
+| --- | --- | ---: | ---: |
+| 27B | llama.cpp | 16 | 17 |
+| | llama.cpp with MTP | 27 | 20 |
+| | **Splash** | **74** | **92** |
+| 35B-A3B | llama.cpp | 69 | 66 |
+| | **Splash** | **175** | **209** |
+
+That is **2.5–3.2×** as fast on the 35B and **4.5–5.3×** on the 27B
+(**2.7–4.6×** against MTP).
+
+**Closely matches llama.cpp's predictions.**
+
+| Next-token agreement ↑ | 27B | 35B-A3B |
 | --- | ---: | ---: |
-| Decode · short prompt | 210 tok/s (1.7×) | 74 tok/s (2.0×) |
-| Prefill · 32K prompt | 2,011 tok/s (1.3×) | 363 tok/s (1.2×) |
-| Cached time to first token · 32K replay | 123 ms (6.6×) | 282 ms (7.3×) |
-| Aggregate decode · 4 concurrent short prompts | 357 tok/s (2.0×) | 170 tok/s (3.9×) |
+| llama.cpp: CPU vs. GPU | 97.8% | 96.5–96.9% |
+| llama.cpp: single-token vs. batched | 99.65–99.75% | 97.95% |
+| **Splash vs. llama.cpp** | **99.30–99.45%** | **97.83–98.14%** |
 
-Splash led on every measure at every prompt length we tested, and the lead
-grows with load: 3.8× at four concurrent 32K requests on the 35B. The
-[launch post](https://inco.ai/blog/splash/) has the method and the full
-comparison against oMLX, Lily, uzu, and Ollama.
-
-For repeatable measurements on your Mac, see [local benchmarks](DEVELOPMENT.md#local-benchmarks).
+Splash uses BF16 KV and `--disable-ane` in this comparison.
+[Benchmark details](docs/performance.md#gguf-against-llamacpp)
 
 ## Design
 
-The runtime, scheduler, cache, and API are shared. Everything else is rebuilt
-per model:
-
-- **A draft trained for the model.** Speculative decoding is the default decode path in
-  Splash. `--no-speculation` turns it off: the draft stays loaded but does no
-  work, and decode is roughly 7x slower on the M2 Pro. Every model ships with its own [DFlash
-  2](https://inco.ai/blog/dflash2/) draft, and one pass of the target verifies a
-  block of tokens in parallel.
-- **Kernels compiled for exact shapes.** Fused Metal kernels, written and tuned
-  by our in-house kernel agents for the model's dimensions, read weights packed
-  for them and mapped zero-copy from disk. They ship precompiled: no Xcode, no
-  compiler toolchain, nothing tuned on your machine.
-- **A memory plan computed for this machine.** Context, KV capacity, and batch
-  limits are worked out at startup from the memory Metal recommends, less the
-  weights, the draft, and each request's state.
-
-The [launch post](https://inco.ai/blog/splash/) covers the design in depth.
+Each supported model pairs a trained DFlash2 draft with Metal kernels for its
+shapes. The runtime, scheduler, cache, and API are shared. Weights are
+converted to the kernels' layouts as they load, with no copy on disk; kernels
+ship precompiled, with no Xcode or local tuning required. Speculative decoding
+is the default decode path; `--no-speculation` decodes one token per step
+instead, with the draft loaded but idle.
+[How Splash works](https://inco.ai/blog/splash/)
 
 ## More
 
-- [DEVELOPMENT.md](DEVELOPMENT.md): building from source, tests, model packages,
-  and release packaging.
-- Apache-2.0, see [LICENSE](LICENSE). Model weights keep their own licenses.
+- [Development](DEVELOPMENT.md): configuration, API, internals, building, and testing.
+- [Issues and feedback](https://github.com/incoai/splash/issues)
+- [Apache-2.0](LICENSE). GGUF kernels include MIT-licensed material from
+  llama.cpp; see [third-party notices](THIRD_PARTY_NOTICES). Model weights keep their own licenses.
