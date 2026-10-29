@@ -600,11 +600,14 @@ StateCache::Entry &StateCache::publicationEntry(uint64_t kvBlock, bool checkpoin
   const bool fresh = !entries_.contains(kvBlock);
   Entry &entry = entryFor(kvBlock);
   // A condemned entry gives up whatever copies it still holds; its readers
-  // keep their own handle to them.
+  // keep their own handle to them. The state published over it is a new
+  // publication, so a handle to the condemned one cannot retire it; the
+  // callers check the count for overflow and advance it after.
   if (entry.invalid) {
     discardRam(entry);
     discardDisk(kvBlock, entry);
     entry.invalid = false;
+    entry.publication = publications_ + 1;
   }
   const bool disposable = checkpoint && !inUse(kvBlock);
   if (fresh && disposable) {

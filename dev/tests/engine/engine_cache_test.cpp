@@ -929,6 +929,30 @@ void testCheckpointRetirementRespectsUseAndPublicationIdentity() {
           "retirement or upgrade corrupted checkpoint accounting");
 }
 
+// A checkpoint condemned under a reader is taken over by the next publication
+// at its block: the stale handle names the condemned publication, not the new
+// one, so retiring it leaves the new checkpoint in place.
+void testCondemnedCheckpointTakeoverIsAFreshPublication() {
+  CacheFixture fixture;
+  const uint64_t block = fixture.blocks[0];
+  fixture.cache.publishCompositeState(block, std::make_shared<TestState>(100), true);
+  const StateCheckpoint first = fixture.cache.checkpointState(block);
+  require(static_cast<bool>(first), "first checkpoint was not published");
+  auto reader = fixture.lookup(33);
+  require(reader.state.has_value(), "checkpoint reader was not pinned");
+  fixture.cache.discardState(block, reader.state->state().get());
+
+  fixture.cache.publishCompositeState(block, std::make_shared<TestState>(100), true);
+  const StateCheckpoint taken = fixture.cache.checkpointState(block);
+  require(taken && taken.publication != first.publication,
+          "a taken-over condemned entry kept its old publication");
+  reader = {};
+  require(fixture.cache.retireCheckpointState(first) &&
+              fixture.cache.checkpointState(block).publication == taken.publication &&
+              fixture.cache.snapshot().stateCache.entries == 1,
+          "a stale checkpoint handle retired the state taken over its entry");
+}
+
 void testRestoredCheckpointsKeepTheirEvictionPriority() {
   CacheFixture fixture;
   fixture.publish(0, 150);
@@ -5572,6 +5596,7 @@ int main() {
     testTieredWriteReuseAndFailure();
     testCheckpointLookupProbeDoesNotPromote();
     testCheckpointRetirementRespectsUseAndPublicationIdentity();
+    testCondemnedCheckpointTakeoverIsAFreshPublication();
     testRestoredCheckpointsKeepTheirEvictionPriority();
     testCheckpointReclaimPrecedesOlderKv();
     testOptionalReclaimLeavesOrdinaryStateIntact();
