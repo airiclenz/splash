@@ -117,6 +117,11 @@ access.
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
+| `--prefill-mode` | `bounded` | `bounded` keeps each prefill GPU command buffer, one per layer, within `--prefill-bound-ms` so macOS does not abort long-context prefill for stalling the display; `full` sends whole 2048-token chunks. |
+| `--prefill-bound-ms` | `SPLASH_PREFILL_BOUND_MS` or `2000` | Longest bounded prefill GPU command buffer, 1 to 600000 ms. After a macOS display-stall abort (`ImpactingInteractivity`) the restarted engine first bounds whole commands, then halves the bound on each later abort, down to 500. `/status` reports it as `scheduler.prefill_bound_ms`. |
+| `--prefill-bound-scope` | `SPLASH_PREFILL_BOUND_SCOPE` or `buffer` | What the prefill bound holds: each GPU command buffer, or each whole `command`, which some Macs need at long context. The first display-stall abort switches to `command`. |
+| `--ane-ffn-share` | Calibrated | The Neural Engine's share of a dense model's prefill FFN, in [0, 1), instead of the one calibration finds at start; `0` prefills on the GPU alone, and `--disable-ane` overrides it. |
+| `--ane-ffn-minimum-rows` | `256` | The least rows of a prefill chunk that splits at `--ane-ffn-share`; needs `--ane-ffn-share`. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](#neural-engine-prefill). |
 | `--verify-rows` | `auto` | The rows of each draft block decode cycles verify: `auto` lets the verify budget choose a MoE target's rows, which is faster but makes its greedy and seeded outputs vary from run to run, and verifies every row of a dense target; `all` verifies every row the output limit leaves on every target, so those outputs repeat when a request runs alone with the same cached prefixes. See [drafts](#drafts) and [sampling](#sampling). |
 | `--no-speculation` | Off | Decode one token per step without draft proposals. The draft stays loaded but prefill and decode run none of its proposal work; `/status` reports `metrics.speculative_decoding: false` and no draft acceptance rate. |
@@ -1549,11 +1554,24 @@ batch the request rode in, so concurrent requests' walls overlap.
 `GET /requests` returns `{"requests": [...]}`, the newest 1024 finished
 requests oldest first, each with `id` (the bare public id a response prefixes
 with `chatcmpl-`, `resp_` or `msg_`), `finished_unix_ms`, `outcome`,
-`prompt_tokens`, `cached_tokens`, `completion_tokens`, `reasoning_tokens`,
-`output_tokens` (completion minus reasoning), `ttft_ms` and `engine`.
+`prompt_tokens`, `cached_tokens`, `prefill_tokens`, `completion_tokens`,
+`reasoning_tokens`, `output_tokens` (completion minus reasoning), `ttft_ms`,
+`prefill_ms` (start to first token), `decode_ms` (first token to done),
+`wall_ms`, `drafted_tokens`, `accepted_draft_tokens`, `draft_cycles` and
+`engine`. A request that ended in an error reports `outcome` `error`, zero
+token counts and null timings.
 `?since=<unix ms>` keeps only records finished after it; a malformed value is a
 400. The ring is memory-only, is lost on restart, and needs the API key when
 authentication is enabled.
+To check `/requests` records against the server-wide counters, bracket the
+requests with `/status` snapshots that are fresh: a snapshot with
+`transport.status_stale` true carries counters from an older native refresh, so
+re-read it until that is false, as `dev/benchmarks/live_probe.py`
+`fresh_status` does. Then the change in `metrics.prefill_input_tokens` equals
+the sum of the records' `engine.prefilled_tokens`, and the change in
+`metrics.decode_output_tokens` equals the sum of `engine.decode_steps` +
+`accepted_draft_tokens`: only decode batches count output tokens, and no record
+field holds that count.
 `splash_kv_free_allocated_pages` counts free pages of allocated extents, not
 remaining capacity; memory headroom is `splash_memory_headroom_bytes`. Consumers
 should tolerate missing native fields while the engine is unavailable, and
@@ -3763,7 +3781,9 @@ It sends one cold prompt (a random nonce leads, so nothing is cached) and then
 its exact repeat, and prints per request prefill and decode tok/s, draft
 acceptance, average prefill chunk rows, cache matched tokens, resource
 suspensions, replay tokens and denied memory reservations, each diffed from
-`GET /status` snapshots taken just before and after the request. It never
+`GET /status` snapshots taken just before and after the request, then the
+memory governor's host available, inactive, wired and compressor bytes, read
+from the after-snapshot alone, and the request's HTTP wall time. It never
 starts a server. `--api-key` defaults to `SPLASH_API_KEY`, `--model` to the
 first model `/v1/models` lists, and `--json` prints the records as JSON. The
 counters are server-wide, so probe an otherwise idle server; a rate whose

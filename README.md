@@ -2,6 +2,7 @@
 > Splash is built by [Inco](https://github.com/incoai/splash): the engine, the models and the draft
 > models are theirs. This fork only adds support for Apple7/8 GPUs (M1, M2), which upstream Splash
 > does not run on: a kernel policy for those GPUs and Metal kernels written for them.
+> Branch `apple7-m1-kernels` also carries fork-only server options and endpoints, described below.
 > This is a community port, not an official Inco release.
 >
 > - **M1/M2:** prebuilt releases on [the releases page](https://github.com/paperniuk/splash/releases);
@@ -143,7 +144,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--language-only` | Skip vision; serve text only. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--state-format bf16` | Use BF16 recurrent states, half the size. Default: FP32. |
-| `--prefill-bound-ms 1000` | Longest prefill GPU command buffer. Prefill ends a buffer at every layer, so 2048-token chunks still fit at most context lengths. Default: 2000 (`SPLASH_PREFILL_BOUND_MS`), so macOS does not abort long-context prefill for stalling the display (`ImpactingInteractivity`); after such an abort the restarted engine halves it, down to 500. `--prefill-mode full` always sends whole 2048-token chunks. `/status` reports it as `scheduler.prefill_bound_ms`. |
+| `--prefill-bound-ms 1000` | Longest prefill GPU command buffer. Prefill ends a buffer at every layer, so 2048-token chunks still fit at most context lengths. Default: 2000 (`SPLASH_PREFILL_BOUND_MS`), so macOS does not abort long-context prefill for stalling the display (`ImpactingInteractivity`); after the first such abort the restarted engine bounds each whole command instead of each buffer (`--prefill-bound-scope command`), and each later abort halves the bound, down to 500. `--prefill-mode full` always sends whole 2048-token chunks. `/status` reports it as `scheduler.prefill_bound_ms`. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
 | `--ane-ffn-share 0.35 --ane-ffn-minimum-rows 520` | Fix the Neural Engine's share of the prefill FFN, and the least chunk rows it splits, instead of calibrating them at start. Default: calibrated; `0` keeps the FFN on the GPU. |
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
