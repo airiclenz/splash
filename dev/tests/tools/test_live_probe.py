@@ -2,6 +2,8 @@ import contextlib
 import copy
 import io
 import json
+import os
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,6 +14,7 @@ from dev.benchmarks import live_probe as probe
 
 API_KEY = "probe-key"
 MODEL = "incoai/Qwen3.8-27B-Splash"
+REPLY_CONTENT = "1\n2"
 
 
 def snapshot(**counters):
@@ -126,7 +129,12 @@ class StubServer:
                     return
                 self.reply(
                     {
-                        "choices": [{"message": {"content": "1\n2"}}],
+                        "choices": [
+                            {
+                                "message": {"content": REPLY_CONTENT},
+                                "finish_reason": "length",
+                            }
+                        ],
                         "usage": {"prompt_tokens": 2048, "completion_tokens": 128},
                     }
                 )
@@ -308,6 +316,79 @@ class LiveProbeTests(unittest.TestCase):
             line for line in output.splitlines() if line.startswith("host wired bytes")
         )
         self.assertEqual(wired_row.split()[-2:], [probe.UNAVAILABLE] * 2)
+
+    def test_main_record_carriesFinishReasonAndContent(self):
+        statuses = [snapshot(), COLD_AFTER, COLD_AFTER, REPEAT_AFTER]
+
+        _stub, document = self.probe_json(statuses)
+
+        for record in document["requests"]:
+            self.assertEqual(record["finish_reason"], "length")
+            self.assertEqual(record["content"], REPLY_CONTENT)
+
+    def test_main_promptFile_sendsFileTextOnceWithoutRepeat(self):
+        prompt = "def last():\n    return 1\nIn one sentence, what does it do?"
+        statuses = [snapshot(), COLD_AFTER]
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as file:
+            file.write(prompt)
+        self.addCleanup(os.remove, file.name)
+
+        with StubServer(statuses) as stub:
+            code, output = run_main(
+                [
+                    "--base-url",
+                    stub.base_url,
+                    "--model",
+                    MODEL,
+                    "--prompt-file",
+                    file.name,
+                    "--prompt-tokens",
+                    "1",
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(stub.chat_bodies), 1)
+        self.assertEqual(
+            stub.chat_bodies[0]["messages"], [{"role": "user", "content": prompt}]
+        )
+        (record,) = json.loads(output)["requests"]
+        self.assertEqual(record["request"], "cold")
+        self.assertEqual(record["prefill_tokens_per_second"], 2048.0)
+        self.assertEqual(record["finish_reason"], "length")
+
+    def test_main_promptFileMissing_failsBeforeAnyRequest(self):
+        with StubServer([snapshot()]) as stub:
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                code, _output = run_main(
+                    ["--base-url", stub.base_url, "--prompt-file", "/no/such/file"]
+                )
+
+        self.assertEqual(code, 1)
+        self.assertIn("--prompt-file", errors.getvalue())
+        self.assertEqual(stub.chat_bodies, [])
+
+    def test_main_table_rendersWithRepliesBelowIt(self):
+        statuses = [snapshot(), COLD_AFTER, COLD_AFTER, REPEAT_AFTER]
+
+        with StubServer(statuses) as stub:
+            code, output = run_main(["--base-url", stub.base_url, "--model", MODEL])
+
+        self.assertEqual(code, 0)
+        lines = output.splitlines()
+        table_rows = lines[2 : 2 + len(probe.REPORT_ROWS)]
+        self.assertEqual(
+            [row.split("  ")[0].strip() for row in table_rows],
+            [label for _key, label in probe.REPORT_ROWS],
+        )
+        self.assertEqual(
+            lines[2 + len(probe.REPORT_ROWS) :],
+            [
+                f"cold: finish_reason length, content {REPLY_CONTENT!r}",
+                f"repeat: finish_reason length, content {REPLY_CONTENT!r}",
+            ],
+        )
 
     def test_coldPrompt_nonceLeadsAndChangesThePrompt(self):
         first = probe.cold_prompt(64, 16, "aaaa")

@@ -1,10 +1,12 @@
 """Probe a running Splash server's prefill and decode rates.
 
 Run as ``python -m dev.benchmarks.live_probe --base-url http://127.0.0.1:8000``.
-Sends one cold prompt and then its exact repeat, and reports per request the
-native rates and cache/pressure counters diffed from ``GET /status`` taken just
-before and just after it. Never starts a server; the counters are server-wide,
-so run it against an otherwise idle server.
+Sends one cold prompt and then its exact repeat (or, with ``--prompt-file``,
+that file's text alone as one request), and reports per request the native
+rates and cache/pressure counters diffed from ``GET /status`` taken just before
+and just after it, plus the reply's finish reason and content. Never starts a
+server; the counters are server-wide, so run it against an otherwise idle
+server.
 """
 
 from __future__ import annotations
@@ -215,10 +217,13 @@ def probe_record(label: str, before: dict, after: dict, reply: dict, wall_ms):
 
     Every rate and counter comes from the snapshot diff; only the token counts
     come from the reply's `usage`. A rate whose denominator delta is 0 is None.
-    The host memory readings come from the after-snapshot alone.
+    The host memory readings come from the after-snapshot alone; the finish
+    reason and content come from the reply's first choice.
     """
     delta = status_delta(before, after, PROBE_PATHS)
     usage = reply.get("usage") or {}
+    choices = reply.get("choices") or [{}]
+    message = choices[0].get("message") or {}
     return {
         "request": label,
         "prompt_tokens": usage.get("prompt_tokens"),
@@ -239,6 +244,8 @@ def probe_record(label: str, before: dict, after: dict, reply: dict, wall_ms):
         "denied_reservations": delta[DENIED],
         **{key: status_reading(after, path) for key, path in HOST_READINGS},
         "http_wall_ms": wall_ms,
+        "finish_reason": choices[0].get("finish_reason"),
+        "content": message.get("content"),
     }
 
 
@@ -270,10 +277,13 @@ def resolve_model(client: ProbeClient, model: str | None) -> str:
 
 
 # ------------------------------------------------------------------------------
-def run_probe(client: ProbeClient, model: str, prompt: str, max_tokens, timeout):
-    """Send `prompt` cold, then its exact repeat; return both report rows.
+def run_probe(
+    client: ProbeClient, model: str, prompt: str, max_tokens, timeout, repeat=True
+):
+    """Send `prompt` cold, then its exact repeat; return the report rows.
 
-    Each `/status` snapshot is taken outside the timed window.
+    With `repeat` False only the cold request is sent. Each `/status` snapshot
+    is taken outside the timed window.
     """
     body = {
         "model": model,
@@ -283,7 +293,7 @@ def run_probe(client: ProbeClient, model: str, prompt: str, max_tokens, timeout)
         "reasoning_effort": "none",
     }
     records = []
-    for label in ("cold", "repeat"):
+    for label in ("cold", "repeat") if repeat else ("cold",):
         try:
             records.append(timed_request(client, label, body, timeout))
         except ProbeError as error:
@@ -343,6 +353,16 @@ def format_table(records: list[dict]) -> str:
 
 
 # ------------------------------------------------------------------------------
+def format_replies(records: list[dict]) -> str:
+    """Render each request's finish reason and reply content, one line each."""
+    return "\n".join(
+        f"{record['request']}: finish_reason {record['finish_reason']}, "
+        f"content {record['content']!r}"
+        for record in records
+    )
+
+
+# ------------------------------------------------------------------------------
 def parse_args(argv=None):
     """Parse and validate the command line."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -360,13 +380,18 @@ def parse_args(argv=None):
         "--model", help="model id (default: the first one /v1/models lists)"
     )
     parser.add_argument("--prompt-tokens", type=int, default=DEFAULT_PROMPT_TOKENS)
+    parser.add_argument(
+        "--prompt-file",
+        help="send this file's text as the user message, once, with no repeat "
+        "(--prompt-tokens is then ignored)",
+    )
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument(
         "--request-timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS
     )
     parser.add_argument("--json", action="store_true", help="print the records as JSON")
     args = parser.parse_args(argv)
-    if args.prompt_tokens < MINIMUM_PROMPT_TOKENS:
+    if not args.prompt_file and args.prompt_tokens < MINIMUM_PROMPT_TOKENS:
         parser.error(f"--prompt-tokens must be at least {MINIMUM_PROMPT_TOKENS}")
     if args.max_tokens < 1 or args.request_timeout <= 0:
         parser.error("--max-tokens and --request-timeout must be positive")
@@ -380,11 +405,24 @@ def main(argv=None) -> int:
     """Run the probe and print the report; return the process exit code."""
     args = parse_args(argv)
     client = ProbeClient(args.base_url, args.api_key)
+    if args.prompt_file:
+        try:
+            with open(args.prompt_file, encoding="utf-8") as prompt_file:
+                prompt = prompt_file.read()
+        except OSError as error:
+            print(f"live_probe: cannot read --prompt-file: {error}", file=sys.stderr)
+            return 1
+    else:
+        prompt = cold_prompt(args.prompt_tokens, args.max_tokens, uuid.uuid4().hex)
     try:
         model = resolve_model(client, args.model)
-        prompt = cold_prompt(args.prompt_tokens, args.max_tokens, uuid.uuid4().hex)
         records = run_probe(
-            client, model, prompt, args.max_tokens, args.request_timeout
+            client,
+            model,
+            prompt,
+            args.max_tokens,
+            args.request_timeout,
+            repeat=not args.prompt_file,
         )
     except ProbeError as error:
         print(f"live_probe: {error}", file=sys.stderr)
@@ -394,6 +432,7 @@ def main(argv=None) -> int:
     else:
         print(f"model: {model}")
         print(format_table(records))
+        print(format_replies(records))
     return 0
 
 

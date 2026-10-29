@@ -3791,7 +3791,12 @@ first model `/v1/models` lists, and `--json` prints the records as JSON. The
 counters are server-wide, so probe an otherwise idle server; a rate whose
 native wall time did not move prints as `unavailable`. Requests ask for
 `reasoning_effort: none`; a chat template that cannot turn thinking off is
-probed with its default effort instead, with a note on stderr.
+probed with its default effort instead, with a note on stderr. Each record
+also carries the reply's `finish_reason` and `content`, printed below the table
+(or as record fields with `--json`). `--prompt-file PATH` sends that file's
+text as the user message in one cold request with no repeat, ignoring
+`--prompt-tokens`; use it to replay a fixed prompt, such as a long-context
+reproduction.
 
 To see what a long cold prefill costs a request that is already decoding, run
 the two-lane contended probe against the same idle server, once per
