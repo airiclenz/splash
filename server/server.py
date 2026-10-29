@@ -2072,6 +2072,7 @@ def main():
                 if args.reasoning_loop_limit is None
                 else args.reasoning_loop_limit
             ),
+            log_token_ids=args.log_token_ids,
         )
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")

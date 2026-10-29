@@ -924,6 +924,17 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--log-token-ids",
+        "requests",
+        dict(
+            action="store_true",
+            default=False,
+            help="end each request's Done line with its output token ids and "
+            "its finish reason with the last id, a diagnostic; the line then "
+            "holds whole replies as decodable ids (default: off)",
+        ),
+    ),
+    ServeOption(
         "--allow-idle-sleep",
         "requests",
         dict(

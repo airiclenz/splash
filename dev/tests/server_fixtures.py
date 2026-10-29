@@ -812,6 +812,7 @@ def main_args(**overrides):
             "max_reasoning_effort": None,
             "reasoning_loop_limit": None,
             "record_requests": None,
+            "log_token_ids": False,
             "no_speculation": False,
             "contended_prefill_rows": None,
             "thinking_token_budget": None,

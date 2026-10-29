@@ -100,4 +100,11 @@ def print_request(record):
         # Each verified draft yields the tokens it accepted and one more.
         per_cycle = 1 + speculation["accepted_draft_tokens"] / speculation["cycles"]
         parts.append(f"{per_cycle:.1f} tok/cycle")
+    token_ids = record.get("token_ids")
+    if token_ids is not None:
+        # `splash serve --log-token-ids`: the reply as ids, then why it ended
+        # and on which token.
+        last_id = token_ids[-1] if token_ids else "none"
+        parts.append(f"ids {','.join(map(str, token_ids))}")
+        parts.append(f"end {outcome}/{last_id}")
     print_status(" · ".join(parts))

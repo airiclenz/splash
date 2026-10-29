@@ -520,6 +520,7 @@ class NativeBackend:
         request_logger,
         thinking_end=DEFAULT_THINKING_END,
         reasoning_loop_limit=DEFAULT_REASONING_LOOP_LIMIT,
+        log_token_ids=False,
     ):
         if reasoning_loop_limit < 0:
             raise ValueError("reasoning loop limit must be non-negative")
@@ -529,6 +530,9 @@ class NativeBackend:
         # Every finished request's record, for `GET /requests`.
         self.request_records = RequestRecords()
         self.reasoning_loop_limit = reasoning_loop_limit
+        # Whether each finished request's log record carries its output token
+        # ids (`splash serve --log-token-ids`), a diagnostic.
+        self.log_token_ids = log_token_ids
         self.tokenizer_decode_fallbacks = 0
         # Whether a /health-started status refresh is owed or running
         # (single-flight), and the event that wakes the refresher for it.
@@ -1253,7 +1257,10 @@ class NativeBackend:
                 f"Warning · tokenizer decode fallback · request {job.request_id} · "
                 f"{decode_fallbacks} incremental decode failures"
             )
-        self._record(job, result=result, error=error)
+        # The streamed ids end with the token the engine stopped on, when it
+        # picked one.
+        token_ids = state.streamer.token_ids if self.log_token_ids and result else None
+        self._record(job, result=result, error=error, token_ids=token_ids)
         job.events.put(("error", error) if error else ("done", result))
 
     @staticmethod
@@ -1324,7 +1331,7 @@ class NativeBackend:
             # rule `_log` follows for the request logger.
             pass
 
-    def _record(self, job, result=None, error=None):
+    def _record(self, job, result=None, error=None, token_ids=None):
         self.request_records.append(self._timing_record(job, result))
         record = {
             "outcome": result.reason if result else "error",
@@ -1340,6 +1347,8 @@ class NativeBackend:
             }
         if error:
             record["error_code"] = error.code
+        if token_ids is not None:
+            record["token_ids"] = token_ids
         self._log(record)
 
     @staticmethod

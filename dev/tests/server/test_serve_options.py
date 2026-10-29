@@ -93,6 +93,7 @@ OPTIONS = {
         {"/var/log/splash/requests.jsonl": "/var/log/splash/requests.jsonl"},
         ("",),
     ),
+    "--log-token-ids": ([(["--log-token-ids"], True)], []),
     "--thinking-end-text": values(
         "--thinking-end-text",
         {"</think>": "</think>", "Time is up.\n</think>": "Time is up.\n</think>"},
@@ -507,6 +508,15 @@ class ServeOptionsTests(unittest.TestCase):
         self.assertIn("--no-speculation", command)
         index = command.index("--contended-prefill-rows")
         self.assertEqual(command[index + 1], "128")
+
+    def test_log_token_ids_is_off_by_default_and_stays_off_the_native_command(self):
+        required = ["model", "--model", "community/custom-splash"]
+        self.assertFalse(api.parse_args(required).log_token_ids)
+
+        args = api.parse_args([*required, "--log-token-ids"])
+
+        self.assertTrue(args.log_token_ids)
+        self.assertNotIn("--log-token-ids", api._native_command(args, args.model_root))
 
     def test_native_command_passes_each_serve_option(self):
         model = "community/custom-splash"

@@ -127,6 +127,7 @@ access.
 | `--no-speculation` | Off | Decode one token per step without draft proposals. The draft stays loaded but prefill and decode run none of its proposal work; `/status` reports `metrics.speculative_decoding: false` and no draft acceptance rate. |
 | `--contended-prefill-rows` | `256` on Apple GPU family 7/8 (M1/M2), `64` otherwise | Smallest prefill command, in rows, while other requests are decoding: a power of two from `64` to `2048`. A larger floor finishes a long prompt sooner but stalls their tokens longer per command (about 0.85 s at 64 rows and 3.3 s at 256 on an M2 Pro). |
 | `--record-requests` | Off | Append every accepted `/v1/chat/completions`, `/v1/messages` and `/v1/responses` request to this file, one JSON line each: `received_unix_ms`, `path` and the request `body` as sent, with its line breaks turned into spaces (split the file on LF only). Token counting, `/tokenize`, `/apply-template`, `/v1/judgments` and `/v1/systemone` are not recorded. The file holds complete prompts, so it is made readable by its owner only (mode 0600). |
+| `--log-token-ids` | Off | A diagnostic: end each request's console Done line with ` · ids <output token ids, comma-joined> · end <finish reason>/<last output id, or none>`. The ids include the token the engine stopped on, when it picked one. The line then holds whole replies as decodable ids. The flag stays in the Python server; the engine never sees it. |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
@@ -3427,7 +3428,8 @@ attention weighs rows past a request's end by zero and a BF16 value is read as
 stored (0 × NaN is NaN). GPU faults and broken engine invariants stay fatal and
 still mark the runtime unhealthy.
 
-Request logs omit bodies; full crash traces require explicit
+Request logs omit bodies, unless `--log-token-ids` is given: its Done lines
+hold each reply as decodable token ids. Full crash traces require explicit
 `SPLASH_CRASH_TRACE=1` and can contain private conversation data. With it, a
 failed engine's last frames, at most 512 and 16 MiB, are written to
 `~/Library/Logs/Splash/crash/`, which keeps the newest four traces within

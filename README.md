@@ -155,8 +155,8 @@ The server listens on localhost without authentication by default. For LAN
 access, authentication, browser apps on other origins, and other options, see
 [server configuration](DEVELOPMENT.md#server-configuration) or
 `splash serve --help`. The fork-only options `--no-speculation`,
-`--contended-prefill-rows`, `--reasoning-loop-limit`, `--max-reasoning-effort`
-and `--record-requests` are described there too.
+`--contended-prefill-rows`, `--reasoning-loop-limit`, `--max-reasoning-effort`,
+`--record-requests` and `--log-token-ids` are described there too.
 [KV precision](DEVELOPMENT.md#kv-cache-precision) ·
 [SSD cache](DEVELOPMENT.md#ssd-cache) ·
 [Advanced memory settings](DEVELOPMENT.md#memory-and-context)

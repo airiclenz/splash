@@ -292,6 +292,41 @@ class DiagnosticsTests(HarnessTestCase):
             " · tools 27·1a2b3c4d\n",
         )
 
+    @staticmethod
+    def done_line(**extra):
+        record = {
+            "outcome": "stop",
+            "prompt_tokens": 40,
+            "completion_tokens": 3,
+            "metrics": {"cache": {"matched_tokens": 0}},
+            **extra,
+        }
+        with (
+            mock.patch.object(api.time, "strftime", return_value="14:32:08"),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            diagnostics.print_request(record)
+        return output.getvalue()
+
+    def test_console_ends_the_done_line_with_logged_token_ids(self):
+        line = self.done_line(token_ids=[785, 13, 248046])
+
+        self.assertEqual(
+            line,
+            "14:32:08 Done · input 40 · cached 0 · output 3"
+            " · ids 785,13,248046 · end stop/248046\n",
+        )
+
+    def test_console_names_no_last_id_for_a_reply_without_tokens(self):
+        line = self.done_line(token_ids=[])
+
+        self.assertTrue(line.endswith(" · ids  · end stop/none\n"), line)
+
+    def test_console_done_line_without_token_ids_is_unchanged(self):
+        line = self.done_line()
+
+        self.assertEqual(line, "14:32:08 Done · input 40 · cached 0 · output 3\n")
+
     def test_console_cancellation_without_tokens_or_latency(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
             diagnostics.print_request({"outcome": "cancelled", "prompt_tokens": 32})

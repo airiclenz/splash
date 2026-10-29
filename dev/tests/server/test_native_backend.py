@@ -459,6 +459,35 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(constraint.finish_calls, 1)
         self.assertFalse(transport.active)
 
+    def logged_done_record(self, *, log_token_ids):
+        records = []
+        runtime = DrivenRuntime()
+        transport = backend_api.NativeBackend(
+            runtime, DigitTokenizer(), records.append, log_token_ids=log_token_ids
+        )
+        self.addCleanup(transport.close)
+        job = make_job()
+        transport.submit(job)
+        call = runtime.calls[0]
+
+        call.emit(wire.StartEvent(call.request_id, 2, 2))
+        # The engine's last id is the token it stopped on.
+        call.emit(wire.TokensEvent(call.request_id, 0, (7, 8, 15)))
+        call.complete(result=success_result(call, tokens=(7, 8, 15)))
+        self.assertEqual(self.terminal(job)[0], "done")
+
+        return next(record for record in records if record["outcome"] == "stop")
+
+    def test_log_token_ids_puts_the_streamed_ids_in_the_done_record(self):
+        record = self.logged_done_record(log_token_ids=True)
+
+        self.assertEqual(record["token_ids"], [7, 8, 15])
+
+    def test_done_record_has_no_token_ids_without_log_token_ids(self):
+        record = self.logged_done_record(log_token_ids=False)
+
+        self.assertNotIn("token_ids", record)
+
     def test_a_console_that_stops_draining_does_not_stall_the_reader(self):
         # A request's Started line is printed when the engine starts it. On a
         # console that stops draining (a paused terminal, an unread pipe) the

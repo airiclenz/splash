@@ -104,6 +104,8 @@ class ServerMainTests(unittest.TestCase):
             thinking_end=backend_api.DEFAULT_THINKING_END,
             # No --reasoning-loop-limit: the guard runs at its default.
             reasoning_loop_limit=serve_options.DEFAULT_REASONING_LOOP_LIMIT,
+            # No --log-token-ids: Done lines carry no ids.
+            log_token_ids=False,
         )
         self.assertEqual(app_type.call_args.args[3], 262144)
         # No --request-timeout, no deadline.
