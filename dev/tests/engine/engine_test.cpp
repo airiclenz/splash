@@ -3383,6 +3383,81 @@ void testRefusedStartKeepsItsLeaseWhileMemoryIsPending() {
           "the waiting start did not resume from its cached state");
 }
 
+// What a start that waited for memory restored, and the queued depth losses
+// the engine counted for it.
+struct QueuedDepthOutcome {
+  uint32_t startTokens = 0;
+  uint64_t losses = 0;
+  uint64_t lostTokens = 0;
+};
+
+// Request 2 finds request 1's state at 64 and waits for memory a state write
+// in flight holds; while it waits, evictWhileWaiting drops every unpinned
+// entry. The cache has no disk tier, so an evicted state is gone.
+QueuedDepthOutcome runStartThatWaitsForMemory(bool evictWhileWaiting) {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(1);
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+  auto write = std::make_shared<OffloadControl>();
+  resources.beginRequest(999);
+  require(resources.ensureTokens(999, 64).granted(), "fixture KV failed");
+  resources.publishCompositeState(
+      test::publishBlocks(resources, 999, std::vector<uint32_t>(64, 9), 64),
+      std::make_shared<OffloadState>(write), false);
+  resources.endRequest(999);
+  require(resources.reclaimOneState(StateClass::Ordinary, false) &&
+              resources.snapshot().stateCache.bytes == 0,
+          "the fixture state was not written");
+  double now = 1;
+  const std::vector<uint32_t> prompt(65, 1);
+  engine.submit(request(1, prompt));
+  tickUntil(engine, now, [&] { return idle(engine); }, "the first request did not finish");
+  executor.beginGrowthBlocked = [&] { return !write->ready; };
+  engine.submit(request(2, prompt));
+  for (int step = 0; step < 5; ++step)
+    static_cast<void>(engine.tick(now++));
+  require(resources.probe(prompt, {}).cachedTokens() == 64 &&
+              engine.resourceWaitSnapshot(now).memory == 1 && events.startIds.size() == 1,
+          "the second request did not wait for memory beside its found state");
+
+  if (evictWhileWaiting) {
+    static_cast<void>(resources.evictAll());
+    require(resources.probe(prompt, {}).cachedTokens() == 0,
+            "the found state survived eviction while its request waited");
+  }
+  write->ready = true;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the waiting start did not run");
+
+  require(events.failedCount == 0, "the waiting start failed");
+  const EngineSnapshot counts = engine.snapshot();
+  return {.startTokens = events.starts.back(),
+          .losses = counts.resourceQueuedDepthLosses,
+          .lostTokens = counts.resourceQueuedDepthLostTokens};
+}
+
+// A start that waited for memory while the state its lookup found at 64 was
+// evicted starts below it and counts one queued depth loss of that gap.
+void testQueuedStartCountsTheDepthItLostWhileWaiting() {
+  const QueuedDepthOutcome outcome = runStartThatWaitsForMemory(true);
+
+  require(outcome.startTokens < 64 && outcome.losses == 1 &&
+              outcome.lostTokens == 64 - outcome.startTokens,
+          "a waited start whose found state was evicted did not count the depth it lost");
+}
+
+// A start that waited for memory and restores the state its lookup found
+// counts no queued depth loss.
+void testQueuedStartRestoringItsFoundStateLosesNoDepth() {
+  const QueuedDepthOutcome outcome = runStartThatWaitsForMemory(false);
+
+  require(outcome.startTokens == 64 && outcome.losses == 0 && outcome.lostTokens == 0,
+          "a waited start restoring its found state counted lost depth");
+}
+
 // A start alone with nothing else to free releases its own lease, and the
 // reclaim writes the state to disk; holding its lane, it looks up again and
 // restores that copy instead of recomputing the prefix.
@@ -12351,6 +12426,8 @@ int main() {
     testActivationReceivesTheRestoreBoundary();
     testRefusedStartKeepsItsLeaseBesideAResidentLane();
     testRefusedStartKeepsItsLeaseWhileMemoryIsPending();
+    testQueuedStartCountsTheDepthItLostWhileWaiting();
+    testQueuedStartRestoringItsFoundStateLosesNoDepth();
     testDroppedLeaseLooksUpAgain();
     testHostRefusedStartKeepsItsLease();
     testSingletonCapacityFailureTerminatesCleanly();
