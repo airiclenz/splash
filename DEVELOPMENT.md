@@ -2171,7 +2171,9 @@ The server runs as `python -m server.server`; `install/launcher.py` and
 PEP 366 header. `serve_options.py` defines the options
 `splash serve` shares with the server once, each with its check, default,
 help and help group, and how the launcher passes it on; it imports only the
-standard library, since the launcher parses them before `.venv` exists.
+standard library and server modules that themselves import only the standard
+library when loaded (`images`, `origins`, `http_security`, `protocol`), since
+the launcher parses them before `.venv` exists.
 
 Flash-Next's two hyper-connection norm kernels, which split a mix's rows
 between them, must write the same bits, which only an uninstrumented run of
@@ -2418,7 +2420,11 @@ three bf16 parts per weight that sum to it exactly, so only fp32 accumulation
 rounds). The GDN convolution and time-step bias become bf16 under the exact
 rule.
 
-Decode runs one of two kernel families, chosen by GPU family in `runtime/ops/LinearGguf.cpp`. On
+Decode runs one of three kernel paths, chosen by GPU family in `runtime/ops/LinearGguf.cpp`. On
+Apple7/8 (M1, M2) the staged tile's dispatches run on simdgroup MMA kernels
+(`kernels/shared/gguf_linear_mma.metal`) with their own split tier, and wherever every format of a
+projection takes it the register tile runs with an fp32 table, with a one-pass gate/up
+(`apple7GateUpFormat`). On
 Apple9 (M3, M4) the register tile (`LinearTile::GgufRegister`) runs the kernels of
 `runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal`, which feed the codes themselves to
 bf16 matrix operations with one fp32 epilogue per coefficient group, so every output is the bf16
@@ -3454,8 +3460,13 @@ GPU; `make check-native-metal` requires a supported Metal device and runs the
 kernel tests under shader validation, and the Linear pipeline resource check
 without it. They include loading small synthetic MLX, GGUF and vision sources
 and the GGUF kernels on synthetic tensors. `make check-native-build` builds
-every native test, benchmark and tool and runs none. Hosted CI runs the CPU
-checks, `check-native-build` and the sanitizers. `make test-sanitizers-metal`
+every native test, benchmark and tool and runs none. Hosted CI runs the source
+checks, the CPU checks, `check-native-build`, the sanitizers, and
+`make check-python` on Python 3.12, 3.13 and 3.14. The Metal suite and the
+real-model runs are in the `release-hardware` job, on self-hosted M3 Max
+through M5 Max runners, started by hand (`workflow_dispatch` with
+`release_gate`, `expect_output_change`, `expect_image_change`).
+`make test-sanitizers-metal`
 runs the Metal tests of the components whose host steps share their state with
 the engine thread and the SSD readers (the hot block cache of spilled KV and
 the history stream) under ThreadSanitizer, built with it in `build/metal-tsan`.
