@@ -242,9 +242,9 @@ class MaxReasoningEffortTests(unittest.TestCase):
         self.addCleanup(harness.close)
         return harness
 
-    def template_app(self, cap):
+    def template_app(self, cap, efforts=QWEN_EFFORTS):
         tokenizer = fixtures.TemplateTokenizer(
-            fixtures.reasoning_template(efforts=QWEN_EFFORTS)
+            fixtures.reasoning_template(efforts=efforts)
         )
         app = fixtures.make_frontend(
             tokenizer,
@@ -323,6 +323,19 @@ class MaxReasoningEffortTests(unittest.TestCase):
 
                 self.assertTrue(job.thinking)
                 self.assertEqual(self.rendered_efforts(tokenizer), ["medium"])
+
+    def test_request_above_cap_renders_cap_on_template_that_accepts_it(self):
+        for effort in ("high", "xhigh", "max"):
+            with self.subTest(effort=effort):
+                tokenizer, app = self.template_app("high", efforts=None)
+
+                job = app.prepare(
+                    fixtures.chat_body(reasoning_effort=effort),
+                    deadline=fixtures.FOREVER,
+                )
+
+                self.assertTrue(job.thinking)
+                self.assertEqual(self.rendered_efforts(tokenizer), ["high"])
 
     def test_alias_retry_never_drops_to_none(self):
         tokenizer, app = self.template_app("minimal")

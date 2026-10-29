@@ -244,20 +244,12 @@ class GenerationOptions:
 def _capped_effort(effort, cap):
     """Return `effort` lowered to `cap`; without a cap, `effort` itself.
 
-    A template that rejects an effort renders its alias instead
-    (render_chat_template), which can rank above the cap, as "high" renders
-    "xhigh": such an effort steps down until its alias fits. It never steps
-    to "none", which would contradict thinking.
+    A template that rejects the capped effort renders its retry effort
+    instead (_retry_effort), which stays within the cap.
     """
     if cap is None:
         return effort
-    limit = REASONING_EFFORT_RANKS[cap]
-    rank = min(REASONING_EFFORT_RANKS[effort], limit)
-    while rank > 1:
-        alias = REASONING_EFFORT_ALIASES.get(REASONING_EFFORTS[rank])
-        if alias is None or REASONING_EFFORT_RANKS[alias] <= limit:
-            break
-        rank -= 1
+    rank = min(REASONING_EFFORT_RANKS[effort], REASONING_EFFORT_RANKS[cap])
     return REASONING_EFFORTS[rank]
 
 
