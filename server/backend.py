@@ -1,6 +1,7 @@
 """Native request submission, cancellation, recovery and completion ownership."""
 
 import functools
+import math
 import queue
 import threading
 import time
@@ -49,6 +50,14 @@ DECODE_RECOVERY_WINDOW = 16
 
 # Converts `time.time()` seconds to the Unix milliseconds `/requests` reports.
 MILLISECONDS_PER_SECOND = 1000
+
+
+def _interval_ms(start, end):
+    """Milliseconds from monotonic `start` to `end`; NaN, which a result's
+    metrics leave out, when either was never stamped."""
+    if start is None or end is None:
+        return math.nan
+    return (end - start) * MILLISECONDS_PER_SECOND
 
 
 def _is_invalid_prefix(error):
@@ -490,9 +499,19 @@ class _JobState:
     streamer: CallbackStreamer
     call: object | None = None
     terminal_enqueued: bool = False
+    # Set under NativeBackend.lock when a stop match queues the early done:
+    # the client's terminal is owned by that item, and the native completion
+    # only records the request.
+    client_done: bool = False
     detached: bool = False
     shutdown_requested: bool = False
     first_token_batch_tokens: int = 0
+    # Monotonic stamps on the server's own clock, the early done's latency:
+    # submission, StartEvent arrival, first TokensEvent arrival, stop match.
+    submitted_at: float = field(default_factory=time.monotonic)
+    started_at: float | None = None
+    first_token_at: float | None = None
+    stopped_at: float | None = None
 
     def detach(self):
         self.detached = True
@@ -997,10 +1016,25 @@ class NativeBackend:
         state = None
 
         def stop_matched():
-            # A stop sequence or a reasoning-loop trip ends the request.
-            call = None
+            # A stop sequence or a reasoning-loop trip ends the request. An
+            # unconstrained job's client gets its done now, not after the
+            # native call drains its in-flight decode cycle; a constrained
+            # job's done waits for the grammar's finish check. Fires from the
+            # reader thread and, through streamer.end(), the finalizer.
+            stopped_at = time.monotonic()
             with self.lock:
                 call = state.call
+                early = job.constraint is None and not (
+                    state.client_done or state.terminal_enqueued or state.detached
+                )
+                if early:
+                    state.client_done = True
+                    state.stopped_at = stopped_at
+                    # Queued under the lock, so it precedes the _finalize item
+                    # on_complete queues once it sees the request.
+                    self.finalizer_queue.put(
+                        functools.partial(self._finish_early, state)
+                    )
             if call is not None:
                 call.stop()
 
@@ -1101,6 +1135,7 @@ class NativeBackend:
             )
             with self.lock:
                 job.cache = cache
+            state.started_at = time.monotonic()
             record = {
                 "outcome": "started",
                 "prompt_tokens": len(job.prompt_tokens),
@@ -1135,6 +1170,7 @@ class NativeBackend:
                 job.latency.tokens()
             if event.sequence_offset == 0:
                 state.first_token_batch_tokens = len(event.tokens)
+                state.first_token_at = time.monotonic()
             if job.constraint is not None:
                 job.constraint.commit(event.tokens)
             state.streamer.put_tokens(event.tokens)
@@ -1173,44 +1209,14 @@ class NativeBackend:
                 # cancelled request needs no check, and its last mask may
                 # still be computing.
                 job.constraint.finish()
-            state.streamer.end()
-            job.reasoning_tokens = state.streamer.count_reasoning_tokens(
-                job.thinking, job.may_call_tools
-            )
-            stop_sequence = state.streamer.stop_sequence
-            if stop_sequence is not None:
-                reason = "stop"
-            elif state.streamer.reasoning_loop_tripped:
-                # `length` lets clients and output validators reuse their
-                # incomplete-reply handling.
-                reason = "length"
-            else:
-                reason = self._FINISH_NAMES[done.reason]
-            stopped_early = (
-                stop_sequence is not None or state.streamer.reasoning_loop_tripped
-            )
-            result = NativeResult(
-                reason=reason,
-                prompt_tokens=done.prompt_tokens,
-                completion_tokens=(
-                    len(state.streamer.token_ids)
-                    if stopped_early
-                    else done.completion_tokens
-                ),
-                option_logits=done.option_logits,
-                start_to_first_token_ms=done.prefill_micros / 1000.0,
-                first_token_to_done_ms=done.decode_micros / 1000.0,
-                request_wall_ms=done.wall_micros / 1000.0,
-                prefill_tokens=max(0, done.prompt_tokens - job.cache.matched_tokens),
-                cache=replace(job.cache, deduplicated_tokens=done.deduplicated_tokens),
-                stop_sequence=stop_sequence,
-                first_token_batch_tokens=state.first_token_batch_tokens,
-                drafted_tokens=done.drafted_tokens,
-                accepted_draft_tokens=done.accepted_draft_tokens,
-                draft_cycles=done.draft_cycles,
-                bounded=done.bounded,
-                engine_timing=done.timing,
-            )
+            if not state.client_done:
+                # An early done already flushed the streamer and counted the
+                # reasoning, which its client may have read.
+                state.streamer.end()
+                job.reasoning_tokens = state.streamer.count_reasoning_tokens(
+                    job.thinking, job.may_call_tools
+                )
+            result = self._result(state, done)
             if job.latency is not None:
                 latency = result.metrics["request_latency"]
                 queued = latency.get("queue_to_start_ms")
@@ -1238,6 +1244,7 @@ class NativeBackend:
             decode_fallbacks = state.streamer.decode_fallbacks
             with self.lock:
                 shutdown_requested = state.shutdown_requested
+                client_done = state.client_done
                 self.tokenizer_decode_fallbacks += decode_fallbacks
                 self._detach_locked(state)
         if shutdown_requested:
@@ -1261,7 +1268,102 @@ class NativeBackend:
         # picked one.
         token_ids = state.streamer.token_ids if self.log_token_ids and result else None
         self._record(job, result=result, error=error, token_ids=token_ids)
+        if client_done:
+            # The client has its done from the stop match; a native error or
+            # a shutdown after it changes only the record.
+            return
         job.events.put(("error", error) if error else ("done", result))
+
+    def _finish_early(self, state):
+        """Put an unconstrained job's done at its stop match, ahead of the
+        native completion, which still records the request with the engine's
+        figures. Runs on the finalizer: counting the reasoning is O(tokens).
+
+        Exactly one terminal reaches the client either way: should building
+        the result fail, the error is that terminal.
+        """
+        job = state.job
+        try:
+            state.streamer.end()
+            job.reasoning_tokens = state.streamer.count_reasoning_tokens(
+                job.thinking, job.may_call_tools
+            )
+            terminal = ("done", self._result(state))
+        except Exception as unexpected:
+            self._warn(
+                f"Warning · early done failed · request {job.request_id} · {unexpected}"
+            )
+            terminal = ("error", self._api_error(unexpected))
+        job.events.put(terminal)
+
+    def _result(self, state, done=None):
+        """Build a request's NativeResult from its native DoneEvent `done`,
+        or, for an early done (None), from the server's own figures: prompt
+        tokens and cache as admitted, latency from the job's monotonic stamps,
+        engine timing, speculation and deduplicated tokens zero."""
+        streamer = state.streamer
+        stop_sequence = streamer.stop_sequence
+        if done is None:
+            figures = self._early_figures(state)
+        else:
+            figures = self._native_figures(state.job, done)
+        if stop_sequence is not None:
+            reason = "stop"
+        elif streamer.reasoning_loop_tripped:
+            # `length` lets clients and output validators reuse their
+            # incomplete-reply handling.
+            reason = "length"
+        else:
+            reason = self._FINISH_NAMES[done.reason]
+        if stop_sequence is not None or streamer.reasoning_loop_tripped:
+            # The engine may have run past the stop match before it stopped.
+            figures["completion_tokens"] = len(streamer.token_ids)
+        return NativeResult(
+            reason=reason,
+            stop_sequence=stop_sequence,
+            first_token_batch_tokens=state.first_token_batch_tokens,
+            **figures,
+        )
+
+    @staticmethod
+    def _native_figures(job, done):
+        """The NativeResult fields a native DoneEvent supplies."""
+        return {
+            "prompt_tokens": done.prompt_tokens,
+            "completion_tokens": done.completion_tokens,
+            "option_logits": done.option_logits,
+            "start_to_first_token_ms": done.prefill_micros / 1000.0,
+            "first_token_to_done_ms": done.decode_micros / 1000.0,
+            "request_wall_ms": done.wall_micros / 1000.0,
+            "prefill_tokens": max(0, done.prompt_tokens - job.cache.matched_tokens),
+            "cache": replace(job.cache, deduplicated_tokens=done.deduplicated_tokens),
+            "drafted_tokens": done.drafted_tokens,
+            "accepted_draft_tokens": done.accepted_draft_tokens,
+            "draft_cycles": done.draft_cycles,
+            "bounded": done.bounded,
+            "engine_timing": done.timing,
+        }
+
+    @staticmethod
+    def _early_figures(state):
+        """The NativeResult fields an early done takes from the server: the
+        latency intervals are submission, start, first token and stop match
+        on its own clock."""
+        job = state.job
+        prompt_tokens = len(job.prompt_tokens)
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": len(state.streamer.token_ids),
+            "start_to_first_token_ms": _interval_ms(
+                state.started_at, state.first_token_at
+            ),
+            "first_token_to_done_ms": _interval_ms(
+                state.first_token_at, state.stopped_at
+            ),
+            "request_wall_ms": _interval_ms(state.submitted_at, state.stopped_at),
+            "prefill_tokens": max(0, prompt_tokens - job.cache.matched_tokens),
+            "cache": job.cache,
+        }
 
     @staticmethod
     def _api_error(error):
@@ -1305,8 +1407,10 @@ class NativeBackend:
             return APIError(400, str(error), "constraint_error")
         if isinstance(error, engine_runtime.PendingLimitExceeded):
             # The native pending limit is --queue-size, the HTTP request
-            # gate's capacity, so only a race with the gate reaches it, as
-            # when a cancelled request still holds its native slot: an
+            # gate's capacity, so only a race with the gate reaches it: a
+            # request whose gate slot is free while its native call still
+            # holds a native slot, as a cancelled request, or a stop that got
+            # its early done while the call drains its last decode cycle. An
             # overload like the gate's own, retried the same way.
             return APIError(503, "request queue is full", "frontend_overloaded")
         if isinstance(
@@ -1421,10 +1525,12 @@ class NativeBackend:
                     if state.terminal_enqueued:
                         continue
                     self._detach_locked(state)
-                    stranded.append(state)
-            for state in stranded:
+                    stranded.append((state, state.client_done))
+            for state, client_done in stranded:
                 error = APIError(503, "server is shutting down", "server_shutdown")
                 self._record(state.job, error=error)
-                state.job.events.put(("error", error))
+                # An early done, queued or sent, is that client's terminal.
+                if not client_done:
+                    state.job.events.put(("error", error))
             self.finalizer_queue.put(None)
             self.finalizer.join()

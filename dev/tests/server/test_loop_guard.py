@@ -1,3 +1,4 @@
+import time
 import unittest
 from unittest import mock
 
@@ -213,6 +214,15 @@ class NativeBackendLoopGuardTests(unittest.TestCase):
             if event[0] in ("done", "error"):
                 return event
 
+    @staticmethod
+    def wait_for_record(backend, timeout=1.0):
+        """Wait until the finalizer has recorded a finished request."""
+        deadline = time.monotonic() + timeout
+        while not backend.request_records.finished_after():
+            if time.monotonic() >= deadline:
+                raise AssertionError("no finished request was recorded")
+            time.sleep(0.001)
+
     def test_repeated_reasoning_stops_the_call_and_finishes_with_length(self):
         backend, runtime = self.make_backend()
         job = make_job()
@@ -225,13 +235,16 @@ class NativeBackendLoopGuardTests(unittest.TestCase):
             stopped_early = runtime.stop_count
             call.emit(wire.TokensEvent(call.request_id, 23, (REPEATED_ID,)))
             stopped = runtime.stop_count
+            # The trip sends the done before the native call completes.
+            kind, result = self.terminal(job)
             generated = (REPEATED_ID,) * 26
             call.complete(
                 result=success_result(
                     call, reason=wire.FinishReason.STOP, tokens=generated
                 )
             )
-            kind, result = self.terminal(job)
+            # The warning comes with the native completion's record.
+            self.wait_for_record(backend)
 
         self.assertEqual((stopped_early, stopped, runtime.cancel_count), (0, 1, 0))
         self.assertEqual(kind, "done")
