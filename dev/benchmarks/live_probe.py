@@ -7,6 +7,10 @@ rates and cache/pressure counters diffed from ``GET /status`` taken just before
 and just after it, plus the reply's finish reason and content. Never starts a
 server; the counters are server-wide, so run it against an otherwise idle
 server.
+
+With ``--stop-sequence`` it instead streams one counting reply that the stop
+sequence cuts short and reports the gap from the last content delta to the
+finish chunk, and the request's decode wall per cycle from ``GET /requests``.
 """
 
 from __future__ import annotations
@@ -36,6 +40,29 @@ STALE_SNAPSHOT_RETRIES = 3
 STALE_RETRY_DELAY_SECONDS = 0.15
 API_KEY_ENVIRONMENT = "SPLASH_API_KEY"
 UNAVAILABLE = "unavailable"
+JSON_ACCEPT = "application/json"
+SSE_ACCEPT = "text/event-stream"
+SSE_DATA_PREFIX = b"data:"
+SSE_DONE = "[DONE]"
+CHAT_PATH = "/v1/chat/completions"
+REQUESTS_PATH = "/requests"
+# Chat completion ids prefix the bare public id `GET /requests` reports.
+CHAT_ID_PREFIX = "chatcmpl-"
+MILLISECONDS_PER_SECOND = 1000.0
+
+# The `--stop-sequence` probe: a greedy counting reply its stop cuts short.
+STOP_COUNT_TO = 60
+STOP_PROMPT = f"Count from 1 to {STOP_COUNT_TO}, separated by commas."
+# The reply the prompt asks for; a stop sequence must occur in it.
+STOP_REFERENCE = ", ".join(str(number) for number in range(1, STOP_COUNT_TO + 1))
+DEFAULT_STOP_SEQUENCE = ", 20,"
+STOP_FINISH_REASON = "stop"
+STOP_LABEL = "stop"
+# The request's `GET /requests` record lands after native completion, which
+# can follow the client's done, so it is polled for this long.
+REQUEST_RECORD_WAIT_SECONDS = 5.0
+REQUEST_RECORD_POLL_SECONDS = 0.1
+REQUEST_RECORD_POLLS = round(REQUEST_RECORD_WAIT_SECONDS / REQUEST_RECORD_POLL_SECONDS)
 
 # Common English words that most tokenizers encode as one token after a space,
 # so the word count approximates the requested prompt token count.
@@ -103,6 +130,11 @@ REPORT_ROWS = (
     ("host_compressor_bytes", "host compressor bytes"),
     ("http_wall_ms", "HTTP wall ms"),
 )
+# The rows a `--stop-sequence` run adds below REPORT_ROWS.
+STOP_ROWS = (
+    ("stop_to_done_ms", "stop to done ms"),
+    ("cycle_ms", "cycle ms"),
+)
 
 
 class ProbeError(RuntimeError):
@@ -132,7 +164,49 @@ class ProbeClient:
         Raises ProbeError on a connection failure, a non-2xx status or a body
         that is not JSON.
         """
-        headers = {"Accept": "application/json"}
+        response = self._open(method, path, body, JSON_ACCEPT, timeout)
+        try:
+            with response:
+                raw = response.read()
+        except OSError as error:
+            raise ProbeError(f"{method} {path}: {error}") from error
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ProbeError(f"{method} {path} returned invalid JSON") from error
+
+    # --------------------------------------------------------------------------
+    def stream(self, path: str, body: dict, timeout: float):
+        """POST `body` to `path` and yield `(arrival, event)` per SSE event.
+
+        `arrival` is `time.monotonic()` just after the event's line was read.
+        Comment and blank lines are skipped and iteration ends at ``[DONE]``.
+        Raises ProbeError as `request` does, and on an event that is not JSON
+        or is the server's in-stream error event.
+        """
+        response = self._open("POST", path, body, SSE_ACCEPT, timeout)
+        with response:
+            try:
+                for line in response:
+                    if not line.startswith(SSE_DATA_PREFIX):
+                        continue
+                    payload = (
+                        line[len(SSE_DATA_PREFIX) :].strip().decode(errors="replace")
+                    )
+                    if payload == SSE_DONE:
+                        return
+                    yield time.monotonic(), sse_event(payload)
+            except OSError as error:
+                raise ProbeError(f"POST {path} stream: {error}") from error
+
+    # --------------------------------------------------------------------------
+    def _open(self, method: str, path: str, body, accept: str, timeout):
+        """Send one request and return its open response for the caller to read.
+
+        Raises ProbeError on a connection failure or a non-2xx status, carrying
+        the HTTP status of a refused request.
+        """
+        headers = {"Accept": accept}
         payload = None
         if body is not None:
             payload = json.dumps(body).encode()
@@ -146,8 +220,7 @@ class ProbeClient:
             method=method,
         )
         try:
-            with urllib.request.urlopen(prepared, timeout=timeout) as response:
-                raw = response.read()
+            return urllib.request.urlopen(prepared, timeout=timeout)
         except urllib.error.HTTPError as error:
             detail = error.read().decode(errors="replace")[:500]
             raise ProbeError(
@@ -155,10 +228,18 @@ class ProbeClient:
             ) from error
         except (urllib.error.URLError, OSError) as error:
             raise ProbeError(f"{method} {path}: {error}") from error
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError as error:
-            raise ProbeError(f"{method} {path} returned invalid JSON") from error
+
+
+# ------------------------------------------------------------------------------
+def sse_event(payload: str) -> dict:
+    """Decode one SSE `data:` payload; ProbeError on bad JSON or an error event."""
+    try:
+        event = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ProbeError(f"stream event is not JSON: {payload[:200]}") from error
+    if isinstance(event, dict) and "error" in event:
+        raise ProbeError(f"stream failed: {json.dumps(event['error'])[:500]}")
+    return event
 
 
 # ------------------------------------------------------------------------------
@@ -301,12 +382,7 @@ def run_probe(
             # native work; measure with its default thinking mode instead.
             if label != "cold" or not refuses_thinking_mode(error):
                 raise
-            del body["reasoning_effort"]
-            print(
-                "live_probe: template cannot disable thinking; "
-                "probing with its default reasoning effort",
-                file=sys.stderr,
-            )
+            drop_reasoning_effort(body)
             records.append(timed_request(client, label, body, timeout))
     return records
 
@@ -320,6 +396,171 @@ def timed_request(client: ProbeClient, label: str, body: dict, timeout) -> dict:
     wall_ms = (time.monotonic() - started) * 1000.0
     after = fresh_status(client)
     return probe_record(label, before, after, reply, wall_ms)
+
+
+# ------------------------------------------------------------------------------
+def drop_reasoning_effort(body: dict) -> None:
+    """Remove `reasoning_effort` from `body`, noting the fallback on stderr."""
+    del body["reasoning_effort"]
+    print(
+        "live_probe: template cannot disable thinking; "
+        "probing with its default reasoning effort",
+        file=sys.stderr,
+    )
+
+
+# ------------------------------------------------------------------------------
+def run_stop_probe(
+    client: ProbeClient, model: str, stop_sequence: str, max_tokens, timeout
+) -> dict:
+    """Stream the counting prompt once with `stop_sequence`; return its record.
+
+    The record carries every REPORT_ROWS and STOP_ROWS key: the token counts
+    come from the stream's usage and the HTTP wall from the probe's clock; no
+    `/status` diff applies, so the other REPORT_ROWS keys are None.
+    """
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": STOP_PROMPT}],
+        "max_completion_tokens": max_tokens,
+        "temperature": 0,
+        "reasoning_effort": "none",
+        "stop": [stop_sequence],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    try:
+        reading = StopStream.read(client, body, timeout)
+    except ProbeError as error:
+        if not refuses_thinking_mode(error):
+            raise
+        drop_reasoning_effort(body)
+        reading = StopStream.read(client, body, timeout)
+    record = dict.fromkeys(key for key, _label in REPORT_ROWS + STOP_ROWS)
+    record.update(
+        request=STOP_LABEL,
+        prompt_tokens=reading.usage.get("prompt_tokens"),
+        completion_tokens=reading.usage.get("completion_tokens"),
+        http_wall_ms=reading.wall_ms,
+        stop_to_done_ms=reading.stop_to_done_ms(),
+        cycle_ms=request_cycle_ms(client, reading.response_id),
+        finish_reason=reading.finish_reason,
+        content="".join(reading.content),
+    )
+    return record
+
+
+class StopStream:
+    """The arrival times and fields of one streamed chat completion."""
+
+    # --------------------------------------------------------------------------
+    def __init__(self):
+        """Start empty: no content, no finish, no usage yet."""
+        self.response_id = None
+        self.content = []
+        self.last_content_at = None
+        self.finish_reason = None
+        self.finished_at = None
+        self.usage = {}
+        self.wall_ms = None
+
+    # --------------------------------------------------------------------------
+    @classmethod
+    def read(cls, client: ProbeClient, body: dict, timeout) -> StopStream:
+        """POST the streaming `body` and fold its events until ``[DONE]``."""
+        reading = cls()
+        started = time.monotonic()
+        for arrival, event in client.stream(CHAT_PATH, body, timeout):
+            reading.observe(arrival, event)
+        reading.wall_ms = (time.monotonic() - started) * MILLISECONDS_PER_SECOND
+        return reading
+
+    # --------------------------------------------------------------------------
+    def observe(self, arrival: float, event: dict) -> None:
+        """Fold one chunk: its id, content delta, finish reason and usage."""
+        self.response_id = event.get("id") or self.response_id
+        self.usage = event.get("usage") or self.usage
+        for choice in event.get("choices") or ():
+            text = (choice.get("delta") or {}).get("content")
+            if text:
+                self.content.append(text)
+                self.last_content_at = arrival
+            if choice.get("finish_reason"):
+                self.finish_reason = choice["finish_reason"]
+                self.finished_at = arrival
+
+    # --------------------------------------------------------------------------
+    def stop_to_done_ms(self):
+        """Return the finish chunk's arrival minus the last content delta's, in ms.
+
+        It includes decoding the stop text the server held back before it
+        matched. None without both chunks.
+        """
+        if self.last_content_at is None or self.finished_at is None:
+            return None
+        return (self.finished_at - self.last_content_at) * MILLISECONDS_PER_SECOND
+
+
+# ------------------------------------------------------------------------------
+def request_cycle_ms(client: ProbeClient, response_id: str | None):
+    """Return the request's decode wall per cycle from its `GET /requests` record.
+
+    A cycle is a draft cycle, or a decode step when the request drafted none.
+    A record still missing after the bounded wait gives None with a note on
+    stderr; a record with no cycles gives None.
+    """
+    record = None
+    if response_id:
+        record = wait_for_request_record(
+            client, response_id.removeprefix(CHAT_ID_PREFIX)
+        )
+    if record is None:
+        print(
+            f"live_probe: no GET {REQUESTS_PATH} record for {response_id} within "
+            f"{REQUEST_RECORD_WAIT_SECONDS:g} s; cycle ms unavailable",
+            file=sys.stderr,
+        )
+        return None
+    engine = record.get("engine") or {}
+    cycles = record.get("draft_cycles") or engine.get("decode_steps") or 0
+    return ratio(engine.get("decode_wall_ms") or 0, cycles)
+
+
+# ------------------------------------------------------------------------------
+def wait_for_request_record(client: ProbeClient, public_id: str):
+    """Poll `GET /requests` until it lists `public_id`; None once the wait ends.
+
+    Polls REQUEST_RECORD_POLLS + 1 times, REQUEST_RECORD_POLL_SECONDS apart.
+    """
+    for attempt in range(REQUEST_RECORD_POLLS + 1):
+        if attempt:
+            time.sleep(REQUEST_RECORD_POLL_SECONDS)
+        listed = client.request("GET", REQUESTS_PATH, timeout=STATUS_TIMEOUT_SECONDS)
+        for record in reversed(listed.get("requests") or []):
+            if record.get("id") == public_id:
+                return record
+    return None
+
+
+# ------------------------------------------------------------------------------
+def stop_failure(record: dict, stop_sequence: str, max_tokens: int) -> str | None:
+    """Return why `record` is not a stop-sequence finish, or None when it is.
+
+    `finish_reason` `stop` alone does not show it, since an EOS finish reports
+    it too: the completion must also end before `max_tokens` with content that
+    ends just before the stop text's place in the counting reply.
+    """
+    if record["finish_reason"] != STOP_FINISH_REASON:
+        return (
+            f"finish_reason is {record['finish_reason']!r}, not {STOP_FINISH_REASON!r}"
+        )
+    completion_tokens = record["completion_tokens"]
+    if not isinstance(completion_tokens, int) or completion_tokens >= max_tokens:
+        return f"usage.completion_tokens {completion_tokens} is not below {max_tokens}"
+    expected = STOP_REFERENCE[: STOP_REFERENCE.index(stop_sequence)]
+    if not (record["content"] or "").endswith(expected):
+        return f"content does not end just before the stop text {stop_sequence!r}"
+    return None
 
 
 # ------------------------------------------------------------------------------
@@ -339,14 +580,17 @@ def format_value(value) -> str:
 
 
 # ------------------------------------------------------------------------------
-def format_table(records: list[dict]) -> str:
-    """Render the records as a fixed-width table, one column per request."""
-    width = max(len(label) for _, label in REPORT_ROWS)
+def format_table(records: list[dict], rows=REPORT_ROWS) -> str:
+    """Render the records as a fixed-width table, one column per request.
+
+    `rows` holds the (record key, label) pairs shown, in order.
+    """
+    width = max(len(label) for _, label in rows)
     header = f"{'':<{width}}" + "".join(
         f"  {record['request']:>12}" for record in records
     )
     lines = [header]
-    for key, label in REPORT_ROWS:
+    for key, label in rows:
         cells = "".join(f"  {format_value(record[key]):>12}" for record in records)
         lines.append(f"{label:<{width}}{cells}")
     return "\n".join(lines)
@@ -389,8 +633,24 @@ def parse_args(argv=None):
     parser.add_argument(
         "--request-timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS
     )
+    parser.add_argument(
+        "--stop-sequence",
+        nargs="?",
+        const=DEFAULT_STOP_SEQUENCE,
+        help="instead stream one counting reply with this stop sequence "
+        f"(default {DEFAULT_STOP_SEQUENCE!r}) and report stop-to-done and cycle ms; "
+        "exits non-zero unless the stop sequence ended it",
+    )
     parser.add_argument("--json", action="store_true", help="print the records as JSON")
     args = parser.parse_args(argv)
+    if args.stop_sequence is not None:
+        if args.prompt_file:
+            parser.error("--stop-sequence and --prompt-file cannot be combined")
+        if STOP_REFERENCE.find(args.stop_sequence) <= 0:
+            parser.error(
+                "--stop-sequence must occur after the start of the counting reply "
+                f"{STOP_REFERENCE[:40]!r}..."
+            )
     if not args.prompt_file and args.prompt_tokens < MINIMUM_PROMPT_TOKENS:
         parser.error(f"--prompt-tokens must be at least {MINIMUM_PROMPT_TOKENS}")
     if args.max_tokens < 1 or args.request_timeout <= 0:
@@ -405,6 +665,8 @@ def main(argv=None) -> int:
     """Run the probe and print the report; return the process exit code."""
     args = parse_args(argv)
     client = ProbeClient(args.base_url, args.api_key)
+    if args.stop_sequence is not None:
+        return main_stop(client, args)
     if args.prompt_file:
         try:
             with open(args.prompt_file, encoding="utf-8") as prompt_file:
@@ -427,13 +689,42 @@ def main(argv=None) -> int:
     except ProbeError as error:
         print(f"live_probe: {error}", file=sys.stderr)
         return 1
-    if args.json:
+    print_report(model, records, args.json)
+    return 0
+
+
+# ------------------------------------------------------------------------------
+def main_stop(client: ProbeClient, args) -> int:
+    """Run the `--stop-sequence` probe and print its report; return the exit code.
+
+    The report prints even when the finish was not the stop sequence's; the
+    exit code is then 1.
+    """
+    try:
+        model = resolve_model(client, args.model)
+        record = run_stop_probe(
+            client, model, args.stop_sequence, args.max_tokens, args.request_timeout
+        )
+    except ProbeError as error:
+        print(f"live_probe: {error}", file=sys.stderr)
+        return 1
+    print_report(model, [record], args.json, REPORT_ROWS + STOP_ROWS)
+    failure = stop_failure(record, args.stop_sequence, args.max_tokens)
+    if failure:
+        print(f"live_probe: not a stop-sequence finish: {failure}", file=sys.stderr)
+        return 1
+    return 0
+
+
+# ------------------------------------------------------------------------------
+def print_report(model: str, records: list[dict], as_json: bool, rows=REPORT_ROWS):
+    """Print the records as JSON, or as the `rows` table with replies below it."""
+    if as_json:
         print(json.dumps({"model": model, "requests": records}, indent=2))
     else:
         print(f"model: {model}")
-        print(format_table(records))
+        print(format_table(records, rows))
         print(format_replies(records))
-    return 0
 
 
 if __name__ == "__main__":

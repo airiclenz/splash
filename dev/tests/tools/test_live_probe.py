@@ -163,6 +163,140 @@ def run_main(arguments):
     return code, output.getvalue()
 
 
+STREAM_ID = "abc123"
+# The counting reply up to the default stop sequence, as the server sends it.
+STOP_CONTENT = probe.STOP_REFERENCE[
+    : probe.STOP_REFERENCE.index(probe.DEFAULT_STOP_SEQUENCE)
+]
+# Main-thread clock readings, in call order: request start, one per stream
+# event (role, two content deltas, finish, usage) and request end.
+STREAM_CLOCK = (10.0, 10.5, 11.0, 11.25, 11.375, 11.5, 11.75)
+STREAM_STOP_TO_DONE_MS = 125.0
+STREAM_WALL_MS = 1750.0
+
+
+def request_record(draft_cycles=10, decode_steps=20, decode_wall_ms=400.0):
+    """Return the stop request's `GET /requests` record."""
+    return {
+        "id": STREAM_ID,
+        "draft_cycles": draft_cycles,
+        "engine": {"decode_wall_ms": decode_wall_ms, "decode_steps": decode_steps},
+    }
+
+
+def stream_events(content=STOP_CONTENT, finish_reason="stop", completion_tokens=38):
+    """Return the chunks of one streamed chat completion, content in two deltas."""
+    middle = len(content) // 2
+
+    def chunk(delta, finish=None):
+        return {
+            "id": f"chatcmpl-{STREAM_ID}",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+
+    usage = {"prompt_tokens": 20, "completion_tokens": completion_tokens}
+    return [
+        chunk({"role": "assistant", "content": ""}),
+        chunk({"content": content[:middle]}),
+        chunk({"content": content[middle:]}),
+        chunk({}, finish_reason),
+        {"id": f"chatcmpl-{STREAM_ID}", "choices": [], "usage": usage},
+    ]
+
+
+class StreamStubServer:
+    """Serve a scripted SSE chat completion and its `GET /requests` record.
+
+    The record is listed from the `record_after`-th `/requests` poll on (0:
+    the first); None never lists it.
+    """
+
+    def __init__(self, events, record=None, record_after=0):
+        self.events = events
+        self.record = record if record is not None else request_record()
+        self.record_after = record_after
+        self.requests_polls = 0
+        self.chat_bodies = []
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_arguments):
+                pass
+
+            def do_GET(self):
+                listed = []
+                if stub.record_after is not None:
+                    if stub.requests_polls >= stub.record_after:
+                        listed = [{"id": "other"}, stub.record]
+                stub.requests_polls += 1
+                raw = json.dumps({"requests": listed}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_POST(self):
+                length = int(self.headers["Content-Length"])
+                stub.chat_bodies.append(json.loads(self.rfile.read(length)))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b": keepalive\n\n")
+                for event in stub.events:
+                    self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exception):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+    @property
+    def base_url(self):
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+
+def scripted_clock(readings):
+    """Return a monotonic clock giving `readings` to the main thread in order.
+
+    Other threads (the stub server's) read the real clock.
+    """
+    real = probe.time.monotonic
+    main = threading.current_thread()
+    remaining = iter(readings)
+
+    def clock():
+        if threading.current_thread() is not main:
+            return real()
+        return next(remaining)
+
+    return clock
+
+
+def run_stop_main(stub, *extra):
+    """Run the probe with `--stop-sequence` against `stub` on the scripted clock.
+
+    Returns (exit code, stdout, stderr).
+    """
+    errors = io.StringIO()
+    arguments = ["--base-url", stub.base_url, "--model", MODEL, "--stop-sequence"]
+    with (
+        mock.patch.object(probe.time, "monotonic", scripted_clock(STREAM_CLOCK)),
+        contextlib.redirect_stderr(errors),
+    ):
+        code, output = run_main([*arguments, *extra])
+    return code, output, errors.getvalue()
+
+
 class LiveProbeTests(unittest.TestCase):
     def probe_json(self, statuses, refuses_effort=False):
         with StubServer(statuses, refuses_effort) as stub:
@@ -397,6 +531,148 @@ class LiveProbeTests(unittest.TestCase):
         self.assertTrue(first.startswith("aaaa\n"))
         self.assertNotEqual(first[:4], second[:4])
         self.assertEqual(first, probe.cold_prompt(64, 16, "aaaa"))
+
+
+class StopSequenceTests(unittest.TestCase):
+    def stop_json(self, stub):
+        code, output, errors = run_stop_main(stub, "--json")
+        (record,) = json.loads(output)["requests"]
+        return code, record, errors
+
+    def test_main_stopSequence_reportsStopToDoneAndCycle(self):
+        with StreamStubServer(stream_events()) as stub:
+            code, record, _errors = self.stop_json(stub)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(record["request"], "stop")
+        self.assertEqual(record["stop_to_done_ms"], STREAM_STOP_TO_DONE_MS)
+        self.assertEqual(record["cycle_ms"], 40.0)
+        self.assertEqual(record["http_wall_ms"], STREAM_WALL_MS)
+        self.assertEqual(record["content"], STOP_CONTENT)
+
+    def test_main_stopSequence_streamsTheCountingPromptWithTheStop(self):
+        with StreamStubServer(stream_events()) as stub:
+            self.stop_json(stub)
+
+        (body,) = stub.chat_bodies
+        self.assertEqual(body["stop"], [probe.DEFAULT_STOP_SEQUENCE])
+        self.assertEqual(body["messages"][0]["content"], probe.STOP_PROMPT)
+        self.assertTrue(body["stream"])
+        self.assertEqual(body["stream_options"], {"include_usage": True})
+        self.assertEqual(body["reasoning_effort"], "none")
+
+    def test_main_stopRecord_carriesEveryReportRowKey(self):
+        with StreamStubServer(stream_events()) as stub:
+            _code, record, _errors = self.stop_json(stub)
+
+        for key, _label in probe.REPORT_ROWS + probe.STOP_ROWS:
+            self.assertIn(key, record)
+        self.assertEqual(record["prompt_tokens"], 20)
+        self.assertEqual(record["completion_tokens"], 38)
+        self.assertIsNone(record["decode_tokens_per_second"])
+        self.assertIsNone(record["host_wired_bytes"])
+
+    def test_main_noDraftCycles_dividesDecodeWallBySteps(self):
+        record = request_record(draft_cycles=0, decode_steps=20)
+
+        with StreamStubServer(stream_events(), record=record) as stub:
+            _code, reported, _errors = self.stop_json(stub)
+
+        self.assertEqual(reported["cycle_ms"], 20.0)
+
+    def test_main_requestRecordLate_isStillFound(self):
+        with StreamStubServer(stream_events(), record_after=3) as stub:
+            code, record, _errors = self.stop_json(stub)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(record["cycle_ms"], 40.0)
+        self.assertEqual(stub.requests_polls, 4)
+
+    def test_main_requestRecordNeverArrives_reportsCycleUnavailable(self):
+        with StreamStubServer(stream_events(), record_after=None) as stub:
+            code, record, errors = self.stop_json(stub)
+
+        self.assertEqual(code, 0)
+        self.assertIsNone(record["cycle_ms"])
+        self.assertIn("cycle ms unavailable", errors)
+        self.assertEqual(stub.requests_polls, probe.REQUEST_RECORD_POLLS + 1)
+
+    def test_main_finishReasonLength_exitsNonZero(self):
+        events = stream_events(finish_reason="length", completion_tokens=128)
+
+        with StreamStubServer(events) as stub:
+            code, record, errors = self.stop_json(stub)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(record["finish_reason"], "length")
+        self.assertIn("not a stop-sequence finish", errors)
+
+    def test_main_stopWithoutStopMatchEvidence_exitsNonZero(self):
+        cases = {
+            "EOS before the stop text": stream_events(content="Sure, 1, 2, 3."),
+            "completion at max_tokens": stream_events(completion_tokens=128),
+        }
+        for name, events in cases.items():
+            with self.subTest(name), StreamStubServer(events) as stub:
+                code, _record, errors = self.stop_json(stub)
+
+                self.assertEqual(code, 1)
+                self.assertIn("not a stop-sequence finish", errors)
+
+    def test_main_stopSequenceTable_addsStopRowsBelowReportRows(self):
+        with StreamStubServer(stream_events()) as stub:
+            code, output, _errors = run_stop_main(stub)
+
+        self.assertEqual(code, 0)
+        rows = probe.REPORT_ROWS + probe.STOP_ROWS
+        lines = output.splitlines()
+        self.assertEqual(lines[1].split(), ["stop"])
+        self.assertEqual(
+            [row.split("  ")[0].strip() for row in lines[2 : 2 + len(rows)]],
+            [label for _key, label in rows],
+        )
+        self.assertEqual(lines[2 + len(rows) - 2].split()[-1], "125")
+
+    def test_main_withoutStopSequence_recordsCarryNoStopKeys(self):
+        statuses = [snapshot(), COLD_AFTER, COLD_AFTER, REPEAT_AFTER]
+
+        with StubServer(statuses) as stub:
+            code, output = run_main(
+                ["--base-url", stub.base_url, "--model", MODEL, "--json"]
+            )
+
+        self.assertEqual(code, 0)
+        for record in json.loads(output)["requests"]:
+            for key, _label in probe.STOP_ROWS:
+                self.assertNotIn(key, record)
+
+    def test_parseArgs_stopSequence_takesValueOrDefault(self):
+        base = ["--base-url", "http://127.0.0.1:1"]
+
+        self.assertIsNone(probe.parse_args(base).stop_sequence)
+        self.assertEqual(
+            probe.parse_args([*base, "--stop-sequence"]).stop_sequence,
+            probe.DEFAULT_STOP_SEQUENCE,
+        )
+        self.assertEqual(
+            probe.parse_args([*base, "--stop-sequence", ", 30,"]).stop_sequence,
+            ", 30,",
+        )
+
+    def test_parseArgs_unusableStopSequence_fails(self):
+        base = ["--base-url", "http://127.0.0.1:1", "--stop-sequence"]
+        cases = {
+            "absent from the counting reply": [*base, "seventy"],
+            "at its very start": [*base, "1, 2"],
+            "with --prompt-file": [*base, ", 20,", "--prompt-file", "prompt.txt"],
+        }
+        for name, arguments in cases.items():
+            with (
+                self.subTest(name),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                probe.parse_args(arguments)
 
 
 class StatusDeltaTests(unittest.TestCase):

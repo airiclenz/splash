@@ -3809,6 +3809,20 @@ text as the user message in one cold request with no repeat, ignoring
 `--prompt-tokens`; use it to replay a fixed prompt, such as a long-context
 reproduction.
 
+`--stop-sequence [S]` instead streams one greedy counting reply ("Count from 1
+to 60, separated by commas.") with `stop: [S]` (default `, 20,`; S must occur
+past the start of `1, 2, ..., 60`) and adds two rows: `stop to done ms`, the
+arrival of the finish chunk minus that of the last content delta (it includes
+decoding the stop text the server held back), and `cycle ms`, the request's
+`GET /requests` `engine.decode_wall_ms` over its `draft_cycles`, or over
+`engine.decode_steps` without the draft. That record lands after native
+completion, which can follow the client's done, so `/requests` is polled for up
+to 5 s; a record still missing leaves `cycle ms` `unavailable` with a note on
+stderr. The stop record's `/status`-diffed rows are `unavailable`. The probe
+exits non-zero unless the finish reason is `stop`, `usage.completion_tokens` is
+below `--max-tokens` and the content ends just before the stop text: an EOS
+finish reports `stop` too. It cannot be combined with `--prompt-file`.
+
 To see what a long cold prefill costs a request that is already decoding, run
 the two-lane contended probe against the same idle server, once per
 `--contended-prefill-rows` floor you compare:
