@@ -512,6 +512,14 @@ class _JobState:
     started_at: float | None = None
     first_token_at: float | None = None
     stopped_at: float | None = None
+    # Whether the job carried image pixels: submit clears them once the frame
+    # is built, so such a job cannot be re-run after an engine failure.
+    carried_pixels: bool = False
+    # Set when the request is resubmitted to a restarted engine; a request is
+    # re-run at most once.
+    retried: bool = False
+    # The last prompt progress forwarded, which a re-run's progress must pass.
+    progress_forwarded: int = 0
 
     def detach(self):
         self.detached = True
@@ -561,6 +569,10 @@ class NativeBackend:
         # (thinking_end_tokens).
         self.thinking_end = thinking_end
         self.active = {}
+        # Admitted requests whose engine failed before their first token,
+        # waiting under self.lock for the relaunch that resubmits them, by
+        # request id; they stay in self.active.
+        self.parked = {}
         self.closing = False
         self.lock = threading.RLock()
         self.status_snapshot = None
@@ -614,15 +626,20 @@ class NativeBackend:
             if self.status_snapshot is not None:
                 # A failed engine's readiness is no longer evidence.
                 self.status_snapshot["ready"] = False
+            stranded = []
             if (unchangeable := self.runtime.fatal_error) is not None:
                 # Changed limits would recur at every relaunch; the error says
                 # how to recover.
-                self._stop_restarting_locked(str(unchangeable))
-            elif (delay := self._restart_delay_locked(served_seconds)) is None:
+                stranded = self._stop_restarting_locked(str(unchangeable))
+            elif (
+                delay := self._restart_delay_locked(
+                    served_seconds, counted=not self._served_only_reruns_locked()
+                )
+            ) is None:
                 # The runtime writes an engine's crash trace before it reports
                 # that engine's failure, to the listener or from wait_ready.
                 trace = self.runtime.last_crash_trace
-                self._stop_restarting_locked(
+                stranded = self._stop_restarting_locked(
                     f"the inference engine failed {self.failures} times in a row, "
                     f"each within {CRASH_LOOP_WINDOW_SECONDS:.0f} s of starting "
                     f"({error}); Splash stopped restarting it. "
@@ -640,25 +657,62 @@ class NativeBackend:
         print_status(f"{event} · {error}", error=True)
         if stopped is not None:
             print_status(f"Engine stopped · {stopped}", error=True)
+            self._end_parked(stranded, APIError(500, stopped, "engine_failed"))
 
-    def _restart_delay_locked(self, served_seconds):
+    def _restart_delay_locked(self, served_seconds, counted=True):
         """Seconds until the relaunch a failure owes; None once a crash loop
-        stops relaunching."""
+        stops relaunching. An uncounted failure leaves the crash-loop count
+        as it is."""
         if served_seconds >= CRASH_LOOP_WINDOW_SECONDS:
             self.failures = 0
-        self.failures += 1
+        if counted:
+            self.failures += 1
         if self.failures >= CRASH_LOOP_LIMIT:
             return None
-        if self.failures == 1:
+        if self.failures <= 1:
             return 0.0
         return RESTART_BACKOFF_SECONDS * 2 ** (self.failures - 2)
 
+    def _served_only_reruns_locked(self):
+        """Whether the failed engine had requests in service and every one was
+        a re-run, a failure that does not count toward the crash loop: each
+        request is re-run once, so it cannot loop.
+
+        The listener runs before the failed engine's calls complete, so its
+        requests are the active ones without a queued terminal; parked ones
+        have theirs. O(active), on an engine failure only."""
+        serving = False
+        for state in self.active.values():
+            if state.terminal_enqueued:
+                continue
+            if not state.retried:
+                return False
+            serving = True
+        return serving
+
     def _stop_restarting_locked(self, message):
         """Stop relaunching for good; there is no way back but a server
-        restart."""
+        restart. Returns the parked requests, detached, whose terminal the
+        caller puts once it has released the lock."""
         self.restart_due = None
         self.fatal_error = message
         self.engine_error = message
+        return self._drain_parked_locked()
+
+    def _drain_parked_locked(self):
+        """Detach and return every request waiting for its re-run."""
+        parked = list(self.parked.values())
+        self.parked.clear()
+        for state in parked:
+            self._detach_locked(state)
+        return parked
+
+    def _end_parked(self, states, error):
+        """Record drained parked requests and put `error` as each one's
+        terminal; outside the lock, as the record logs."""
+        for state in states:
+            self._record(state.job, error=error)
+            state.job.events.put(("error", error))
 
     def _ensure_recovery_locked(self):
         """Start the recovery worker when work is owed and none runs.
@@ -726,10 +780,20 @@ class NativeBackend:
             self._failed("Engine restart failed", error, 0.0)
             return
         with self.lock:
-            # A failure after Ready may already owe the next relaunch.
+            # A failure after Ready may already owe the next relaunch, which
+            # then resubmits the parked requests.
+            reruns = []
             if self.restart_due == due:
                 self.restart_due = None
+                reruns = list(self.parked.values())
+                self.parked.clear()
+                for state in reruns:
+                    state.retried = True
             self.refresh_due = True
+        for state in reruns:
+            # The request is rebuilt, never stored: a parked job carried no
+            # pixels, and its prompt is the job's own.
+            self._admit(state, self._generation_request(state.job))
 
     def refusal(self):
         """The error a request not yet admitted gets now; None while the
@@ -1049,51 +1113,40 @@ class NativeBackend:
             self.reasoning_loop_limit if job.thinking else 0,
             job.thinking,
         )
-        state = _JobState(job, streamer)
+        state = _JobState(job, streamer, carried_pixels=bool(job.image_pixels))
         request = self._generation_request(job)
         # The engine copies the pixels at admission; only the frame written
         # below needs them, and the job lives until the response ends.
         job.image_pixels = b""
+        self._admit(state, request)
 
-        def on_event(call, event):
-            with self.lock:
-                if state.detached:
-                    return
-                if state.call is None:
-                    state.call = call
-                cancel = job.cancelled.is_set() or self.closing
-            # A raise here is the call's callback error, which cancels it.
-            self._on_event(state, event)
-            if cancel:
-                call.cancel()
+    def _admit(self, state, request):
+        """Write `state`'s `request` to the engine, with `state` in `active`.
 
-        def on_complete(call):
-            with self.lock:
-                if state.detached or state.terminal_enqueued:
-                    return
-                if state.call is None:
-                    state.call = call
-                state.terminal_enqueued = True
-                self.finalizer_queue.put(functools.partial(self._finalize, state, call))
-
+        A new request and a re-run after an engine restart both come through
+        here. A re-run forgets its failed call first, so the new call's
+        completion is the one the finalizer takes. A refusal, or a server
+        shutting down, is the request's terminal; a re-run's is recorded too,
+        as the request was admitted once.
+        """
+        job = state.job
         with self.lock:
             if self.closing:
-                state.detach()
-                job.events.put(
-                    (
-                        "error",
-                        APIError(
-                            503,
-                            "server is shutting down",
-                            "server_shutdown",
-                        ),
-                    )
-                )
-                return
-            self.active[job.request_id] = state
+                self._detach_locked(state)
+                refusal = APIError(503, "server is shutting down", "server_shutdown")
+            else:
+                refusal = None
+                state.terminal_enqueued = False
+                state.call = None
+                self.active[job.request_id] = state
+        if refusal is not None:
+            self._refuse(state, refusal)
+            return
         try:
             call = self.runtime.submit(
-                request, on_event=on_event, on_complete=on_complete
+                request,
+                on_event=functools.partial(self._call_event, state),
+                on_complete=functools.partial(self._call_completed, state),
             )
             with self.lock:
                 if not state.detached:
@@ -1118,7 +1171,36 @@ class NativeBackend:
                 ):
                     # Not admitted: refused as a request arriving now would be.
                     refusal = self.refusal()
-                job.events.put(("error", refusal or self._api_error(error)))
+                self._refuse(state, refusal or self._api_error(error))
+
+    def _refuse(self, state, error):
+        """Put a request's admission refusal; a re-run's is also recorded."""
+        if state.retried:
+            self._record(state.job, error=error)
+        state.job.events.put(("error", error))
+
+    def _call_event(self, state, call, event):
+        """The runtime call's event listener, on the reader thread."""
+        with self.lock:
+            if state.detached:
+                return
+            if state.call is None:
+                state.call = call
+            cancel = state.job.cancelled.is_set() or self.closing
+        # A raise here is the call's callback error, which cancels it.
+        self._on_event(state, event)
+        if cancel:
+            call.cancel()
+
+    def _call_completed(self, state, call):
+        """The runtime call's completion listener: queues the finalizer."""
+        with self.lock:
+            if state.detached or state.terminal_enqueued:
+                return
+            if state.call is None:
+                state.call = call
+            state.terminal_enqueued = True
+            self.finalizer_queue.put(functools.partial(self._finalize, state, call))
 
     def _detach_locked(self, state):
         state.detach()
@@ -1135,6 +1217,8 @@ class NativeBackend:
             )
             with self.lock:
                 job.cache = cache
+            # A re-run starts again; its client has had its start.
+            first_start = state.started_at is None
             state.started_at = time.monotonic()
             record = {
                 "outcome": "started",
@@ -1152,8 +1236,14 @@ class NativeBackend:
             # that stops draining must not hold up the reader thread, which
             # delivers every request's tokens and masks.
             self.finalizer_queue.put(functools.partial(self._log, record))
-            job.events.put(("start", None))
+            if first_start:
+                job.events.put(("start", None))
         elif isinstance(event, wire.PromptProgressEvent):
+            # A re-run's prefill starts over; its client's progress never
+            # regresses.
+            if state.retried and event.processed_tokens <= state.progress_forwarded:
+                return
+            state.progress_forwarded = event.processed_tokens
             job.events.put(
                 (
                     "progress",
@@ -1179,9 +1269,14 @@ class NativeBackend:
         call = None
         with self.lock:
             job.cancelled.set()
-            state = self.active.get(job.request_id)
-            if state is not None:
+            # A parked request is dropped: it has no call to cancel.
+            parked = self.parked.pop(job.request_id, None)
+            if parked is not None:
+                self._detach_locked(parked)
+            elif (state := self.active.get(job.request_id)) is not None:
                 call = state.call
+        if parked is not None:
+            self._end_parked([parked], self._engine_stopped_error())
         if call is not None:
             call.cancel()
 
@@ -1197,6 +1292,7 @@ class NativeBackend:
         job = state.job
         error = None
         result = None
+        parked = False
         try:
             done = call.result(0)
             if call.callback_error is not None:
@@ -1226,27 +1322,30 @@ class NativeBackend:
             # An admitted request ends with EngineUnhealthy or ProtocolFatal
             # only when the engine running it fails: it stopped or broke the
             # protocol. The listener has already decided whether that engine
-            # restarts; the console names the failure.
+            # restarts; the console names the failure. A request without
+            # output yet waits for the restarted engine instead.
             with self.lock:
                 fatal_error = self.fatal_error
+                parked = fatal_error is None and self._park_locked(state)
             if fatal_error is not None:
                 error = APIError(500, fatal_error, "engine_failed")
-            else:
-                error = APIError(
-                    503,
-                    "the inference engine stopped unexpectedly and is restarting; "
-                    "retry the request",
-                    "runtime_unavailable",
-                )
+            elif not parked:
+                error = self._engine_stopped_error()
         except Exception as unexpected:
             error = self._api_error(unexpected)
         finally:
-            decode_fallbacks = state.streamer.decode_fallbacks
-            with self.lock:
-                shutdown_requested = state.shutdown_requested
-                client_done = state.client_done
-                self.tokenizer_decode_fallbacks += decode_fallbacks
-                self._detach_locked(state)
+            # A parked request stays active, its streamer carried into the
+            # re-run.
+            if not parked:
+                decode_fallbacks = state.streamer.decode_fallbacks
+                with self.lock:
+                    shutdown_requested = state.shutdown_requested
+                    client_done = state.client_done
+                    self.tokenizer_decode_fallbacks += decode_fallbacks
+                    self._detach_locked(state)
+        if parked:
+            print_status(f"Retry · request {job.request_id} · after the engine restart")
+            return
         if shutdown_requested:
             # Once close() has claimed an active HTTP request, its public
             # terminal is deterministic even if the native cancellation and
@@ -1273,6 +1372,37 @@ class NativeBackend:
             # a shutdown after it changes only the record.
             return
         job.events.put(("error", error) if error else ("done", result))
+
+    def _park_locked(self, state):
+        """Park `state` for one re-run on the restarted engine, and say
+        whether it was.
+
+        Only while a relaunch is owed, so the relaunch that clears it takes
+        the request; a cancelled request, a re-run, a job that carried image
+        pixels and one whose output (or early done) began end instead.
+        """
+        if (
+            self.closing
+            or self.restart_due is None
+            or state.retried
+            or state.carried_pixels
+            or state.client_done
+            or state.first_token_at is not None
+            or state.job.cancelled.is_set()
+        ):
+            return False
+        self.parked[state.job.request_id] = state
+        return True
+
+    @staticmethod
+    def _engine_stopped_error():
+        """The error of a request whose engine failed under it."""
+        return APIError(
+            503,
+            "the inference engine stopped unexpectedly and is restarting; "
+            "retry the request",
+            "runtime_unavailable",
+        )
 
     def _finish_early(self, state):
         """Put an unconstrained job's done at its stop match, ahead of the
@@ -1504,6 +1634,11 @@ class NativeBackend:
             for state in self.active.values():
                 state.shutdown_requested = True
                 calls.append(state.call)
+            # Their failed calls are done; close's stranded pass skips them.
+            parked = self._drain_parked_locked()
+        self._end_parked(
+            parked, APIError(503, "server is shutting down", "server_shutdown")
+        )
         self.wakeup.set()
         self.health_refresh_wanted.set()
         for call in calls:

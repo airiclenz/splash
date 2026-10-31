@@ -694,9 +694,16 @@ class ServerRecoveryTests(HarnessTestCase):
         self.assertTrue(transport["stopped"])
         self.assertFalse(transport["recovering"])
 
+    @staticmethod
+    def events_to_terminal(job):
+        events = []
+        while not events or events[-1][0] not in ("done", "error"):
+            events.append(job.events.get(timeout=1))
+        return events
+
     def test_engine_failure_under_a_request_asks_its_client_to_retry(self):
-        # The engine stops, or breaks the protocol; either way it fails, and
-        # its requests with it.
+        # The engine stops, or breaks the protocol, after the request's first
+        # token; either way it fails, and its requests with it.
         protocol_failure = wire.ErrorEvent(
             wire.FailureClass.PROTOCOL_FATAL,
             0,
@@ -723,9 +730,12 @@ class ServerRecoveryTests(HarnessTestCase):
                 job = make_job()
                 with mock.patch.object(backend_api, "print_status") as console:
                     backend.submit(job)
-                    factory.processes[0].stdin.wait_for(wire.RequestFrame)
-                    fail(factory.processes[0])
-                    kind, error = job.events.get(timeout=1)
+                    process = factory.processes[0]
+                    (frame,) = process.stdin.wait_for(wire.RequestFrame)
+                    process.send(wire.StartEvent(frame.request_id, 0, 0))
+                    process.send(wire.TokensEvent(frame.request_id, 0, (7,)))
+                    fail(process)
+                    kind, error = self.events_to_terminal(job)[-1]
                     self.wait_until(lambda: console.called)
                 self.assertEqual(kind, "error")
                 self.assertEqual(
@@ -741,6 +751,42 @@ class ServerRecoveryTests(HarnessTestCase):
                 self.assertEqual(
                     console.call_args_list[0].args[0], f"Engine failed · {reason}"
                 )
+
+    def test_engine_failure_before_the_first_token_reruns_the_request(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
+        backend = self.backend(runtime)
+        job = make_job()
+        with mock.patch.object(backend_api, "print_status") as console:
+            backend.submit(job)
+            failed = factory.processes[0]
+            (frame,) = failed.stdin.wait_for(wire.RequestFrame)
+            failed.send(wire.StartEvent(frame.request_id, 0, 0))
+            failed.close_stdout()
+            self.wait_until(lambda: len(factory.processes) == 2, 2)
+            relaunched = factory.processes[1]
+            (frame,) = relaunched.stdin.wait_for(wire.RequestFrame, timeout=2)
+            self.assertEqual(frame.prompt_tokens, (11, 12, 13, 14))
+            relaunched.send(wire.StartEvent(frame.request_id, 0, 0))
+            relaunched.send(wire.TokensEvent(frame.request_id, 0, (7,)))
+            relaunched.send(
+                wire.DoneEvent(
+                    frame.request_id, wire.FinishReason.STOP, 4, 1, 100, 200, 350, ()
+                )
+            )
+            events = self.events_to_terminal(job)
+        kinds = [kind for kind, _ in events]
+        self.assertEqual(kinds.count("start"), 1)
+        self.assertEqual(kinds[-1], "done")
+        self.assertNotIn("error", kinds)
+        self.assertIn(
+            mock.call(f"Retry · request {job.request_id} · after the engine restart"),
+            console.call_args_list,
+        )
+        self.wait_until(lambda: not backend.active)
+        self.assertEqual(backend.failures, 1)
 
     def test_recovery_refusals_carry_the_last_engine_failure(self):
         runtime = RecoveringRuntime()

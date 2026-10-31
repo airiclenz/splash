@@ -45,7 +45,13 @@ restarts count) Splash stops restarting it, and requests get 500 `engine_failed`
 until the server is restarted; its message names the crash trace when
 `SPLASH_CRASH_TRACE=1` recorded one
 ([crash traces](#failures-and-crash-traces)). Meanwhile generation requests get
-503 `engine_recovering`, whose message names the last failure. An engine whose
+503 `engine_recovering`, whose message names the last failure. A request the
+failed engine was running that has no output yet, and carried no image, is
+re-run once on the restarted engine, its client seeing one start and no error;
+one with output, an image, or whose re-run fails too, gets 503
+`runtime_unavailable`, and one waiting for its re-run gets 500 `engine_failed`
+if restarts stop. A failure while the engine ran only re-run requests does not
+count toward the three. An engine whose
 loop leaves a status request unanswered for 30 seconds, while requests are
 pending or during a background status refresh, is failed and restarted by the
 same rules. A restarted engine serves what the first one announced: the same
@@ -1645,7 +1651,7 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | 500 | `model_result_invalid` | The model produced a non-finite result for this request; others continue ([failures](#failures-and-crash-traces)). |
 | 500 | `internal_server_error` | A fault in the server, not in the request; the console names the error's type and the server line it arose at. |
 | 501 | `not_implemented` | The request's method is not one the server has. |
-| 503 | `engine_recovering`, `runtime_unavailable` | The engine is restarting; retry. |
+| 503 | `engine_recovering`, `runtime_unavailable` | The engine is restarting; retry. A request with no output yet (and no image) is re-run once instead ([engine restarts](#engine-restarts-and-sleep)). |
 | 503 | `server_shutdown` | The server is stopping: requests that arrive or are still running get it. |
 | 503 | `frontend_overloaded` | The server holds `--queue-size` requests, every connection slot holds a request ([request limits](#request-limits-and-timeouts)), or a shared input budget or request preparation is full; retry. |
 | 503 | `resource_timeout` | The request waited for memory, or for the SSD cache's room for its KV, and got none in time; retry, or free memory. |

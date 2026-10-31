@@ -1,4 +1,5 @@
 import array
+import functools
 import gc
 import io
 import math
@@ -1242,6 +1243,236 @@ class ScriptedStreamer:
 
     def count_reasoning_tokens(self, enabled, tool_calls=False):
         return len(self.token_ids) if enabled else 0
+
+
+class RelaunchingRuntime(DrivenRuntime):
+    """A DrivenRuntime the test fails, whose relaunch waits for the test to
+    put its outcome: None for Ready, or the error the relaunch raises. In
+    raise_before_call mode its submit first marks the engine not ready, as an
+    engine that failed again between Ready and the submit would be."""
+
+    def __init__(self):
+        super().__init__()
+        self.outcomes = queue.Queue()
+        self.before_refusal = None
+
+    def fail(self, transport, served=1.0):
+        self.ready = False
+        transport._engine_failed(EngineUnhealthy("native protocol reached EOF"), served)
+
+    def wait_ready(self, timeout=None):
+        outcome = self.outcomes.get(timeout=3)
+        if outcome is not None:
+            raise outcome
+        self.ready = True
+        return True
+
+    def submit(self, request, *, on_event=None, on_complete=None):
+        if self.mode == "raise_before_call":
+            self.ready = False
+            if self.before_refusal is not None:
+                self.before_refusal()
+        return super().submit(request, on_event=on_event, on_complete=on_complete)
+
+    def close(self):
+        self.outcomes.put(runtime.RuntimeClosed("runtime is closed"))
+        super().close()
+
+
+class NativeBackendRetryTests(unittest.TestCase):
+    """A request whose engine fails before its first token is re-run once on
+    the restarted engine."""
+
+    def setUp(self):
+        patcher = mock.patch.object(backend_api, "print_status")
+        self.console = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.start_transport()
+
+    def start_transport(self):
+        self.native = RelaunchingRuntime()
+        self.transport = backend_api.NativeBackend(
+            self.native, DigitTokenizer(), lambda _record: None
+        )
+        self.addCleanup(self.transport.close)
+
+    @staticmethod
+    def wait_until(predicate, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() >= deadline:
+                raise AssertionError("test condition did not become true")
+            time.sleep(0.001)
+
+    @staticmethod
+    def events_to_terminal(job):
+        events = []
+        while not events or events[-1][0] not in ("done", "error"):
+            events.append(job.events.get(timeout=1))
+        return events
+
+    def fail_call(self, call, *, emitted=()):
+        """Fail the engine under `call` after it emitted `emitted`, in the
+        runtime's order: the listener, then the call's completion."""
+        call.emit(wire.StartEvent(call.request_id, 0, 0))
+        for event in emitted:
+            call.emit(event)
+        self.native.fail(self.transport)
+        call.complete(error=EngineUnhealthy("native protocol reached EOF"))
+
+    def parked(self, job):
+        """Submit `job` and fail its engine before its first token."""
+        self.transport.submit(job)
+        self.fail_call(self.native.calls[-1])
+        self.wait_until(lambda: job.request_id in self.transport.parked)
+
+    def relaunch(self):
+        self.native.outcomes.put(None)
+        self.wait_until(lambda: self.transport.recovery is None)
+
+    def assert_error(self, job, status, code):
+        kind, error = self.events_to_terminal(job)[-1]
+        self.assertEqual(kind, "error")
+        self.assertEqual((error.status, error.code), (status, code))
+
+    def test_request_without_output_is_rerun_once_and_completes(self):
+        job = make_job()
+        self.parked(job)
+        self.assertEqual(len(self.native.calls), 1)
+        self.relaunch()
+        self.assertEqual(len(self.native.calls), 2)
+        first, second = self.native.requests
+        # Rebuilt from the job, not kept from the first submit.
+        self.assertIsNot(second, first)
+        self.assertEqual(second.frame, first.frame)
+        call = self.native.calls[1]
+        call.emit(wire.StartEvent(call.request_id, 0, 0))
+        call.emit(wire.TokensEvent(call.request_id, 0, (7,)))
+        call.complete(result=success_result(call, tokens=(7,)))
+        kinds = [kind for kind, _ in self.events_to_terminal(job)]
+        self.assertEqual(kinds.count("start"), 1)
+        self.assertEqual(kinds[-1], "done")
+        self.assertNotIn("error", kinds)
+        self.wait_until(lambda: not self.transport.active)
+        self.console.assert_any_call(
+            f"Retry · request {job.request_id} · after the engine restart"
+        )
+
+    def test_request_with_output_is_not_rerun(self):
+        job = make_job()
+        self.transport.submit(job)
+        call = self.native.calls[0]
+        self.fail_call(call, emitted=[wire.TokensEvent(call.request_id, 0, (7,))])
+        self.assert_error(job, 503, "runtime_unavailable")
+        self.relaunch()
+        self.assertEqual(len(self.native.calls), 1)
+        self.assertFalse(self.transport.active)
+
+    def test_request_that_carried_image_pixels_is_not_rerun(self):
+        job = make_job()
+        job.image_spans = (wire.ImageSpan(0, 1, 1, 1, 1, 2),)
+        job.image_pixels = bytes(job.image_spans[0].pixel_bytes)
+        self.transport.submit(job)
+        self.fail_call(self.native.calls[0])
+        self.assert_error(job, 503, "runtime_unavailable")
+        self.relaunch()
+        self.assertEqual(len(self.native.calls), 1)
+        self.assertFalse(self.transport.active)
+
+    def test_rerun_that_fails_again_is_not_rerun_twice(self):
+        job = make_job()
+        self.parked(job)
+        self.relaunch()
+        self.fail_call(self.native.calls[1])
+        self.assert_error(job, 503, "runtime_unavailable")
+        self.relaunch()
+        self.assertEqual(len(self.native.calls), 2)
+        self.assertFalse(self.transport.active)
+
+    def test_failure_under_only_reruns_is_not_counted(self):
+        job = make_job()
+        self.parked(job)
+        self.assertEqual(self.transport.failures, 1)
+        self.relaunch()
+        self.fail_call(self.native.calls[1])
+        self.assertEqual(self.transport.failures, 1)
+        self.assert_error(job, 503, "runtime_unavailable")
+
+    def test_failure_with_only_a_parked_request_is_counted(self):
+        job = make_job()
+        self.parked(job)
+        self.native.fail(self.transport)
+        self.assertEqual(self.transport.failures, 2)
+        self.assertIn(job.request_id, self.transport.parked)
+
+    def test_idle_engine_failure_is_counted(self):
+        self.native.fail(self.transport)
+        self.assertEqual(self.transport.failures, 1)
+
+    def test_rerun_progress_never_regresses(self):
+        job = make_job()
+        self.transport.submit(job)
+        call = self.native.calls[0]
+        self.fail_call(call, emitted=[wire.PromptProgressEvent(call.request_id, 3, 10)])
+        self.wait_until(lambda: job.request_id in self.transport.parked)
+        self.relaunch()
+        call = self.native.calls[1]
+        call.emit(wire.StartEvent(call.request_id, 0, 0))
+        for processed in (2, 3, 4):
+            call.emit(wire.PromptProgressEvent(call.request_id, processed, 10))
+        call.complete(result=success_result(call))
+        progress = [
+            payload["processed"]
+            for kind, payload in self.events_to_terminal(job)
+            if kind == "progress"
+        ]
+        self.assertEqual(progress, [3, 4])
+
+    def test_rerun_refused_at_admission_gets_the_submit_refusal(self):
+        # The engine failed again between Ready and the resubmit.
+        for fatal, expected in (
+            (None, (503, "engine_recovering")),
+            ("engine stopped", (500, "engine_failed")),
+        ):
+            with self.subTest(expected=expected):
+                self.start_transport()
+                job = make_job()
+                self.parked(job)
+                self.native.mode = "raise_before_call"
+                if fatal is not None:
+                    self.native.before_refusal = functools.partial(
+                        setattr, self.transport, "fatal_error", fatal
+                    )
+                self.native.outcomes.put(None)
+                self.assert_error(job, *expected)
+                self.assertEqual(self.native.submit_attempts, 2)
+                self.assertFalse(self.transport.active)
+
+    def test_parked_request_fails_when_restarts_stop(self):
+        job = make_job()
+        self.parked(job)
+        self.transport.failures = backend_api.CRASH_LOOP_LIMIT - 1
+        self.native.fail(self.transport)
+        self.assert_error(job, 500, "engine_failed")
+        self.assertFalse(self.transport.parked)
+        self.assertFalse(self.transport.active)
+
+    def test_parked_request_ends_with_server_shutdown_on_close(self):
+        job = make_job()
+        self.parked(job)
+        self.transport.close()
+        self.assert_error(job, 503, "server_shutdown")
+        self.assertEqual(len(self.native.calls), 1)
+        self.assertFalse(self.transport.active)
+
+    def test_cancelled_parked_request_is_not_rerun(self):
+        job = make_job()
+        self.parked(job)
+        self.transport.cancel(job)
+        self.assertFalse(self.transport.parked)
+        self.relaunch()
+        self.assertEqual(len(self.native.calls), 1)
+        self.assertFalse(self.transport.active)
 
 
 class NativeBackendEarlyDoneTests(unittest.TestCase):
