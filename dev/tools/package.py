@@ -71,6 +71,7 @@ SERVER_FILES = (
     "schema_validation.py",
     "crash_trace.py",
     "release_identity.py",
+    "prefill_bounds.py",
     "chat.html",
     "favicon.svg",
 )
