@@ -1,8 +1,10 @@
 import io
+import json
 import math
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -17,6 +19,23 @@ ROOT = Path(__file__).resolve().parents[3]
 SERVER_ARGS = ["model", "--model", "owner/repo"]
 LAUNCHER_ARGS = ["serve", "--model", "owner/repo"]
 PARSERS = ((api.parse_args, SERVER_ARGS), (launcher.parse_args, LAUNCHER_ARGS))
+# A Mac model and macOS version, and a server start the display-stall tests
+# make, with its engine command under the default options.
+MAC = ("Mac14,2", "26.0")
+STALL_PACKAGE = api.ROOT / "install/models/community/custom-splash"
+STALL_ARGS = [str(STALL_PACKAGE), "--model", "community/custom-splash"]
+STALL_COMMAND = [
+    str(api.ROOT / "build/splash"),
+    "serve-native",
+    str(STALL_PACKAGE),
+    "auto",
+    "auto",
+]
+STALL = api.engine_runtime.EngineUnhealthy(
+    "Metal backend is unhealthy: Metal command 117 failed (sparse event 0): "
+    "Impacting Interactivity "
+    "(0000000e:kIOGPUCommandBufferCallbackErrorImpactingInteractivity)"
+)
 
 
 def values(flag, accepted, refused, repeatable=False):
@@ -293,8 +312,19 @@ class ServeOptionsTests(unittest.TestCase):
             "SPLASH_THINKING_END_TEXT",
             "SPLASH_MAX_REASONING_EFFORT",
             "SPLASH_REASONING_LOOP_LIMIT",
+            "SPLASH_PREFILL_BOUND_MS",
+            "SPLASH_PREFILL_BOUND_SCOPE",
         ):
             os.environ.pop(name, None)
+        # Nor the prefill bound learned on the Mac running the tests.
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.learned_bound = directory / "prefill-bound.json"
+        self.enterContext(
+            mock.patch.object(api.prefill_bounds, "PATH", self.learned_bound)
+        )
+        self.enterContext(
+            mock.patch.object(api.prefill_bounds, "machine_key", return_value=MAC)
+        )
 
     def refuse(self, parse, arguments):
         with (
@@ -665,6 +695,173 @@ class ServeOptionsTests(unittest.TestCase):
             )
             full = stall_policy([*required, "--prefill-mode", "full"])
             self.assertIsNone(full(stall))
+        # Without a save, no abort is kept for later starts.
+        self.assertFalse(self.learned_bound.exists())
+
+    def start(self, argv):
+        """(command, policy) of a server started with argv, the learned bound
+        recalled and the abort policy built as main() builds them."""
+        parsed = api.parse_args([*STALL_ARGS, *argv])
+        learned, save = api._recall_learned_bound(parsed)
+        options = (
+            {}
+            if learned is None
+            else {"prefill_bound_scope": learned[0], "prefill_bound_ms": learned[1]}
+        )
+        command = api._native_command(parsed, parsed.model_root, **options)
+        policy = api._shorter_prefill_after_display_stall(
+            parsed, parsed.model_root, learned, save
+        )
+        return command, policy
+
+    def abort(self, policy):
+        """The policy's relaunch command after a display-stall abort, once
+        the save it started has finished."""
+        command = policy(STALL)
+        if policy.saving is not None:
+            policy.saving.join()
+        return command
+
+    def learn(self, **record):
+        self.learned_bound.write_text(
+            json.dumps(
+                {"mac": MAC[0], "macos": MAC[1], "scope": "command", "bound_ms": 1000}
+                | record
+            )
+        )
+
+    def test_display_stall_abort_teaches_later_starts_its_bound(self):
+        with (
+            mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            command, policy = self.start([])
+            # The first start: no learned bound, and nothing to warn about.
+            self.assertEqual(command, STALL_COMMAND)
+            self.assertNotIn("Warning ·", stderr.getvalue())
+            self.abort(policy)
+            self.assertEqual(
+                json.loads(self.learned_bound.read_text()),
+                {"mac": MAC[0], "macos": MAC[1], "scope": "command", "bound_ms": 2000},
+            )
+            command, policy = self.start([])
+            self.assertEqual(
+                command, [*STALL_COMMAND, "--prefill-bound-scope", "command"]
+            )
+            # A second abort halves the learned bound for the next start.
+            self.assertIn("--prefill-bound-ms", self.abort(policy))
+            command, _ = self.start([])
+        self.assertEqual(
+            command,
+            [
+                *STALL_COMMAND,
+                "--prefill-bound-ms",
+                "1000",
+                "--prefill-bound-scope",
+                "command",
+            ],
+        )
+        self.assertIn(
+            f"Prefill bound · 1000 ms per command, learned after a display-stall "
+            f"abort on this Mac (delete {self.learned_bound} to reset)",
+            stdout.getvalue(),
+        )
+        self.assertNotIn("Warning ·", stderr.getvalue())
+
+    def test_explicit_prefill_bound_options_ignore_and_keep_the_learned_bound(self):
+        self.learn()
+        learned = self.learned_bound.read_bytes()
+        for argv, environment, command in (
+            (["--prefill-bound-ms", "2000"], {}, STALL_COMMAND),
+            (["--prefill-bound-scope", "buffer"], {}, STALL_COMMAND),
+            ([], {"SPLASH_PREFILL_BOUND_MS": "2000"}, STALL_COMMAND),
+            (
+                [],
+                {"SPLASH_PREFILL_BOUND_SCOPE": "command"},
+                [*STALL_COMMAND, "--prefill-bound-scope", "command"],
+            ),
+        ):
+            with (
+                self.subTest(argv=argv, environment=environment),
+                mock.patch.dict(os.environ, environment),
+                mock.patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                started, policy = self.start(argv)
+                self.assertEqual(started, command)
+                self.assertIsNotNone(self.abort(policy))
+                self.assertIsNone(policy.saving)
+                self.assertEqual(self.learned_bound.read_bytes(), learned)
+
+    def test_learned_bound_of_another_mac_or_a_malformed_one_is_ignored(self):
+        for written in (
+            json.dumps({"mac": "Mac15,3", "macos": MAC[1], "scope": "command"}),
+            json.dumps(
+                {
+                    "mac": "Mac15,3",
+                    "macos": MAC[1],
+                    "scope": "command",
+                    "bound_ms": 1000,
+                }
+            ),
+            json.dumps(
+                {"mac": MAC[0], "macos": "15.6", "scope": "command", "bound_ms": 1000}
+            ),
+            "{not json",
+            json.dumps(["command", 1000]),
+            json.dumps({"mac": MAC[0], "macos": MAC[1], "scope": "command"}),
+            json.dumps(
+                {"mac": MAC[0], "macos": MAC[1], "scope": "whole", "bound_ms": 1000}
+            ),
+            json.dumps(
+                {"mac": MAC[0], "macos": MAC[1], "scope": "command", "bound_ms": 0}
+            ),
+            json.dumps(
+                {
+                    "mac": MAC[0],
+                    "macos": MAC[1],
+                    "scope": "command",
+                    "bound_ms": serve_options.PREFILL_BOUND_MAX_MS + 1,
+                }
+            ),
+            json.dumps(
+                {"mac": MAC[0], "macos": MAC[1], "scope": "command", "bound_ms": "1000"}
+            ),
+            json.dumps(
+                {"mac": MAC[0], "macos": MAC[1], "scope": "command", "bound_ms": 1e3}
+            ),
+        ):
+            self.learned_bound.write_text(written)
+            with (
+                self.subTest(written=written),
+                mock.patch("sys.stdout", new_callable=io.StringIO),
+                mock.patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                command, _ = self.start([])
+                self.assertEqual(command, STALL_COMMAND)
+
+    def test_learned_bound_that_cannot_be_kept_warns_and_relaunches(self):
+        blocked = Path(self.enterContext(tempfile.TemporaryDirectory())) / "file"
+        blocked.touch()
+        _, policy = self.start([])
+        # The file's directory is a file by the time the abort is kept.
+        with (
+            mock.patch.object(
+                api.prefill_bounds, "PATH", blocked / "prefill-bound.json"
+            ),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            command = self.abort(policy)
+        self.assertEqual(command, [*STALL_COMMAND, "--prefill-bound-scope", "command"])
+        warnings = [
+            line for line in stderr.getvalue().splitlines() if "Warning ·" in line
+        ]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("cannot keep the learned prefill bound", warnings[0])
+
+    def test_native_command_without_a_learned_pair_reads_no_file(self):
+        self.learn()
+        parsed = api.parse_args(STALL_ARGS)
+        self.assertEqual(api._native_command(parsed, parsed.model_root), STALL_COMMAND)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 import io
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from dev.tests import server_fixtures as fixtures
@@ -374,6 +376,12 @@ class ThinkingEndTextTests(unittest.TestCase):
             fixtures.unprepared_hold(),
             mock.patch.object(server.signal, "signal"),
             mock.patch.object(server, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                server.prefill_bounds,
+                "PATH",
+                Path(self.enterContext(tempfile.TemporaryDirectory()))
+                / "prefill-bound.json",
+            ),
             mock.patch.object(
                 server.AutoTokenizer, "from_pretrained", return_value=self.tokenizer()
             ),

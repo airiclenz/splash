@@ -18,6 +18,15 @@ from server.origins import ANY_ORIGIN
 
 
 class ServerMainTests(unittest.TestCase):
+    def setUp(self):
+        # main() neither reads nor writes the prefill bound learned on the Mac
+        # running the tests.
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.learned_bound = directory / "prefill-bound.json"
+        self.enterContext(
+            mock.patch.object(api.prefill_bounds, "PATH", self.learned_bound)
+        )
+
     def test_sigterm_uses_the_normal_main_cleanup_path(self):
         args = main_args()
         runtime = mock.Mock()
@@ -401,6 +410,63 @@ class ServerMainTests(unittest.TestCase):
         relaunch = runtime_type.call_args.kwargs["relaunch_command"]
         self.assertEqual(command[2], str(served))
         self.assertEqual(relaunch(runtime.readiness)[2], str(served))
+
+    def test_main_starts_every_engine_with_the_bound_a_display_stall_taught(self):
+        key = ("Mac14,2", "26.0")
+        self.learned_bound.write_text(
+            json.dumps(
+                {"mac": key[0], "macos": key[1], "scope": "command", "bound_ms": 2000}
+            )
+        )
+        today = ["splash", "serve-native", "model", "auto", "auto"]
+        ready = native_wire.ReadyEvent(4, 61433, False)
+        relaunch_context = ["--relaunch-context", "61433"]
+        for options, command in (
+            # Neither bound option: the learned bound governs every engine.
+            ({}, [*today, "--prefill-bound-scope", "command"]),
+            # An explicit bound: the options govern, as before.
+            ({"prefill_bound_ms": 2000}, today),
+        ):
+            with self.subTest(options=options):
+                runtime = mock.Mock()
+                runtime.readiness = native_wire.ReadyEvent(4, 131072, False)
+                with (
+                    mock.patch.object(
+                        api, "parse_args", return_value=main_args(**options)
+                    ),
+                    unprepared_hold(),
+                    mock.patch.object(api, "load_thinking_key", return_value=None),
+                    mock.patch.object(
+                        api.prefill_bounds, "machine_key", return_value=key
+                    ),
+                    mock.patch.object(
+                        api.AutoTokenizer, "from_pretrained", return_value=object()
+                    ),
+                    mock.patch.object(api, "validate_tokenizer"),
+                    mock.patch.object(api, "ChatTemplates"),
+                    mock.patch.object(
+                        api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+                    ) as runtime_type,
+                    mock.patch.object(api, "NativeBackend"),
+                    mock.patch.object(api, "ConstraintFactory"),
+                    mock.patch.object(api, "Frontend"),
+                    mock.patch.object(
+                        api, "FrontendServer", return_value=mock.Mock(server_port=8000)
+                    ),
+                    mock.patch.object(api.signal, "signal"),
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                ):
+                    api.main()
+                self.assertEqual(runtime_type.call_args.args[0], command)
+                relaunch = runtime_type.call_args.kwargs["relaunch_command"]
+                self.assertEqual(
+                    relaunch(ready),
+                    [*command[:5], *relaunch_context, *command[5:]],
+                )
+                self.assertEqual(
+                    "learned after a display-stall abort" in stdout.getvalue(),
+                    not options,
+                )
 
     def test_main_refuses_a_directory_that_names_no_prepared_model(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))

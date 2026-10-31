@@ -344,6 +344,12 @@ class ServedModelNamesTests(unittest.TestCase):
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
+                api.prefill_bounds,
+                "PATH",
+                Path(self.enterContext(tempfile.TemporaryDirectory()))
+                / "prefill-bound.json",
+            ),
+            mock.patch.object(
                 api.AutoTokenizer, "from_pretrained", return_value=object()
             ),
             mock.patch.object(api, "validate_tokenizer"),

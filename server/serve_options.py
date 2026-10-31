@@ -822,8 +822,10 @@ SERVE_OPTIONS = (
             default=None,
             metavar="MILLISECONDS",
             help="longest bounded prefill GPU command buffer in milliseconds (default: "
-            f"SPLASH_PREFILL_BOUND_MS or {PREFILL_BOUND_DEFAULT_MS}); halved after "
-            "each macOS display-stall abort once the bound holds whole commands",
+            "SPLASH_PREFILL_BOUND_MS, the bound an earlier macOS display-stall "
+            f"abort taught this Mac, or {PREFILL_BOUND_DEFAULT_MS}); halved after "
+            "each such abort once the bound holds whole commands, and kept for "
+            "later starts that give neither prefill bound option",
         ),
         environment="SPLASH_PREFILL_BOUND_MS",
     ),
@@ -835,7 +837,8 @@ SERVE_OPTIONS = (
             default=None,
             metavar="buffer|command",
             help="what the prefill bound holds: each GPU command buffer "
-            "(default: SPLASH_PREFILL_BOUND_SCOPE or buffer) or each whole "
+            "(default: SPLASH_PREFILL_BOUND_SCOPE, the scope an earlier macOS "
+            "display-stall abort taught this Mac, or buffer) or each whole "
             "command, which some Macs need at long context; the first macOS "
             "display-stall abort switches to command",
         ),

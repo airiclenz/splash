@@ -4,9 +4,11 @@ import http.client
 import io
 import json
 import queue
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -779,6 +781,12 @@ class ServerRecoveryTests(HarnessTestCase):
             mock.patch.object(api, "parse_args", return_value=main_args()),
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                api.prefill_bounds,
+                "PATH",
+                Path(self.enterContext(tempfile.TemporaryDirectory()))
+                / "prefill-bound.json",
+            ),
             mock.patch.object(
                 api.AutoTokenizer, "from_pretrained", return_value=object()
             ),

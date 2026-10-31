@@ -27,7 +27,7 @@ from install import assembly
 from install.models import ModelError
 
 from . import images as image_input
-from . import json_codec, judgments, release_identity, serve_options
+from . import json_codec, judgments, prefill_bounds, release_identity, serve_options
 from . import protocol as wire
 from . import runtime as engine_runtime
 from .api_shapes import (
@@ -1942,14 +1942,23 @@ def _native_command(
     return command
 
 
-def _shorter_prefill_after_display_stall(args, model_root):
+def _shorter_prefill_after_display_stall(args, model_root, learned=None, save=None):
     """Relaunch command policy: macOS aborts a GPU command that holds the
     GPU while the display needs it, and how long it tolerates depends on
     the Mac and display load. Some Macs abort a long command however it is
     split into command buffers, so the first such abort bounds whole
-    commands instead; each later one halves the bound for the next engine."""
-    bound = _prefill_bound(args)
-    scope = _prefill_bound_scope(args)
+    commands instead; each later one halves the bound for the next engine.
+
+    `learned` is the (scope, bound) a previous server learned, the policy's
+    start in place of the options'. `save`, given only when the learned bound
+    governs this run, is called with each new (scope, bound) on a thread of
+    its own, since the policy runs under the runtime's state lock; the last
+    such thread is the policy's `saving` attribute."""
+    scope, bound = (
+        (_prefill_bound_scope(args), _prefill_bound(args))
+        if learned is None
+        else learned
+    )
 
     def command_after_failure(failure, first_ready=None):
         nonlocal bound, scope
@@ -1965,6 +1974,10 @@ def _shorter_prefill_after_display_stall(args, model_root):
             f"Prefill bound · {bound} ms per {scope} after a macOS display-stall abort",
             error=True,
         )
+        if save is not None:
+            command_after_failure.saving = _start_save(
+                save, scope, bound, command_after_failure.saving
+            )
         return _native_command(
             args,
             model_root,
@@ -1973,7 +1986,52 @@ def _shorter_prefill_after_display_stall(args, model_root):
             prefill_bound_scope=scope,
         )
 
+    command_after_failure.saving = None
     return command_after_failure
+
+
+def _start_save(save, scope, bound, previous):
+    """Run save(scope, bound) on a daemon thread, after the previous save
+    finished so that the last bound learned is the one kept."""
+
+    def run():
+        if previous is not None:
+            previous.join()
+        save(scope, bound)
+
+    saving = threading.Thread(target=run, name="prefill-bound-save", daemon=True)
+    saving.start()
+    return saving
+
+
+def _learned_bound_applies(args):
+    """Whether a learned bound governs this run: bounded prefill and neither
+    bound option given, on the command line or in the environment."""
+    return (
+        args.prefill_mode == "bounded"
+        and args.prefill_bound_ms is None
+        and args.prefill_bound_scope is None
+    )
+
+
+def _recall_learned_bound(args):
+    """(learned, save) for main(): the (scope, bound) a previous server
+    learned on this Mac, and the save for the bounds this one learns; both
+    None where the options govern."""
+    if not _learned_bound_applies(args):
+        return None, None
+    key = prefill_bounds.machine_key()
+    if key is None:
+        return None, None
+    learned = prefill_bounds.recall(key)
+    if learned is not None:
+        scope, bound = learned
+        print_status(
+            f"Prefill bound · {bound} ms per {scope}, learned after a "
+            f"display-stall abort on this Mac (delete {prefill_bounds.PATH} "
+            "to reset)"
+        )
+    return learned, partial(prefill_bounds.remember, key)
 
 
 def _raise_descriptor_limit():
@@ -2051,16 +2109,22 @@ def main():
         thinking_end = thinking_end_tokens(tokenizer, args.thinking_end_text)
         chat_templates = ChatTemplates(tokenizer)
         print_status(f"Chat template · {chat_templates.describe()}")
+        learned, save_learned = _recall_learned_bound(args)
+        learned_options = (
+            {}
+            if learned is None
+            else {"prefill_bound_scope": learned[0], "prefill_bound_ms": learned[1]}
+        )
         runtime = engine_runtime.MultiplexedRuntime(
-            _native_command(args, model_root),
+            _native_command(args, model_root, **learned_options),
             relaunch_command=lambda first: _native_command(
-                args, model_root, first.max_context_tokens
+                args, model_root, first.max_context_tokens, **learned_options
             ),
             startup_timeout=NATIVE_START_TIMEOUT,
             pending_limit=args.queue_size,
         )
         runtime.command_after_failure = _shorter_prefill_after_display_stall(
-            args, model_root
+            args, model_root, learned, save_learned
         )
         backend = NativeBackend(
             runtime,

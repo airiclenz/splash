@@ -1,5 +1,7 @@
 import io
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from dev.tests.server_fixtures import unprepared_hold
@@ -70,6 +72,12 @@ class TokenizerContractTests(unittest.TestCase):
             unprepared_hold(),
             mock.patch.object(server.signal, "signal"),
             mock.patch.object(server, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                server.prefill_bounds,
+                "PATH",
+                Path(self.enterContext(tempfile.TemporaryDirectory()))
+                / "prefill-bound.json",
+            ),
             mock.patch.object(
                 server.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
