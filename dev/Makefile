@@ -14,6 +14,55 @@ package-bottle:
 package-check:
 	$(PYTHON) dev/tools/package_brew.py check --version "$(RELEASE_VERSION)"
 
+# dist/Splash.app, app/ around the runtime make package ships, signed ad hoc
+# or, with SIGN_IDENTITY, a Developer ID Application identity, for the
+# hardened runtime. dmg also wraps it in dist/Splash-RELEASE_VERSION.dmg, for
+# testing: only release-app notarizes.
+SIGN_IDENTITY ?=
+APP_ARGS = --version "$(RELEASE_VERSION)" --macos-min "$(MACOS_MIN_VERSION)" \
+	$(if $(SIGN_IDENTITY),--sign "$(SIGN_IDENTITY)")
+.PHONY: app dmg check-app
+app: install-environment all
+	$(PYTHON) dev/tools/package_app.py app $(APP_ARGS)
+
+dmg: install-environment all
+	$(PYTHON) dev/tools/package_app.py dmg $(APP_ARGS)
+
+# dist/release/RELEASE_VERSION, release RELEASE_VERSION of Splash, made from
+# its annotated tag and ready to publish by hand (docs/package.md, Releases):
+# the app and its disk image signed with SIGN_IDENTITY, notarized with
+# NOTARY_PROFILE, a notarytool keychain profile, or NOTARY_KEY, an App Store
+# Connect API key's file, with NOTARY_KEY_ID and NOTARY_ISSUER, and stapled;
+# the command line's files package and package-bottle leave in dist/; the
+# appcast, with RELEASE_NOTES, a Markdown file outside the checkout, signed
+# with the release key from the login keychain or SPARKLE_KEY_FILE; and the
+# tap's formula and cask. DRY_RUN=1 signs ad hoc, prints what needs the
+# Developer ID or the notary service instead of running it, and writes
+# dist/release/RELEASE_VERSION-dry-run.
+NOTARY_PROFILE ?=
+NOTARY_KEY ?=
+NOTARY_KEY_ID ?=
+NOTARY_ISSUER ?=
+RELEASE_NOTES ?=
+SPARKLE_KEY_FILE ?=
+DRY_RUN ?=
+RELEASE_ARGS = $(APP_ARGS) --notes "$(RELEASE_NOTES)" \
+	$(if $(NOTARY_PROFILE),--notary-profile "$(NOTARY_PROFILE)") \
+	$(if $(NOTARY_KEY),--notary-key "$(NOTARY_KEY)") \
+	$(if $(NOTARY_KEY_ID),--notary-key-id "$(NOTARY_KEY_ID)") \
+	$(if $(NOTARY_ISSUER),--notary-issuer "$(NOTARY_ISSUER)") \
+	$(if $(SPARKLE_KEY_FILE),--sparkle-key-file "$(SPARKLE_KEY_FILE)") \
+	$(if $(filter 1,$(DRY_RUN)),--dry-run)
+.PHONY: release-app
+release-app: install-environment all
+	@test -n "$(RELEASE_NOTES)" || { echo "set RELEASE_NOTES to the release notes, a Markdown file"; exit 1; }
+	@test -z "$(filter-out 0 1,$(DRY_RUN))" || { echo "set DRY_RUN to 1 for a dry run, or leave it out"; exit 1; }
+	$(PYTHON) dev/tools/release_app.py $(RELEASE_ARGS)
+
+# The app's own tests; the Python ones cover what packages it.
+check-app:
+	swift test --package-path app
+
 # Uploads the built RELEASE_VERSION archive, its checksum, the tester installer
 # and the `latest` pointer to the private Hugging Face repo testers install
 # from. Uses the developer's own `hf auth login`.
@@ -99,7 +148,7 @@ check-python: install-development test-python
 architecture-check: install-environment
 	$(PYTHON) dev/tools/check_architecture.py
 
-check: check-source check-native-engine check-python
+check: check-source check-native-engine check-python check-app
 
 check-source: architecture-check
 	@git diff --check
@@ -158,7 +207,7 @@ endif
 
 # The installer's restarts without the Hub, a full source hash and the
 # digests of the weight images a load of the installation holds
-# (DEVELOPMENT.md, Release check). WEIGHT_DIGESTS_ARGS, weight-digests'
+# (docs/validate.md, Release check). WEIGHT_DIGESTS_ARGS, weight-digests'
 # --expert-memory SIZE and --ple-memory SIZE as the runtime oracle takes them,
 # streams the routed experts and the PLE table from their files, here and in
 # both builds of the comparison with BASELINE, and leaves their bytes out of
@@ -168,12 +217,11 @@ verify-models: preflight $(TARGET) $(WEIGHT_DIGESTS) $(LIB)
 	@$(PYTHON) dev/tools/installer_restarts.py $(MODEL_ARGS)
 	@mkdir -p "$(MODEL_RESULTS)"
 	@$(WEIGHT_DIGESTS) $(LIB) "$(MODEL_ROOT)" $(WEIGHT_DIGESTS_ARGS) \
-		> "$(MODEL_RESULTS)/weights.json.tmp"
-	@mv "$(MODEL_RESULTS)/weights.json.tmp" "$(MODEL_RESULTS)/weights.json"
+		> "$(MODEL_RESULTS)/weights.json"
 	@echo "weight images: $(MODEL_RESULTS)/weights.json"
 
 # One model on this machine against BASELINE, a retained build that loads it
-# (DEVELOPMENT.md, Release check); make check and test-sanitizers run once per
+# (docs/validate.md, Release check); make check and test-sanitizers run once per
 # source identity, check-native-metal and the agent clients once per machine.
 release-check: preflight
 	@test -n "$(BASELINE)" || { \

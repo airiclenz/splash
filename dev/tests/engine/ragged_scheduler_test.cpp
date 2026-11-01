@@ -617,6 +617,67 @@ void testStreamWaitStaysOutOfTheCommandEstimate() {
           "a streamed command's wait on its reads widened other commands' slices");
 }
 
+// The images a prefill command encodes run ahead of it as a command of their
+// own: the command owes decode their time as its own, and the command
+// estimate other commands' slices come from leaves it out.
+void testImageEncodesStayOutOfTheCommandEstimate() {
+  Scheduler scheduler(0.5);
+  scheduler.observePrefill(2048, 1024.0);
+  scheduler.submit(request(1, 4096));
+  scheduler.resourcesReady(1, 0);
+  scheduler.submit(request(2, 1));
+  scheduler.resourcesReady(2, 1);
+  completeDecode(scheduler);
+  BatchPlan plan = *scheduler.next({});
+  require(plan.kind == WorkKind::Prefill && plan.items[0].tokenCount == 512,
+          "a contended command did not take the slice's rows");
+  // 512 rows at 3 ms each behind 5 s of encodes: the rows alone train the
+  // estimate to 1.125 ms a row (256 rows a slice); untrained it would stay at
+  // 0.5 (512), trained with the encodes it would reach 3.57 (128).
+  scheduler.commit(plan, {});
+  const std::array result{StepResult{1, 512, false, DecodeStage::Regular}};
+  scheduler.complete(plan, result, 6536.0, true, 0.0, std::nullopt, 5000.0);
+  uint32_t decodes = 0;
+  for (plan = *scheduler.next({}); plan.kind == WorkKind::Decode; plan = *scheduler.next({})) {
+    scheduler.commit(plan, {});
+    const std::array decoded{StepResult{2, 0, false, DecodeStage::Regular}};
+    scheduler.complete(plan, decoded, 250.0, true);
+    ++decodes;
+  }
+  require(decodes == 14, "a command did not owe decode the time of its images' encodes");
+  require(plan.items[0].requestId == 1 && plan.items[0].tokenCount == 256,
+          "a command's image encodes trained other commands' slices, or its rows did not");
+}
+
+// A command in passes whose first pass encoded images trains the estimate
+// with its passes' time less the encodes: its next command runs in the
+// passes and rows of one that encoded none.
+void testImageEncodesStayOutOfAPassedCommandsEstimate() {
+  std::array<BatchPlan, 2> next;
+  for (const bool encodes : {false, true}) {
+    Scheduler scheduler(0.0);
+    scheduler.observePrefill(2048, 4900.0, 3400.0);
+    scheduler.submit(passingLane(1, 48));
+    scheduler.resourcesReady(1, 0);
+    BatchPlan plan = *scheduler.next({});
+    const uint32_t passes = plan.passes;
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+      require(plan.items[0].requestId == 1 && plan.pass == pass && plan.passes == passes,
+              "a command's next pass did not go on");
+      const double encoded = encodes && !pass ? 5000.0 : 0.0;
+      scheduler.commit(plan, {});
+      const uint32_t consumed = pass + 1 == passes ? plan.items[0].tokenCount : 0;
+      const std::array result{StepResult{1, consumed, false, DecodeStage::Regular}};
+      scheduler.complete(plan, result, 500.0 + encoded, true, 300.0, std::nullopt, encoded);
+      plan = *scheduler.next({});
+    }
+    next[encodes] = plan;
+  }
+  require(next[0].passes == 19 && next[1].passes == next[0].passes &&
+              next[1].items[0].tokenCount == next[0].items[0].tokenCount,
+          "a command's first pass's image encodes trained its next command's passes");
+}
+
 // Each gap a decoding lane sees between its commands across a streaming
 // prefill command is recorded, and the command counts as contended; gaps
 // across other commands are not recorded.
@@ -697,13 +758,14 @@ void testShortenedPrefillResumesFromItsRows() {
 }
 
 // With tail alignment, a prompt's last rows a few past a multiple of it end
-// that command on the multiple and leave the rest to the next; rows that do
-// not finish the prompt, rows too far past, too few rows and no alignment
-// keep the whole budget.
+// that command on the multiple and leave the rest to the next, unless trimming
+// drops the command below the Neural Engine minimum; rows that do not finish
+// the prompt, rows too far past, too few rows and no alignment keep the whole
+// budget.
 void testAlignedPrefillLeavesItsTail() {
-  const auto first = [](uint32_t alignment, uint32_t prompt) {
+  const auto first = [](uint32_t alignment, uint32_t prompt, uint32_t aneMinimum = 0) {
     engine::Scheduler scheduler(0.0);
-    scheduler.alignPrefillTails(alignment);
+    scheduler.alignPrefillTails(alignment, aneMinimum);
     scheduler.submit(request(1, prompt));
     scheduler.resourcesReady(1, 0);
     return scheduler.next({})->items.at(0).tokenCount;
@@ -713,6 +775,13 @@ void testAlignedPrefillLeavesItsTail() {
   require(first(128, 384) == 384 && first(128, 360) == 360 && first(128, 288 - 32 - 1) == 255 &&
               first(128, 280) == 256 && first(0, 288) == 288 && first(128, 2048 + 4096 + 16) == 2048,
           "tail alignment cut rows it must keep");
+  // Skipping the trim when it would drop the command below the Neural Engine minimum:
+  require(first(128, 288, 280) == 288 && first(128, 276, 280) == 256 && first(128, 416, 280) == 384,
+          "an aligned prompt's last command trimmed below the ANE minimum or failed to trim above it");
+  require(first(128, 288, 256) == 256,
+          "an aligned prompt's last command kept its tail although the trimmed rows reach the ANE minimum");
+  require(first(128, 288, 0) == 256,
+          "tail alignment without ANE minimum changed behaviour");
   engine::Scheduler scheduler(0.0);
   scheduler.alignPrefillTails(128);
   scheduler.submit(request(1, 288));
@@ -721,6 +790,16 @@ void testAlignedPrefillLeavesItsTail() {
   const BatchPlan tail = *scheduler.next({});
   require(tail.items.size() == 1 && tail.items[0].promptOffset == 256 && tail.items[0].tokenCount == 32,
           "the aligned prompt's tail did not run next");
+  engine::Scheduler aneScheduler(0.0);
+  aneScheduler.alignPrefillTails(128, 280);
+  aneScheduler.submit(request(1, 2048 + 288));
+  aneScheduler.resourcesReady(1, 0);
+  require(aneScheduler.next({})->items.at(0).tokenCount == 2048,
+          "the long prompt did not run its first full chunk");
+  completePrefill(aneScheduler, *aneScheduler.next({}));
+  const BatchPlan second = *aneScheduler.next({});
+  require(second.items.size() == 1 && second.items[0].promptOffset == 2048 && second.items[0].tokenCount == 288,
+          "the second command did not keep its 288 rows whole on ANE");
 }
 
 void testEqualPromptsFinishInArrivalOrder() {
@@ -1743,6 +1822,8 @@ int main() {
     testContendedStreamingLaneHalvesFromItsGroup();
     testStreamEstimateIgnoresCommandsThatReadNothing();
     testStreamWaitStaysOutOfTheCommandEstimate();
+    testImageEncodesStayOutOfTheCommandEstimate();
+    testImageEncodesStayOutOfAPassedCommandsEstimate();
     testDecodeGapAcrossStreamingPrefill();
     testShortestRemainingFirstUsesActualRows();
     testShortenedPrefillResumesFromItsRows();

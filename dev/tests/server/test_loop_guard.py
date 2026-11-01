@@ -1,3 +1,4 @@
+import dataclasses
 import time
 import unittest
 from unittest import mock
@@ -7,6 +8,7 @@ from dev.tests.server_fixtures import FakeRuntime, byte_backend, make_job
 from server import backend as backend_api
 from server import output as model_output
 from server import protocol as wire
+from server.chat_format import QWEN
 
 REPEATED = "I should check the file again."
 THINK_END_ID = 3
@@ -30,12 +32,15 @@ class LoopTokenizer:
         return "".join(self.fragments[token] for token in token_ids)
 
 
-def use_loop_think_end(test):
-    """The backend reads the close of thinking as a module constant; the
-    tests' tokenizer has it at THINK_END_ID."""
-    patcher = mock.patch.object(backend_api, "THINK_END_TOKEN_ID", THINK_END_ID)
-    patcher.start()
-    test.addCleanup(patcher.stop)
+# The Qwen chat format with its close of thinking at the tests' tokenizer's
+# THINK_END_ID, the token the backend reads from a job's chat format.
+LOOP_FORMAT = dataclasses.replace(QWEN, think_end_id=THINK_END_ID)
+
+
+def make_loop_job():
+    job = make_job()
+    job.chat_format = LOOP_FORMAT
+    return job
 
 
 def feed_repeated(guard, sentence, times, separator=" "):
@@ -152,14 +157,11 @@ class ReasoningLoopGuardTests(unittest.TestCase):
 
 
 class CallbackStreamerLoopGuardTests(unittest.TestCase):
-    def setUp(self):
-        use_loop_think_end(self)
-
     @staticmethod
     def streamer(limit=24, on_stop=None):
         chunks = []
         streamer = backend_api.CallbackStreamer(
-            LoopTokenizer(), chunks.append, (), on_stop, limit, True
+            LoopTokenizer(), chunks.append, (), on_stop, limit, True, THINK_END_ID
         )
         return streamer, chunks
 
@@ -196,9 +198,6 @@ class CallbackStreamerLoopGuardTests(unittest.TestCase):
 
 
 class NativeBackendLoopGuardTests(unittest.TestCase):
-    def setUp(self):
-        use_loop_think_end(self)
-
     def make_backend(self, limit=backend_api.DEFAULT_REASONING_LOOP_LIMIT):
         runtime = FakeRuntime(manual=True)
         backend = backend_api.NativeBackend(
@@ -225,7 +224,7 @@ class NativeBackendLoopGuardTests(unittest.TestCase):
 
     def test_repeated_reasoning_stops_the_call_and_finishes_with_length(self):
         backend, runtime = self.make_backend()
-        job = make_job()
+        job = make_loop_job()
         job.thinking = True
         backend.submit(job)
         call = runtime.calls[0]
@@ -261,7 +260,7 @@ class NativeBackendLoopGuardTests(unittest.TestCase):
 
     def test_non_thinking_job_is_not_guarded(self):
         backend, runtime = self.make_backend()
-        job = make_job()
+        job = make_loop_job()
         backend.submit(job)
         call = runtime.calls[0]
 

@@ -1291,8 +1291,18 @@ struct MetalBackend::Impl {
     // warning says so. If every spin started late, the GPU busy with other
     // work, the check decides nothing: awake steps run as plain ones for
     // kHostStepSpinRecheck, and the first command with one after that checks
-    // again.
+    // again. On Apple7/8 awake steps run as plain ones, unchecked and without
+    // a warning: a spin's buffer there starts once committed, before the work
+    // ahead of its step ended, and spins out its bound beside that work: a
+    // decode cycle of 49 streamed expert loads took 0.51-0.98 s instead of
+    // 93-144 ms (M2 Max, Flash-Next Q2_0; served with 24G of experts, 4.6
+    // against 44.6 tok/s). A spin held until the work ahead ended gained
+    // nothing over plain steps there.
     void checkHostStepSpin() {
+        if (capabilities.appleGpuFamily < 9) {
+            nextSpinCheck = AwakeClock::time_point::max();
+            return;
+        }
         @autoreleasepool {
             try {
                 HostStepSpin spin = newHostStepSpin();

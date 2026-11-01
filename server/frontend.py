@@ -22,6 +22,7 @@ from .api_shapes import (
     template_messages,
 )
 from .backend import Job, ReasoningRequest, remaining_request_time
+from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     REASONING_EFFORT_ALIASES,
@@ -46,11 +47,7 @@ from .serve_options import (
 )
 from .tokenization import PromptTokenizer, tokenizable
 from .tool_schema import (
-    THINK_END,
-    THINK_END_TOKEN_ID,
-    TOOL_CALL_OPEN,
     ToolPolicy,
-    function_opening,
     json_grammar,
     normalize_response_format,
     normalize_tools,
@@ -134,7 +131,7 @@ def _generation_prompt(probed, rendered, tokens):
         )
     count = len(ids)
     return (
-        text.rfind("<think>") > text.rfind(THINK_END),
+        text.rfind(THINK_START) > text.rfind(THINK_END),
         count if count < len(tokens) and tuple(tokens[-count:]) == ids else 0,
     )
 
@@ -284,6 +281,7 @@ class Frontend:
         *,
         constraint_factory,
         chat_templates,
+        chat_format,
         thinking_codec,
         vision,
         max_image_pixels=image_input.MAX_PIXELS,
@@ -303,7 +301,9 @@ class Frontend:
         # Probed at startup; requests choose among these, never the
         # tokenizer's own.
         self.chat_templates = chat_templates
-        self.prompt_tokenizer = PromptTokenizer(tokenizer)
+        # The served family's: how its output reasons and calls tools.
+        self.chat_format = chat_format
+        self.prompt_tokenizer = PromptTokenizer(tokenizer, chat_format.message_boundary)
         self.backend = backend
         # The model id the engine loaded. /status reports it, so an alias
         # can never hide what served a request (#81).
@@ -387,10 +387,26 @@ class Frontend:
         """The one list /status, /v1/models and client setup report."""
         return ["text", "image", "pdf"] if self.vision else ["text"]
 
+    @property
+    def reasoning(self):
+        """What /v1/models reports of reasoning: the default template's
+        (ChatTemplate.reasoning), with the server's default effort in place of
+        the template's own, named by the listed effort it renders like; no
+        efforts for a model that decides itself whether to reason."""
+        if not self.chat_format.reasoning_switch:
+            return {"thinks": None, "efforts": [], "default": None}
+        template = self.chat_templates.select(None)
+        reasoning = dict(template.reasoning)
+        if (effort := self.default_reasoning_effort) is not None:
+            reasoning["thinks"] = effort != "none"
+            reasoning["default"] = template.effort_names.get(effort)
+        return reasoning
+
     def status(self):
         status = self.backend.status()
         status["vision"] = self.vision
         status["input_modalities"] = self.input_modalities
+        status["reasoning_switch"] = self.chat_format.reasoning_switch
         status["chat_template"] = self.chat_templates.status()
         with self.preparation_lock:
             status["frontend"] = {
@@ -715,6 +731,7 @@ class Frontend:
                 self.chat_templates.select(None).source,
                 messages,
                 labels,
+                chat_format=self.chat_format,
                 admit=admit,
                 checkpoint=checkpoint,
             )
@@ -1145,13 +1162,20 @@ class Frontend:
             with self.latencies.measure("grammar"):
                 if tool_constrained:
                     constraint = self.constraint_factory.create(
-                        tool_grammar(tool_policy, thinking, response_schema),
+                        tool_grammar(
+                            tool_policy,
+                            thinking,
+                            response_schema,
+                            chat_format=self.chat_format,
+                        ),
                         timeout=remaining_request_time(deadline),
                         prefixes=lambda: self._call_openings(tool_policy, thinking),
                     )
                 else:
                     constraint = self.constraint_factory.create(
-                        json_grammar(response_schema, thinking),
+                        json_grammar(
+                            response_schema, thinking, chat_format=self.chat_format
+                        ),
                         timeout=remaining_request_time(deadline),
                     )
         remaining_request_time(deadline)
@@ -1187,6 +1211,7 @@ class Frontend:
             reasoning=ReasoningRequest(
                 prompt.sent_effort, prompt.reasoning_effort, prompt.enable_thinking
             ),
+            chat_format=self.chat_format,
             thinking_token_budget=(
                 budget if thinking and budget is not None and budget < max_new else None
             ),
@@ -1204,15 +1229,18 @@ class Frontend:
         )
 
     def _call_openings(self, policy, thinking):
-        """The tokens that begin each strict tool's call. Its parameter names
-        may come next, so a tool with more of them than the parser admits
-        fails there."""
-        reasoning = [THINK_END_TOKEN_ID] if thinking else []
+        """The tokens that begin each strict tool's call, after the close of
+        the reasoning the generation prompt opened. Its parameter names may
+        come next, so a tool with more of them than the parser admits fails
+        there."""
+        chat_format = self.chat_format
+        reasoning = [chat_format.think_end_id] if thinking else []
         return [
             (
                 reasoning
                 + self._tokenize(
-                    TOOL_CALL_OPEN + function_opening(name), add_special_tokens=False
+                    TOOL_CALL_OPEN + chat_format.call_syntax.function_opening(name),
+                    add_special_tokens=False,
                 )["input_ids"],
                 f"tool {name} has too many parameters to constrain",
             )

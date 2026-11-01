@@ -59,6 +59,7 @@ public:
   provideMask(uint64_t requestId, std::span<const uint32_t> words) override;
   [[nodiscard]] uint32_t prefillCommandBuffers() const noexcept override;
   [[nodiscard]] uint32_t prefillTailAlignment() const noexcept override;
+  [[nodiscard]] uint32_t prefillAneMinimumRows() const noexcept override;
   void end(uint64_t requestId) override;
 
   [[nodiscard]] WarmupStepResult warmupPrefill(uint32_t rows) override;

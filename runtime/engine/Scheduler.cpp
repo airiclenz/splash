@@ -42,7 +42,9 @@ constexpr uint32_t kMinimumPrefillRows = 64;
 static_assert(Scheduler::kMinimumContendedPrefillRows == kMinimumPrefillRows,
               "the minimum contended floor is the minimum matrix shape");
 // The most rows past a multiple of the prefill tail alignment that a prompt's
-// last command leaves to one of their own: the decode tiles' rows.
+// last command leaves to one of their own: the decode tiles' rows, unless
+// that takes the command below the Neural Engine split's minimum
+// (Model::prefillAneMinimumRows), where it would run its FFN on the GPU alone.
 constexpr uint32_t kPrefillTailRows = 32;
 // The weight of a command's measured time in a running estimate (per row,
 // fixed, or a lane's wait on its history's reads): one unusually slow or
@@ -426,7 +428,8 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
     const uint32_t remaining = view.request->spec.prefillTokens - view.promptProcessed;
     uint32_t rows = std::min(remaining, budget);
     if (const uint32_t tail = prefillTailAlignment_ ? rows % prefillTailAlignment_ : 0;
-        rows == remaining && rows > 2 * prefillTailAlignment_ && tail && tail <= kPrefillTailRows)
+        rows == remaining && rows > 2 * prefillTailAlignment_ && tail && tail <= kPrefillTailRows &&
+        !(aneMinimumRows_ && rows >= aneMinimumRows_ && rows - tail < aneMinimumRows_))
       rows -= tail;
     // The command's attention stays within maximumAttentionPairs_: a lane's
     // rows halve until they fit, and one that does not fit at
@@ -641,7 +644,8 @@ void Scheduler::complete(const BatchPlan &plan,
                          double wallMilliseconds,
                          bool representativePrefillTiming,
                          double hostMilliseconds,
-                         std::optional<double> streamMilliseconds) {
+                         std::optional<double> streamMilliseconds,
+                         double imageEncodeMilliseconds) {
   if (!active_ || active_->kind != plan.kind ||
       active_->items.size() != plan.items.size() ||
       results.size() != plan.items.size()) {
@@ -714,14 +718,17 @@ void Scheduler::complete(const BatchPlan &plan,
     }
   }
   // A streaming command trains the command estimate as if it had not waited
-  // on its history's reads, and its lane's own estimate with that wait. A
-  // command in passes trains it once, with its passes' time together.
-  double commandWall = wallMilliseconds, commandHost = hostMilliseconds;
+  // on its history's reads, and its lane's own estimate with that wait; a
+  // command trains it without the encodes of its images. A command in passes
+  // trains it once, with its passes' time together.
+  const double rowsWall =
+      wallMilliseconds - std::clamp(imageEncodeMilliseconds, 0.0, std::max(wallMilliseconds, 0.0));
+  double commandWall = rowsWall, commandHost = hostMilliseconds;
   bool representative = representativePrefillTiming;
   if (plan.kind == WorkKind::Prefill && plan.passes > 1) {
     Request &lane = get(plan.items.front().requestId);
     if (lane.passes) {
-      commandWall = lane.passes->wallMilliseconds += wallMilliseconds;
+      commandWall = lane.passes->wallMilliseconds += rowsWall;
       commandHost = lane.passes->hostMilliseconds += hostMilliseconds;
       representative = lane.passes->representative = lane.passes->representative && representativePrefillTiming;
     }

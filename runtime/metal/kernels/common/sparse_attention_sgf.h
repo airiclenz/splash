@@ -23,16 +23,16 @@ template <typename CacheElement> struct SparseScratch {
   uint entries[kSparseSgfBlocks];
   SplashKvPage pages[kSparseSgfBlocks];
   uint places[kSparseSgfBlocks];
-  alignas(16) CacheElement values[SplashKvHeadDimension * 32];
+  alignas(16) CacheElement values[SPLASH_KV_HEAD_DIMENSION * 32];
 };
 
 // Copies the step's values, token-major in the cache, into the stage as
 // [dimension][token]; tokens of a slot past the list's end are zero.
 template <uint KVHeads, typename CacheElement>
 inline void sparse_gather_values(threadgroup SparseScratch<CacheElement> &scratch,
-                                 const SplashKvAddressing<KVHeads, CacheElement> addressing,
+                                 const SplashKvAddressing<KVHeads, SPLASH_KV_HEAD_DIMENSION, CacheElement> addressing,
                                  uint thread_index, uint threads) {
-  constexpr uint D = SplashKvHeadDimension;
+  constexpr uint D = SPLASH_KV_HEAD_DIMENSION;
   constexpr uint PerChunk = 16 / sizeof(CacheElement);
   constexpr uint RowChunks = D / PerChunk;
   for (uint chunk = thread_index; chunk < 32 * RowChunks; chunk += threads) {
@@ -66,7 +66,7 @@ __attribute__((always_inline)) inline void sparse_tile(
   constexpr uint G = QueryHeadsPerKVHead;
   constexpr uint M = 8 * G;
   constexpr uint N = 32;
-  constexpr uint D = SplashKvHeadDimension;
+  constexpr uint D = SPLASH_KV_HEAD_DIMENSION;
   constexpr uint BlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
   constexpr uint PageBlocks = SplashKvPageTokens / BlockTokens;
   constexpr uint AllRows = (1u << 8) - 1u;
@@ -106,7 +106,7 @@ __attribute__((always_inline)) inline void sparse_tile(
   for (uint d = 0; d < 32; ++d)
     output[d] = float2(0.0f);
   float2 row_max(-INFINITY), row_sum(0.0f);
-  const SplashKvAddressing<KVHeads, CacheElement> addressing(kv, kv_head);
+  const SplashKvAddressing<KVHeads, D, CacheElement> addressing(kv, kv_head);
 
   for (uint step = begin; step < end; step += kSparseSgfBlocks) {
     if (thread_index < kSparseSgfBlocks) {

@@ -516,6 +516,31 @@ void testImagePromptsRunPrefillGroups() {
   }
 }
 
+// A ticket of several commands, as a prefill command whose images are
+// encoded ahead of it, runs each on the engine's wakes (advance()): the
+// second only once the first has completed, however many wakes come before.
+void testTicketAdvancesOnTheEngineWakes() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  model.stagePrefillUntil = std::make_shared<std::atomic<bool>>(false);
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  engine.submit(request(1, std::vector<uint32_t>(100, 7)));
+  double now = 1;
+  for (uint32_t tick = 0; tick < 8; ++tick)
+    static_cast<void>(engine.tick(now++));
+  require(engine.commandInFlight() && events.completedCount == 0,
+          "a prefill command of two ran its second before its first completed");
+  *model.stagePrefillUntil = true;
+  tickUntil(engine, now, [&] { return idle(engine); },
+            "a prefill command of two did not run its second on the engine's wakes");
+  require(events.completedCount == 1 && events.failedCount == 0,
+          "a prefill command of two did not complete its request");
+}
+
 // Where the model runs a prefill command in passes over its layers, a long
 // prompt's commands run in passes, each its own command with the command's
 // rows: a decoding lane's steps run between them, its own page table goes
@@ -1699,6 +1724,73 @@ void testKvGrowthReclaimsIdleStateBeforeCache() {
                 engine.snapshot().recycledStatePublications == 0,
             "KV growth evicted useful composite state before idle state memory");
   }
+}
+
+// A KV growth denial that the cache covers keeps the lane's pooled buffers:
+// their draft ring is the one buffer no cached state holds, so a request that
+// arrives while the host is short of memory still starts beside the growing
+// one. Here each lane takes a pooled ring (pooledLaneBytes) or allocates one,
+// which the host refuses while it is short and the start is not in service.
+void testKvGrowthKeepsTheRingAWaitingLaneStartsFrom() {
+  constexpr uint64_t kRing = 4096;
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  bool serving = false;
+  bool hostShort = false;
+  EngineConfig config = test::engineConfig();
+  config.growthPaused = [&] { return hostShort; };
+  config.serving = [&](bool mark) { return std::exchange(serving, mark); };
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  executor.pooledLaneBytes = kRing;
+  executor.statesLacked = [&]() -> uint32_t {
+    return executor.pooledLaneBytes ? 0 : std::numeric_limits<uint32_t>::max();
+  };
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] {
+    if (executor.pooledLaneBytes >= kRing) {
+      executor.pooledLaneBytes -= kRing;
+      return false;
+    }
+    return hostShort && !serving;
+  };
+  executor.laneReleased = [&] { executor.pooledLaneBytes += kRing; };
+  const auto resident = [&](uint64_t id) {
+    const auto found = executor.requests.find(id);
+    return found != executor.requests.end() && found->second.resident;
+  };
+  const auto done = [&](uint64_t id) { return events.usage.contains(id); };
+  const auto submit = [&](uint64_t id, uint32_t tokens) {
+    EngineRequest next = request(id, std::vector<uint32_t>(65, static_cast<uint32_t>(id)));
+    next.maxNewTokens = tokens;
+    next.deadlineMilliseconds = 1e9;
+    engine.submit(next);
+  };
+
+  double now = 1;
+  submit(40, 8);
+  submit(41, 400);
+  tickUntil(engine, now, [&] { return done(40); }, "the first request did not finish");
+  require(resident(41) && executor.pooledLaneBytes == kRing,
+          "the finished lane's ring did not return to the pool");
+
+  hostShort = true;
+  storage.growthBlocked = true;
+  executor.kvGrowthBlocked = &storage.growthBlocked;
+  executor.unblockGrowthOnSuspend = false;
+  executor.reclaimableIdleStateBytes = 1U << 20;
+  tickUntil(engine, now, [&] { return !storage.growthBlocked; }, "KV growth was never denied");
+  require(executor.pooledLaneBytes == kRing, "KV growth reclaimed the ring a lane starts from");
+
+  submit(42, 8);
+  tickUntil(engine, now, [&] { return resident(42) || done(42); }, "the waiting request never started");
+  require(resident(41), "the waiting request started only once the growing one ended");
+  tickUntil(engine, now, [&] { return done(41) && done(42); }, "a request did not finish");
+  require(events.failures.empty(), "a request failed");
 }
 
 // Two lanes prefill their prompts, replay states included, in one command.
@@ -5194,10 +5286,10 @@ void testBudgetDenialRetriesAfterRelease() {
   }
 }
 
-// A lane's admission keeps the pooled buffers a lane starts from: its
-// activation takes them, so releasing them would only make the retry allocate
-// them again. KV growth has no use for them and releases them.
-void testStateAdmissionKeepsThePooledLaneBuffers() {
+// A lane's admission keeps the pooled buffers it starts from: its activation
+// takes them, so releasing them would only make the retry allocate them
+// again. KV growth releases them once the cache has nothing to give.
+void testLaneAdmissionAndKvGrowthKeepThePooledLaneBuffers() {
   for (bool state : {true, false}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 0);
@@ -5219,7 +5311,7 @@ void testStateAdmissionKeepsThePooledLaneBuffers() {
                 events.failures == std::vector<std::string>{"capacity_exhausted"} &&
                 (executor.pooledLaneBytes != 0) == state,
             state ? "a lane's admission released the pooled buffers it starts from"
-                  : "KV growth kept idle state buffers it cannot use");
+                  : "KV growth kept the pooled buffers with no lane waiting for them");
   }
 }
 
@@ -5561,6 +5653,100 @@ void testCompactionWaitsForTheCommandInFlight() {
   runUntilIdle(engine);
   require(events.completedCount == 5 && events.failedCount == 0,
           "a request did not complete after the held decode");
+}
+
+// A windowed target's engine gives up the windowed layers' K/V of the pages
+// every window has passed between commands (Cache::trimWindows), and runs
+// as it does with every page Full: no step reads a page of its window that
+// is not Full (Executor::windowPages), the steps read the same marks there,
+// and the requests start and emit alike, a second turn that resumes at the
+// first one's replay point among them, which finds its history Slim and
+// its tail Full; only the memory of the pages differs.
+void testWindowTrimChangesNoOutput() {
+  struct Outcome {
+    std::unordered_map<uint64_t, std::vector<uint32_t>> outputs;
+    std::vector<uint32_t> starts;
+    uint64_t digest = 0;
+    uint64_t trimmed = 0;
+    uint32_t slimPages = 0;
+  };
+  const auto run = [](bool trim) {
+    test::TestKvStorage storage(512, 4096, 4, 0, 1024);
+    KvPool pool(storage, 0);
+    engine::Cache cache(pool, nullptr, nullptr, std::nullopt, CacheWindowPolicy{2, trim});
+    Executor model;
+    model.kv = &storage;
+    model.windowPages = 2;
+    model.decodeFinishes = false;
+    model.decodeTokens = 4;
+    Events events;
+    engine::Engine engine(test::engineConfig(), cache, model, events);
+    guardReleases(storage, engine);
+    double now = 1;
+    std::vector<uint32_t> prompt = ScatteredPages::prompt(1000, 3000);
+    EngineRequest first = request(1, prompt);
+    first.maxNewTokens = 40;
+    engine.submit(first);
+    tickUntil(engine, now, [&] { return idle(engine); }, "the first request did not end");
+    // The fake marks no decoded rows, so the next turn shares the prompt
+    // alone.
+    for (uint32_t token = 0; token < 300; ++token)
+      prompt.push_back(90000 + token);
+    EngineRequest second = request(2, prompt);
+    second.maxNewTokens = 20;
+    engine.submit(second);
+    tickUntil(engine, now, [&] { return idle(engine); }, "the continuation did not end");
+    const CacheSnapshot cached = cache.snapshot();
+    return Outcome{events.outputs, events.starts, model.windowDigest, cached.window->trimmedPages,
+                   cached.pool.slim.pagesAllocated - cached.pool.slim.pagesFree};
+  };
+  const Outcome trimmed = run(true), full = run(false);
+  require(trimmed.outputs == full.outputs && trimmed.starts == full.starts && trimmed.digest == full.digest &&
+              trimmed.starts.size() == 2 && trimmed.starts[1] > 0 && trimmed.outputs.at(2).size() == 20,
+          "trimming changed what the steps read or emitted");
+  require(trimmed.trimmed > 90 && trimmed.slimPages > 90 && full.trimmed == 0 && full.slimPages == 0,
+          "the pages the windows passed did not give up their windowed layers, or did with trimming off");
+}
+
+// While the host pauses growth (macOS warns), a windowed target's trims are
+// memory the request in service needs, as its pages are: a prompt longer
+// than the budget holds Full pages completes, the pages its windows passed
+// Slim, where trims the pause refused would leave every page Full and the
+// request at the engine's limit.
+void testWindowTrimServesThroughTheHostPause() {
+  test::TestKvStorage storage(512, 4096, 4, 0, 1024);
+  // 128 Full pages, 4096 tokens; the prompt is 8000.
+  storage.budgetPages = 128;
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr, std::nullopt, CacheWindowPolicy{2, true});
+  Executor model;
+  model.kv = &storage;
+  model.windowPages = 2;
+  model.decodeFinishes = false;
+  Events events;
+  bool serving = false;
+  EngineConfig config = test::engineConfig();
+  config.growthPaused = [] { return true; };
+  config.serving = [&](bool value) { return std::exchange(serving, value); };
+  // As the governor does: the host refuses growth unless a request in
+  // service needs it, then the engine's limit binds.
+  storage.growthAllowed = [&](uint32_t) {
+    storage.allocationFailure =
+        serving ? metal::AllocationFailure::EngineBudget : metal::AllocationFailure::HostPressure;
+    return serving;
+  };
+  engine::Engine engine(config, cache, model, events);
+  guardReleases(storage, engine);
+  EngineRequest prompt = request(1, ScatteredPages::prompt(1000, 8000));
+  prompt.maxNewTokens = 8;
+  engine.submit(prompt);
+  double now = 1;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the long prompt did not end");
+  const CacheSnapshot cached = cache.snapshot();
+  require(events.completedCount == 1 && events.failures.empty() && events.outputs.at(1).size() == 8,
+          "a prompt the trims fit failed under the host's pause");
+  require(cached.window->trimmedPages > 128 && cached.pool.slim.pagesAllocated > 128,
+          "the pages the prompt's windows passed stayed Full under the host's pause");
 }
 
 void testAllocationCausesRemainDistinct() {
@@ -12262,6 +12448,7 @@ int main() {
     testSharedPrefillFailedPublicationFallsBack();
     testSharedPrefillDoesNotBlockUnrelatedWork();
     testImagePromptsRunPrefillGroups();
+    testTicketAdvancesOnTheEngineWakes();
     testPrefillPassesInterleaveDecodeAndEndAtACancel();
     testSharedPrefillHonorsPriorityAndLateArrival();
     testLateSharedPrefillExtendsTheProducerPlan();
@@ -12385,6 +12572,7 @@ int main() {
     testCancellationInFlightAtBoundaryPublishesNoState();
     testLaneStateGrowthReclaimsCachedStateAndRetries();
     testKvGrowthReclaimsIdleStateBeforeCache();
+    testKvGrowthKeepsTheRingAWaitingLaneStartsFrom();
     testKvGrowthDenialKeepsEveryLaneReplayState();
     testBoundaryStatesAreCapturedInsideCommands();
     testRefusedBuffersEndTheCommandAtTheirBoundary();
@@ -12479,7 +12667,7 @@ int main() {
     testRecoveryAdmitsFailedKvTargetBeforeReplaying();
     testFailedResumeRestoreKeepsTheKvTarget();
     testBudgetDenialRetriesAfterRelease();
-    testStateAdmissionKeepsThePooledLaneBuffers();
+    testLaneAdmissionAndKvGrowthKeepThePooledLaneBuffers();
     testPausedStateAdmissionReusesCachedStates();
     testDeniedGrowthAllocatesEachExtentOnce();
     testGrowthBeyondTheBudgetFailsAtOnce();
@@ -12488,6 +12676,8 @@ int main() {
     testStateStartGathersFreePagesBeforeEvicting();
     testCommandReadsItsPageTableAfterRoomForItsStates();
     testCompactionWaitsForTheCommandInFlight();
+    testWindowTrimChangesNoOutput();
+    testWindowTrimServesThroughTheHostPause();
     testAllocationCausesRemainDistinct();
     testAdmissionRespectsPriorityBeforeHashOrder();
     testConstraintMaskOverlapsInsideOneSchedulerBatch();

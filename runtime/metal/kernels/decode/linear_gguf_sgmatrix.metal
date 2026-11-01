@@ -91,6 +91,40 @@ template <class F, bool F32>
 using OperandType = metal::conditional_t<!F32, bfloat, metal::conditional_t<F::Kind == QuantFloat16, float, half>>;
 // The pair table's entries: as the operand, half for fp32 operands (no codebook format has them).
 template <class F, bool F32> using LutPair = vec<metal::conditional_t<F32, half, bfloat>, 2>;
+// The grids whose F32 instances read their magnitudes as half pairs from the pair table: entry e's four at lut[2e]
+// and lut[2e + 1], so the operand is a load instead of four byte-to-half conversions, and index(q) the entries of
+// pairs 0, 1 (x) and 2, 3 (y). On an M2 Max this takes 12-14% off the 27B's IQ3_S and IQ3_XXS projections at one
+// lane and 2-9% at two to four.
+template <uint Id> struct HalfGridOf { static constexpr constant uint Entries = 0; };
+template <> struct HalfGridOf<GGUF_FMT_IQ3S> {
+  static constexpr constant uint Entries = 512;
+  static uint word(uint e) { return kIQ3SGrid[e]; }
+  static uint2 index(uint q) { return uint2((q & 0xFF) | ((q >> 16) & 0x100), ((q >> 8) & 0xFF) | ((q >> 17) & 0x100)); }
+};
+template <> struct HalfGridOf<GGUF_FMT_IQ3XXS> {
+  static constexpr constant uint Entries = 256;
+  static uint word(uint e) { return kIQ3XXSGrid[e]; }
+  static uint2 index(uint q) { return uint2(q & 0xFF, (q >> 8) & 0xFF); }
+};
+template <class F> using HalfGrid = HalfGridOf<F::Id>;
+// The pair table's entries: a codebook's pairs, an F32 instance's half grid, or none.
+template <class F, bool F32>
+constant constexpr uint kLutEntries = F::Kind == QuantCodebook ? kQuantPairTableEntries
+                                      : F32 && HalfGrid<F>::Entries ? 2 * HalfGrid<F>::Entries
+                                                                    : 1;
+// Fills the pair table (quant_pair_table, or the half grid); called by all threads of the threadgroup.
+template <class F, bool F32, class T> inline void lut_table(threadgroup T *lut, uint thread_index, uint threads) {
+  if constexpr (F32 && HalfGrid<F>::Entries) {
+    for (uint e = thread_index; e < HalfGrid<F>::Entries; e += threads) {
+      const uchar4 m = as_type<uchar4>(HalfGrid<F>::word(e));
+      lut[2 * e] = T(half(m[0]), half(m[1]));
+      lut[2 * e + 1] = T(half(m[2]), half(m[3]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  } else {
+    quant_pair_table<F>(lut, thread_index, threads);
+  }
+}
 // The activation operand: the table's bf16, or on Apple7/8 its fp32 (Table16F), which enters the MMA as it is.
 template <bool F32> using InputType = metal::conditional_t<F32, float, bfloat>;
 template <bool F32> using TableElem = InputType<F32>;
@@ -114,6 +148,11 @@ inline vec<OperandType<F, true>, 2> operand_f32(typename F::Chunk ch, uint f, th
   } else if constexpr (F::Kind == QuantFloat16) {
     static_assert(is_same_v<typename F::Value, bfloat>, "the register tile takes bf16 values only");
     return float2(as_type<bfloat2>(F::values(ch)[f]));
+  } else if constexpr (HalfGrid<F>::Entries != 0) {
+    const uint2 e = HalfGrid<F>::index(ch);
+    const uint s = F::signs(ch) >> (2 * f);
+    const half2 v = lut[2 * (f < 2 ? e.x : e.y) + (f & 1)];
+    return select(v, -v, bool2(s & 1u, s & 2u));
   } else {
     const uint2 g = F::grid(ch);
     const uchar4 m = as_type<uchar4>(f < 2 ? g.x : g.y);
@@ -161,10 +200,11 @@ inline half2 q3_operand(uint2 chunk, uint f) {
   return as_type<half2>((low & 0x01800180u) | ((chunk.y << (9 - 2 * f)) & 0x02000200u) | 0x3C003C00u) - half2(1.5h);
 }
 
-// Apple7/8's (F32) view of Q4_0 and Q5_0: the zero point taken as a min, m = -zero d, so their chains close once per
+// Apple7/8's (F32) view of Q4_0, Q5_0, PQ2_0 and Q2_0: the zero point taken as a min, m = -zero d, so their chains close once per
 // 32 inputs against the table's sums, as Q4_1's and Q5_1's do, instead of once per 16 against the seeds. On an M2
 // Max this takes 8-14% off Q4_0's 17408 x 5120 gate/up at one to four lanes (Q5_0's 2-8%), and the 27B in Q4_0,
-// MLX 4-bit's size, decodes 3-7% below MLX 4-bit instead of 10-14%.
+// MLX 4-bit's size, decodes 3-7% below MLX 4-bit instead of 10-14%. Q2_0 shares FmtTwoBit's algebra with PQ2_0
+// (value = d * (q - 1), Zero 1), so it takes the same view.
 template <class F> struct ZeroAsMin {
   enum : uint { Id = F::Id, P0 = F::P0, P1 = F::P1, MetaBytes = F::MetaBytes };
   enum : ushort { MetaGroups = F::MetaGroups, Zero = 0, Group = F::Group };
@@ -182,10 +222,36 @@ template <class F> struct ZeroAsMin {
     return k;
   }
 };
+// Apple7/8's (F32) view of IQ3_XXS: each chunk's signs from kQuantSigns7 rather than quant_signs7's popcount and
+// parity per sign index. On an M2 Max this takes another 4-5% off the 27B's IQ3_XXS projections at one lane and
+// 1% at two and three.
+struct IQ3XXSSignTable {
+  typedef FmtIQ3XXS F;
+  enum : uint { Id = F::Id, P0 = F::P0, P1 = F::P1, MetaBytes = F::MetaBytes };
+  enum : ushort { MetaGroups = F::MetaGroups, Zero = F::Zero, Group = F::Group };
+  static constexpr constant QuantKind Kind = F::Kind;
+  static constexpr constant bool ScaleInChunk = F::ScaleInChunk;
+  typedef F::Payload Payload; typedef F::Chunk Chunk; typedef F::Meta Meta;
+  static Payload load(device uchar *p0, device uchar *p1) { return F::load(p0, p1); }
+  static Meta loadMeta(device uchar *m) { return F::loadMeta(m); }
+  static Chunk chunk(Payload w, ushort c) {
+    const uint l = 7u * (c >> 1), h = 4u * (c & 1);
+    const uint s = ((uint(kQuantSigns7[(w.b >> l) & 127]) >> h) & 0xF) |
+                   ((uint(kQuantSigns7[(w.b >> (l + 14)) & 127]) >> h) & 0xF) << 4;
+    return ((w.a.x >> (8 * c)) & 0xFF) | ((w.a.y >> (8 * c)) & 0xFF) << 8 | s << 16 | (w.b >> 28) << 26;
+  }
+  static Chunk loadChunk(device uchar *p0, device uchar *p1, ushort c) { return chunk(F::load(p0, p1), c); }
+  static uint2 grid(Chunk q) { return F::grid(q); }
+  static uint signs(Chunk q) { return F::signs(q); }
+  static QuantCoef coef(Meta mt, Chunk q) { return F::coef(mt, q); }
+};
 // The format an F32 instance decodes F as.
 template <class F> struct F32Format { typedef F type; };
 template <> struct F32Format<FmtQ40> { typedef ZeroAsMin<FmtQ40> type; };
 template <> struct F32Format<FmtQ50> { typedef ZeroAsMin<FmtQ50> type; };
+template <> struct F32Format<FmtPQ20> { typedef ZeroAsMin<FmtPQ20> type; };
+template <> struct F32Format<FmtQ20> { typedef ZeroAsMin<FmtQ20> type; };
+template <> struct F32Format<FmtIQ3XXS> { typedef IQ3XXSSignTable type; };
 // Formats with a min per 32 inputs whose chunk is one word of 4-bit codes in Q4_K's order (Q4_K, Q4_1, Q4_0 as
 // ZeroAsMin, MLX affine 4-bit in groups of 32), or 5-bit codes in Q5_K's planes (Q5_K, Q5_1, Q5_0 as ZeroAsMin):
 // their F32 chains per 32 inputs take nibble_operand too.
@@ -803,10 +869,10 @@ GGUF_PREPARE(decode_linear_gguf_prepare_f, float)
                    constant GgufDecodeParams &p [[buffer(9)]], uint2 tg [[threadgroup_position_in_grid]],       \
                    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],    \
                    uint lane [[thread_index_in_simdgroup]]) {                                               \
-    threadgroup gguf_sg::LutPair<F, F32> lut[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];        \
+    threadgroup gguf_sg::LutPair<F, F32> lut[gguf_sg::kLutEntries<F, F32>];                                 \
     threadgroup gguf_sg::Coef<F> coefs[gguf_sg::kCoefs<F>];                                                 \
     threadgroup uint arrival;                                                                               \
-    quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);                                                   \
+    gguf_sg::lut_table<F, F32>(lut, tid, GGUF_REGISTER_THREADS);                                            \
     gguf_sg::decode<F, L, EP, F32>(table, sums, w0, w1, meta, out, partials, counters, aux, p, tg, tid, sg, \
                                    lane, lut, coefs, &arrival);                                             \
   }
@@ -830,10 +896,10 @@ GGUF_PREPARE(decode_linear_gguf_prepare_f, float)
                    device atomic_uint *counters [[buffer(10)]], constant GgufDecodeParams &p [[buffer(11)]],     \
                    uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],          \
                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {      \
-    threadgroup gguf_sg::LutPair<F, true> lut[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];         \
+    threadgroup gguf_sg::LutPair<F, true> lut[gguf_sg::kLutEntries<F, true>];                                  \
     threadgroup gguf_sg::Coef<F> coefs[gguf_sg::kCoefs<F>];                                                 \
     threadgroup uint arrival;                                                                               \
-    quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);                                                   \
+    gguf_sg::lut_table<F, true>(lut, tid, GGUF_REGISTER_THREADS);                                           \
     gguf_sg::decode_fragment_paired<F, L, true, bfloat>(table, sums, g0, g1, gm, u0, u1, um, out, partials,     \
                                                         counters, p, tg, tid, sg, lane, lut, coefs, &arrival); \
   }
@@ -899,11 +965,12 @@ GGUF_SG_FUSED(4)
 #undef GGUF_SG_SEGMENT
 
 // MoE experts (ops/MoE.cpp): threadgroup (x, y) computes 64 columns of grouped 8-row tile y from its Table16 tile
-// (kernels/shared/moe.metal) with the weights of the tile's expert (moe_gguf_segment), in the format the tile picks
+// (kernels/shared/moe.metal) with the weights of the tile's expert (moe_gguf_segment) of a block whose shared expert
+// is Shared slices (each instance's slices suffix, ops::kCompiledMoeRoutings), in the format the tile picks
 // at run time: on the 40-core M3 Max one run-time-format kernel is within +1.6% of the per-format kernels
 // (23040x2048 Q4_K and 92160x512 Q5_K, one to four lanes). No K splits, so no partials or counters.
 // aux is the gate of the up pass. Grid (column tiles, expert tiles), GGUF_REGISTER_THREADS threads.
-template <GgufEpilogue Ep>
+template <GgufEpilogue Ep, uint Shared>
 inline void gguf_sg_expert(device const bfloat *table, device const float *sums, device const MoeTileDescriptor *tiles,
                            device const uint *tile_count, device uchar *w0, device uchar *w1, device uchar *meta,
                            device uchar *sw0, device uchar *sw1, device uchar *smeta, device bfloat *out,
@@ -911,7 +978,7 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
                            uint2 tg, uint tid, uint sg, uint lane, threadgroup bfloat2 *lut, threadgroup float2 *coefs,
                            threadgroup uint *arrival) {
   if (tg.y >= *tile_count) return;
-  const MoeGgufSegment s = moe_gguf_segment(tiles[tg.y].expert, p, slots, w0, w1, meta, sw0, sw1, smeta);
+  const MoeGgufSegment s = moe_gguf_segment<Shared>(tiles[tg.y].expert, p, slots, w0, w1, meta, sw0, sw1, smeta);
   const uint K = p.input_size, N = p.output_size;
   const ulong rows = ulong(tg.y) * 8;
   const GgufDecodeParams q{K, 1, N, 0, 0};
@@ -924,7 +991,7 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
         arrival);
   });
 }
-#define GGUF_SG_EXPERT(Name, EP)                                                                                    \
+#define GGUF_SG_EXPERT(Name, EP, Shared)                                                                            \
   kernel void Name(device const bfloat *table [[buffer(0)]], device const float *sums [[buffer(1)]],              \
                    device const MoeTileDescriptor *tiles [[buffer(2)]], device const uint *tile_count [[buffer(3)]], \
                    device uchar *w0 [[buffer(4)]], device uchar *w1 [[buffer(5)]], device uchar *meta [[buffer(6)]], \
@@ -937,9 +1004,11 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
     threadgroup bfloat2 lut[kQuantPairTableEntries];                                                                \
     threadgroup float2 coefs[gguf_sg::kCoefFloat2s];                                                                \
     threadgroup uint arrival;                                                                                       \
-    gguf_sg_expert<EP>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, slots, p, tg, tid, sg, \
-                       lane, lut, coefs, &arrival);                                                                 \
+    gguf_sg_expert<EP, Shared>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, slots, p, tg, \
+                               tid, sg, lane, lut, coefs, &arrival);                                                \
   }
-GGUF_SG_EXPERT(moe_expert_gguf_sg_a, EpNone)
-GGUF_SG_EXPERT(moe_expert_gguf_sg_g, EpUpWithGate)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_a, EpNone, 1)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_g, EpUpWithGate, 1)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_a_s2, EpNone, 2)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_g_s2, EpUpWithGate, 2)
 #undef GGUF_SG_EXPERT

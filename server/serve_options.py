@@ -308,6 +308,20 @@ def parse_decode_share(value):
     return share
 
 
+def parse_contended_prefill_rows(value):
+    try:
+        rows = int(value)
+    except ValueError:
+        rows = 0
+    is_in_range = MIN_CONTENDED_PREFILL_ROWS <= rows <= MAX_CONTENDED_PREFILL_ROWS
+    if not is_in_range or rows & (rows - 1):
+        raise argparse.ArgumentTypeError(
+            "must be a power of two in "
+            f"[{MIN_CONTENDED_PREFILL_ROWS}, {MAX_CONTENDED_PREFILL_ROWS}]"
+        )
+    return rows
+
+
 def parse_ane_ffn_share(value):
     try:
         share = float(value)
@@ -395,20 +409,6 @@ def parse_reasoning_loop_limit(value):
     if limit < 0:
         raise argparse.ArgumentTypeError("must be a nonnegative integer")
     return limit
-
-
-def parse_contended_prefill_rows(value):
-    try:
-        rows = int(value)
-    except ValueError:
-        rows = 0
-    is_in_range = MIN_CONTENDED_PREFILL_ROWS <= rows <= MAX_CONTENDED_PREFILL_ROWS
-    if not is_in_range or rows & (rows - 1):
-        raise argparse.ArgumentTypeError(
-            "must be a power of two in "
-            f"[{MIN_CONTENDED_PREFILL_ROWS}, {MAX_CONTENDED_PREFILL_ROWS}]"
-        )
-    return rows
 
 
 def parse_record_requests(value):
@@ -804,6 +804,20 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--contended-prefill-rows",
+        "requests",
+        dict(
+            type=parse_contended_prefill_rows,
+            default=None,
+            metavar="N",
+            help="smallest prefill command, in rows, while other requests "
+            "decode; a power of two in "
+            f"[{MIN_CONTENDED_PREFILL_ROWS}, {MAX_CONTENDED_PREFILL_ROWS}] "
+            "(default: 256 on Apple GPU family 7/8 (M1/M2), "
+            f"{MIN_CONTENDED_PREFILL_ROWS} otherwise)",
+        ),
+    ),
+    ServeOption(
         "--prefill-mode",
         "requests",
         dict(
@@ -898,20 +912,6 @@ SERVE_OPTIONS = (
             default=False,
             help="decode one token per step without draft proposals; the draft "
             "stays loaded (default: speculative decoding on)",
-        ),
-    ),
-    ServeOption(
-        "--contended-prefill-rows",
-        "requests",
-        dict(
-            type=parse_contended_prefill_rows,
-            default=None,
-            metavar="N",
-            help="smallest prefill command, in rows, while other requests "
-            "decode; a power of two in "
-            f"[{MIN_CONTENDED_PREFILL_ROWS}, {MAX_CONTENDED_PREFILL_ROWS}] "
-            "(default: 256 on Apple GPU family 7/8 (M1/M2), "
-            f"{MIN_CONTENDED_PREFILL_ROWS} otherwise)",
         ),
     ),
     ServeOption(

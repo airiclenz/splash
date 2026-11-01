@@ -1667,6 +1667,10 @@ std::optional<bool> spinCheck(MetalBackend &backend, std::string_view test) {
     return std::nullopt;
 }
 
+// Whether awake host steps spin on this GPU: Apple7/8 run them as plain
+// ones, unchecked (checkHostStepSpin).
+bool spinsOnThisGpu(const MetalBackend &backend) { return backend.capabilities().appleGpuFamily >= 9; }
+
 // How long the GPU work after a host step may take to start: the spin's bound
 // (60 ms or more) is far above both, and a GPU idle through the step only wakes
 // up, at times slowly under the validation layer or other work.
@@ -1678,7 +1682,7 @@ constexpr double kIdleResumeSeconds = 0.05;
 // fifty of them (more command buffers than a queue holds by default) runs
 // them in order, keeping the GPU awake or not, and on the backend's runner,
 // never on the submitting thread; a GPU spin through an awake step sees the
-// CPU end it on this system (host_step.metal).
+// CPU end it on this system (host_step.metal), and Apple7/8 run none.
 // Once the command completed, before its wait returns, each step's round trip
 // reached its `timed`: its work as long as the step took, and pickup and
 // resume within a second. A step without work is refused.
@@ -1693,9 +1697,10 @@ void hostSteps(const std::string &metallibPath) {
     const std::vector<ComputeDispatch> dispatches(kSteps + 1, addition(buffer, count, one));
     const std::thread::id submitter = std::this_thread::get_id();
     const std::optional<bool> spins = spinCheck(backend, "the awake host steps' resume");
-    require(spins.value_or(true), "a GPU spin through an awake host step did not see the CPU end it");
+    require(spinsOnThisGpu(backend) ? spins.value_or(true) : spins == false,
+            "a GPU spin through an awake host step did not see the CPU end it, or one ran on Apple7/8");
     for (const bool awake : {false, true}) {
-        const double resumeBound = awake && spins ? kSpinningResumeSeconds : kIdleResumeSeconds;
+        const double resumeBound = awake && spins.value_or(false) ? kSpinningResumeSeconds : kIdleResumeSeconds;
         const std::string kind = awake ? "awake" : "plain";
         *value = 0;
         std::vector<uint32_t> seen;
@@ -1783,7 +1788,8 @@ void hostSteps(const std::string &metallibPath) {
 
 // The first command of a fresh backend may hold an awake host step: the
 // backend builds and checks the spin before it encodes the command, which
-// runs the step between its work and spins through it on this system.
+// runs the step between its work and spins through it on this system, or
+// runs it as a plain one on Apple7/8.
 void firstCommandWithAnAwakeHostStep(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
     MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
@@ -1800,10 +1806,12 @@ void firstCommandWithAnAwakeHostStep(const std::string &metallibPath) {
             "an awake host step in a fresh backend's first command did not run between its work");
     // A first check that decided nothing ran the step without the spin.
     const std::optional<bool> spins = spinCheck(backend, "a fresh backend's first awake host step");
-    require(spins.value_or(true) && timing.resumeSeconds < kIdleResumeSeconds,
-            "the GPU did not spin through an awake host step of a fresh backend's first command: resume " +
-                std::to_string(timing.resumeSeconds) + " s");
-    std::cout << "PASS a fresh backend's first command spins through its awake host step\n";
+    const bool spinning = spinsOnThisGpu(backend);
+    require((spinning ? spins.value_or(true) : spins == false) && timing.resumeSeconds < kIdleResumeSeconds,
+            "the GPU did not spin through an awake host step of a fresh backend's first command, or spun on "
+            "Apple7/8: resume " + std::to_string(timing.resumeSeconds) + " s");
+    std::cout << (spinning ? "PASS a fresh backend's first command spins through its awake host step\n"
+                           : "PASS a fresh backend's first command runs its awake host step as a plain one\n");
 }
 
 id noCommandQueue(id, SEL) { return nil; }
@@ -1816,7 +1824,8 @@ CFTimeInterval startedLate(id, SEL) { return std::numeric_limits<CFTimeInterval>
 // library's, metal_backend_test.metal), and when Metal creates no queue for
 // the check. A check whose every spin started after its release, as when the
 // GPU is busy with other work, decides nothing and warns of nothing: a later
-// check spins.
+// check spins. Apple7/8 check no spin, so even a library Metal cannot load
+// beside the backend's warns of nothing there.
 void hostStepSpinFallsBack(const std::string &metallibPath) {
     namespace fs = std::filesystem;
     constexpr std::string_view kWarning = "Metal host steps run without keeping the GPU awake";
@@ -1847,6 +1856,19 @@ void hostStepSpinFallsBack(const std::string &metallibPath) {
     const fs::path library = directory.path() / "test.metallib";
     const fs::path spinLibrary = directory.path() / "host-step.metallib";
     fs::copy_file(metallibPath, library);
+    {
+        writeFile(spinLibrary, "not a metallib");
+        MetalBackend backend(library.string());
+        if (!spinsOnThisGpu(backend)) {
+            const std::string warnings = capturedStderr([&] { runAwakeSteps(backend); });
+            require(warnings.find(kWarning) == std::string::npos && backend.healthy() &&
+                        BackendInstrumentation::awakeHostStepsSpin(backend) == false,
+                    "awake host steps on Apple7/8 checked their spin, warned or spun: " + warnings);
+            std::cout << "PASS awake host steps run as plain ones on Apple7/8, unchecked\n";
+            return;
+        }
+        fs::remove(spinLibrary);
+    }
     {
         MetalBackend backend(library.string());
         fallsBack(backend, spinLibrary.string());

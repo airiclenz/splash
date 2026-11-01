@@ -126,19 +126,30 @@ void baselinePlans() {
   }
 }
 
-// MoE plans run the three expert passes: the exact register tile on Apple9,
-// with its Table16 row sums in the workspace bounds, staged tiles everywhere
-// else (32-row tiles for prefill chunks past one route per expert), on the MMA
-// kernels below Apple9.
+// MoE plans run the three expert passes: the exact register tile on Apple9
+// GPUs of more than 10 cores, with its Table16 row sums in the workspace
+// bounds, staged tiles everywhere else (32-row tiles for prefill chunks past
+// one route per expert), on the MMA kernels below Apple9.
 void ggufMoePlans() {
   const MoeShape shape = routedShape;
-  for (uint32_t family : {0U, 7U, 8U, 9U, 10U, 11U}) {
-    ExecutionPlans plans(device(family));
+  // A GPU family, the cores its device reports (none: kAssumedGpuCores) and its tile.
+  struct Device final {
+    uint32_t family, reportedCores;
+    MoeGgufTile expected;
+  };
+  for (const auto [family, reportedCores, expected] :
+       {Device{0, 0, MoeGgufTile::Mma}, Device{7, 0, MoeGgufTile::Mma}, Device{8, 0, MoeGgufTile::Mma},
+        Device{9, 0, MoeGgufTile::Register}, Device{9, 11, MoeGgufTile::Register}, Device{9, 10, MoeGgufTile::Staged},
+        Device{10, 0, MoeGgufTile::Staged}, Device{11, 0, MoeGgufTile::Staged}}) {
+    DeviceCapabilities capabilities = device(family);
+    capabilities.gpuCoreCount = reportedCores;
+    ExecutionPlans plans(capabilities);
+    const uint32_t cores = plannedGpuCores(capabilities);
     // Below Apple9 the staged tiles' plans run on the MMA kernels.
     const MoeGgufTile stagedTile = gpuFamilyClass(family) == GpuFamilyClass::Apple7
                                        ? MoeGgufTile::Mma : MoeGgufTile::Staged;
-    const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : stagedTile;
-    require(moeGgufTile(gpuFamilyClass(family), shape) == expected, "GGUF expert tile is not gated on GPU family 9");
+    require(moeGgufTile(gpuFamilyClass(family), cores, shape) == expected,
+            "GGUF expert tile is not gated on GPU family 9 of more than 10 cores");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(shape, lanes);
       require(plan.configuration().ggufTile == expected && plan.tileRows() == 8 &&
@@ -150,18 +161,18 @@ void ggufMoePlans() {
               "GGUF register plan sums its Table16 tiles");
       covers(plans.moeDecodeWorkspacePerLane(shape), plan.workspace(), lanes, kMoeWorkspaceFields);
     }
-    // Apple9 stages experts mostly in a format it stages (IQ2_XS: UD-Q2_K_XL)
-    // and keeps the register tile for the others (Q4_K: UD-Q4_K_M).
+    // Apple9 stages experts mostly in a format it stages (IQ2_XS: UD-Q2_K_XL),
+    // and the others (Q4_K: UD-Q4_K_M) take the device's tile.
     MoeShape staged = shape, q4k = shape;
     staged.expertFormat = GGUF_FMT_IQ2XS;
     q4k.expertFormat = GGUF_FMT_Q4K;
-    require(moeGgufTile(gpuFamilyClass(family), staged) == stagedTile &&
-                moeGgufTile(gpuFamilyClass(family), q4k) == expected,
+    require(moeGgufTile(gpuFamilyClass(family), cores, staged) == stagedTile &&
+                moeGgufTile(gpuFamilyClass(family), cores, q4k) == expected,
             "GGUF expert tile does not follow the experts' format on GPU family 9");
     // An expert weight in a format the register tile does not take (F16) stages the experts.
     MoeShape f16 = q4k;
     f16.registerFormats = false;
-    require(moeGgufTile(gpuFamilyClass(family), f16) == stagedTile,
+    require(moeGgufTile(gpuFamilyClass(family), cores, f16) == stagedTile,
             "GGUF experts with an F16 weight took the register tile");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(staged, lanes);
@@ -171,20 +182,29 @@ void ggufMoePlans() {
     }
     // Prefill: the register tile's 8 rows, or staged 8-row tiles while the
     // routes average at most one row per expert (32 rows of 8 of 256
-    // experts). The router's float tile follows Linear::ggufFloatTile (32
-    // assumed cores: the neural accelerator from 321 rows, only from Apple10).
-    for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 100U, 256U, 257U, 320U, 321U, 2048U}) {
-      const MoePlan plan = plans.moePrefill(shape, rows);
-      const uint32_t tileRows = expected == MoeGgufTile::Register || rows <= 32 ? 8 : 32;
-      const FloatTile router = family >= 10 && rows > 320 ? FloatTile::NeuralAccelerator : FloatTile::Simdgroup;
-      require(plan.configuration().ggufTile == expected && plan.tileRows() == tileRows &&
-                  (plan.workspace().groupedSumsBytes > 0) == (expected == MoeGgufTile::Register) &&
-                  plan.configuration().ggufRouterTile == router,
-              "GGUF MoE prefill plan left the device's tile");
-      covers(plans.moePrefillWorkspace(shape, 2048), plan.workspace(), 1, kMoeWorkspaceFields);
+    // experts). The router's float tile follows Linear::ggufFloatTile and the
+    // router's format (32 assumed cores: the neural accelerator from 321
+    // rows of BF16 values, 449 of F32 values and 705 of a quantized format's
+    // rows, only on Apple10).
+    for (const auto [routerFormat, first] :
+         {std::pair{uint32_t{GGUF_FMT_BF16}, 321U}, std::pair{QuantizedSegment::kFloat32, 449U},
+          std::pair{uint32_t{GGUF_FMT_AF8G64}, 705U}}) {
+      MoeShape routed = shape;
+      routed.routerFormat = routerFormat;
+      const MoeWorkspace bound = plans.moePrefillWorkspace(routed, 2048);
+      for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 100U, 256U, 257U, 320U, 321U, 448U, 449U, 704U, 705U, 2048U}) {
+        const MoePlan plan = plans.moePrefill(routed, rows);
+        const uint32_t tileRows = expected == MoeGgufTile::Register || rows <= 32 ? 8 : 32;
+        const FloatTile router = family >= 10 && rows >= first ? FloatTile::NeuralAccelerator : FloatTile::Simdgroup;
+        require(plan.configuration().ggufTile == expected && plan.tileRows() == tileRows &&
+                    (plan.workspace().groupedSumsBytes > 0) == (expected == MoeGgufTile::Register) &&
+                    plan.configuration().ggufRouterTile == router,
+                "GGUF MoE prefill plan left the device's tile");
+        covers(bound, plan.workspace(), 1, kMoeWorkspaceFields);
+      }
     }
-    // The prefill bound holds the device's plans and nothing else: on Apple9
-    // the register tile's 8-row tiles (20480 grouped rows at 2048 rows), not
+    // The prefill bound holds the device's plans and nothing else: on the
+    // register tile its 8-row tiles (20480 grouped rows at 2048 rows), not
     // the staged 32-row tiles it never runs (26624).
     MoeWorkspace devicePlans;
     for (uint32_t rows = 1; rows <= 2048; ++rows) {
@@ -223,6 +243,37 @@ void unknownCoreCount() {
       require(unknown.moeDecode(routedShape, lanes).configuration() ==
                   planned.moeDecode(routedShape, lanes).configuration(),
               "an unknown core count planned a MoE decode step for other than the assumed cores");
+  }
+}
+
+void apple7PrefillAttentionPlans() {
+  for (uint32_t family : {7U, 8U}) {
+    for (uint32_t cores : {32U, 38U, 76U}) {
+      DeviceCapabilities dev = device(family);
+      dev.gpuCoreCount = cores;
+      const ExecutionPlans plans(dev);
+      for (uint32_t kvHeads : {2U, 4U}) {
+        const uint32_t queryHeads = kvHeads == 2 ? 16U : 24U;
+        const kv::Layout layout{1, kvHeads, 256};
+        require(plans.prefillAttention(2048, queryHeads, layout).splits == 1,
+                "2048-row piece takes 1 split");
+        require(plans.prefillAttention(512, queryHeads, layout).splits == 4,
+                "512-row piece scales splits with cores");
+        require(plans.prefillAttention(256, queryHeads, layout).splits == 8,
+                "256-row piece scales splits with cores");
+        require(plans.prefillAttention(128, queryHeads, layout).splits == 16,
+                "128-row piece scales splits with cores");
+
+        // The workspace bound equals the baseline bound (capped at 2048 rows)
+        const auto ws = plans.prefillAttentionWorkspace(2048, queryHeads, layout);
+        const auto baseWs = PagedAttention::prefillWorkspace(2048, queryHeads, layout);
+        require(ws.partialsBytes == baseWs.partialsBytes &&
+                    ws.statisticsBytes == baseWs.statisticsBytes,
+                "prefill attention workspace bound unchanged under cap");
+        for (uint32_t rows : {128U, 256U, 512U, 1024U, 2048U})
+          covers(ws, plans.prefillAttention(rows, queryHeads, layout).workspace, 1, attentionFields);
+      }
+    }
   }
 }
 
@@ -300,6 +351,7 @@ int main() {
     baselinePlans();
     ggufMoePlans();
     unknownCoreCount();
+    apple7PrefillAttentionPlans();
     workspaceBounds();
     invalidLookupsAndContextEdges();
     std::cout << "PASS execution plans: device policies, device MoE tiles, B1-B4 "

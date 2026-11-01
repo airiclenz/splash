@@ -39,6 +39,7 @@ from .api_shapes import (
     anthropic_usage,
     completion_response,
     finish_reason,
+    is_custom_call,
     responses_item,
     responses_item_id,
     responses_output,
@@ -664,6 +665,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "context_length": self.app.max_context,
                     "vision": self.app.vision,
                     "input_modalities": self.app.input_modalities,
+                    "reasoning": self.app.reasoning,
                     **(
                         {"root": self.app.response_model}
                         if name != self.app.response_model
@@ -1018,14 +1020,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
         start, each piece of output, the idle waits and prompt progress:
         streams send them, and complete Messages and Responses gather the
         output into blocks."""
-        splitter = ReasoningSplitter(job.thinking, job.may_call_tools)
+        splitter = ReasoningSplitter(job.thinking, job.may_call_tools, job.chat_format)
         # A chat answer is parsed as it arrives whether it streams or not:
         # its calls where tools may be called, and in any answer, a </think>
         # the model writes after its reasoning ended is dropped. A text
         # completion, without a chat template, is its text as written.
         projector = (
             StreamingToolCallProjector(
-                job.tool_policy, job.public_id, job.response_validator is not None
+                job.tool_policy,
+                job.public_id,
+                job.response_validator is not None,
+                job.chat_format.call_syntax,
             )
             if job.tool_policy is not None or job.reasoning is not None
             else None
@@ -1229,7 +1234,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         ),
                         "stop_sequence": result.stop_sequence,
                     },
-                    "usage": {"output_tokens": result.completion_tokens},
+                    "usage": {
+                        "output_tokens": result.completion_tokens,
+                        "output_tokens_details": {
+                            "thinking_tokens": job.reasoning_tokens
+                        },
+                    },
+                    "timings": timings_dict(result),
                 },
             )
             send("message_stop", {})
@@ -1380,6 +1391,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 )
 
         def item_delta(index, block, text):
+            if is_custom_call(job, block):
+                # A custom tool's input is the string inside the arguments;
+                # it streams whole when the call closes.
+                return
             if block.kind == "tool":
                 event, extra = "response.function_call_arguments.delta", {}
             elif block.kind == "reasoning":
@@ -1402,7 +1417,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
         def close_item(index, block):
             item = responses_item(job, block, index)
-            if block.kind == "tool":
+            if is_custom_call(job, block):
+                for event, field in (("delta", "delta"), ("done", "input")):
+                    send(
+                        f"response.custom_tool_call_input.{event}",
+                        item_id=item["id"],
+                        output_index=index,
+                        **{field: item["input"]},
+                    )
+            elif block.kind == "tool":
                 send(
                     "response.function_call_arguments.done",
                     item_id=item["id"],
@@ -2102,11 +2125,21 @@ def main():
         # exits, so that no installation collects the assembly its tokenizer
         # and engines, a relaunched one too, serve.
         model_root, held = assembly.hold(Path(args.model_root))
+        # The family the installation found the model to be, whose chat
+        # format its output is read in.
+        family = assembly.family(model_root)
+        if family is None:
+            raise ModelError(
+                f"{args.model} is not prepared as a model of a family this "
+                "release serves: prepare it again"
+            )
         tokenizer = AutoTokenizer.from_pretrained(
             model_root / "tokenizer", local_files_only=True, trust_remote_code=False
         )
-        validate_tokenizer(tokenizer)
-        thinking_end = thinking_end_tokens(tokenizer, args.thinking_end_text)
+        validate_tokenizer(tokenizer, family.chat_format)
+        thinking_end = thinking_end_tokens(
+            tokenizer, args.thinking_end_text, family.chat_format
+        )
         chat_templates = ChatTemplates(tokenizer)
         print_status(f"Chat template · {chat_templates.describe()}")
         learned, save_learned = _recall_learned_bound(args)
@@ -2155,7 +2188,7 @@ def main():
         # The server is bound before git runs or the engine reports its build
         # id, so the identity is handed over here, before activation.
         server.build_identity = release_identity.resolve(_startup_build_id(backend))
-        constraint_factory = ConstraintFactory(tokenizer)
+        constraint_factory = ConstraintFactory(tokenizer, family.chat_format)
         app = Frontend(
             tokenizer,
             backend,
@@ -2167,6 +2200,7 @@ def main():
             readiness.max_concurrent_requests,
             constraint_factory=constraint_factory,
             chat_templates=chat_templates,
+            chat_format=family.chat_format,
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
             served_model_names=args.served_model_name,
@@ -2194,7 +2228,7 @@ def main():
             if effective_context % 1024 == 0
             else f"{effective_context:,}"
         )
-        mode = "" if readiness.vision else " · language only"
+        mode = "" if readiness.vision else " · text only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
     except (

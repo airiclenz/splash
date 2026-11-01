@@ -133,10 +133,12 @@ template <> struct ValueRun<bfloat> {
   }
 };
 
-// One tile of eight query rows x G heads over its split's pages, as
+// One tile of Rows query rows x G heads over its split's pages, as
 // splash_paged_attention_tile: row r of the tile sees committed_tokens + r + 1
-// tokens, and rows past active_rows repeat the last active row's mask.
-template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement>
+// tokens, and rows past active_rows repeat the last active row's mask. Rows is
+// the eight-row tile's, or one part's (splash_attention_tile_part), so that a
+// group of sixteen runs as two parts of 64 fused rows, eight simdgroups each.
+template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement, uint Rows = 8>
 __attribute__((always_inline)) inline void tile(
     device const bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
@@ -144,14 +146,13 @@ __attribute__((always_inline)) inline void tile(
     uint sg, uint lane, threadgroup uint *query_stage) {
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr uint G = QueryHeadsPerKVHead;
-  constexpr uint Rows = 8;
   constexpr uint M = Rows * G;
   constexpr uint N = SplashKvPageTokens;
-  constexpr uint D = SplashKvHeadDimension;
+  constexpr uint D = SPLASH_KV_HEAD_DIMENSION;
   static_assert(N == 32 && D == 256, "fragment maps assume Page32 and D = 256");
-  static_assert(SPLASH_TARGET_VERIFY_ROWS == Rows &&
-                    SPLASH_PREFILL_ATTENTION_TILE_ROWS == Rows,
-                "one simdgroup per G fused rows of an eight-row tile");
+  static_assert(SPLASH_TARGET_VERIFY_ROWS == 8 && SPLASH_PREFILL_ATTENTION_TILE_ROWS == 8 &&
+                    8 % Rows == 0 && M % 8 == 0,
+                "one simdgroup per eight fused rows of an eight-row tile or one of its parts");
   const uint visible = committed_tokens + active_rows;
   const uint pages = splash_attention_pages(visible);
   const uint per_split = splash_attention_pages_per_split(pages, splits);
@@ -191,7 +192,7 @@ __attribute__((always_inline)) inline void tile(
   float2 row_max(-INFINITY), row_sum(0.0f);
   // The four tokens of this lane's score rows: base + {0, 1, 4, 5}.
   const uint scale_base = page_token(fm, 0);
-  const SplashKvAddressing<KVHeads, CacheElement> addressing(kv, kv_head);
+  const SplashKvAddressing<KVHeads, D, CacheElement> addressing(kv, kv_head);
 
   for (uint page = page_begin; page < page_end; ++page) {
     const SplashKvPageTensors<CacheElement> tensors = addressing.page(page_table[page]);

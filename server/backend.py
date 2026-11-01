@@ -12,6 +12,7 @@ from tokenizers.decoders import DecodeStream
 from . import json_codec
 from . import protocol as wire
 from . import runtime as engine_runtime
+from .chat_format import THINK_END, ChatFormat
 from .constraints import TokenConstraint
 from .diagnostics import print_status
 from .errors import APIError, ConstraintError
@@ -19,13 +20,7 @@ from .latency import RequestLatency
 from .metrics import RequestRecords, engine_dict, metrics_dict
 from .output import ReasoningLoopGuard, hold_partial
 from .serve_options import DEFAULT_REASONING_LOOP_LIMIT
-from .tool_schema import (
-    CALL_OPEN,
-    THINK_END,
-    THINK_END_TOKEN_ID,
-    TOOL_CALL_OPEN_TOKEN_ID,
-    ToolPolicy,
-)
+from .tool_schema import ToolPolicy
 
 # A failure counts toward a crash loop unless its engine served this long.
 CRASH_LOOP_WINDOW_SECONDS = 60.0
@@ -66,27 +61,23 @@ def _is_invalid_prefix(error):
     return str(error).startswith("Invalid prefix encountered")
 
 
-# What the engine selects where a thinking budget runs out without
-# --thinking-end-text: the close of thinking alone.
-DEFAULT_THINKING_END = (THINK_END_TOKEN_ID,)
-
-
 class ThinkingEndError(ValueError):
     """A --thinking-end-text the model's tokenizer cannot end thinking with."""
 
 
-def thinking_end_tokens(tokenizer, text):
+def thinking_end_tokens(tokenizer, text, chat_format):
     """The tokens the engine selects where a thinking budget runs out:
-    DEFAULT_THINKING_END, or --thinking-end-text, which must encode as text
-    then the close of thinking as its own token, at most
-    wire.MAX_THINKING_END_TOKENS tokens. The text holds none of the
-    tokenizer's added tokens, the template's special tokens."""
+    --thinking-end-text's, which must encode as text then chat_format's
+    close of thinking as its own token, at most wire.MAX_THINKING_END_TOKENS
+    tokens. The text holds none of the tokenizer's added tokens, the
+    template's special tokens. None without a text, where the close alone
+    ends thinking (NativeBackend)."""
     if text is None:
-        return DEFAULT_THINKING_END
+        return None
     tokens = tuple(tokenizer.encode(text, add_special_tokens=False))
     if (
         not tokens
-        or tokens[-1] != THINK_END_TOKEN_ID
+        or tokens[-1] != chat_format.think_end_id
         or not tokenizer.added_tokens_decoder.keys().isdisjoint(tokens[:-1])
     ):
         raise ThinkingEndError(
@@ -176,6 +167,9 @@ class Job:
     # A chat request's reasoning options, which its Started line shows; None
     # for a request without a chat template.
     reasoning: ReasoningRequest | None = None
+    # The format a chat request's output is read in; None for a request
+    # without a chat template.
+    chat_format: ChatFormat | None = None
     # The thinking tokens the job may select before its thinking closes, set
     # only where that comes before the output limit; None for no cap.
     thinking_token_budget: int | None = None
@@ -249,6 +243,7 @@ class CallbackStreamer:
         on_stop=None,
         reasoning_loop_limit=0,
         thinking=False,
+        think_end_id=None,
     ):
         self.tokenizer = tokenizer
         self.callback = callback
@@ -268,6 +263,8 @@ class CallbackStreamer:
         # True while stop matching waits for the think-end text; without stop
         # sequences there is nothing to gate, so text flows straight through.
         self.is_reasoning = bool(thinking) and bool(self.stop_sequences)
+        # The family's close-of-reasoning token, which retires the guard.
+        self.think_end_id = think_end_id
         self.reasoning_loop_guard = (
             ReasoningLoopGuard(reasoning_loop_limit)
             if reasoning_loop_limit > 0
@@ -348,7 +345,7 @@ class CallbackStreamer:
         for token_id in token_ids:
             token_id = int(token_id)
             self.token_ids.append(token_id)
-            is_think_end = token_id == THINK_END_TOKEN_ID
+            is_think_end = token_id == self.think_end_id
             guard = self.reasoning_loop_guard
             if guard is not None and is_think_end:
                 self.reasoning_loop_guard = guard = None
@@ -468,29 +465,43 @@ class CallbackStreamer:
             self._send(self.pending_text)
             self.pending_text = ""
 
-    def count_reasoning_tokens(self, enabled, tool_calls=False):
-        """The tokens before the reasoning's end, as ReasoningSplitter reads
-        the text: its close, or where a call may follow, a call's opening."""
-        if not enabled:
+    def count_reasoning_tokens(self, chat_format, thinking, tool_calls=False):
+        """The reasoning's tokens, as ReasoningSplitter reads the text: from
+        the start of the output where the generation prompt opened the
+        reasoning (thinking), or after the model's own opening of it
+        (chat_format.think_start_id), to its close or, where a call may follow
+        and a call's opening ends the reasoning, a call's opening; none for
+        a request without a chat format."""
+        if chat_format is None:
             return 0
-        for index, token in enumerate(self.token_ids):
-            if token == THINK_END_TOKEN_ID or (
-                tool_calls
-                and token == TOOL_CALL_OPEN_TOKEN_ID
-                and self._opens_call(index)
+        if thinking:
+            start = 0
+        elif chat_format.think_start_id is not None and self.token_ids[:1] == [
+            chat_format.think_start_id
+        ]:
+            start = 1
+        else:
+            return 0
+        calls_end = tool_calls and chat_format.calls_end_reasoning
+        for index in range(start, len(self.token_ids)):
+            token = self.token_ids[index]
+            if token == chat_format.think_end_id or (
+                calls_end
+                and token == chat_format.call_open_id
+                and self._opens_call(index, chat_format.call_syntax.call_open)
             ):
-                return index
-        return len(self.token_ids)
+                return index - start
+        return len(self.token_ids) - start
 
-    def _opens_call(self, index):
+    def _opens_call(self, index, call_open):
         """Whether the text from the call-open token at `index` on begins
-        CALL_OPEN, decoded from as few tokens as decide it."""
+        call_open, decoded from as few tokens as decide it."""
         text = ""
         for end in range(index + 1, len(self.token_ids) + 1):
             text = self.tokenizer.decode(self.token_ids[index:end])
-            if len(text) >= len(CALL_OPEN) or not CALL_OPEN.startswith(text):
+            if len(text) >= len(call_open) or not call_open.startswith(text):
                 break
-        return text.startswith(CALL_OPEN)
+        return text.startswith(call_open)
 
 
 @dataclass
@@ -545,7 +556,7 @@ class NativeBackend:
         runtime,
         tokenizer,
         request_logger,
-        thinking_end=DEFAULT_THINKING_END,
+        thinking_end=None,
         reasoning_loop_limit=DEFAULT_REASONING_LOOP_LIMIT,
         log_token_ids=False,
     ):
@@ -566,7 +577,8 @@ class NativeBackend:
         self.health_refresh_inflight = False
         self.health_refresh_wanted = threading.Event()
         # What the engine selects where a thinking budget runs out
-        # (thinking_end_tokens).
+        # (thinking_end_tokens); None for the close of thinking alone, in
+        # each job's chat format.
         self.thinking_end = thinking_end
         self.active = {}
         # Admitted requests whose engine failed before their first token,
@@ -1032,16 +1044,20 @@ class NativeBackend:
     def _thinking_budget(self, job):
         """The engine's cutoff of the thinking a job generates in, which it
         ends with the server's thinking end. The engine's thinking ends at its
-        close or, where a call may follow, at any call-open token, while
-        count_reasoning_tokens ends the reasoning at a call-open token only
-        where it begins CALL_OPEN: a stray call-open token in the thinking ends
-        the engine's count, and the reasoning can then run past the budget."""
+        close or, where a call may follow and a call's opening ends the
+        reasoning, at any call-open token, while count_reasoning_tokens ends
+        the reasoning at a call-open token only where it begins the call's
+        opening: a stray call-open token in the thinking ends the engine's
+        count, and the reasoning can then run past the budget."""
         if job.thinking_token_budget is None:
             return None
+        chat_format = job.chat_format
         return wire.ThinkingBudget(
             job.thinking_token_budget,
-            self.thinking_end,
-            TOOL_CALL_OPEN_TOKEN_ID if job.may_call_tools else THINK_END_TOKEN_ID,
+            self.thinking_end or (chat_format.think_end_id,),
+            chat_format.call_open_id
+            if job.may_call_tools and chat_format.calls_end_reasoning
+            else chat_format.think_end_id,
         )
 
     def release_weights(self, timeout=5.0):
@@ -1112,6 +1128,7 @@ class NativeBackend:
             stop_matched,
             self.reasoning_loop_limit if job.thinking else 0,
             job.thinking,
+            job.chat_format.think_end_id if job.chat_format is not None else None,
         )
         state = _JobState(job, streamer, carried_pixels=bool(job.image_pixels))
         request = self._generation_request(job)
@@ -1310,7 +1327,7 @@ class NativeBackend:
                 # reasoning, which its client may have read.
                 state.streamer.end()
                 job.reasoning_tokens = state.streamer.count_reasoning_tokens(
-                    job.thinking, job.may_call_tools
+                    job.chat_format, job.thinking, job.may_call_tools
                 )
             result = self._result(state, done)
             if job.latency is not None:
@@ -1416,7 +1433,7 @@ class NativeBackend:
         try:
             state.streamer.end()
             job.reasoning_tokens = state.streamer.count_reasoning_tokens(
-                job.thinking, job.may_call_tools
+                job.chat_format, job.thinking, job.may_call_tools
             )
             terminal = ("done", self._result(state))
         except Exception as unexpected:

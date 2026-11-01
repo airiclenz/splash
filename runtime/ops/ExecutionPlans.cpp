@@ -25,17 +25,18 @@ void include(Workspace &bound, const Workspace &required,
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
     : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)),
+      gpuCores_(plannedGpuCores(device)),
       attentionTile_(family_ == GpuFamilyClass::Apple7 ? AttentionTile::Register : AttentionTile::Mpp) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
-    uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {
-  return PagedAttention::prefillPlan(rows, queryHeads, layout, attentionTile_);
+    uint32_t rows, uint32_t queryHeads, kv::Layout layout, AttentionVariant variant) const {
+  return PagedAttention::prefillPlan(rows, queryHeads, layout, variant, attentionTile_, gpuCores_);
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens) const {
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, attentionTile_);
+    std::span<const uint32_t> historyTokens, AttentionVariant variant) const {
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, variant, attentionTile_);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
@@ -46,10 +47,10 @@ DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
 // The expert tiles and their rows, and the router's tile.
 MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phase) const {
   MoeConfig config;
-  config.ggufTile = moeGgufTile(family_, shape);
+  config.ggufTile = moeGgufTile(family_, gpuCores_, shape);
   config.expertTile =
       phase == MoePhase::Prefill ? moeGgufPrefillTile(shape, rows, config.ggufTile) : MoeExpertTile::M8;
-  config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);
+  config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts, shape.routerFormat);
   return config;
 }
 
@@ -66,7 +67,7 @@ MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
 
 AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
     uint32_t maximumRows, uint32_t queryHeads, kv::Layout layout) const {
-  return PagedAttention::prefillWorkspace(maximumRows, queryHeads, layout);
+  return PagedAttention::prefillWorkspace(maximumRows, queryHeads, layout, attentionTile_, gpuCores_);
 }
 
 // The verify bound is linear in the lanes: one lane's is every width's share.

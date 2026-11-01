@@ -20,7 +20,7 @@ BUILD_ID_PYTHON ?= python3
 SPLASH_MAKEFILE := $(abspath $(firstword $(MAKEFILE_LIST)))
 MODEL ?=
 # MODEL with the installer's source options selects one installation
-# (DEVELOPMENT.md, Upstream model loading); every model target passes them.
+# (docs/models.md, Upstream model loading); every model target passes them.
 # LANGUAGE_ONLY=1 selects the text-only installation; 0 or empty, the one
 # with vision.
 REVISION ?=
@@ -307,6 +307,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Qwen4Exp.cpp \
 	runtime/model/Qwen4Steps.cpp \
 	runtime/model/Qwen4ExpTarget.cpp \
+	runtime/model/Flint.cpp \
+	runtime/model/FlintTarget.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \

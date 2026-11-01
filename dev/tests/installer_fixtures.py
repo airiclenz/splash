@@ -22,8 +22,9 @@ from install import families, gguf, hub, models
 DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
 FLASH_NEXT = families.named("Qwen3.8-Flash-Next")
+FLINT = families.named("Flint")
 # The families whose targets the engine loads from a GGUF only.
-GGUF_ONLY = (FLASH_NEXT,)
+GGUF_ONLY = (FLASH_NEXT, FLINT)
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
 # An MLX config.json (of a GGUF_ONLY family, the one the installer derives
 # from its GGUF), a DFlash2 draft config and the scalar metadata of a GGUF
@@ -88,8 +89,11 @@ GGML = {
     "Q8_0": 8,
     "Q2_K": 10,
     "Q4_K": 12,
+    "Q5_K": 13,
+    "Q6_K": 14,
     "IQ2_XXS": 16,
     "IQ3_XXS": 18,
+    "IQ3_S": 21,
     "IQ4_XS": 23,
     "IQ1_M": 29,
     "BF16": 30,
@@ -272,7 +276,9 @@ class FakeHub:
             self.downloads.append(f"{repo_id}/{name}")
         return path
 
-    def snapshot_download(self, repo_id, *, revision, allow_patterns, max_workers):
+    def snapshot_download(
+        self, repo_id, *, revision, allow_patterns, max_workers, tqdm_class=None
+    ):
         for name in allow_patterns:
             self.fetch(repo_id, name, revision)
         return str(self.snapshot(repo_id, revision))

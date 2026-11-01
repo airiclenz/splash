@@ -28,9 +28,10 @@ from dev.tests.server_fixtures import (
 )
 from server import backend as backend_api
 from server import constraints as generation_constraints
-from server import diagnostics, images, runtime, tool_schema
+from server import diagnostics, images, runtime
 from server import errors as api_errors
 from server import protocol as wire
+from server.chat_format import QWEN
 from server.runtime import STATUS_ANSWER_LIMIT_SECONDS, EngineUnhealthy
 
 
@@ -229,7 +230,9 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(constraint.mask_calls, [(), tuple(range(8))])
 
         with self.assertRaises(api_errors.ConstraintError):
-            generation_constraints.TokenConstraint(None, None).masks(tuple(range(9)))
+            generation_constraints.TokenConstraint(None, None, QWEN).masks(
+                tuple(range(9))
+            )
 
     def test_release_weights_asks_the_engine_and_returns_its_status(self):
         transport, runtime = self.make_transport()
@@ -679,7 +682,7 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_token_constraint_consumes_committed_batches_only_at_mask_or_finish(self):
         matcher = FakeMatcher()
-        constraint = generation_constraints.TokenConstraint(matcher, None)
+        constraint = generation_constraints.TokenConstraint(matcher, None, QWEN)
         constraint.commit((7, 8))
         constraint.commit((9,))
         self.assertEqual(matcher.consumed, [])
@@ -1241,8 +1244,8 @@ class ScriptedStreamer:
             if self.on_stop is not None:
                 self.on_stop()
 
-    def count_reasoning_tokens(self, enabled, tool_calls=False):
-        return len(self.token_ids) if enabled else 0
+    def count_reasoning_tokens(self, _chat_format, thinking, _tool_calls=False):
+        return len(self.token_ids) if thinking else 0
 
 
 class RelaunchingRuntime(DrivenRuntime):
@@ -1718,8 +1721,8 @@ class CallbackStreamerTests(unittest.TestCase):
     def test_reasoning_tokens_end_where_the_splitter_ends_reasoning(self):
         # A call-open token ends the reasoning where a call may follow and its
         # text opens one; a </think> ends it always.
-        think_end = tool_schema.THINK_END_TOKEN_ID
-        call = tool_schema.TOOL_CALL_OPEN_TOKEN_ID
+        think_end = QWEN.think_end_id
+        call = QWEN.call_open_id
         texts = {
             1: "a",
             2: " b",
@@ -1742,9 +1745,9 @@ class CallbackStreamerTests(unittest.TestCase):
                 streamer = backend_api.CallbackStreamer(tokenizer, lambda *_: None)
                 streamer.token_ids = token_ids
                 self.assertEqual(
-                    streamer.count_reasoning_tokens(True, tool_calls), expected
+                    streamer.count_reasoning_tokens(QWEN, True, tool_calls), expected
                 )
-                self.assertEqual(streamer.count_reasoning_tokens(False, True), 0)
+                self.assertEqual(streamer.count_reasoning_tokens(QWEN, False, True), 0)
 
     def test_callback_streamer_matches_one_shot_for_random_token_batches(self):
         family = "👨‍👩‍👧‍👦".encode()
@@ -1910,17 +1913,17 @@ class CallbackStreamerTests(unittest.TestCase):
         because, think_end, first, second, tail = tokenizer.token_ids
         chunks = []
         stopped = []
-        with mock.patch.object(backend_api, "THINK_END_TOKEN_ID", think_end):
-            streamer = backend_api.CallbackStreamer(
-                tokenizer,
-                chunks.append,
-                ("second",),
-                lambda: stopped.append(True),
-                0,
-                True,
-            )
-            streamer.put_tokens([because, think_end, first, second, tail])
-            streamer.end()
+        streamer = backend_api.CallbackStreamer(
+            tokenizer,
+            chunks.append,
+            ("second",),
+            lambda: stopped.append(True),
+            0,
+            True,
+            think_end,
+        )
+        streamer.put_tokens([because, think_end, first, second, tail])
+        streamer.end()
 
         self.assertEqual(
             ("".join(chunks), stopped, streamer.stop_sequence),
@@ -1934,20 +1937,25 @@ class CallbackStreamerTests(unittest.TestCase):
         think, repeated, think_end = tokenizer.token_ids
         token_ids = [think, *([repeated] * 10)]
         tripped_at = []
-        with mock.patch.object(backend_api, "THINK_END_TOKEN_ID", think_end):
-            for decode_stream in (None, FailingDecodeStream(3)):
-                stopped = []
-                streamer = backend_api.CallbackStreamer(
-                    tokenizer, [].append, (), lambda: stopped.append(True), 4, True
-                )
-                if decode_stream is not None:
-                    streamer.decode_stream = decode_stream
+        for decode_stream in (None, FailingDecodeStream(3)):
+            stopped = []
+            streamer = backend_api.CallbackStreamer(
+                tokenizer,
+                [].append,
+                (),
+                lambda: stopped.append(True),
+                4,
+                True,
+                think_end,
+            )
+            if decode_stream is not None:
+                streamer.decode_stream = decode_stream
 
-                streamer.put_tokens(token_ids)
+            streamer.put_tokens(token_ids)
 
-                self.assertTrue(streamer.reasoning_loop_tripped)
-                self.assertEqual(stopped, [True])
-                tripped_at.append(len(streamer.token_ids))
+            self.assertTrue(streamer.reasoning_loop_tripped)
+            self.assertEqual(stopped, [True])
+            tripped_at.append(len(streamer.token_ids))
         self.assertEqual(tripped_at[0], tripped_at[1])
         self.assertLess(tripped_at[1], len(token_ids))
 
