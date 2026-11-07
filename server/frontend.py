@@ -721,7 +721,8 @@ class Frontend:
 
     def _prepare_prompt(self, body, tool_namespaces, *, deadline, without_slot):
         self.check_model(body)
-        reasoning_effort = body.get("reasoning_effort")
+        sent_effort, thinking_on = request_fields.reasoning(body)
+        reasoning_effort = sent_effort
         if reasoning_effort is None:
             reasoning_effort = self.default_reasoning_effort
         if reasoning_effort is not None and (
@@ -747,6 +748,12 @@ class Frontend:
             raise APIError(
                 400, "chat_template_kwargs enable_thinking must be a boolean"
             )
+        if thinking_on and enable_thinking is None:
+            # Thinking on at the effort sent or the default, else the
+            # template's own effort where the default is "none".
+            enable_thinking = True
+            if reasoning_effort == "none":
+                reasoning_effort = None
         messages = normalize_messages(body.get("messages"), vision=self.vision)
         tools, tool_policy = normalize_tools(
             body.get("tools"),
@@ -772,7 +779,7 @@ class Frontend:
             preserve_thinking,
             enable_thinking,
             template_kwargs,
-            body.get("reasoning_effort"),
+            sent_effort,
         )
 
     def _tokenize(self, text, **options):

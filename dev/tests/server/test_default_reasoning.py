@@ -92,6 +92,102 @@ class DefaultReasoningTests(unittest.TestCase):
                 self.assertEqual(status, 400, payload)
         self.assertEqual(harness.backend.runtime.requests, [])
 
+    def request(self, harness, path, options):
+        body = (
+            fixtures.responses_body()
+            if path.endswith("responses")
+            else fixtures.chat_body()
+        )
+        return harness.request("POST", path, {**body, **options})
+
+    def test_reasoning_object_effort_renders_as_reasoning_effort(self):
+        # OpenRouter's dialect, which /v1/models' per-model reasoning invites.
+        for default in (None, "none", "high"):
+            harness = self.harness(default)
+            for effort in EFFORTS:
+                with self.subTest(default=default, effort=effort):
+                    rendered = []
+                    for options in (
+                        {"reasoning_effort": effort},
+                        {"reasoning": {"effort": effort}},
+                    ):
+                        status, _, payload = self.request(
+                            harness, "/v1/chat/completions", options
+                        )
+                        self.assertEqual(status, 200, payload)
+                        rendered.append(harness.tokenizer.templates[-1][1])
+                    self.assertEqual(rendered[0], rendered[1])
+            harness.close()
+
+    def test_reasoning_enabled_false_turns_thinking_off(self):
+        harness = self.harness("high")
+        for path in ("/v1/chat/completions", "/v1/responses"):
+            for reasoning in ({"enabled": False}, {"enabled": False, "effort": "none"}):
+                with self.subTest(path=path, reasoning=reasoning):
+                    status, _, payload = self.request(
+                        harness, path, {"reasoning": reasoning}
+                    )
+                    self.assertEqual(status, 200, payload)
+                    self.assert_effort(harness, "none")
+
+    def test_reasoning_enabled_true_thinks_at_the_effort_it_has(self):
+        for default, path, reasoning, expected in (
+            ("high", "/v1/chat/completions", {"enabled": True}, "high"),
+            ("none", "/v1/chat/completions", {"enabled": True, "effort": "low"}, "low"),
+            ("high", "/v1/responses", {"enabled": True}, "high"),
+        ):
+            harness = self.harness(default)
+            with self.subTest(default=default, path=path, reasoning=reasoning):
+                status, _, payload = self.request(
+                    harness, path, {"reasoning": reasoning}
+                )
+                self.assertEqual(status, 200, payload)
+                self.assert_effort(harness, expected)
+            harness.close()
+        # Under a default of "none", thinking on at the template's own effort.
+        for default in (None, "none"):
+            harness = self.harness(default)
+            status, _, payload = self.request(
+                harness, "/v1/chat/completions", {"reasoning": {"enabled": True}}
+            )
+            self.assertEqual(status, 200, payload)
+            template = harness.tokenizer.templates[-1][1]
+            self.assertIs(template["enable_thinking"], True)
+            self.assertNotIn("reasoning_effort", template)
+            harness.close()
+
+    def test_reasoning_effort_outranks_the_reasoning_object(self):
+        harness = self.harness("none")
+        for reasoning in ({"effort": "high"}, {"enabled": False}, {"enabled": True}):
+            with self.subTest(reasoning=reasoning):
+                status, _, payload = self.request(
+                    harness,
+                    "/v1/chat/completions",
+                    {"reasoning_effort": "low", "reasoning": reasoning},
+                )
+                self.assertEqual(status, 200, payload)
+                self.assert_effort(harness, "low")
+
+    def test_malformed_or_contradictory_reasoning_object_is_refused(self):
+        harness = self.harness("none")
+        for path in ("/v1/chat/completions", "/v1/responses"):
+            for reasoning in (
+                "high",
+                [],
+                {"effort": ""},
+                {"effort": "invalid"},
+                {"enabled": "no"},
+                {"enabled": 0},
+                {"enabled": False, "effort": "high"},
+                {"enabled": True, "effort": "none"},
+            ):
+                with self.subTest(path=path, reasoning=reasoning):
+                    status, _, payload = self.request(
+                        harness, path, {"reasoning": reasoning}
+                    )
+                    self.assertEqual(status, 400, payload)
+        self.assertEqual(harness.backend.runtime.requests, [])
+
     def test_anthropic_thinking_and_count_tokens_ignore_openai_default(self):
         for default in ("none", "xhigh"):
             harness = self.harness(default)

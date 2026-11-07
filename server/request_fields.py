@@ -48,3 +48,32 @@ def cache_salt(body):
         salt.encode("utf-8", "surrogatepass"), digest_size=16, person=b"splash-salt"
     ).digest()
     return int.from_bytes(digest, "little")
+
+
+def reasoning(body):
+    """The reasoning effort a chat request sends, and whether it turns
+    thinking on: its reasoning_effort, else the effort in OpenRouter's
+    reasoning object ({"effort": ..., "enabled": ...}, which /v1/models'
+    per-model reasoning invites and Responses also sends), where enabled
+    false asks for "none". reasoning_effort wins over the object, whose
+    other keys (Responses' summary, ...) are left alone. Returns
+    (effort, enabled), None for each the request does not send; the effort
+    is checked by request preparation alike from either field."""
+    effort = body.get("reasoning_effort")
+    sent = body.get("reasoning")
+    if sent is None:
+        return effort, None
+    if not isinstance(sent, dict):
+        raise APIError(400, "reasoning must be an object")
+    enabled = sent.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise APIError(400, "reasoning enabled must be a boolean")
+    object_effort = sent.get("effort")
+    if enabled is not None and object_effort is not None:
+        if (object_effort == "none") == enabled:
+            raise APIError(400, "reasoning enabled contradicts its effort")
+    if enabled is False:
+        object_effort = "none"
+    if effort is not None:
+        return effort, None
+    return object_effort, enabled

@@ -513,11 +513,9 @@ def to_chat_body(body, items):
         choice = {"type": "function", "function": {"name": name}}
     if choice is not None:
         chat["tool_choice"] = choice
-    reasoning = body.get("reasoning")
-    if reasoning is not None and not isinstance(reasoning, dict):
-        raise APIError(400, "reasoning must be an object")
-    if reasoning and reasoning.get("effort") is not None:
-        chat["reasoning_effort"] = reasoning["effort"]
+    # Chat reads the object as it reads its own (request_fields.reasoning).
+    if body.get("reasoning") is not None:
+        chat["reasoning"] = body["reasoning"]
     response_format = _response_format(body.get("text"))
     if response_format is not None:
         chat["response_format"] = response_format

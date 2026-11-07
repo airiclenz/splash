@@ -74,7 +74,10 @@ Chat Completions also takes `messages`, `tools`, `tool_choice` and
 ([structured output](#structured-output)), `reasoning_effort` and
 `chat_template_kwargs` ([default reasoning effort](server.md#default-reasoning-effort)),
 `thinking_token_budget` ([thinking token budget](server.md#thinking-token-budget)),
-`preserve_thinking`, which reaches the template (the Qwen templates keep earlier
+OpenRouter's `reasoning` object, whose `effort` counts as `reasoning_effort`,
+`enabled: false` as `"none"` and `enabled: true` as thinking on at the default
+effort (a top-level `reasoning_effort` wins; an `enabled` that contradicts the
+object's `effort` returns 400), `preserve_thinking`, which reaches the template (the Qwen templates keep earlier
 turns' reasoning with it), `max_completion_tokens` or `max_tokens`,
 `ignore_eos` and the [sampling](#sampling) fields. The reply's reasoning comes
 in `reasoning_content`, beside `content`, in the message and in each stream
@@ -99,7 +102,7 @@ below, `seed`, `stop`, `priority`, `timeout` and `stream` with
 
 Responses takes `input` and `instructions`, function `tools` and `namespace`
 groups of them, custom (freeform) `tools`, `tool_choice`,
-`parallel_tool_calls`, `reasoning.effort`, `thinking_token_budget`,
+`parallel_tool_calls`, `reasoning.effort` and `reasoning.enabled` (as in Chat), `thinking_token_budget`,
 `text.format` for structured output, `max_output_tokens`, the sampling fields,
 Chat's `ignore_eos`, `chat_template_kwargs` and `preserve_thinking`, and `store`
 and `previous_response_id` ([Responses state](#responses-state)). Reasoning
