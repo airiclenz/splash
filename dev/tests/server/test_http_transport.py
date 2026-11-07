@@ -223,7 +223,27 @@ class HttpTransportTests(HarnessTestCase):
         response.close()
         connection.close()
         self._wait_for_http_active(harness.server.requests, 0)
-        self.assertTrue(blocking.cancelled.is_set())
+        self.assertTrue(blocking.ended.is_set())
+        self.assertEqual(
+            harness.request("POST", "/v1/chat/completions", chat_body())[0], 200
+        )
+
+    def test_ingress_slot_held_until_a_stopped_call_drains(self):
+        # A stop's early done answers before the native call ends; the slot
+        # stays held until it has, as the native pending limit is the gate's.
+        draining = Plan([[14], [15], [4]], reason="length", hold_done=True)
+        harness = self.harness(FakeRuntime(draining), queue_size=1)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/chat/completions",
+            chat_body(stop="second", reasoning_effort="none"),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["choices"][0]["finish_reason"], "stop")
+        self.assertTrue(draining.ended.wait(1))
+        self.assertEqual(harness.server.requests.stats()["active"], 1)
+        draining.done_release.set()
+        self._wait_for_http_active(harness.server.requests, 0)
         self.assertEqual(
             harness.request("POST", "/v1/chat/completions", chat_body())[0], 200
         )
@@ -712,7 +732,7 @@ class HttpTransportTests(HarnessTestCase):
     def test_a_burst_beyond_capacity_is_answered_within_bounded_descriptors(self):
         with (
             mock.patch.object(api.FrontendServer, "control_connection_capacity", 1),
-            mock.patch.object(api.FrontendServer, "refused_connection_capacity", 4),
+            mock.patch.object(api.FrontendServer, "answered_connection_capacity", 4),
         ):
             harness = self.harness(FakeRuntime(), queue_size=1)
         address = harness.server.server_address
@@ -805,6 +825,34 @@ class HttpTransportTests(HarnessTestCase):
             client = socket.create_connection(server.server_address, timeout=2)
             self.addCleanup(client.close)
             client.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+    def test_a_request_sent_after_the_answered_one_does_not_reset_the_answer(self):
+        harness = self.harness(FakeRuntime())
+        client = socket.create_connection(harness.server.server_address, timeout=2)
+        self.addCleanup(client.close)
+        # A second request pipelined behind the first, longer than what the
+        # handler buffers ahead, so most of it stays unread when the answer to
+        # the first, which closes the connection, is sent.
+        body = b" " * 100_000
+        client.sendall(
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        self._wait_for_http_active(harness.server.connections, 0)
+        time.sleep(0.1)
+        # The client reads the one answer, then the end of the connection;
+        # the request after it is dropped unanswered.
+        received = b""
+        while chunk := client.recv(65536):
+            received += chunk
+        self.assertTrue(received.startswith(b"HTTP/1.1 200 "), received[:64])
+        self.assertIn(b"\r\nConnection: close\r\n", received)
+        self.assertEqual(received.count(b"HTTP/1.1 "), 1)
+        # Lingering until its client closes, it holds up no other connection.
+        self.assertEqual(harness.request("GET", "/health")[0], 200)
 
     def test_a_connection_whose_serving_fails_returns_its_slot(self):
         server = api.FrontendServer(("127.0.0.1", 0), None)

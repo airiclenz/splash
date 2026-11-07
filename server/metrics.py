@@ -37,6 +37,12 @@ class LabelledCounter:
     paths: dict
 
 
+def label_value(text):
+    """A label value in the Prometheus text format: backslash, double quote
+    and line feed escaped."""
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 # Each gauge or counter Prometheus reads from the status, by the path of
 # keys to its value.
 PROMETHEUS_SERIES = {
@@ -94,29 +100,31 @@ PROMETHEUS_SERIES = {
     "splash_scheduler_prefill_batches_total": ("scheduler", "prefill_batches"),
     "splash_scheduler_prefill_rows_total": ("scheduler", "prefill_rows"),
     "splash_scheduler_decode_batches_total": ("scheduler", "decode_batches"),
-    "splash_scheduler_decode_b1_total": (
+    "splash_scheduler_decode_gap_target_milliseconds": (
         "scheduler",
-        "decode_batches_by_width",
-        "b1",
+        "decode_gap_target_ms",
     ),
-    "splash_scheduler_decode_b2_total": (
+    "splash_scheduler_contended_prefill_p99_milliseconds": (
         "scheduler",
-        "decode_batches_by_width",
-        "b2",
+        "contended_prefill_ms",
+        "p99",
     ),
-    "splash_scheduler_decode_b3_total": (
+    "splash_scheduler_contended_prefill_max_milliseconds": (
         "scheduler",
-        "decode_batches_by_width",
-        "b3",
+        "contended_prefill_ms",
+        "max",
     ),
-    "splash_scheduler_decode_b4_total": (
+    "splash_scheduler_bound_cuts_total": ("scheduler", "bound_cuts"),
+    "splash_scheduler_index_page_conflicts_total": (
         "scheduler",
-        "decode_batches_by_width",
-        "b4",
+        "index_page_conflicts",
     ),
+    "splash_scheduler_replans_total": ("scheduler", "replans"),
     "splash_kv_pages_allocated": ("kv", "pages_allocated"),
     "splash_kv_evictions_total": ("kv", "evictions"),
     "splash_kv_pages_active": ("kv", "pages_active"),
+    "splash_kv_extents_active": ("kv", "extents_active"),
+    "splash_kv_active_bytes": ("kv", "active_bytes"),
     "splash_kv_pages_cache": ("kv", "pages_cache"),
     "splash_kv_free_allocated_pages": ("kv", "pages_free"),
     "splash_kv_allocated_bytes": ("kv", "allocated_bytes"),
@@ -207,6 +215,17 @@ PROMETHEUS_SERIES = {
     ),
     "splash_memory_limit_bytes": ("memory_governor", "limit_bytes"),
     "splash_memory_headroom_bytes": ("memory_governor", "headroom_bytes"),
+    "splash_memory_owed_bytes": ("memory_governor", "owed", "bytes"),
+    "splash_memory_owed_transfers": ("memory_governor", "owed", "transfers"),
+    "splash_memory_claims_waiting": ("memory_governor", "claims", "waiting"),
+    "splash_memory_claims_bytes": ("memory_governor", "claims", "bytes"),
+    "splash_streamed_experts_chunks": ("streamed_experts", "chunks"),
+    "splash_streamed_experts_shrinks_total": ("streamed_experts", "shrinks"),
+    "splash_streamed_experts_regrows_total": ("streamed_experts", "regrows"),
+    "splash_kv_spill_converted_total": ("kv_spill", "requests", "converted"),
+    "splash_loop_max_tick_milliseconds": ("loop", "max_tick_ms"),
+    "splash_loop_tick_host_p99_milliseconds": ("loop", "tick_host_ms", "p99"),
+    "splash_loop_tick_host_max_milliseconds": ("loop", "tick_host_ms", "max"),
     "splash_admission_waiting_memory": ("admission", "waiting_memory"),
     "splash_admission_waiting_concurrency": ("admission", "waiting_concurrency"),
     "splash_admission_waiting_schedule": ("admission", "waiting_schedule"),
@@ -218,6 +237,10 @@ PROMETHEUS_SERIES = {
     "splash_ttft_p95_milliseconds": ("metrics", "ttft_ms", "p95"),
     "splash_itl_p50_milliseconds": ("metrics", "itl_ms", "p50"),
     "splash_itl_p95_milliseconds": ("metrics", "itl_ms", "p95"),
+    "splash_decode_gap_p50_milliseconds": ("metrics", "decode_gap_ms", "p50"),
+    "splash_decode_gap_p99_milliseconds": ("metrics", "decode_gap_ms", "p99"),
+    "splash_decode_gap_max_milliseconds": ("metrics", "decode_gap_ms", "max"),
+    "splash_decode_gaps_total": ("metrics", "decode_gap_ms", "samples"),
     "splash_prefill_input_tokens_total": ("metrics", "prefill_input_tokens"),
     "splash_prefill_wall_milliseconds_total": ("metrics", "prefill_wall_ms"),
     "splash_prefill_tokens_per_second": (
@@ -334,10 +357,10 @@ def _status_value(status, path):
 def _labelled_counter_lines(name, family, status):
     """HELP, TYPE and one sample per present label; nothing without any."""
     samples = []
-    for label_value, path in family.paths.items():
+    for label, path in family.paths.items():
         metric_value = _status_value(status, path)
         if metric_value is not None:
-            samples.append(f'{name}{{{family.label}="{label_value}"}} {metric_value}')
+            samples.append(f'{name}{{{family.label}="{label}"}} {metric_value}')
     if not samples:
         return []
     return [f"# HELP {name} {family.help_text}", f"# TYPE {name} counter", *samples]
@@ -345,11 +368,6 @@ def _labelled_counter_lines(name, family, status):
 
 # The `/status` `build` fields `splash_build_info` labels, in label order.
 _BUILD_IDENTITY_FIELDS = ("version", "commit", "build_id")
-
-
-def _label_value(text):
-    """Escape a Prometheus label value: backslash, double quote and newline."""
-    return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def _build_info_lines(status):
@@ -362,7 +380,7 @@ def _build_info_lines(status):
         value = build.get(field)
         if not isinstance(value, str):
             return []
-        labels.append(f'{field}="{_label_value(value)}"')
+        labels.append(f'{field}="{label_value(value)}"')
     return [
         "# HELP splash_build_info The build this server runs.",
         "# TYPE splash_build_info gauge",
@@ -404,6 +422,23 @@ def prometheus_metrics(status):
             f'splash_disk_writes_gated{{state="{state}"}} {1 if gated == state else 0}'
         )
     is_speculation_disabled = _is_speculation_disabled(status)
+    for account in governor.get("accounts", ()):
+        label = f'account="{label_value(account["name"])}"'
+        for measure in ("floor", "current", "cap"):
+            lines.append(
+                f'splash_memory_account_bytes{{{label},measure="{measure}"}} '
+                f"{account[measure + '_bytes']}"
+            )
+        lines.append(f"splash_memory_account_grows_total{{{label}}} {account['grows']}")
+        lines.append(
+            f"splash_memory_account_shrinks_total{{{label}}} {account['shrinks']}"
+        )
+    # One counter per decode width the engine reports, b1 to its maximum
+    # batch width.
+    widths = status.get("scheduler", {}).get("decode_batches_by_width", {})
+    for width, count in widths.items():
+        if is_finite_number(count):
+            lines.append(f"splash_scheduler_decode_{width}_total {count}")
     for name, path in PROMETHEUS_SERIES.items():
         if is_speculation_disabled and name in _SPECULATION_METRICS:
             continue

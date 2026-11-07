@@ -9,6 +9,7 @@ from openai import OpenAI
 from dev.tests.server_fixtures import FakeRuntime, FakeTokenizer, Harness, Plan
 from server import protocol as wire
 from server import server as api
+from server.output import MAX_STOP_CHARACTERS
 
 CHAT = ("/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}]})
 COMPLETION = ("/v1/completions", {"prompt": "once upon a time"})
@@ -165,7 +166,7 @@ class TextCompletionTests(unittest.TestCase):
                 self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
                 self.assertTrue(all("usage" not in chunk for chunk in chunks))
 
-    def test_stop_string_ends_the_text_and_cancels_generation(self):
+    def test_stop_string_ends_the_text_and_stops_generation(self):
         harness, runtime = self.harness(
             Plan([[14], [15], [4]], reason="length", delay=0.01)
         )
@@ -174,16 +175,24 @@ class TextCompletionTests(unittest.TestCase):
         self.assertEqual(response["choices"][0]["text"], "first ")
         self.assertEqual(response["choices"][0]["finish_reason"], "stop")
         self.assertEqual(response["usage"]["completion_tokens"], 2)
-        # A matched stop string ends the call with a Stop frame, not Cancel.
+        # The response can end before the stop reaches the call: count once
+        # the stopped call has released its plan.
+        self.assertTrue(runtime.calls[0].plan.ended.wait(1.0))
         self.assertEqual((runtime.stop_count, runtime.cancel_count), (1, 0))
-        for stop in ("", ["x"] * 5, 3):
-            with self.subTest(stop=stop):
+        shape = "stop must be a string or up to four strings"
+        for stop, message in (
+            ("", shape),
+            (3, shape),
+            (["x"] * 5, "stop must be up to four strings"),
+            (
+                ["x" * (MAX_STOP_CHARACTERS + 1)],
+                f"each of stop must be at most {MAX_STOP_CHARACTERS} characters",
+            ),
+        ):
+            with self.subTest(stop=repr(stop)[:40]):
                 status, response = self.complete(harness, stop=stop)
                 self.assertEqual(status, 400)
-                self.assertEqual(
-                    response["error"]["message"],
-                    "stop must be a string or up to four strings",
-                )
+                self.assertEqual(response["error"]["message"], message)
 
     def test_unsupported_fields_are_rejected_by_name(self):
         harness, runtime = self.harness()

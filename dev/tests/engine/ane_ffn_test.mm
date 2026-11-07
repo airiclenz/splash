@@ -86,9 +86,8 @@ using splash::test::floatToBf16;
 
 namespace {
 
-// The smallest hidden size both the ANE programs (segments of 2560 channels) and ane_ffn_rotate (groups of 1024)
-// take, and an intermediate size whose ANE share, kAneUnits of its 12 channel units, spans two segments of down's
-// inputs.
+// A hidden size of two segments of the ANE programs (2560 channels each) in whole groups of ane_ffn_rotate (1024),
+// and an intermediate size whose ANE share, kAneUnits of its 12 channel units, spans two segments of down's inputs.
 constexpr uint32_t kHidden = 5120, kSegment = 2560, kIntermediate = 6144, kLayers = 3, kAneUnits = 6;
 // The most the split's output may differ from the GPU's alone, as the RMS of their difference relative to the GPU's:
 // int8 leaves about 1%.
@@ -431,14 +430,21 @@ void takes(const Model &mlx, const Model &gguf) {
   if (AneFfn::unsupported(mlx.layers) || AneFfn::unsupported(gguf.layers))
     fail("the split does not take the models");
   if (!AneFfn::unsupported({})) fail("the split takes no layers");
-  // A hidden size the programs' segments do not take, and layers of two shapes.
+  // Hidden sizes in whole groups of ane_ffn_rotate, a last segment of the rest among them, but not others, and
+  // layers of two shapes.
   const auto projection = [](uint32_t outputs, uint32_t inputs) {
     return Projection(outputs, inputs,
                       BlockWeights{{QuantizedSegment::planes(GGUF_FMT_AF4G64, outputs, inputs, {}, {}, {})}});
   };
-  const Projection gate = projection(kIntermediate, 4096), down = projection(4096, kIntermediate);
-  const std::vector<SwiGluProjections> narrow{{&gate, &gate, &down}}, mixed{mlx.layers[0], narrow[0]};
-  if (!AneFfn::unsupported(narrow)) fail("the split takes a hidden size of 4096");
+  const auto layer = [&](uint32_t hidden) {
+    return std::pair{projection(kIntermediate, hidden), projection(hidden, kIntermediate)};
+  };
+  const auto [gate, down] = layer(4096);
+  const auto [unevenGate, unevenDown] = layer(4608);
+  const std::vector<SwiGluProjections> narrow{{&gate, &gate, &down}}, uneven{{&unevenGate, &unevenGate, &unevenDown}},
+      mixed{mlx.layers[0], narrow[0]};
+  if (const char *reason = AneFfn::unsupported(narrow)) fail(std::string("the split refuses a hidden size of 4096: ") + reason);
+  if (!AneFfn::unsupported(uneven)) fail("the split takes a hidden size of 4608, which ane_ffn_rotate does not");
   if (!AneFfn::unsupported(mixed)) fail("the split takes layers of two shapes");
   if (AneFfn::units(mlx.layers) != kIntermediate / 512) fail("the split moves other units than 512 channels");
   // Units that leave the GPU or the ANE no channels.
@@ -556,7 +562,7 @@ void split(MetalBackend &backend, const Linear &linear, const Model &model, cons
            "% RMS from the GPU alone" + (got.usable ? "" : ", unusable: " + split->reason()));
   }
   section("split: " + model.name + " layers at share 0.5 from layers gone before it runs, its planned memory, "
-          "chunks of 2048, 256 and 700 rows");
+          "chunks of 2048, " + std::to_string(AneFfn::kMinimumRows) + " and 700 rows");
 
   // A least chunk of more rows leaves the smaller ones to the GPU; one of rows no function holds is refused.
   split->setMinimumRows(640);
@@ -859,7 +865,7 @@ void split(MetalBackend &backend) {
 }
 
 // ---------------------------------------------------------------- faults
-// Each fault of an evaluation at layer 0, 1 and 2 of chunks of 256, 700 and 2048 rows stops the split (stops()); an
+// Each fault of an evaluation at layer 0, 1 and 2 of chunks of kMinimumRows, 700 and 2048 rows stops the split (stops()); an
 // evaluation that signals the event below its value leaves it there.
 void faults(MetalBackend &backend) {
   using Faults = ane::ProgramInstrumentation::Faults;
@@ -886,7 +892,8 @@ void faults(MetalBackend &backend) {
       for (const uint32_t count : {AneFfn::kMinimumRows, 700u, AneFfn::kMaximumRows})
         stops(backend, linear, model, buffers, kind.arm(layer + 1),
               std::string(kind.name) + " at layer " + std::to_string(layer), count, kind.reason);
-    section(std::string("faults: ") + kind.name + " at each layer of chunks of 256, 700 and 2048 rows");
+    section(std::string("faults: ") + kind.name + " at each layer of chunks of " + std::to_string(AneFfn::kMinimumRows) +
+            ", 700 and 2048 rows");
   }
 
   // A program that does not load again after the idle release.

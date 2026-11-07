@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 
 from tokenizers.decoders import DecodeStream
 
-from . import json_codec
+from . import json_codec, supervision
 from . import protocol as wire
 from . import runtime as engine_runtime
 from .chat_format import THINK_END, ChatFormat
@@ -18,21 +18,17 @@ from .diagnostics import print_status
 from .errors import APIError, ConstraintError
 from .latency import RequestLatency
 from .metrics import RequestRecords, engine_dict, metrics_dict
-from .output import ReasoningLoopGuard, hold_partial
+from .output import ReasoningLoopGuard, StopSearch, hold_partial
 from .serve_options import DEFAULT_REASONING_LOOP_LIMIT
 from .tool_schema import ToolPolicy
 
-# A failure counts toward a crash loop unless its engine served this long.
-CRASH_LOOP_WINDOW_SECONDS = 60.0
-# Consecutive such failures, failed relaunches included, that stop relaunching.
-CRASH_LOOP_LIMIT = 3
-# The n-th consecutive relaunch waits RESTART_BACKOFF_SECONDS * 2**(n-2); the
-# first waits 0.
-RESTART_BACKOFF_SECONDS = 5.0
+# Engine outcomes whose message the engine words from its own limits and
+# counts, never from a request: the client gets it as it is, and the console
+# prints it beside the code.
+_ENGINE_RESOURCE_CODES = frozenset(
+    {"capacity_exhausted", "kv_disk_quota", "kv_write_budget", "resource_timeout"}
+)
 
-
-# Control requests use a short live probe and explicitly label stale snapshots.
-STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
 # /health never probes native; it starts a background refresh once the cached
 # snapshot is this old, so a lone /health poller still sees live state.
 STATUS_HEALTH_MAX_AGE_SECONDS = 1.0
@@ -62,16 +58,18 @@ def _is_invalid_prefix(error):
 
 
 class ThinkingEndError(ValueError):
-    """A --thinking-end-text the model's tokenizer cannot end thinking with."""
+    """A thinking end, --thinking-end-text or the chat template's close, the
+    model's tokenizer cannot end thinking with."""
 
 
 def thinking_end_tokens(tokenizer, text, chat_format):
-    """The tokens the engine selects where a thinking budget runs out:
-    --thinking-end-text's, which must encode as text then chat_format's
-    close of thinking as its own token, at most wire.MAX_THINKING_END_TOKENS
-    tokens. The text holds none of the tokenizer's added tokens, the
-    template's special tokens. None without a text, where the close alone
-    ends thinking (NativeBackend)."""
+    """The tokens the engine selects where a thinking budget runs out: those
+    of the text, --thinking-end-text or else the close the chat template
+    writes after a reasoning (ChatTemplate.thinking_end), which must encode
+    as text then chat_format's close of thinking as its own token, at most
+    wire.MAX_THINKING_END_TOKENS tokens. The text holds none of the
+    tokenizer's added tokens, the template's special tokens. None without a
+    text, where the close alone ends thinking (NativeBackend)."""
     if text is None:
         return None
     tokens = tuple(tokenizer.encode(text, add_special_tokens=False))
@@ -81,24 +79,15 @@ def thinking_end_tokens(tokenizer, text, chat_format):
         or not tokenizer.added_tokens_decoder.keys().isdisjoint(tokens[:-1])
     ):
         raise ThinkingEndError(
-            f"--thinking-end-text must end with {THINK_END} and hold no other "
-            "special token"
+            f"the thinking end {text!r} must end with {THINK_END} and hold no "
+            "other special token"
         )
     if len(tokens) > wire.MAX_THINKING_END_TOKENS:
         raise ThinkingEndError(
-            f"--thinking-end-text takes {len(tokens)} tokens; the most is "
+            f"the thinking end {text!r} takes {len(tokens)} tokens; the most is "
             f"{wire.MAX_THINKING_END_TOKENS}"
         )
     return tokens
-
-
-def remaining_request_time(deadline):
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise APIError(504, "request timed out", "request_timeout")
-    # Callers wait this long, and waits reject a timeout above TIMEOUT_MAX;
-    # a request without a deadline has infinite time left.
-    return min(remaining, threading.TIMEOUT_MAX)
 
 
 @dataclass(frozen=True)
@@ -173,7 +162,6 @@ class Job:
     # The thinking tokens the job may select before its thinking closes, set
     # only where that comes before the output limit; None for no cap.
     thinking_token_budget: int | None = None
-    thinking_display: str = "summarized"
     reasoning_tokens: int = 0
     events: queue.Queue = field(default_factory=queue.Queue)
     cancelled: threading.Event = field(default_factory=threading.Event)
@@ -183,18 +171,21 @@ class Job:
     constraint: TokenConstraint | None = None
     cache: CacheInfo = field(default_factory=CacheInfo)
     # Image placeholder spans with their grids and digests, plus the
-    # concatenated resized pixels the engine encodes during prefill.
+    # concatenated resized pixels the engine encodes during prefill and their
+    # charge against the in-flight image budget, held until the frame is
+    # written.
     image_spans: tuple = ()
     image_pixels: bytes = b""
     image_owner: object | None = None
     public_id: str = ""
     created_at: int = field(default_factory=lambda: int(time.time()))
-    response_store: bool = False
     # (count, short hash) of the normalized tool list, so the console shows
     # when a client's tool block changes between turns and breaks its prefix.
     tools_signature: tuple | None = None
-    response_previous_id: str | None = None
-    response_history_items: list | None = None
+    # Input an API keeps past preparation for its answer, such as the
+    # conversation a stored Responses answer is stored with, charged to the
+    # request body budget until the job is released (retain_for).
+    retained_input: list | None = None
     # Option token ids for score-only jobs; empty means ordinary generation.
     score_tokens: tuple = ()
     # Trailing prompt tokens of the chat template's generation prompt; zero
@@ -204,8 +195,6 @@ class Job:
     # The request asked for more output than the context leaves, and
     # max_new_tokens was lowered to what it leaves.
     output_clamped_to_context: bool = False
-    # The digest of a judgment's rendered prompt, which its response reports.
-    prompt_sha256: str | None = None
     # The request's cache_salt hashed to 128 bits; zero without one.
     cache_salt: int = 0
     latency: RequestLatency | None = None
@@ -247,7 +236,7 @@ class CallbackStreamer:
     ):
         self.tokenizer = tokenizer
         self.callback = callback
-        self.stop_sequences = tuple(stop_sequences)
+        self.stops = StopSearch(stop_sequences) if stop_sequences else None
         self.on_stop = on_stop
         self.backend = tokenizer.backend_tokenizer
         self.decode_stream = DecodeStream(skip_special_tokens=True)
@@ -262,7 +251,7 @@ class CallbackStreamer:
         self.reasoning_loop_tripped = False
         # True while stop matching waits for the think-end text; without stop
         # sequences there is nothing to gate, so text flows straight through.
-        self.is_reasoning = bool(thinking) and bool(self.stop_sequences)
+        self.is_reasoning = bool(thinking) and self.stops is not None
         # The family's close-of-reasoning token, which retires the guard.
         self.think_end_id = think_end_id
         self.reasoning_loop_guard = (
@@ -308,27 +297,20 @@ class CallbackStreamer:
             text = self._pass_reasoning(text, ends_reasoning)
         if not text:
             return
-        if not self.stop_sequences:
+        if self.stops is None:
             self._send(text)
             return
         self.pending_text += text
-        matches = [
-            (self.pending_text.find(stop), stop)
-            for stop in self.stop_sequences
-            if stop in self.pending_text
-        ]
-        if matches:
-            offset, self.stop_sequence = min(matches, key=lambda match: match[0])
-            self._send(self.pending_text[:offset])
+        found = self.stops.search(text)
+        if found is not None:
+            self.stop_sequence, back = found
+            self._send(self.pending_text[: len(self.pending_text) - back])
             self.pending_text = ""
             if self.on_stop is not None:
                 self.on_stop()
             return
 
-        retained = max(
-            len(hold_partial(self.pending_text, stop)[1])
-            for stop in self.stop_sequences
-        )
+        retained = self.stops.held
         ready = self.pending_text[:-retained] if retained else self.pending_text
         self.pending_text = self.pending_text[-retained:] if retained else ""
         self._send(ready)
@@ -531,11 +513,24 @@ class _JobState:
     retried: bool = False
     # The last prompt progress forwarded, which a re-run's progress must pass.
     progress_forwarded: int = 0
+    # What the client's request still holds after its early done, run once
+    # the native call ends: its HTTP request gate slot.
+    drain_releases: list = field(default_factory=list)
 
     def detach(self):
         self.detached = True
         self.call = None
         self.streamer.on_stop = None
+
+
+def _failure_code(error):
+    """How an engine failed (supervision.EngineFailure): the code its
+    failure carries, engine_unhealthy for one the runtime did not class."""
+    if isinstance(
+        error, (engine_runtime.EngineUnhealthy, engine_runtime.ProtocolFatal)
+    ):
+        return error.code
+    return "engine_unhealthy"
 
 
 class NativeBackend:
@@ -592,14 +587,18 @@ class NativeBackend:
         # Since when the engine loop has left status probes unanswered.
         self.status_unanswered_since = None
         # Recovery state, under self.lock: the one background worker, when a
-        # relaunch is owed (monotonic), whether a status refresh is owed,
-        # consecutive failures without a full window of service, and why
-        # relaunching stopped for good.
+        # relaunch is owed (monotonic), whether a status refresh is owed, when
+        # to relaunch after a failure, and why relaunching stopped for good.
         self.recovery = None
         self.restart_due = None
         self.refresh_due = False
-        self.failures = 0
-        self.fatal_error = None
+        self.policy = supervision.RestartPolicy()
+        self.stop_reason = None
+        # The requests refused for having been in flight at two engine
+        # failures in a row, and the last engine failure, until its engine has
+        # exited and it is counted (_count_failure).
+        self.quarantine = supervision.Quarantine()
+        self.failure_to_count = None
         # Set by close() to cut a relaunch's backoff short.
         self.wakeup = threading.Event()
         # Why the engine cannot serve: its failure, the last failed restart or
@@ -624,66 +623,82 @@ class NativeBackend:
         self.health_refresher.start()
         runtime.on_engine_failure = self._engine_failed
 
-    def _engine_failed(self, error, served_seconds):
-        """The runtime's failure listener: an engine that reached Ready failed
-        after serving for `served_seconds`."""
-        self._failed("Engine failed", error, served_seconds)
+    def _engine_failed(self, error, served_seconds, started, exit_status):
+        """The runtime's failure listener (engine_runtime.FailureListener): an
+        engine that reached Ready failed after serving for `served_seconds`."""
+        self._failed(
+            "Engine failed",
+            supervision.EngineFailure(
+                _failure_code(error),
+                str(error),
+                served_seconds,
+                started=started,
+                exit_status=exit_status,
+            ),
+        )
 
-    def _failed(self, event, error, served_seconds):
+    def _failed(self, event, failure):
         # Clients get the reason with every refusal until a status succeeds.
         with self.lock:
-            if self.closing or self.fatal_error is not None:
+            if self.closing or self.stop_reason is not None:
                 return
-            self.engine_error = str(error)
+            self.engine_error = failure.message
             if self.status_snapshot is not None:
                 # A failed engine's readiness is no longer evidence.
                 self.status_snapshot["ready"] = False
             stranded = []
-            if (unchangeable := self.runtime.fatal_error) is not None:
-                # Changed limits would recur at every relaunch; the error says
-                # how to recover.
-                stranded = self._stop_restarting_locked(str(unchangeable))
-            elif (
-                delay := self._restart_delay_locked(
-                    served_seconds, counted=not self._served_only_reruns_locked()
-                )
-            ) is None:
-                # The runtime writes an engine's crash trace before it reports
-                # that engine's failure, to the listener or from wait_ready.
-                trace = self.runtime.last_crash_trace
-                stranded = self._stop_restarting_locked(
-                    f"the inference engine failed {self.failures} times in a row, "
-                    f"each within {CRASH_LOOP_WINDOW_SECONDS:.0f} s of starting "
-                    f"({error}); Splash stopped restarting it. "
-                    + (
-                        f"Crash trace: {trace}. "
-                        if trace
-                        else "Set SPLASH_CRASH_TRACE=1 to record a crash trace. "
-                    )
-                    + "Restart the Splash server after fixing the cause."
-                )
+            if failure.exit_status is not None:
+                self.failure_to_count = failure
+            # A failure whose engine served only re-runs does not count toward
+            # the crash loop: each request is re-run once, so it cannot loop.
+            delay = self.policy.after(
+                failure, counted=not self._served_only_reruns_locked()
+            )
+            if delay is None:
+                stranded = self._stop_restarting_locked(self._stop_message(failure))
             else:
                 self.restart_due = time.monotonic() + delay
-            stopped = self.fatal_error
+            stopped = self.stop_reason
             self._ensure_recovery_locked()
-        print_status(f"{event} · {error}", error=True)
+        print_status(f"{event} · {failure.message}", error=True)
         if stopped is not None:
             print_status(f"Engine stopped · {stopped}", error=True)
             self._end_parked(stranded, APIError(500, stopped, "engine_failed"))
 
-    def _restart_delay_locked(self, served_seconds, counted=True):
-        """Seconds until the relaunch a failure owes; None once a crash loop
-        stops relaunching. An uncounted failure leaves the crash-loop count
-        as it is."""
-        if served_seconds >= CRASH_LOOP_WINDOW_SECONDS:
-            self.failures = 0
-        if counted:
-            self.failures += 1
-        if self.failures >= CRASH_LOOP_LIMIT:
-            return None
-        if self.failures <= 1:
-            return 0.0
-        return RESTART_BACKOFF_SECONDS * 2 ** (self.failures - 2)
+    def _stop_message(self, failure):
+        """Why relaunching stopped after `failure`, and what to do."""
+        kind = failure.start.kind if failure.start is not None else None
+        if kind is wire.StartFailureKind.COMMAND_MEMORY:
+            return (
+                "the engine's start ran out of GPU memory another process holds "
+                "(another Splash server?); Splash stopped restarting it. Quit that "
+                "process, then restart the Splash server."
+            )
+        if kind is wire.StartFailureKind.MODEL:
+            return (
+                f"the model's files can no longer be served ({failure.message}); "
+                "Splash stopped restarting the engine. Restore or reinstall the "
+                "model, then restart the Splash server."
+            )
+        cause = (
+            failure.message
+            if supervision.permanent(failure)
+            else f"it failed {supervision.CRASH_LOOP_FAILURES} times in a row, each "
+            f"within {self.policy.thresholds.short_lived:.0f} s of starting "
+            f"({failure.message})"
+        )
+        # The runtime writes an engine's crash trace before it reports that
+        # engine's failure, to the listener or from wait_ready.
+        trace = self.runtime.last_crash_trace
+        return (
+            f"Splash stopped restarting the engine: {cause}. "
+            + (
+                f"Crash trace: {trace}. "
+                if trace
+                else "Set SPLASH_CRASH_TRACE=1 to record a crash trace. "
+            )
+            + "Restart the Splash server after fixing the cause."
+        )
 
     def _served_only_reruns_locked(self):
         """Whether the failed engine had requests in service and every one was
@@ -707,7 +722,7 @@ class NativeBackend:
         restart. Returns the parked requests, detached, whose terminal the
         caller puts once it has released the lock."""
         self.restart_due = None
-        self.fatal_error = message
+        self.stop_reason = message
         self.engine_error = message
         return self._drain_parked_locked()
 
@@ -733,7 +748,7 @@ class NativeBackend:
         is started by the next probe or request."""
         if (
             self.closing
-            or self.fatal_error is not None
+            or self.stop_reason is not None
             or (self.restart_due is None and not self.refresh_due)
             or (self.recovery is not None and self.recovery.is_alive())
         ):
@@ -754,7 +769,7 @@ class NativeBackend:
         owed."""
         while True:
             with self.lock:
-                if self.closing or self.fatal_error is not None:
+                if self.closing or self.stop_reason is not None:
                     self.recovery = None
                     return
                 due = self.restart_due
@@ -771,7 +786,7 @@ class NativeBackend:
             try:
                 restarts = self.runtime.restart_count
                 event = self.runtime.status(
-                    timeout=engine_runtime.STATUS_ANSWER_LIMIT_SECONDS,
+                    timeout=self.policy.thresholds.status_answer,
                     fail_unanswered=True,
                 )
                 self._cache_status(self._decode_status_event(event), restarts)
@@ -783,13 +798,48 @@ class NativeBackend:
                     with self.lock:
                         self.status_unanswered_since = None
 
+    def _count_failure(self):
+        """Count the last engine failure toward the quarantine once its engine
+        has exited, which it waits for at most the stop grace, and before the
+        relaunch admits requests: how the engine exited decides whether a
+        request it ran may have caused the failure
+        (supervision.request_caused). Its output may end before its exit
+        status is there to read."""
+        with self.lock:
+            failure = self.failure_to_count
+            self.failure_to_count = None
+        if failure is None or not supervision.request_caused(
+            failure.code, failure.exit_status()
+        ):
+            return
+        refused = self.quarantine.after(failure.started)
+        if refused:
+            print_status(
+                f"Quarantine · {len(refused)} request"
+                f"{'' if len(refused) == 1 else 's'} in flight at two engine "
+                "failures in a row refused until the server restarts",
+                error=True,
+            )
+
     def _relaunch(self, due):
+        self._count_failure()
         try:
             # It returns once the engine is Ready. The failure listener counts
             # a failure after Ready, even one before wait_ready returns.
             self.runtime.wait_ready()
         except Exception as error:
-            self._failed("Engine restart failed", error, 0.0)
+            self._failed(
+                "Engine restart failed",
+                supervision.EngineFailure(
+                    _failure_code(error),
+                    str(error),
+                    0.0,
+                    start=error.event
+                    if isinstance(error, engine_runtime.EngineStartFailed)
+                    else None,
+                    launch=isinstance(error, engine_runtime.EngineLaunchFailed),
+                ),
+            )
             return
         with self.lock:
             # A failure after Ready may already owe the next relaunch, which
@@ -807,23 +857,53 @@ class NativeBackend:
             # pixels, and its prompt is the job's own.
             self._admit(state, self._generation_request(state.job))
 
+    def _recovery_retry_after_locked(self):
+        """The Retry-After of a refusal while the engine restarts: the seconds
+        until the next bound on the relaunched engine's start still ahead. It
+        should be Ready as long after its spawn as the engine before took to
+        start; past that it waits for memory the host or Metal refused, up to
+        the start retry window more; past that the start timeout ends it.
+        Before the spawn, while the relaunch waits for its backoff or for the
+        engine before to exit, it is as long after the later of now and the
+        time the relaunch is due; a relaunch not owed yet, before the failure
+        listener has run, is due now. At least 1, and at most
+        supervision.RETRY_AFTER_LIMIT_SECONDS."""
+        now = time.monotonic()
+        start = self.runtime.last_start_seconds
+        spawned = self.runtime.spawned_at
+        if spawned is None:
+            due = now if self.restart_due is None else max(self.restart_due, now)
+            ready = due + start
+        else:
+            bounds = (
+                spawned + start,
+                spawned + start + self.policy.thresholds.start_retry_window,
+                spawned + supervision.START_TIMEOUT_SECONDS,
+            )
+            ready = next((bound for bound in bounds if bound > now), now)
+        return min(
+            max(math.ceil(ready - now), 1), supervision.RETRY_AFTER_LIMIT_SECONDS
+        )
+
     def refusal(self):
         """The error a request not yet admitted gets now; None while the
         engine serves."""
         with self.lock:
             if self.closing:
                 return APIError(503, "server is shutting down", "server_shutdown")
-            if self.fatal_error is not None:
-                return APIError(500, self.fatal_error, "engine_failed")
+            if self.stop_reason is not None:
+                return APIError(500, self.stop_reason, "engine_failed")
             self._ensure_recovery_locked()
             if self.runtime.ready:
                 return None
             failure = self.engine_error
+            retry_after = self._recovery_retry_after_locked()
         return APIError(
             503,
             "engine is recovering; retry shortly"
             + (f" (last failure: {failure})" if failure else ""),
             "engine_recovering",
+            retry_after,
         )
 
     def is_ready(self):
@@ -914,7 +994,7 @@ class NativeBackend:
             print_status("Engine restarted")
         return True
 
-    def status(self, timeout=STATUS_REFRESH_TIMEOUT_SECONDS):
+    def status(self, timeout=supervision.STATUS_PROBE_SECONDS):
         stale_error = None
         stale_age_ms = None
         with self.lock:
@@ -965,7 +1045,7 @@ class NativeBackend:
                     and snapshot.get("ready") is True
                     and (
                         unanswered is None
-                        or now - unanswered < engine_runtime.STATUS_ANSWER_LIMIT_SECONDS
+                        or now - unanswered < self.policy.thresholds.status_answer
                     )
                 )
         else:
@@ -977,7 +1057,7 @@ class NativeBackend:
         with self.lock:
             transport_ready = not self.closing and self.runtime.ready
             engine_error = self.engine_error
-            stopped = self.fatal_error is not None
+            stopped = self.stop_reason is not None
             decode_fallbacks = self.tokenizer_decode_fallbacks
         snapshot["tokenizer"] = {"decode_fallbacks": decode_fallbacks}
         snapshot["transport"] = {
@@ -1038,7 +1118,10 @@ class NativeBackend:
             thinking_budget=self._thinking_budget(job),
         )
         return engine_runtime.GenerationRequest(
-            frame, job.deadline, self._mask_provider(job), job.image_owner
+            frame,
+            job.deadline,
+            self._mask_provider(job),
+            wire.request_fingerprint(frame),
         )
 
     def _thinking_budget(self, job):
@@ -1099,7 +1182,7 @@ class NativeBackend:
             # A stop sequence or a reasoning-loop trip ends the request. An
             # unconstrained job's client gets its done now, not after the
             # native call drains its in-flight decode cycle; a constrained
-            # job's done waits for the grammar's finish check. Fires from the
+            # job's done waits for the native completion. Fires from the
             # reader thread and, through streamer.end(), the finalizer.
             stopped_at = time.monotonic()
             with self.lock:
@@ -1132,25 +1215,40 @@ class NativeBackend:
         )
         state = _JobState(job, streamer, carried_pixels=bool(job.image_pixels))
         request = self._generation_request(job)
-        # The engine copies the pixels at admission; only the frame written
-        # below needs them, and the job lives until the response ends.
-        job.image_pixels = b""
-        self._admit(state, request)
+        try:
+            self._admit(state, request)
+        finally:
+            # The frame, the request's last copy of its pixels, is written
+            # or refused: the pixels and their charge end here, not with the
+            # response, which may decode for minutes.
+            job.image_pixels = b""
+            job.image_owner = None
 
     def _admit(self, state, request):
         """Write `state`'s `request` to the engine, with `state` in `active`.
 
         A new request and a re-run after an engine restart both come through
         here. A re-run forgets its failed call first, so the new call's
-        completion is the one the finalizer takes. A refusal, or a server
-        shutting down, is the request's terminal; a re-run's is recorded too,
-        as the request was admitted once.
+        completion is the one the finalizer takes. A refusal, a server
+        shutting down or a quarantined request, is the request's terminal; a
+        re-run's is recorded too, as the request was admitted once.
         """
         job = state.job
         with self.lock:
             if self.closing:
                 self._detach_locked(state)
                 refusal = APIError(503, "server is shutting down", "server_shutdown")
+            elif self.quarantine.refuses(request.fingerprint):
+                # Retrying fails the same way, as capacity_exhausted does.
+                self._detach_locked(state)
+                trace = self.runtime.last_crash_trace
+                refusal = APIError(
+                    400,
+                    "this request was in flight at two engine failures in "
+                    "a row; Splash refuses it until the server restarts"
+                    + (f" (crash trace: {trace})" if trace else ""),
+                    "request_quarantined",
+                )
             else:
                 refusal = None
                 state.terminal_enqueued = False
@@ -1174,8 +1272,8 @@ class NativeBackend:
         except Exception as error:
             with self.lock:
                 deliver = not state.detached and not state.terminal_enqueued
-                if deliver:
-                    self._detach_locked(state)
+                releases = self._detach_locked(state) if deliver else []
+            self._run_drain_releases(releases)
             if deliver:
                 refusal = None
                 if isinstance(
@@ -1220,9 +1318,38 @@ class NativeBackend:
             self.finalizer_queue.put(functools.partial(self._finalize, state, call))
 
     def _detach_locked(self, state):
+        """Detach `state` and return its drain releases, which the caller
+        runs once it has left the lock."""
         state.detach()
         if self.active.get(state.job.request_id) is state:
             del self.active[state.job.request_id]
+        releases, state.drain_releases = state.drain_releases, []
+        return releases
+
+    @staticmethod
+    def _run_drain_releases(releases):
+        for release in releases:
+            try:
+                release()
+            except Exception as unexpected:
+                # The finalizer and close() must go on to the next request.
+                print_status(f"Drain release failed · {unexpected}", error=True)
+
+    def release_after_drain(self, job, release):
+        """Hold `release` until `job`'s native call ends and return True,
+        when an early done answered the client while the call still drains;
+        otherwise return False, and the caller releases now.
+
+        The HTTP request gate releases its slot this way: the native pending
+        limit is the gate's capacity, so a slot freed while the call drains
+        would admit a request the native limit then refuses.
+        """
+        with self.lock:
+            state = self.active.get(job.request_id)
+            if state is None or state.job is not job or not state.client_done:
+                return False
+            state.drain_releases.append(release)
+            return True
 
     def _on_event(self, state, event):
         job = state.job
@@ -1284,25 +1411,26 @@ class NativeBackend:
 
     def cancel(self, job):
         call = None
+        error = None
         with self.lock:
             job.cancelled.set()
             # A parked request is dropped: it has no call to cancel.
             parked = self.parked.pop(job.request_id, None)
             if parked is not None:
                 self._detach_locked(parked)
+                error = self._engine_stopped_error_locked()
             elif (state := self.active.get(job.request_id)) is not None:
                 call = state.call
         if parked is not None:
-            self._end_parked([parked], self._engine_stopped_error())
+            self._end_parked([parked], error)
         if call is not None:
             call.cancel()
 
     def _finalize_loop(self):
         while (work := self.finalizer_queue.get()) is not None:
             work()
-            # Do not keep a finished request alive while waiting: its image
-            # batch returns the request budget only once nothing references
-            # it.
+            # Do not keep a finished request, its output and its events,
+            # alive while waiting for the next one.
             del work
 
     def _finalize(self, state, call):
@@ -1317,10 +1445,11 @@ class NativeBackend:
             if (
                 job.constraint is not None
                 and done.reason != wire.FinishReason.CANCELLED
+                and state.streamer.stop_sequence is None
             ):
                 # The grammar checks what was generated after the last mask. A
-                # cancelled request needs no check, and its last mask may
-                # still be computing.
+                # cancelled request, or one a stop sequence ended, needs no
+                # check, and its last mask may still be computing.
                 job.constraint.finish()
             if not state.client_done:
                 # An early done already flushed the streamer and counted the
@@ -1342,12 +1471,11 @@ class NativeBackend:
             # restarts; the console names the failure. A request without
             # output yet waits for the restarted engine instead.
             with self.lock:
-                fatal_error = self.fatal_error
-                parked = fatal_error is None and self._park_locked(state)
-            if fatal_error is not None:
-                error = APIError(500, fatal_error, "engine_failed")
-            elif not parked:
-                error = self._engine_stopped_error()
+                parked = self.stop_reason is None and self._park_locked(state)
+                if self.stop_reason is not None:
+                    error = APIError(500, self.stop_reason, "engine_failed")
+                elif not parked:
+                    error = self._engine_stopped_error_locked()
         except Exception as unexpected:
             error = self._api_error(unexpected)
         finally:
@@ -1359,7 +1487,8 @@ class NativeBackend:
                     shutdown_requested = state.shutdown_requested
                     client_done = state.client_done
                     self.tokenizer_decode_fallbacks += decode_fallbacks
-                    self._detach_locked(state)
+                    releases = self._detach_locked(state)
+                self._run_drain_releases(releases)
         if parked:
             print_status(f"Retry · request {job.request_id} · after the engine restart")
             return
@@ -1411,14 +1540,14 @@ class NativeBackend:
         self.parked[state.job.request_id] = state
         return True
 
-    @staticmethod
-    def _engine_stopped_error():
+    def _engine_stopped_error_locked(self):
         """The error of a request whose engine failed under it."""
         return APIError(
             503,
             "the inference engine stopped unexpectedly and is restarting; "
             "retry the request",
             "runtime_unavailable",
+            self._recovery_retry_after_locked(),
         )
 
     def _finish_early(self, state):
@@ -1523,17 +1652,10 @@ class NativeBackend:
             message = error.message_bytes.decode("utf-8", "replace")
             if code == "deadline_exceeded":
                 return APIError(504, message, "request_timeout")
-            if code == "capacity_exhausted":
-                return APIError(
-                    400,
-                    "the request does not fit in the memory this server may use, even "
-                    "after every cached prefix was evicted; restart the server with a "
-                    f"larger --max-memory or a smaller --max-context ({message})",
-                    code,
-                )
-            # The SSD cache cannot hold even the prompt's KV of a request that
-            # does not fit in memory; the message names its quota.
-            if code == "kv_disk_quota":
+            # A request that does not fit even alone, in memory or in the SSD
+            # cache, fails the same way on a retry; the engine's message names
+            # what it lacked and the limits that would fit it.
+            if code in ("capacity_exhausted", "kv_disk_quota"):
                 return APIError(400, message, code)
             request_codes = {
                 "invalid_constraint",
@@ -1554,11 +1676,11 @@ class NativeBackend:
             return APIError(400, str(error), "constraint_error")
         if isinstance(error, engine_runtime.PendingLimitExceeded):
             # The native pending limit is --queue-size, the HTTP request
-            # gate's capacity, so only a race with the gate reaches it: a
-            # request whose gate slot is free while its native call still
-            # holds a native slot, as a cancelled request, or a stop that got
-            # its early done while the call drains its last decode cycle. An
-            # overload like the gate's own, retried the same way.
+            # gate's capacity, so only a race with the gate reaches it, as
+            # when a cancelled request still holds its native slot (a stop's
+            # early done keeps its gate slot until the call drains: see
+            # release_after_drain): an overload like the gate's own, retried
+            # the same way.
             return APIError(503, "request queue is full", "frontend_overloaded")
         if isinstance(
             error,
@@ -1598,6 +1720,8 @@ class NativeBackend:
             }
         if error:
             record["error_code"] = error.code
+            if error.code in _ENGINE_RESOURCE_CODES:
+                record["engine_reason"] = error.message
         if token_ids is not None:
             record["token_ids"] = token_ids
         self._log(record)
@@ -1647,10 +1771,8 @@ class NativeBackend:
             if self.closing:
                 return
             self.closing = True
-            calls = []
             for state in self.active.values():
                 state.shutdown_requested = True
-                calls.append(state.call)
             # Their failed calls are done; close's stranded pass skips them.
             parked = self._drain_parked_locked()
         self._end_parked(
@@ -1658,11 +1780,10 @@ class NativeBackend:
         )
         self.wakeup.set()
         self.health_refresh_wanted.set()
-        for call in calls:
-            if call is not None:
-                call.cancel()
         try:
-            # Also fails a relaunch in progress.
+            # Fails every call and a relaunch in progress, and stops the
+            # engine, which takes no more work. A cancel per call first could
+            # wait the write budget (write_progress) for a frame being written.
             self.runtime.close()
         finally:
             with self.lock:
@@ -1676,9 +1797,10 @@ class NativeBackend:
                 for state in list(self.active.values()):
                     if state.terminal_enqueued:
                         continue
-                    self._detach_locked(state)
-                    stranded.append((state, state.client_done))
-            for state, client_done in stranded:
+                    releases = self._detach_locked(state)
+                    stranded.append((state, state.client_done, releases))
+            for state, client_done, releases in stranded:
+                self._run_drain_releases(releases)
                 error = APIError(503, "server is shutting down", "server_shutdown")
                 self._record(state.job, error=error)
                 # An early done, queued or sent, is that client's terminal.

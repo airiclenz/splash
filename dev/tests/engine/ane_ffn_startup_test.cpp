@@ -1,12 +1,15 @@
 // What a start makes of the prefill FFN's Neural Engine split (engine/AneFfnStartup.cpp) on a model the test plays:
 // each outcome, the memory plan it adopts, the automatic context and the context a relaunch keeps, the calibration it
-// remembers or takes again and the line it logs.
+// remembers or takes again, the line it logs and what a start a command of the split ends reports.
 
+#include "Supervision.hpp"
 #include "TestChecks.hpp"
 #include "TestModel.hpp"
 #include "TestStderr.hpp"
 #include "ane/Program.hpp"
 #include "engine/AneFfnStartup.hpp"
+#include "engine/Bootstrap.hpp"
+#include "metal/MetalBackend.hpp"
 
 #include <array>
 #include <cmath>
@@ -516,6 +519,66 @@ void testFailures() {
   rejects([&] { static_cast<void>(start(fake)); }, "stopped serving", "a start went on on a backend that stopped");
 }
 
+// A command of the split's calibration or setup that ran out of GPU memory ends the start, and resource assembly fails
+// on it as on any Metal command of its steps (RuntimeResources::create): the start reports CommandMemory, which no
+// start retries, as for a warmup's command. Another process holds what the commands need, and a retry, in the
+// process or the server's relaunch, would take it from that process. So does a command of the load, the expert
+// store's fill. A command that failed otherwise is Internal at any step: the load's too, whose files the loader took
+// (it was Model, which the server never relaunches after). A load the loader refused is still Model.
+void testACommandOutOfMemoryIsCommandMemory() {
+  using FailureKind = protocol::StartFailureKind;
+  for (const bool setup : {false, true}) {
+    for (const bool outOfMemory : {true, false}) {
+      Fake fake;
+      // A failed command stops the backend serving (MetalBackend's markUnhealthy).
+      const auto failed = [&] {
+        fake.healthy = false;
+        return metal::MetalBackendError("Metal command 2 failed: Insufficient Memory", outOfMemory);
+      };
+      if (setup)
+        fake.prepare = [&](uint32_t, bool) -> AneFfnPrepared { throw failed(); };
+      else
+        fake.time = [&]() -> Timings { throw failed(); };
+      const std::string what = std::string(setup ? "setup" : "calibration") + "'s command that failed " +
+                               (outOfMemory ? "for want of GPU memory" : "otherwise");
+      try {
+        static_cast<void>(start(fake));
+        throw std::runtime_error("a start went on after its split's " + what);
+      } catch (const metal::MetalBackendError &error) {
+        const RuntimeBootstrapReport report =
+            RuntimeBootstrapError(RuntimeResourcesError(RuntimeResourceStage::StorageAllocation, error, "budget"))
+                .report();
+        const FailureKind kind = startFailedEvent(report).kind;
+        require(kind == (outOfMemory ? FailureKind::CommandMemory : FailureKind::Internal) &&
+                    report.commandOutOfMemory == outOfMemory &&
+                    report.resourceStage == RuntimeResourceStage::StorageAllocation &&
+                    report.resourceFailure == RuntimeResourceFailure::Other &&
+                    report.message == "Metal command 2 failed: Insufficient Memory" &&
+                    report.budgetDescription == "budget",
+                "a start whose split's " + what + " failed as kind " +
+                    std::to_string(static_cast<int>(kind)) + (report.commandOutOfMemory ? ", out of memory" : ""));
+        StartupRetryWindow window(supervision::kStartRetryWindow);
+        require(!window.retryUntil(report, StartupRetryWindow::Clock::now()),
+                "a start whose split's " + what + " was retried in-process");
+      }
+    }
+  }
+  for (const bool outOfMemory : {true, false}) {
+    const RuntimeBootstrapReport report =
+        RuntimeBootstrapError(RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
+                                                    metal::MetalBackendError("Metal command 1 failed", outOfMemory)))
+            .report();
+    require(startFailedEvent(report).kind == (outOfMemory ? FailureKind::CommandMemory : FailureKind::Internal),
+            std::string("a load whose command failed ") + (outOfMemory ? "for want of GPU memory" : "otherwise") +
+                " was not classed by it");
+  }
+  const RuntimeBootstrapReport refused =
+      RuntimeBootstrapError(RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
+                                                  "the target's safetensors header is truncated"))
+          .report();
+  require(startFailedEvent(refused).kind == FailureKind::Model, "a load the loader refused was not Model");
+}
+
 // No share predicted to gain enough, or no chunk timed to, leaves the GPU alone and remembers that none does.
 void testNoGain() {
   Fake fake;
@@ -604,14 +667,16 @@ void testGivenShare() {
   require(started.start.outcome.kind == Kind::Split && !fake.timings && fake.prepared == std::pair(7u, false) &&
               !fake.recalled && !fake.remembered && started.start.plan &&
               started.start.plan->breakdown().aneFfnBytes == fake.bytes(7) &&
-              has(started.log, "Neural Engine FFN split at the given share 0.21 for chunks of 256 rows or more, 2.5% "
-                               "from the GPU alone on the Neural Engine's part"),
+              has(started.log, "Neural Engine FFN split at the given share 0.21 for chunks of " +
+                                   std::to_string(AneFfnSetting::kGivenMinimumRows) +
+                                   " rows or more, 2.5% from the GPU alone on the Neural Engine's part"),
           "the given share did not run as given: " + started.log);
   started = start(fake, {.given = AneFfnSetting::Given{0.2, 832}});
   require(started.start.outcome.kind == Kind::Split && has(started.log, "for chunks of 832 rows or more"),
           "the given least chunk did not run as given: " + started.log);
   for (const AneFfnSetting::Given given : {AneFfnSetting::Given{0.0}, AneFfnSetting::Given{1.0},
-                                           AneFfnSetting::Given{0.2, 255}, AneFfnSetting::Given{0.2, 2049}})
+                                           AneFfnSetting::Given{0.2, ops::AneFfn::kMinimumRows - 1},
+                                           AneFfnSetting::Given{0.2, 2049}})
     rejects([&] { static_cast<void>(start(fake, {.given = given})); }, "ANE FFN",
             "a given split of share " + std::to_string(given.share) + " from " + std::to_string(given.minimumRows) +
                 " rows ran");
@@ -620,7 +685,7 @@ void testGivenShare() {
                       off = AneFfnSetting::fromGiven(0.0, 832), given = AneFfnSetting::fromGiven(0.3, 832);
   require(calibrated.enabled && !calibrated.given && !off.enabled && given.enabled && given.given &&
               given.given->share == 0.3 && given.given->minimumRows == 832 &&
-              AneFfnSetting::fromGiven(0.3, std::nullopt).given->minimumRows == ops::AneFfn::kMinimumRows,
+              AneFfnSetting::fromGiven(0.3, std::nullopt).given->minimumRows == AneFfnSetting::kGivenMinimumRows,
           "a dev tool's options did not give their setting");
   rejects([] { static_cast<void>(AneFfnSetting::fromGiven(std::nullopt, 832)); }, "without a share",
           "least rows without a share were taken");
@@ -640,6 +705,7 @@ int main() {
     testExplicitContext();
     testRelaunchContext();
     testFailures();
+    testACommandOutOfMemoryIsCommandMemory();
     testNoGain();
     testRemembered();
     testRefined();

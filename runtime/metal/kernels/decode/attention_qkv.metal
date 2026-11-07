@@ -69,19 +69,19 @@ inline void full_qkv_decode_phase(
         qkv, q_norm, k_norm, nullptr, nullptr, queries, keys, values,         \
         reductions, normalized, group, thread_index, lane, simd_group);       \
   }
+// Each geometry's instances for the norm types its families store: bf16 (an
+// MLX target's) and F32, or F32 alone for Qwen3.8-Flash-Next's (_kv2_g12) and
+// Flint's (_kv4_g8_d128), which load from GGUFs only.
 VERIFY_ATTENTION_QKV(verify_attention_qkv, 24, 4, 256, 32, true, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8, 16, 2, 256, 32, true, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_f32, 24, 4, 256, 32, true, float)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8_f32, 16, 2, 256, 32, true, float)
-VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g12, 24, 2, 256, 32, true, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g12_f32, 24, 2, 256, 32, true, float)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g16, 32, 2, 256, 32, true, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g16_f32, 32, 2, 256, 32, true, float)
 // Four KV heads of 128 dimensions without an output gate, their whole heads
 // rotated (64 pairs) or unrotated.
-VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g8_d128, 32, 4, 128, 64, false, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g8_d128_f32, 32, 4, 128, 64, false, float)
-VERIFY_ATTENTION_QKV_NOPE(verify_attention_qkv_kv4_g8_d128_nope, 32, 4, 128, false, bfloat)
 VERIFY_ATTENTION_QKV_NOPE(verify_attention_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, float)
 #undef VERIFY_ATTENTION_QKV_NOPE
 #undef VERIFY_ATTENTION_QKV
@@ -172,7 +172,7 @@ ATTENTION_GATE_TABLE(verify_attention_gate_table16f_kv2_g16, 32, 2, 256, gguf_sg
   kernel void Name( \
       device const bfloat *attention [[buffer(0)]], \
       device bfloat *hidden [[buffer(1)]], \
-      device bfloat *table [[buffer(2)]], device float *sums [[buffer(3)]], \
+      device Layout::Elem *table [[buffer(2)]], device float *sums [[buffer(3)]], \
       uint index [[thread_position_in_grid]], \
       uint lane [[thread_index_in_simdgroup]]) { \
     constexpr uint width = QHeads * HeadDim; \
@@ -185,4 +185,5 @@ ATTENTION_GATE_TABLE(verify_attention_gate_table16f_kv2_g16, 32, 2, 256, gguf_sg
                   width, (element % width) / 64, row % 8, lane, a, b); \
   }
 ATTENTION_GATHER_TABLE(verify_attention_gather_table16_kv4_g8_d128, 32, 4, 128, gguf_sg::Table16)
+ATTENTION_GATHER_TABLE(verify_attention_gather_table16f_kv4_g8_d128, 32, 4, 128, gguf_sg::Table16F)
 #undef ATTENTION_GATHER_TABLE

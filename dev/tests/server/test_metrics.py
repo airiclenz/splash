@@ -107,6 +107,9 @@ splash_thermal_state{state="critical"} 0
 splash_disk_writes_gated{state="no"} 0
 splash_disk_writes_gated{state="budget"} 0
 splash_disk_writes_gated{state="closed"} 0
+splash_scheduler_decode_b1_total 10
+splash_scheduler_decode_b2_total 5
+splash_scheduler_decode_b4_total 1
 splash_ready 1
 splash_metal_healthy 1
 splash_transport_pending 2
@@ -119,9 +122,6 @@ splash_requests_failed_total 1
 splash_scheduler_queued 3
 splash_cache_resource_replay_tokens_total 4096
 splash_scheduler_decoding 2
-splash_scheduler_decode_b1_total 10
-splash_scheduler_decode_b2_total 5
-splash_scheduler_decode_b4_total 1
 splash_kv_free_allocated_pages 512
 splash_state_entries 4
 splash_state_pinned 0

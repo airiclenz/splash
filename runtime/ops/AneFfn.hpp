@@ -38,14 +38,22 @@ class Measurement;
 class AneFfn final {
 public:
   // A chunk runs on the smallest of the program's functions that holds it,
-  // one every kProgramStep rows from kMinimumRows to the prefill budget,
-  // since an evaluation costs the ANE its function's rows. This fork starts
-  // at 256 rows: on M1 and M2 the GPU alone is slow enough that smaller
+  // one every kProgramStep rows from kMinimumRows and one of the prefill
+  // budget, since an evaluation costs the ANE its function's rows. This fork
+  // starts at 128 rows: on M1 and M2 the GPU alone is slow enough that smaller
   // chunks gain (calibration on an M1 Max splits the 27B's chunks from 287
-  // rows), and calibration still drops the functions that lose to it.
-  static constexpr uint32_t kMinimumRows = 256, kProgramStep = 128, kMaximumRows = SPLASH_PREFILL_TOKEN_BUDGET;
+  // rows; on a 16-core M1 Pro chunks of 130-250 rows run 13-27% faster split),
+  // and calibration still drops the functions that lose to it. The ANE
+  // compiler refuses a program of more than kMaximumFunctions functions, so
+  // the step's functions just below the budget go: their chunks run on the
+  // budget's function.
+  static constexpr uint32_t kMinimumRows = 128, kProgramStep = 128, kMaximumRows = SPLASH_PREFILL_TOKEN_BUDGET;
+  static constexpr size_t kMaximumFunctions = 15;
   static_assert(kMaximumRows >= kMinimumRows && (kMaximumRows - kMinimumRows) % kProgramStep == 0,
                 "the functions cover the chunks the split takes");
+  // The GPU part's down projection is a view of leading inputs, which only
+  // the prefill residual tile runs: no chunk the split takes stages.
+  static_assert(kMinimumRows > kMaximumStagedPrefillRows, "the split's chunks run the prefill residual tile");
 
   // The ANE takes `aneUnits` of the units() of intermediate channels. The
   // program is compiled and loaded here, and the wait for the ANE's service
@@ -150,10 +158,11 @@ private:
   friend class ane_ffn::Measurement;
 
   // The split's channels: hidden and intermediate, the layers', the GPU's and
-  // the ANE's, and the segments of down's inputs the ANE takes.
+  // the ANE's, and the segments of the hidden inputs and of down's inputs the
+  // ANE takes.
   struct Shape final {
     uint32_t hidden = 0, intermediate = 0, layers = 0, gpu = 0, ane = 0;
-    std::vector<uint32_t> downSegments;
+    std::vector<uint32_t> inputSegments, downSegments;
   };
   // A staging set of the ANE's int8 weights: gate's and up's rows over each
   // segment of the hidden inputs, down's rows over each segment of its ANE
