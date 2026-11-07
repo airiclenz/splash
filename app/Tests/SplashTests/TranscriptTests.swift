@@ -33,7 +33,7 @@ struct TranscriptTests {
         // Images as the addresses the page loads them from, which the app serves.
         #expect(messages[0]["images"] as? [String] == ["chat-image://\(conversation.messages[0].id.uuidString)/0"])
         #expect(messages[0]["line"] is NSNull && messages[0]["error"] is NSNull && messages[0]["details"] as? String == "")
-        #expect(messages[1]["line"] as? [String: AnyHashable] == ["verb": "Thinking", "facts": "1.2K tokens · 3.2s", "since": NSNull()])
+        #expect(messages[1]["line"] as? [String: AnyHashable] == ["verb": "Thinking", "facts": "\(1_200.formatted(.number.notation(.compactName))) tokens · \(3.2.formatted())s", "since": NSNull()])
         #expect(messages[1]["details"] as? String == "Name of a/Big-GGUF:Q4 · 38 tok/s · Stopped")
         #expect(messages[1]["live"] as? Bool == false)
         // The reply that streams, the last.

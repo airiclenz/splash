@@ -190,7 +190,7 @@ struct ServeSettingsTests {
     @Test func theContextHintIsTheModels() {
         #expect(ContextLength.message(Self.flint).contains("at most 256K, the model’s own window"))
         #expect(!ContextLength.message(Self.flint).contains("YaRN"))
-        #expect(ContextLength.message(Self.moe).contains("at most 1,010,000. Past the model’s own window, 256K, it stretches it with YaRN"))
+        #expect(ContextLength.message(Self.moe).contains("at most \(1_010_000.formatted()). Past the model’s own window, 256K, it stretches it with YaRN"))
         #expect(ContextLength.message(.unknown).contains("YaRN"))
     }
 
@@ -201,7 +201,7 @@ struct ServeSettingsTests {
         #expect(ContextLength.parse("0") == nil && ContextLength.parse("12.5K") == nil && ContextLength.parse("lots") == nil)
         #expect(ContextLength.title(32768) == "32K tokens")
         #expect(ContextLength.title(1_000_000) == "1M tokens")
-        #expect(ContextLength.title(100_000) == "100,000 tokens")
+        #expect(ContextLength.title(100_000) == "\(100_000.formatted()) tokens")
         // As typed, read back alike.
         #expect([32768, 1_000_000, 100_000].map { ContextLength.parse(ContextLength.text($0)) } == [32768, 1_000_000, 100_000])
     }
@@ -218,15 +218,15 @@ struct ServeSettingsTests {
         }
         func problem(_ failure: ServeRecord.Failure) -> String { Server.problem(failure, port: 8000) }
         #expect(problem(failure("memory_budget", "max_memory", required: 10_858_659_840, budget: 1_073_741_824))
-            == "It needs 10.1 GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options.")
+            == "It needs \(10.1.formatted()) GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options.")
         #expect(problem(failure("memory_budget", "device_memory", required: 10_858_659_840, budget: 1_073_741_824))
-            == "It needs 10.1 GB of memory but this Mac can give it 1 GB. Choose a smaller model.")
+            == "It needs \(10.1.formatted()) GB of memory but this Mac can give it 1 GB. Choose a smaller model.")
         #expect(problem(failure("context_budget", "device_memory", plan: 73728))
             == "Its context fits up to 72K tokens on this Mac. Choose a shorter context length, or Auto.")
         #expect(problem(failure("context_budget", "max_memory", plan: 73721))
-            == "Its context fits up to 73,721 tokens within the memory limit. Choose a shorter context length, or raise the memory limit.")
+            == "Its context fits up to \(73_721.formatted()) tokens within the memory limit. Choose a shorter context length, or raise the memory limit.")
         #expect(problem(failure("context_budget", "disk", plan: 73721))
-            == "Its context fits up to 73,721 tokens in the SSD cache. Choose a shorter context length, or a larger SSD cache.")
+            == "Its context fits up to \(73_721.formatted()) tokens in the SSD cache. Choose a shorter context length, or a larger SSD cache.")
         #expect(problem(failure("host_memory"))
             == "Other apps are using the memory it needs. Quit some, then start it again.")
         #expect(problem(failure("command_memory"))
@@ -451,13 +451,13 @@ struct ServerTests {
         #expect(record.pid == 4242 && record.phase == .failed)
         let failure = try #require(record.failure)
         #expect(Server.problem(failure, port: 8000)
-            == "It needs 10.1 GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options.")
+            == "It needs \(10.1.formatted()) GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options.")
     }
 
     @Test func wordsAFailedStartByItsOwnRecord() throws {
         let golden = Self.goldens.appending(path: "server/serve_record_golden.json")
         let record = try JSONDecoder().decode(ServeRecord.self, from: Data(contentsOf: golden))
-        let words = "It needs 10.1 GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options."
+        let words = "It needs \(10.1.formatted()) GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options."
         func problem(_ record: ServeRecord?, pid: pid_t, holder: pid_t? = nil) -> String {
             Server.startProblem(record: record, pid: pid, port: 8000, holder: holder)
         }
@@ -951,21 +951,21 @@ struct OutputTests {
     }
 
     @Test func formatsFiguresAndTimes() {
-        #expect(Format.seconds(9.84) == "9.8s" && Format.seconds(24.4) == "24s" && Format.seconds(84) == "1m 24s")
-        #expect(Format.latency(.milliseconds(136)) == ("136", "ms") && Format.latency(.milliseconds(1440)) == ("1.4", "s"))
+        #expect(Format.seconds(9.84) == "\(9.8.formatted())s" && Format.seconds(24.4) == "24s" && Format.seconds(84) == "1m 24s")
+        #expect(Format.latency(.milliseconds(136)) == ("136", "ms") && Format.latency(.milliseconds(1440)) == (1.4.formatted(), "s"))
         #expect(Format.parts("4.3 GB") == ("4.3", "GB") && Format.parts("12") == ("12", nil))
         #expect(Format.whole(36.8) == "37")
     }
 
     @Test func formatsSizes() {
         #expect(Format.size(120_000_000) == "120 MB")
-        #expect(Format.size(6_730_000_000) == "6.7 GB")
+        #expect(Format.size(6_730_000_000) == "\(6.7.formatted()) GB")
         #expect(Format.size(10_980_000_000) == "11 GB")
         #expect(Format.size(21_250_000_000) == "21 GB")
         #expect(Format.size(Format.gigabytes(24)) == "24 GB")
         // Memory counts as the memory limit does: a 16 GB limit is 16 GiB.
         #expect(Format.memory(16 << 30) == "16 GB")
-        #expect(Format.memory(18_467_000_000) == "17.2 GB")
+        #expect(Format.memory(18_467_000_000) == "\(17.2.formatted()) GB")
         #expect(Format.memory(512 << 20) == "512 MB")
     }
 }
@@ -1000,7 +1000,7 @@ struct ChatTests {
         // A first message too long has no earlier ones a new chat would leave behind.
         #expect(ChatClient.message(of: overflow, for: [chat[0]], server: target) == "This message is longer than the model’s 256K-token context.")
         target.context = 57_337
-        #expect(ChatClient.message(of: overflow, for: [chat[0]], server: target) == "This message is longer than the model’s 57,337-token context.")
+        #expect(ChatClient.message(of: overflow, for: [chat[0]], server: target) == "This message is longer than the model’s \(57_337.formatted())-token context.")
         target.context = nil
         #expect(ChatClient.message(of: overflow, for: chat, server: target) == "This chat is longer than the model’s context. Start a new chat to continue.")
         let other = Data(#"{"error":{"message":"engine is recovering; retry shortly","code":"engine_recovering"}}"#.utf8)
