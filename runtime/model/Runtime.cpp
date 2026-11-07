@@ -641,6 +641,10 @@ struct Runtime::Impl {
     InitialSelection,
     Prefill,
     Decode,
+    // A constrained decode step's graph holds only the rope and draft
+    // dispatches; its own site keeps that small size from shrinking the
+    // full Decode graph's reservation.
+    ConstrainedDecode,
     VerifyForward,
     VerifyCommit,
     Count,
@@ -3304,7 +3308,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
   const uint32_t ropeRows = width * kDecodeRows;
-  CommandGraph commandGraph = impl_->newGraph(Impl::GraphSite::Decode);
+  const Impl::GraphSite site = constrained ? Impl::GraphSite::ConstrainedDecode
+                                           : Impl::GraphSite::Decode;
+  CommandGraph commandGraph = impl_->newGraph(site);
   impl_->addRopeTables(
       commandGraph,
       impl_->decodeArena->batchSlice(DecodeTensor::Positions, width), ropeRows,
@@ -3328,14 +3334,14 @@ Runtime::decodeAsync(const BatchPlan &plan,
   // The weights it reads on demand and the spilled K/V its reads bring.
   WorkCount count({}, impl_->model.expertStore(), reads);
   if (constrained) {
-    impl_->recordGraph(Impl::GraphSite::Decode, commandGraph);
+    impl_->recordGraph(site, commandGraph);
     return std::make_unique<Impl::ConstrainedDecodeTicket>(*impl_, std::move(lanes), items, std::move(reads),
                                                            commandGraph, std::move(count), std::move(completion));
   }
   impl_->encodeBatchVerifyEmbedding(commandGraph, width);
   impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, *reads);
   impl_->encodeVerifyCommit(commandGraph, entries, items, {maximumRetained.data(), width});
-  impl_->recordGraph(Impl::GraphSite::Decode, commandGraph);
+  impl_->recordGraph(site, commandGraph);
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
