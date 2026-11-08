@@ -2777,7 +2777,7 @@ bool Cache::pollTierTransfers() {
   return progressed;
 }
 
-PersistStatus Cache::persist(uint64_t block) {
+PersistStatus Cache::persist(uint64_t block, bool secondary) {
   // A point's copies land over many calls: its chain is taken once, and
   // each call goes on from the first block whose copy has not landed, so
   // that a call costs what is left to copy rather than the chain's depth
@@ -2787,7 +2787,8 @@ PersistStatus Cache::persist(uint64_t block) {
       persisting_ = {};
     return status;
   };
-  if (!newestPoint(block))
+  // A secondary point that became ordinary since is copied as one.
+  if (!newestPoint(block) && !(secondary && secondaryCheckpoint(block)))
     return settled(PersistStatus::Unneeded);
   if (!kvTierWritable())
     return settled(PersistStatus::Refused);

@@ -234,6 +234,7 @@ bool StateCache::checkpointPinned(StateCheckpoint checkpoint) const noexcept {
 
 void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
   kv_.noteState(kvBlock);
+  entry.secondary = false;
   if (!entry.checkpoint)
     return;
   --checkpointEntries_;
@@ -265,6 +266,52 @@ uint64_t StateCache::resumePoint() const noexcept {
 bool StateCache::ordinary(uint64_t kvBlock) const noexcept {
   const auto found = entries_.find(kvBlock);
   return found != entries_.end() && !found->second.invalid && !found->second.checkpoint;
+}
+
+void StateCache::markSecondary(uint64_t kvBlock) noexcept {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end() || found->second.invalid || !found->second.checkpoint ||
+      found->second.secondary)
+    return;
+  found->second.secondary = true;
+  reindex(kvBlock, found->second);
+}
+
+void StateCache::clearSecondary(uint64_t kvBlock) noexcept {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end() || !found->second.secondary)
+    return;
+  found->second.secondary = false;
+  reindex(kvBlock, found->second);
+}
+
+void StateCache::markBranchPoint(uint64_t kvBlock) noexcept {
+  if (const auto found = entries_.find(kvBlock); found != entries_.end() && !found->second.invalid)
+    found->second.branchPoint = true;
+}
+
+void StateCache::recordBranchPoint(uint64_t kvBlock, uint64_t branchPoint) noexcept {
+  if (const auto found = entries_.find(kvBlock); found != entries_.end() && !found->second.branchPoint)
+    found->second.branchParent = branchPoint;
+}
+
+uint64_t StateCache::branchPointOf(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end() || found->second.invalid)
+    return 0;
+  return found->second.branchPoint ? kvBlock : found->second.branchParent;
+}
+
+void StateCache::retireBranchPoint(uint64_t kvBlock) noexcept {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end() || !found->second.branchPoint || found->second.pins || inUse(kvBlock))
+    return;
+  static_cast<void>(erase(kvBlock, true));
+}
+
+bool StateCache::secondary(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found != entries_.end() && !found->second.invalid && found->second.secondary;
 }
 
 uint64_t StateCache::bytes(uint64_t kvBlock) const noexcept {
@@ -392,7 +439,7 @@ uint64_t StateCache::lastUsed(uint64_t kvBlock) const noexcept {
 bool StateCache::reclaimWrites(uint64_t kvBlock) const noexcept {
   const auto found = entries_.find(kvBlock);
   return found != entries_.end() && found->second.ram && !found->second.disk &&
-         found->second.ram->canOffload(inUse(kvBlock));
+         !found->second.secondary && found->second.ram->canOffload(inUse(kvBlock));
 }
 
 bool StateCache::takesWrite(bool inUse) const noexcept {
@@ -417,7 +464,10 @@ StateCache::Reclaims StateCache::reclaims(bool inUse, std::span<const uint64_t> 
     if (found == entries_.end() || !candidate(kvBlock, found->second) || this->inUse(kvBlock))
       continue;
     --candidates;
-    writers -= result.writes && !found->second.disk && found->second.ram->writable() ? 1 : 0;
+    writers -= result.writes && !found->second.disk && !found->second.secondary &&
+                       found->second.ram->writable()
+                   ? 1
+                   : 0;
   }
   // The walk's order: checkpoints, ordinary states, states in use.
   if (!pending_ && writers) {
@@ -455,7 +505,7 @@ KvCache::StateMarks StateCache::marks(uint64_t kvBlock, const Entry &target) con
   // does it need its KV as it is.
   const bool leaves = candidate(kvBlock, target) && !target.disk;
   KvCache::Keeps keeps = used ? KvCache::keepBit(Keep::Used) : 0;
-  if (leaves && target.ram->writable())
+  if (leaves && !target.secondary && target.ram->writable())
     keeps |= KvCache::keepBit(used ? Keep::UsedWriter : Keep::Writer);
   return {.keeps = keeps, .needed = !leaves, .candidate = candidate(kvBlock, target)};
 }
@@ -759,7 +809,7 @@ void StateCache::reindex(uint64_t kvBlock, Entry &target) noexcept {
   const bool used = inUse(kvBlock);
   if (candidate(kvBlock, target)) {
     (used ? inUse_ : target.checkpoint ? checkpoints_ : ordinary_).link(target.ramNode, target.lastUsed, kvBlock);
-    if (!target.disk && target.ram->writable())
+    if (!target.disk && !target.secondary && target.ram->writable())
       (used ? inUseWrites_ : target.checkpoint ? checkpointWrites_ : ordinaryWrites_)
           .link(target.writeNode, target.lastUsed, kvBlock);
   }
