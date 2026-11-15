@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from dev.tests.server_fixtures import console_written
 from install import launcher
 from server import images, serve_options
 from server import server as api
@@ -144,6 +145,9 @@ OPTIONS = {
             ["--ane-ffn-minimum-rows=520"],
             *values("--ane-ffn-minimum-rows", {}, ("0", "-1", "1.5", "rows"))[1],
         ],
+    ),
+    "--activations": values(
+        "--activations", {"auto": "auto", "bf16": "bf16"}, ("", "on", "off", "BF16")
     ),
     "--verify-rows": values(
         "--verify-rows",
@@ -748,6 +752,7 @@ class ServeOptionsTests(unittest.TestCase):
             command, policy = self.start([])
             # The first start: no learned bound, and nothing to warn about.
             self.assertEqual(command, STALL_COMMAND)
+            console_written()
             self.assertNotIn("Warning ·", stderr.getvalue())
             self.abort(policy)
             self.assertEqual(
@@ -761,6 +766,7 @@ class ServeOptionsTests(unittest.TestCase):
             # A second abort halves the learned bound for the next start.
             self.assertIn("--prefill-bound-ms", self.abort(policy))
             command, _ = self.start([])
+            console_written()
         self.assertEqual(
             command,
             [
@@ -861,6 +867,7 @@ class ServeOptionsTests(unittest.TestCase):
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
         ):
             command = self.abort(policy)
+            console_written()
         self.assertEqual(command, [*STALL_COMMAND, "--prefill-bound-scope", "command"])
         warnings = [
             line for line in stderr.getvalue().splitlines() if "Warning ·" in line

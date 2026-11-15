@@ -5,6 +5,7 @@ import math
 import queue
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 from tokenizers.decoders import DecodeStream
@@ -170,6 +171,9 @@ class Job:
     response_format: dict | None = None
     constraint: TokenConstraint | None = None
     cache: CacheInfo = field(default_factory=CacheInfo)
+    # The engine's id of the request once the engine has taken it, by which
+    # the console's lines name it.
+    engine_request_id: int | None = None
     # Image placeholder spans with their grids and digests, plus the
     # concatenated resized pixels the engine encodes during prefill and their
     # charge against the in-flight image budget, held until the frame is
@@ -601,10 +605,13 @@ class NativeBackend:
         self.failure_to_count = None
         # Set by close() to cut a relaunch's backoff short.
         self.wakeup = threading.Event()
+        # Called once relaunching has stopped for good, with stop_reason,
+        # without the lock: the server then exits (server.main).
+        self.on_stopped: Callable[[str], None] | None = None
         # Why the engine cannot serve: its failure, the last failed restart or
         # why restarts stopped.
         self.engine_error = None
-        # What the finalizer runs, in order: requests' Started lines and
+        # What the finalizer runs, in order: requests' early dones and
         # terminals, which must not hold up the runtime's reader thread.
         self.finalizer_queue = queue.Queue()
         self.finalizer = threading.Thread(
@@ -664,6 +671,15 @@ class NativeBackend:
         if stopped is not None:
             print_status(f"Engine stopped · {stopped}", error=True)
             self._end_parked(stranded, APIError(500, stopped, "engine_failed"))
+            if self.on_stopped is not None:
+                self.on_stopped(stopped)
+
+    def _closed_error_locked(self):
+        """What a request gets from a server closing: why its engine stopped
+        for good, where that is why it closes."""
+        if self.stop_reason is not None:
+            return APIError(500, self.stop_reason, "engine_failed")
+        return APIError(503, "server is shutting down", "server_shutdown")
 
     def _stop_message(self, failure):
         """Why relaunching stopped after `failure`, and what to do."""
@@ -672,14 +688,18 @@ class NativeBackend:
             return (
                 "the engine's start ran out of GPU memory another process holds "
                 "(another Splash server?); Splash stopped restarting it. Quit that "
-                "process, then restart the Splash server."
+                "process, then start the Splash server again."
             )
         if kind is wire.StartFailureKind.MODEL:
             return (
                 f"the model's files can no longer be served ({failure.message}); "
                 "Splash stopped restarting the engine. Restore or reinstall the "
-                "model, then restart the Splash server."
+                "model, then start the Splash server again."
             )
+        if failure.launch:
+            # A missing executable stays missing: no crash trace or restart
+            # helps, only the current installation, which its message names.
+            return f"Splash stopped restarting the engine: {failure.message}."
         cause = (
             failure.message
             if supervision.permanent(failure)
@@ -697,7 +717,7 @@ class NativeBackend:
                 if trace
                 else "Set SPLASH_CRASH_TRACE=1 to record a crash trace. "
             )
-            + "Restart the Splash server after fixing the cause."
+            + "Start the Splash server again after fixing the cause."
         )
 
     def _served_only_reruns_locked(self):
@@ -718,9 +738,9 @@ class NativeBackend:
         return serving
 
     def _stop_restarting_locked(self, message):
-        """Stop relaunching for good; there is no way back but a server
-        restart. Returns the parked requests, detached, whose terminal the
-        caller puts once it has released the lock."""
+        """Stop relaunching for good: the server exits once _failed has said
+        why (on_stopped). Returns the parked requests, detached, whose
+        terminal the caller puts once it has released the lock."""
         self.restart_due = None
         self.stop_reason = message
         self.engine_error = message
@@ -738,7 +758,13 @@ class NativeBackend:
         """Record drained parked requests and put `error` as each one's
         terminal; outside the lock, as the record logs."""
         for state in states:
-            self._record(state.job, error=error)
+            # Named by the engine's id of its failed run, as its Started line
+            # named it.
+            self._record(
+                state.job,
+                error=error,
+                request_id=state.call.request_id if state.call else None,
+            )
             state.job.events.put(("error", error))
 
     def _ensure_recovery_locked(self):
@@ -817,7 +843,7 @@ class NativeBackend:
             print_status(
                 f"Quarantine · {len(refused)} request"
                 f"{'' if len(refused) == 1 else 's'} in flight at two engine "
-                "failures in a row refused until the server restarts",
+                "failures in a row refused for an hour",
                 error=True,
             )
 
@@ -889,10 +915,8 @@ class NativeBackend:
         """The error a request not yet admitted gets now; None while the
         engine serves."""
         with self.lock:
-            if self.closing:
-                return APIError(503, "server is shutting down", "server_shutdown")
-            if self.stop_reason is not None:
-                return APIError(500, self.stop_reason, "engine_failed")
+            if self.closing or self.stop_reason is not None:
+                return self._closed_error_locked()
             self._ensure_recovery_locked()
             if self.runtime.ready:
                 return None
@@ -1154,7 +1178,7 @@ class NativeBackend:
         """
         with self.lock:
             if self.closing:
-                raise APIError(503, "server is shutting down", "server_shutdown")
+                raise self._closed_error_locked()
         restarts = self.runtime.restart_count
         try:
             event = self.runtime.release_weights(timeout=timeout)
@@ -1237,15 +1261,15 @@ class NativeBackend:
         with self.lock:
             if self.closing:
                 self._detach_locked(state)
-                refusal = APIError(503, "server is shutting down", "server_shutdown")
+                refusal = self._closed_error_locked()
             elif self.quarantine.refuses(request.fingerprint):
-                # Retrying fails the same way, as capacity_exhausted does.
+                # Retrying fails the same way until the quarantine ends.
                 self._detach_locked(state)
                 trace = self.runtime.last_crash_trace
                 refusal = APIError(
                     400,
-                    "this request was in flight at two engine failures in "
-                    "a row; Splash refuses it until the server restarts"
+                    "this request was in flight at two engine failures in a "
+                    "row; Splash refuses it for an hour after the second failure"
                     + (f" (crash trace: {trace})" if trace else ""),
                     "request_quarantined",
                 )
@@ -1267,6 +1291,7 @@ class NativeBackend:
                 if not state.detached:
                     state.call = call
                 cancel = state.detached or self.closing or job.cancelled.is_set()
+            job.engine_request_id = call.request_id
             if cancel:
                 call.cancel()
         except Exception as error:
@@ -1366,6 +1391,7 @@ class NativeBackend:
             state.started_at = time.monotonic()
             record = {
                 "outcome": "started",
+                "request_id": event.request_id,
                 "prompt_tokens": len(job.prompt_tokens),
                 "cached_tokens": cache.matched_tokens,
             }
@@ -1376,10 +1402,7 @@ class NativeBackend:
                     "enable_thinking": job.reasoning.enable_thinking,
                     "thinking": job.thinking,
                 }
-            # The finalizer prints it, as it prints the Done line: a console
-            # that stops draining must not hold up the reader thread, which
-            # delivers every request's tokens and masks.
-            self.finalizer_queue.put(functools.partial(self._log, record))
+            self._log(record)
             if first_start:
                 job.events.put(("start", None))
         elif isinstance(event, wire.PromptProgressEvent):
@@ -1484,7 +1507,11 @@ class NativeBackend:
             if not parked:
                 decode_fallbacks = state.streamer.decode_fallbacks
                 with self.lock:
-                    shutdown_requested = state.shutdown_requested
+                    # A server whose engine stopped for good closes as it
+                    # exits: that stop, not the close, ended these requests.
+                    shutdown_requested = (
+                        state.shutdown_requested and self.stop_reason is None
+                    )
                     client_done = state.client_done
                     self.tokenizer_decode_fallbacks += decode_fallbacks
                     releases = self._detach_locked(state)
@@ -1512,7 +1539,13 @@ class NativeBackend:
         # The streamed ids end with the token the engine stopped on, when it
         # picked one.
         token_ids = state.streamer.token_ids if self.log_token_ids and result else None
-        self._record(job, result=result, error=error, token_ids=token_ids)
+        self._record(
+            job,
+            result=result,
+            error=error,
+            token_ids=token_ids,
+            request_id=call.request_id,
+        )
         if client_done:
             # The client has its done from the stop match; a native error or
             # a shutdown after it changes only the record.
@@ -1704,12 +1737,14 @@ class NativeBackend:
             # rule `_log` follows for the request logger.
             pass
 
-    def _record(self, job, result=None, error=None, token_ids=None):
+    def _record(self, job, result=None, error=None, token_ids=None, request_id=None):
         self.request_records.append(self._timing_record(job, result))
         record = {
             "outcome": result.reason if result else "error",
             "prompt_tokens": len(job.prompt_tokens),
         }
+        if request_id is not None:
+            record["request_id"] = request_id
         if result:
             record["completion_tokens"] = result.completion_tokens
             record["metrics"] = result.metrics
@@ -1722,6 +1757,7 @@ class NativeBackend:
             record["error_code"] = error.code
             if error.code in _ENGINE_RESOURCE_CODES:
                 record["engine_reason"] = error.message
+            error.logged = True
         if token_ids is not None:
             record["token_ids"] = token_ids
         self._log(record)
@@ -1775,9 +1811,8 @@ class NativeBackend:
                 state.shutdown_requested = True
             # Their failed calls are done; close's stranded pass skips them.
             parked = self._drain_parked_locked()
-        self._end_parked(
-            parked, APIError(503, "server is shutting down", "server_shutdown")
-        )
+            parked_error = self._closed_error_locked()
+        self._end_parked(parked, parked_error)
         self.wakeup.set()
         self.health_refresh_wanted.set()
         try:
@@ -1798,11 +1833,21 @@ class NativeBackend:
                     if state.terminal_enqueued:
                         continue
                     releases = self._detach_locked(state)
-                    stranded.append((state, state.client_done, releases))
-            for state, client_done, releases in stranded:
+                    stranded.append(
+                        (
+                            state,
+                            state.client_done,
+                            releases,
+                            self._closed_error_locked(),
+                        )
+                    )
+            for state, client_done, releases, error in stranded:
                 self._run_drain_releases(releases)
-                error = APIError(503, "server is shutting down", "server_shutdown")
-                self._record(state.job, error=error)
+                self._record(
+                    state.job,
+                    error=error,
+                    request_id=state.call.request_id if state.call else None,
+                )
                 # An early done, queued or sent, is that client's terminal.
                 if not client_done:
                     state.job.events.put(("error", error))

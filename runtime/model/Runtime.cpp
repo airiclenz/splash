@@ -222,10 +222,12 @@ StateAdmission admitIdleLane(const QwenStateStorage &states,
   return {{}, StateFailure::ConcurrencyLimit};
 }
 
-// A prefill arena's linear scratch. Prefill plans read plain bf16 rows, so
-// there is no input table or sums.
+// A prefill arena's linear scratch. Prefill plans read plain bf16 rows; the
+// int8 prefill tile quantizes them into the table and sums.
 ops::LinearScratch prefillScratch(const PrefillArena &arena) {
-  return {.partials = arena.get(PrefillTensor::LinearPartials),
+  return {.input = arena.get(PrefillTensor::LinearTable),
+          .sums = arena.get(PrefillTensor::LinearSums),
+          .partials = arena.get(PrefillTensor::LinearPartials),
           .counters = arena.get(PrefillTensor::LinearCounters),
           .rotated = arena.get(PrefillTensor::LinearRotated)};
 }
@@ -1750,7 +1752,16 @@ struct Runtime::Impl {
   // DFlash2 draft captures.
   std::vector<PrefillChunk> preparePrefill(std::span<const ModelBatchItem> items,
                                            std::array<Request *, kLaneCount> &entries) {
+    // A command the Neural Engine's split takes in two chunks runs as a pair
+    // (AneFfn::pairRows): the split runs each chunk's FFN beside the other's
+    // mixer.
+    uint32_t rows = 0;
+    for (const ModelBatchItem &item : items) rows += item.tokenCount;
+    uint32_t firstRows = kPrefillRows;
+    if (geometry.prefillPairs && aneFfn && aneFfn->splits(rows))
+      firstRows = aneFfn->pairRows(rows).value_or(kPrefillRows);
     std::vector<PrefillChunk> chunks(1);
+    const auto chunkRows = [&] { return chunks.size() == 1 ? firstRows : kPrefillRows; };
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const ModelBatchItem &item = items[lane];
       Request &entry = prefillLane(item);
@@ -1760,13 +1771,13 @@ struct Runtime::Impl {
       QwenLogicalLengths lengths = states.metadata(entry.stateLane).lengths;
       size_t nextCapture = 0;
       for (uint32_t offset = 0; offset < item.tokenCount;) {
-        if (chunks.back().rows == kPrefillRows) chunks.emplace_back();
+        if (chunks.back().rows == chunkRows()) chunks.emplace_back();
         PrefillChunk &chunk = chunks.back();
         PrefillSequence &sequence = chunk.sequences.emplace_back();
         ModelBatchItem &part = sequence.part;
         part = item;
         part.logicalPosition = item.logicalPosition + offset;
-        part.tokenCount = std::min(kPrefillRows - chunk.rows, item.tokenCount - offset);
+        part.tokenCount = std::min(chunkRows() - chunk.rows, item.tokenCount - offset);
         part.inputTokens = item.inputTokens.subspan(offset, part.tokenCount);
         part.stateCaptures.clear();
         const uint64_t partEnd = part.logicalPosition + part.tokenCount;
@@ -1830,6 +1841,43 @@ struct Runtime::Impl {
                                    rebuild.rows, rebuild.begin, kPrefillRows);
     draftModel.addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
                                  states.draft(lane), rebuild.rows, rebuild.begin);
+  }
+
+  // Creates the pipelines of a draft rebuild of `rows` on `lane` without
+  // running it (Runtime::warmupPrefill).
+  void prepareDraftRebuild(uint32_t lane, uint32_t rows) const {
+    CommandGraph graph;
+    addDraftRebuild(graph, lane, {0, rows});
+    backend.preparePipelines(graph.dispatches());
+  }
+
+  // Creates the pipelines only a state captured inside a prefill chunk runs,
+  // on `lane`, without running it (Runtime::warmupPrefill).
+  void prepareInsideCapture(uint32_t lane) const {
+    CommandGraph graph;
+    targetModel->addInsideCapture(graph, states.current(lane).auxiliary, states.next(lane).auxiliary);
+    if (!graph.dispatches().empty()) backend.preparePipelines(graph.dispatches());
+  }
+
+  // Creates the pipelines of a verify of `entries`, each after the longest
+  // history the target serves, without running it (Runtime::warmupDecodeBatch).
+  // The lanes' inputs are prepared for that history; the next decode prepares
+  // its own.
+  void prepareLongestVerify(std::span<Request *const> entries) {
+    const uint32_t history = geometry.target.contextTokens() - kDecodeRows;
+    const std::vector<uint32_t> tokens(history);
+    const std::vector<uint32_t> pages((history + kDecodeRows + kv::kPageTokens - 1) / kv::kPageTokens);
+    std::vector<ModelBatchItem> items(entries.size());
+    for (uint32_t lane = 0; lane < entries.size(); ++lane) {
+      QwenTargetRequest request = targetRequest(*entries[lane]);
+      request.tokens = tokens;
+      targetModel->prepareVerifyLane(lane, history, request);
+      items[lane] = {.requestId = entries[lane]->id, .logicalPosition = history, .pageTable = pages};
+    }
+    SpilledKvReads reads;
+    CommandGraph graph;
+    encodeTargetVerifyBatchForward(graph, entries, items, reads);
+    backend.preparePipelines(graph.dispatches());
   }
 
   // The draft's context of chunk `index` of a command's chunks: the rows its
@@ -1939,6 +1987,10 @@ struct Runtime::Impl {
       for (uint32_t s = 0; s < chunks[c].sequences.size(); ++s) parts[chunks[c].sequences[s].lane].push_back({c, s});
     std::vector<std::vector<const GdnParityBuffers *>> written(chunks.size());
     for (uint32_t c = 0; c < chunks.size(); ++c) written[c].resize(chunks[c].sequences.size());
+    // A pair's scratch cell with the lane's next cell's recurrent states: the
+    // scan loads a state's rows before it stores them, so the second chunk
+    // advances in place what the first left there.
+    std::optional<GdnParityBuffers> pairCell;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const GdnParityBuffers *const next = &states.next(entries[lane]->stateLane);
       // The cell the part after this one writes; none after the last part,
@@ -1953,8 +2005,14 @@ struct Runtime::Impl {
         const GdnParityBuffers *cell = next;
         if (boundary)
           cell = &boundary->reservation->buffers().gdn->buffers();
-        else if (after == next)
+        else if (after == next) {
           cell = prefillArena->groupCell();
+          if (cell && geometry.prefillPairs) {
+            pairCell = *cell;
+            pairCell->recurrentLayers = next->recurrentLayers;
+            cell = &*pairCell;
+          }
+        }
         if (!cell) throw std::logic_error("a prefill group has no scratch cell");
         written[c][s] = after = cell;
       }
@@ -3229,12 +3287,14 @@ Runtime::prefillAsync(const BatchPlan &plan,
                   impl_->model.expertStore(), reads);
   if (encodes.empty())
     return std::make_unique<DeferredMetalTicket>(submit({}), std::move(finish), std::move(count));
-  // Metal fails an event wait unmet 5 s after its queue reached it, which it
-  // does for a command's first host step or Neural Engine wait as the
-  // command is submitted, whatever work runs ahead of it (MetalBackend.hpp,
-  // EventStep): the images' encodes, seconds of GPU work on a small GPU, run
-  // as a command of their own, and the command is submitted once they have
-  // completed.
+  // The images' encodes, seconds of GPU work on a small GPU, run as a command
+  // of their own, and the command is submitted once they have completed. So
+  // they are timed apart, and the scheduler leaves their time out of the time
+  // it sizes later prefill commands by (Scheduler::complete); and they hold
+  // up no Neural Engine wait: Metal fails an event wait unmet 5 s after its
+  // queue reached it, which it does for the command's first wait, if no host
+  // step comes before it, as the command is submitted, whatever work runs
+  // ahead of it (MetalBackend.hpp, EventStep).
   return std::make_unique<DeferredMetalTicket>(impl_->backend.submitCommandAsync(encodes.command(), completion),
                                                submit, std::move(finish), std::move(count));
 }
@@ -3601,6 +3661,18 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     }
     lanes.push_back({std::move(result[0]), impl_->request(id).pendingToken,
                      impl_->states.metadata(0).lengths.targetTokens});
+    // A restored lane's first chunk begins with its draft rebuild, which no
+    // other command runs, and a start's restore warmup may be memory-limited,
+    // as a 16 GB Mac's is: so each prefill warmup creates the rebuild's
+    // pipelines on its lane. Without them the 35B's first cached prefix on
+    // the 10-core M4 created two, 15 ms cold.
+    impl_->prepareDraftRebuild(0, std::min(rows, ExecutionLimits::draftContextTokens));
+    // No warmup captures a state inside its chunk, as a prompt does at a
+    // cached boundary inside one: Flash-Next's first such request created
+    // ngram_embedding_history while serving (0.6 ms warm on the 48 GB
+    // M5 Pro). So each prefill warmup also creates, without running it, what
+    // such a capture runs on its lane.
+    impl_->prepareInsideCapture(0);
     end(id);
   } catch (...) {
     end(id);
@@ -3669,6 +3741,16 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
           "decode warmup B" + std::to_string(width) +
           " mismatch [results=" + std::to_string(decoded.size()) + "]");
     }
+    // A verify's kernels follow its lanes' history, and these lanes' is
+    // short: past 7.2K tokens Apple10's INT8 attention scores INT8 queries
+    // (the 27B's first 10.7K-token request created verify_attention_q8q_split
+    // while serving, 97 ms on the 48 GB M5 Pro), and past 2,048 Flash-Next's
+    // indexer selects blocks. Each choice has one threshold, so each decode
+    // warmup also creates the pipelines of its verify after the longest
+    // history.
+    std::array<Impl::Request *, ExecutionLimits::maximumBatchWidth> entries{};
+    for (uint32_t lane = 0; lane < width; ++lane) entries[lane] = &impl_->request(firstId + lane);
+    impl_->prepareLongestVerify(std::span(entries).first(width));
     for (uint32_t lane = 0; lane < width; ++lane) {
       lanes.push_back({std::move(decoded[lane]),
                        impl_->request(firstId + lane).pendingToken,

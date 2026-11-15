@@ -6,16 +6,18 @@ when tracked files differ from that commit. The native build id comes from
 the engine's own status. Resolution runs git at most twice and reads at most
 one file; callers keep the result and never resolve per request.
 
-Only the standard library is imported, so the packaged layout needs nothing
-beyond this file. `dev/tools/build_identity.py` is unrelated: it computes the
+Only the standard library and the console (diagnostics, itself standard
+library alone) are imported, so the launcher can import it before .venv
+exists. `dev/tools/build_identity.py` is unrelated: it computes the
 native build id at build time.
 """
 
 import json
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+from .diagnostics import print_line
 
 # The program root: the checkout, or the unpacked release holding release.json.
 ROOT = Path(__file__).resolve().parents[1]
@@ -128,5 +130,6 @@ def _git(root, run, *arguments):
 
 
 def _warn(message):
-    """Report a resolution fallback on stderr; startup carries on with `unknown`."""
-    print(f"Warning · build identity: {message}", file=sys.stderr, flush=True)
+    """Report a resolution fallback on stderr, through the console's one
+    writer (diagnostics); startup carries on with `unknown`."""
+    print_line(f"Warning · build identity: {message}", error=True)

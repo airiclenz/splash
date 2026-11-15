@@ -23,10 +23,10 @@ if __name__ == "__main__" and not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "install"
 
-# The options serve shares with the server, and the build identity it
-# reports, in modules of the standard library alone: the launcher runs before
-# .venv exists.
-from server import release_identity, serve_options, serve_record
+# The options, the record and the console serve shares with the server, and
+# the build identity it reports, in modules of the standard library alone: the
+# launcher runs before .venv exists.
+from server import diagnostics, release_identity, serve_options, serve_record
 
 from . import clients, paths
 from . import models as model_artifacts
@@ -111,6 +111,13 @@ def _run_held(command, *, relay=None, **options):
         signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
 
 
+def _flush_console():
+    """Wait, LAST_LINES_SECONDS at most, for the launcher's lines to be
+    written before an exec, which drops those its console (diagnostics) still
+    holds."""
+    diagnostics.flush_console(diagnostics.LAST_LINES_SECONDS)
+
+
 def _base_url(port):
     return f"http://127.0.0.1:{port}"
 
@@ -150,7 +157,7 @@ def _ensure_runtime():
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                print("Another Splash build is running; waiting...", flush=True)
+                diagnostics.print_line("Another Splash build is running; waiting...")
                 fcntl.flock(lock, fcntl.LOCK_EX)
             for command in (
                 ["make", "platform-check", "install-environment"],
@@ -202,8 +209,7 @@ def _ensure_installed(selection):
         if isinstance(event, dict) and event.get("event") == "error":
             failure = event["message"]
         else:
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            diagnostics.print_line(line.removesuffix("\n"))
 
     if _run_held(command, cwd=ROOT, relay=relay):
         if failure is None:
@@ -436,6 +442,7 @@ def serve(args):
             command, environment = _server(args, _prepare_start(args), record)
             os.set_inheritable(installation.fileno(), True)
             os.set_inheritable(lock.fileno(), True)
+            _flush_console()
             # The exec resets the handlers; the server unblocks the signals
             # once its own are in place, past its imports.
             signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
@@ -502,19 +509,20 @@ def coding_client(args):
         client_version=client_version,
         later_system=args.command == "pi" and _renders_later_system(args.port),
     )
-    print(f"Starting {args.command}: {model} · {context:,} context tokens", flush=True)
+    diagnostics.print_line(
+        f"Starting {args.command}: {model} · {context:,} context tokens"
+    )
     if args.command == "claude":
-        print(
+        diagnostics.print_line(
             "Claude hosted WebSearch is unavailable. "
-            "WebFetch, local tools and MCP are unchanged.",
-            flush=True,
+            "WebFetch, local tools and MCP are unchanged."
         )
     elif args.command == "codex":
-        print(
+        diagnostics.print_line(
             "Codex hosted WebSearch is disabled: Splash does not provide "
-            "OpenAI's search service. Local tools and MCP are unchanged.",
-            flush=True,
+            "OpenAI's search service. Local tools and MCP are unchanged."
         )
+    _flush_console()
     os.execvpe(path, command, environment)
 
 
@@ -558,7 +566,9 @@ def _stamped_build_id(root):
     except FileNotFoundError:
         return release_identity.UNKNOWN
     except (OSError, ValueError, KeyError, TypeError) as error:
-        print(f"Warning · build identity: {stamp}: {error}", file=sys.stderr)
+        diagnostics.print_line(
+            f"Warning · build identity: {stamp}: {error}", error=True
+        )
         return release_identity.UNKNOWN
     if isinstance(build_id, str) and build_id:
         return build_id
@@ -581,7 +591,9 @@ class _VersionAction(argparse.Action):
         )
 
     def __call__(self, parser, namespace, values, option_string=None):
-        print(_version(), flush=True)
+        diagnostics.print_line(_version())
+        # The exit waits, LAST_LINES_SECONDS at most, for the console to
+        # write it.
         parser.exit()
 
 
@@ -776,10 +788,10 @@ def main(argv=None):
     except LauncherError as error:
         if not error.said:
             subject = f"{error.subject}: " if error.subject else ""
-            print(f"error: {subject}{error}", file=sys.stderr)
+            diagnostics.print_line(f"error: {subject}{error}", error=True)
         return 1
     except (clients.ClientError, OSError, serve_record.NotRecorded) as error:
-        print(f"error: {error}", file=sys.stderr)
+        diagnostics.print_line(f"error: {error}", error=True)
         return 1
     except StopSignal as stop:
         # The status a shell gives a program the signal ends: 130 for

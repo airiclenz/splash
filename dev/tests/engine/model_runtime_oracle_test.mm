@@ -4495,7 +4495,7 @@ int main(int argc, char **argv) {
         model::loadModel(backend, modelRoot, descriptor, loadOptions);
     if (loadOptions.streamedTableBytes)
       std::cout << "ple_memory=" << (model.streamedTable() ? "streamed" : "ignored") << '\n';
-    ops::ExecutionPlans operators(backend.capabilities());
+    ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(model, operators, format, stateFormat, model::StreamedParts::loaded(model));
     // The memory plan with `aneFfnBytes` set aside for the prefill FFN's
@@ -4604,8 +4604,9 @@ int main(int argc, char **argv) {
       return result.plan ? result.plan->maximumContextTokens() : 0u;
     };
     const uint32_t automaticContext =
-        aneFfnStart.split ? contextOf(aneFfnModel.plannedBytes(static_cast<uint32_t>(
-                                std::lround(aneFfnStart.split->share() * aneFfnModel.units))))
+        aneFfnStart.split ? contextOf(aneFfnModel.plannedBytes(
+                                static_cast<uint32_t>(std::lround(aneFfnStart.split->share() * aneFfnModel.units)),
+                                aneFfnSetting.given.has_value()))
                           : contextOf(0);
     std::cout << "ane_ffn_context=" << aneFfnStart.outcome.context
               << " no_ane_context=" << aneFfnStart.outcome.contextWithout << " checks_context=" << checksContext
