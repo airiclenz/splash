@@ -5326,6 +5326,47 @@ void testStateEvictionsAreCountedByCause() {
     sum += count;
   require(states.evictions == 4 && sum == states.evictions,
           "the eviction causes do not sum to the evictions");
+
+  // Every class that can take cache (a Floor claim takes nothing: takeRights),
+  // with and without the host's refusal, under the default scope and a
+  // capture's. A capture keeps its cause; otherwise the host's claim is a
+  // pressure pass, a refused need of any other class paused backing, and the
+  // rest growth. Two states each: Growth and the host's pass under normal
+  // pressure keep the resume point, so they take the older one.
+  struct ClassCauses final {
+    ClaimSpec spec;
+    StateEvictionCause plain;
+    StateEvictionCause refused;
+  };
+  const ClassCauses classes[] = {
+      {{.cls = ClaimClass::InService}, StateEvictionCause::Growth, StateEvictionCause::PausedBacking},
+      {{.cls = ClaimClass::Start}, StateEvictionCause::Growth, StateEvictionCause::PausedBacking},
+      {{.cls = ClaimClass::Optional, .requestId = 1}, StateEvictionCause::Growth, StateEvictionCause::PausedBacking},
+      {{.cls = ClaimClass::Growth}, StateEvictionCause::Growth, StateEvictionCause::PausedBacking},
+      {{.cls = ClaimClass::Host}, StateEvictionCause::PressurePass, StateEvictionCause::PressurePass},
+  };
+  for (const ClassCauses &each : classes) {
+    for (const bool hostRefused : {false, true}) {
+      for (const bool snapshot : {false, true}) {
+        CacheFixture fresh;
+        fresh.publish(2);
+        fresh.publish(3);
+        const StateEvictionCause expected = snapshot      ? StateEvictionCause::Snapshot
+                                            : hostRefused ? each.refused
+                                                          : each.plain;
+        bool gave = false;
+        {
+          std::optional<EvictionScope> capture;
+          if (snapshot)
+            capture.emplace(fresh.cache, StateEvictionCause::Snapshot);
+          gave = test::takeStep(fresh.cache, each.spec, {.hostRefused = hostRefused, .stateBuffers = 1}).gave();
+        }
+        const StateCacheSnapshot taken = fresh.cache.snapshot().stateCache;
+        require(gave && taken.evictions == 1 && counted(fresh.cache, expected) == 1,
+                "a claim class's state eviction was not counted under its cause");
+      }
+    }
+  }
 }
 
 // Every KV block erased counts once in the cache's snapshot.
