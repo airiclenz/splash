@@ -315,6 +315,8 @@ private:
   [[nodiscard]] Request &get(uint64_t requestId);
   [[nodiscard]] const Request &get(uint64_t requestId) const;
   [[nodiscard]] static bool terminal(Phase phase) noexcept;
+  // Queued or waiting for resources or a prefix: not yet admitted to prefill.
+  [[nodiscard]] static bool beforeAdmission(Phase phase) noexcept;
   [[nodiscard]] static bool byPriorityThenOrder(const Request *a,
                                                 const Request *b) noexcept;
   [[nodiscard]] static bool samePlan(const BatchPlan &a, const BatchPlan &b) noexcept;

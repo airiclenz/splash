@@ -1425,15 +1425,12 @@ EngineSpillConfig RuntimeResources::spillConfig() const noexcept {
 }
 
 metal::WiredSample RuntimeResources::weightWiring() const {
-  if (!model_.images)
-    return {};
   // Taken afresh at each read: a release frees the images' memory and a
   // restore gives it other addresses, so none is kept across reads.
-  const std::vector<model::WeightImages::Contents> images = model_.images->contents();
   std::vector<std::span<const uint8_t>> ranges;
-  ranges.reserve(images.size());
-  for (const model::WeightImages::Contents &image : images)
-    ranges.push_back(image.bytes);
+  if (model_.images)
+    for (const model::WeightImages::Contents &image : model_.images->contents())
+      ranges.push_back(image.bytes);
   return metal::sampleWiredBytes(ranges);
 }
 

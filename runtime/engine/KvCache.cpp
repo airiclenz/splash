@@ -1069,10 +1069,7 @@ void KvCache::erase(uint64_t blockId) {
 }
 
 KvCache::Block &KvCache::block(uint64_t blockId) {
-  auto found = blocks_.find(blockId);
-  if (found == blocks_.end())
-    throw std::out_of_range("unknown KV cache block");
-  return found->second;
+  return const_cast<Block &>(std::as_const(*this).block(blockId));
 }
 
 const KvCache::Block &KvCache::block(uint64_t blockId) const {

@@ -6,12 +6,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <compare>
 #include <functional>
 #include <limits>
 #include <map>
-#include <set>
-#include <tuple>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -3152,10 +3149,7 @@ CacheSnapshot Cache::snapshot() const {
 }
 
 Cache::Request &Cache::request(uint64_t requestId) {
-  auto found = requests_.find(requestId);
-  if (found == requests_.end())
-    throw std::out_of_range("unknown request");
-  return found->second;
+  return const_cast<Request &>(std::as_const(*this).request(requestId));
 }
 
 const Cache::Request &Cache::request(uint64_t requestId) const {

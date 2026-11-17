@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <span>
 #include <sstream>
 #include <thread>
@@ -214,11 +213,8 @@ std::string ServingRuntime::statusJson() {
   MemoryGovernorSnapshot memoryGovernor = resources_->memoryGovernor().snapshot();
   // Sampled here alone, once per status read: the page breakdown it sits in
   // is omitted while the host is unmeasured, and so are its queries.
-  if (memoryGovernor.hostMeasurementValid) {
-    const metal::WiredSample weights = resources_->weightWiring();
-    memoryGovernor.hostWeightBytes = weights.bytes;
-    memoryGovernor.hostWeightWiredBytes = weights.wiredBytes;
-  }
+  if (memoryGovernor.hostMeasurementValid)
+    memoryGovernor.hostWeights = resources_->weightWiring();
   StatusSample sample{.engine = nativeLoop_->statusSnapshot(),
                       .resourceWait = nativeLoop_->resourceWaitSnapshot(),
                       .weights = nativeLoop_->weightsSnapshot(),

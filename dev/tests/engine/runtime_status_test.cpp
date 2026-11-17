@@ -779,8 +779,7 @@ void testHostPageBreakdown() {
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostInactiveBytes = 3 * kGiB;
   governor.hostWiredBytes = 5 * kGiB;
-  governor.hostWeightBytes = 4 * kGiB;
-  governor.hostWeightWiredBytes = 3 * kGiB;
+  governor.hostWeights = {.bytes = 4 * kGiB, .wiredBytes = 3 * kGiB};
   governor.hostCompressorBytes = 1 * kGiB;
   governor.deniedReservations = 3;
   governor.deniedHostReservations = 2;

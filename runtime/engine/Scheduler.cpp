@@ -101,11 +101,8 @@ void Scheduler::submit(RequestSpec request) {
 
 void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
   Request &request = get(id);
-  if (request.phase != Phase::Queued &&
-      request.phase != Phase::WaitingResources &&
-      request.phase != Phase::WaitingPrefix) {
+  if (!beforeAdmission(request.phase))
     throw std::logic_error("only queued work can be admitted");
-  }
   if (processed > request.spec.prefillTokens) {
     throw std::invalid_argument("processed prompt exceeds request");
   }
@@ -153,32 +150,22 @@ void Scheduler::resumeFromResources(uint64_t id, uint32_t processed,
 
 void Scheduler::deferAdmission(uint64_t id) {
   Request &request = get(id);
-  if (request.suspended ||
-      (request.phase != Phase::Queued &&
-       request.phase != Phase::WaitingResources &&
-       request.phase != Phase::WaitingPrefix))
+  if (request.suspended || !beforeAdmission(request.phase))
     throw std::logic_error("only unstarted work can wait for scheduling");
   request.phase = Phase::Queued;
 }
 
 void Scheduler::waitForResources(uint64_t id) {
   Request &request = get(id);
-  if (request.phase != Phase::Queued &&
-      request.phase != Phase::WaitingResources &&
-      request.phase != Phase::WaitingPrefix) {
+  if (!beforeAdmission(request.phase))
     throw std::logic_error("resident request cannot wait before admission");
-  }
   request.phase = Phase::WaitingResources;
 }
 
 void Scheduler::waitForPrefix(uint64_t id) {
   Request &request = get(id);
-  if (request.suspended ||
-      (request.phase != Phase::Queued &&
-       request.phase != Phase::WaitingResources &&
-       request.phase != Phase::WaitingPrefix)) {
+  if (request.suspended || !beforeAdmission(request.phase))
     throw std::logic_error("only unstarted requests can wait for a prefix");
-  }
   request.phase = Phase::WaitingPrefix;
 }
 
@@ -227,11 +214,8 @@ std::vector<uint64_t> Scheduler::admissionOrder() const {
   std::vector<const Request *> ready;
   ready.reserve(requests_.size());
   for (const auto &[_, request] : requests_) {
-    if (request.phase == Phase::Queued ||
-        request.phase == Phase::WaitingResources ||
-        request.phase == Phase::WaitingPrefix) {
+    if (beforeAdmission(request.phase))
       ready.push_back(&request);
-    }
   }
   std::sort(ready.begin(), ready.end(), byPriorityThenOrder);
   std::vector<uint64_t> result;
@@ -246,10 +230,7 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
   // A request admission has not started, from the tokens it starts at.
   const auto unstarted = [&](const PrefillAdmission &entry) {
     const Request &value = get(entry.requestId);
-    if (value.suspended ||
-        (value.phase != Phase::Queued && value.phase != Phase::WaitingResources &&
-         value.phase != Phase::WaitingPrefix) ||
-        entry.cachedTokens >= value.spec.prefillTokens)
+    if (value.suspended || !beforeAdmission(value.phase) || entry.cachedTokens >= value.spec.prefillTokens)
       throw std::logic_error("invalid pending prefill admission");
     return lane(value, entry.cachedTokens, in);
   };
@@ -696,8 +677,7 @@ void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
       youngestServed = std::max(youngestServed, get(item.requestId).order);
     for (auto &[id, request] : requests_) {
       if (request.spec.priority != priority || request.suspended || listed(in.excluded, id) ||
-          (request.phase != Phase::Queued && request.phase != Phase::WaitingResources &&
-           request.phase != Phase::WaitingPrefix && request.phase != Phase::Prefill))
+          (!beforeAdmission(request.phase) && request.phase != Phase::Prefill))
         continue;
       if (holds(plan.items, id))
         request.overtaken = 0;
@@ -885,10 +865,7 @@ SchedulerSnapshot Scheduler::snapshot() const noexcept {
 }
 
 Scheduler::Request &Scheduler::get(uint64_t id) {
-  auto found = requests_.find(id);
-  if (found == requests_.end())
-    throw std::out_of_range("unknown request");
-  return found->second;
+  return const_cast<Request &>(static_cast<const Scheduler &>(*this).get(id));
 }
 
 const Scheduler::Request &Scheduler::get(uint64_t id) const {
@@ -901,6 +878,10 @@ const Scheduler::Request &Scheduler::get(uint64_t id) const {
 bool Scheduler::terminal(Phase phase) noexcept {
   return phase == Phase::Completed || phase == Phase::Cancelled ||
          phase == Phase::Failed;
+}
+
+bool Scheduler::beforeAdmission(Phase phase) noexcept {
+  return phase == Phase::Queued || phase == Phase::WaitingResources || phase == Phase::WaitingPrefix;
 }
 
 bool Scheduler::byPriorityThenOrder(const Request *a,

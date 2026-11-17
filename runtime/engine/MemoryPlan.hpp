@@ -6,7 +6,6 @@
 #include "ops/PagedKv.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
