@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import copy
 import io
 import itertools
 import json
@@ -513,6 +514,17 @@ AGENT_STATUS = snapshot(
 )
 
 
+def wiring_status(chat_requests):
+    """Return AGENT_STATUS with wired weight bytes that grow with each chat request.
+
+    A turn's before-snapshot is read before its request arrives and its
+    after-snapshot once it has, so the two readings of every turn differ.
+    """
+    document = copy.deepcopy(AGENT_STATUS)
+    document["memory_governor"]["host_weight_wired_bytes"] = (chat_requests + 1) * GIB
+    return document
+
+
 def agent_arguments(stub, turns, *extra):
     return [
         "--base-url",
@@ -572,6 +584,52 @@ class AgentModeTests(unittest.TestCase):
         ):
             self.assertEqual(turn[key], 0, key)
         self.assertGreater(turn["os_warn_s"], 0)
+
+    def test_main_agentTurns_recordsWeightWiringBeforeAndAfterEachTurn(self):
+        with StubServer(wiring_status, cached_tokens=[0, 90]) as stub:
+            code, output = run_main(agent_arguments(stub, 2, "--json"))
+
+        self.assertEqual(code, 0)
+        phases = json.loads(output)["phases"]
+        readings = [
+            (
+                phase["host_weight_wired_bytes_before"],
+                phase["host_weight_wired_bytes_after"],
+            )
+            for phase in phases
+        ]
+        self.assertEqual(readings, [(GIB, 2 * GIB), (2 * GIB, 3 * GIB)])
+
+    def test_main_statusWithoutWeightWiring_recordsNullNotZero(self):
+        with StubServer(AGENT_STATUS, cached_tokens=[0, 90]) as stub:
+            code, output = run_main(agent_arguments(stub, 2, "--json"))
+
+        self.assertEqual(code, 0)
+        for phase in json.loads(output)["phases"]:
+            self.assertIsNone(phase["host_weight_wired_bytes_before"])
+            self.assertIsNone(phase["host_weight_wired_bytes_after"])
+
+    def test_formatReport_agentTurns_rendersWeightWiringRows(self):
+        cases = (
+            ("reported", wiring_status, [[GIB, 2 * GIB], [2 * GIB, 3 * GIB]]),
+            ("omitted", AGENT_STATUS, [["unavailable"] * 2] * 2),
+        )
+        for name, status, expected in cases:
+            with self.subTest(name):
+                with StubServer(status, cached_tokens=[0, 90]) as stub:
+                    _code, output = run_main(agent_arguments(stub, 2))
+
+                rows = {
+                    cells[0]: cells[1:]
+                    for cells in map(str.split, output.splitlines())
+                    if cells
+                }
+                for edge, column in (("before", 0), ("after", 1)):
+                    self.assertEqual(
+                        rows[f"host_weight_wired_bytes_{edge}"],
+                        [str(turn[column]) for turn in expected],
+                        edge,
+                    )
 
     def test_formatReport_agentTurns_rendersTtftAndOsWarnRows(self):
         with StubServer(AGENT_STATUS, cached_tokens=[0, 90]) as stub:

@@ -20,7 +20,8 @@ published at or below the divergence can be reused.
 each turn is sent right after the previous one finishes and carries the
 previous prompt, the returned reply and ``--tool-tokens`` filler words, so the
 whole earlier conversation is reusable. Each turn is its own phase, reported
-with its cached tokens, TTFT, counter deltas and OS warn seconds; the probe
+with its cached tokens, TTFT, counter deltas, OS warn seconds and the server's
+``host_weight_wired_bytes`` read before and after the request; the probe
 exits AGENT_COLD_TURN_EXIT_CODE when a turn after the first reuses 0 tokens,
 and AGENT_TURN_FAILED_EXIT_CODE when a turn fails, which ends the session.
 
@@ -214,6 +215,11 @@ SAMPLE_READINGS = (
     # Pages exist only in allocated extents: every allocated page is resident.
     ("kv_pages_resident", ("kv", "pages_allocated")),
 )
+# (phase key, `/status` path) of the point readings each phase row keeps from
+# its before and after snapshots, as `<key>_before` and `<key>_after`.
+PHASE_READINGS = (
+    ("host_weight_wired_bytes", ("memory_governor", "host_weight_wired_bytes")),
+)
 # (summary key, sample key) of the readings whose minimum the summary reports.
 MINIMUM_READINGS = (
     ("min_governor_headroom_bytes", "governor_headroom_bytes"),
@@ -244,6 +250,29 @@ def counter_delta(before: dict, after: dict) -> dict:
         start, end = status_reading(before, path), status_reading(after, path)
         delta[key] = None if start is None or end is None else end - start
     return delta
+
+
+# ------------------------------------------------------------------------------
+def phase_readings(before: dict, after: dict) -> dict:
+    """Return the PHASE_READINGS of a phase's before and after `/status` snapshots.
+
+    A reading the snapshot leaves out reads as None, never 0: /status omits the
+    host page breakdown while its host measurement is invalid, and an older
+    server does not export it.
+    """
+    readings = {}
+    for key, path in PHASE_READINGS:
+        readings[f"{key}_before"] = status_reading(before, path)
+        readings[f"{key}_after"] = status_reading(after, path)
+    return readings
+
+
+# ------------------------------------------------------------------------------
+def phase_reading_keys() -> list[str]:
+    """Return the phase row keys phase_readings fills, in report order."""
+    return [
+        f"{key}_{edge}" for key, _ in PHASE_READINGS for edge in ("before", "after")
+    ]
 
 
 # ------------------------------------------------------------------------------
@@ -906,9 +935,10 @@ def run_phase(
 ) -> dict:
     """Send `bodies` (lane -> request) concurrently and wait for all or the guard.
 
-    Returns the phase row: lane rows, counter deltas and whether the swap guard
-    stopped it. On a trip the unfinished lanes are left to the server and the
-    after-snapshot is taken at once. `replies`, when given, receives each
+    Returns the phase row: lane rows, counter deltas, the PHASE_READINGS before
+    and after the requests and whether the swap guard stopped it. On a trip the
+    unfinished lanes are left to the server and the after-snapshot is taken at
+    once. `replies`, when given, receives each
     finished lane's decoded reply. `ballast`, when given, is tended about every
     SWAP_POLL_SECONDS while the lanes run.
     """
@@ -936,6 +966,7 @@ def run_phase(
         "lanes": sorted(records, key=lambda record: record["lane"]),
         "swap_aborted": guard.tripped.is_set(),
         **counter_delta(before, after),
+        **phase_readings(before, after),
     }
 
 
@@ -1095,10 +1126,11 @@ def format_report(document: dict) -> str:
             lines.append("".join(f"{cell:>12}" for cell in cells))
             if record["error"]:
                 lines.append(f"    error: {record['error']}")
-    width = max(len(key) for key, _ in PHASE_COUNTERS)
+    row_keys = [key for key, _ in PHASE_COUNTERS] + phase_reading_keys()
+    width = max(len(key) for key in row_keys)
     names = [phase["phase"] for phase in document["phases"]]
     lines += ["", f"{'':<{width}}" + "".join(f"{name:>12}" for name in names)]
-    for key, _ in PHASE_COUNTERS:
+    for key in row_keys:
         cells = "".join(
             f"{format_value(phase[key]):>12}" for phase in document["phases"]
         )
