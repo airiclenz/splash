@@ -1277,7 +1277,9 @@ bool emitCheckpointSummary(
   if (!isIntervalReached) {
     std::cerr << "checkpoints scenario failed: no checkpoint interval reached "
                  "(a run's prompt plus output tokens stayed below "
-              << *smallestInterval << ")\n";
+              << *smallestInterval
+              << "; without --prompt-tokens-file the synthetic prompt ends at "
+                 "EOS within a few tokens)\n";
   }
   return isPassing;
 }
@@ -1744,10 +1746,13 @@ int main(int argc, char **argv) {
         }
         continuationResult.coldOutputMatch =
             continuationResult.outputTokens == continuationCold.outputTokens;
-        if (coldResult.draftContextRows != expectedDraftContextRows(
-                length, engine::kPrefillCheckpointTokens)) {
+        const uint64_t expectedColdRows =
+            expectedDraftContextRows(length, engine::kPrefillCheckpointTokens);
+        if (coldResult.draftContextRows != expectedColdRows) {
           throw std::runtime_error(
-              "cold prefill performed unnecessary draft-context work");
+              "cold prefill draft-context work differs from its plan: rows=" +
+              std::to_string(coldResult.draftContextRows) +
+              " expected=" + std::to_string(expectedColdRows));
         }
         if (exactResult.ttftMilliseconds * 2.0 >=
             coldResult.ttftMilliseconds) {
