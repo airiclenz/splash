@@ -79,6 +79,8 @@ void writeHostPages(json::Writer &w, const MemoryGovernorSnapshot &governor) {
     return;
   w.field("host_inactive_bytes", governor.hostInactiveBytes)
       .field("host_wired_bytes", governor.hostWiredBytes)
+      .field("host_weight_bytes", governor.hostWeightBytes)
+      .field("host_weight_wired_bytes", governor.hostWeightWiredBytes)
       .field("host_compressor_bytes", governor.hostCompressorBytes);
 }
 

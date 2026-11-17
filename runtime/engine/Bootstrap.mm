@@ -211,6 +211,14 @@ std::string ServingRuntime::statusJson() {
   // the safe-point pressure monitor already refresh the cached sample.
   metal::MetalBackend &backend = resources_->backend();
   const bool healthy = backend.healthy();
+  MemoryGovernorSnapshot memoryGovernor = resources_->memoryGovernor().snapshot();
+  // Sampled here alone, once per status read: the page breakdown it sits in
+  // is omitted while the host is unmeasured, and so are its queries.
+  if (memoryGovernor.hostMeasurementValid) {
+    const metal::WiredSample weights = resources_->weightWiring();
+    memoryGovernor.hostWeightBytes = weights.bytes;
+    memoryGovernor.hostWeightWiredBytes = weights.wiredBytes;
+  }
   StatusSample sample{.engine = nativeLoop_->statusSnapshot(),
                       .resourceWait = nativeLoop_->resourceWaitSnapshot(),
                       .weights = nativeLoop_->weightsSnapshot(),
@@ -220,7 +228,7 @@ std::string ServingRuntime::statusJson() {
                       .metalHealthy = healthy,
                       .metalFailureReason = healthy ? std::string{} : backend.unhealthyReason(),
                       .pipelinesCreatedWhileServing = backend.pipelinesCreatedWhileServing(),
-                      .memoryGovernor = resources_->memoryGovernor().snapshot(),
+                      .memoryGovernor = std::move(memoryGovernor),
                       .aneFfn = resources_->aneFfnSnapshot(),
                       .thermalState = thermalState_.state(),
                       .loopMaxTickMilliseconds = loopMaxTick_(),

@@ -159,6 +159,11 @@ struct MemoryGovernorSnapshot {
   // measurement is invalid.
   uint64_t hostInactiveBytes = 0;
   uint64_t hostWiredBytes = 0;
+  // The weight images held now and the part of them macOS keeps wired
+  // (metal::sampleWiredBytes), 0 while none are held. The status read fills
+  // them, not the governor, and no rule acts on them.
+  uint64_t hostWeightBytes = 0;
+  uint64_t hostWeightWiredBytes = 0;
   uint64_t hostCompressorBytes = 0;
   uint64_t hostReserveBytes = 0;
   uint64_t hostSpareBytes = 0;

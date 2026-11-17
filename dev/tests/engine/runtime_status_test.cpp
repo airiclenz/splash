@@ -779,6 +779,8 @@ void testHostPageBreakdown() {
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostInactiveBytes = 3 * kGiB;
   governor.hostWiredBytes = 5 * kGiB;
+  governor.hostWeightBytes = 4 * kGiB;
+  governor.hostWeightWiredBytes = 3 * kGiB;
   governor.hostCompressorBytes = 1 * kGiB;
   governor.deniedReservations = 3;
   governor.deniedHostReservations = 2;
@@ -790,6 +792,8 @@ void testHostPageBreakdown() {
   require(measured.find("\"host_available_bytes\":" + std::to_string(8 * kGiB) +
                         ",\"host_inactive_bytes\":" + std::to_string(3 * kGiB) +
                         ",\"host_wired_bytes\":" + std::to_string(5 * kGiB) +
+                        ",\"host_weight_bytes\":" + std::to_string(4 * kGiB) +
+                        ",\"host_weight_wired_bytes\":" + std::to_string(3 * kGiB) +
                         ",\"host_compressor_bytes\":" + std::to_string(1 * kGiB) +
                         ",\"host_reserve_bytes\":") != std::string::npos,
           "status omitted the host page breakdown");
@@ -800,6 +804,8 @@ void testHostPageBreakdown() {
   const std::string unmeasured = status();
   require(unmeasured.find("\"host_inactive_bytes\"") == std::string::npos &&
               unmeasured.find("\"host_wired_bytes\"") == std::string::npos &&
+              unmeasured.find("\"host_weight_bytes\"") == std::string::npos &&
+              unmeasured.find("\"host_weight_wired_bytes\"") == std::string::npos &&
               unmeasured.find("\"host_compressor_bytes\"") == std::string::npos,
           "an invalid host measurement still reported a page breakdown");
 }

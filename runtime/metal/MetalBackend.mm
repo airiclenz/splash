@@ -12,6 +12,8 @@
 
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 
 #include <algorithm>
 #include <array>
@@ -2347,6 +2349,41 @@ DeviceCapabilities probeDeviceCapabilities() {
         readDeviceCapabilities(device, capabilities);
         return capabilities;
     }
+}
+
+WiredSample sampleWiredBytes(std::span<const std::span<const uint8_t>> ranges) noexcept {
+    // mach_vm_page_query resolves addresses in the host's VM pages.
+    const uint64_t pageBytes = vm_page_size;
+    uint64_t totalBytes = 0;
+    for (const std::span<const uint8_t> range : ranges) totalBytes += range.size();
+    if (!totalBytes) return {};
+
+    const mach_port_t task = mach_task_self();
+    uint64_t wiredBytes = 0;
+    for (const std::span<const uint8_t> range : ranges) {
+        if (range.empty()) continue;
+        const uint64_t bytes = range.size();
+        // No mapped range is near 2^56 bytes, so bytes times the budget
+        // cannot overflow.
+        const uint64_t rangePages = (bytes + pageBytes - 1) / pageBytes;
+        const uint64_t samples =
+            std::clamp<uint64_t>(bytes * kWiredSamplePages / totalBytes, 1, rangePages);
+        const uint64_t base = reinterpret_cast<uintptr_t>(range.data());
+        // A range's samples split it at bytes*i/n, so their shares sum to it
+        // exactly; each queries the page under the middle of its share.
+        for (uint64_t index = 0; index < samples; ++index) {
+            const uint64_t start = bytes * index / samples;
+            const uint64_t end = bytes * (index + 1) / samples;
+            const uint64_t address = base + start + (end - start) / 2;
+            integer_t disposition = 0;
+            integer_t references = 0;
+            const kern_return_t result = mach_vm_page_query(
+                task, address - address % pageBytes, &disposition, &references);
+            if (result == KERN_SUCCESS && (disposition & VM_PAGE_QUERY_PAGE_WIRED))
+                wiredBytes += end - start;
+        }
+    }
+    return {totalBytes, wiredBytes};
 }
 
 void MetalBackend::checkOperation() const {

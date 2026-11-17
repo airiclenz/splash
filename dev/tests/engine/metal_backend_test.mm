@@ -12,6 +12,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -32,6 +33,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -950,6 +952,52 @@ bool waitFor(Predicate done, std::chrono::milliseconds limit) {
     while (!done() && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     return done();
+}
+
+// A wired sample reads a buffer the backend holds as wired, the same buffer
+// once its keep-alive lapsed as not wired (the idle unwiring /status watches
+// for) and its mlocked pages as wired, and follows the buffer's memory as the
+// status read takes it: nothing while released, the restored memory after a
+// restore.
+void wiredSampleFollowsTheMemory(const std::string &metallibPath) {
+    using splash::metal::WiredSample;
+    using splash::metal::sampleWiredBytes;
+    constexpr double kKeepAliveSeconds = 0.2;
+    const auto sample = [](const MetalBuffer &buffer) {
+        const auto *bytes = static_cast<const uint8_t *>(buffer.contents());
+        const std::array<std::span<const uint8_t>, 1> ranges{
+            std::span<const uint8_t>(bytes, bytes ? buffer.sizeBytes() : 0)};
+        return sampleWiredBytes(ranges);
+    };
+    const auto wiredWhileLocked = [&](const MetalBuffer &buffer) {
+        require(mlock(buffer.contents(), buffer.sizeBytes()) == 0, "the buffer's pages could not be locked");
+        const WiredSample locked = sample(buffer);
+        require(munlock(buffer.contents(), buffer.sizeBytes()) == 0, "the buffer's pages could not be unlocked");
+        return locked;
+    };
+    const WiredSample none = sampleWiredBytes({});
+    require(none.bytes == 0 && none.wiredBytes == 0, "a sample of no memory counted bytes");
+
+    MetalBackend backend(metallibPath, kKeepAliveSeconds);
+    constexpr uint64_t kPages = 64;
+    const uint64_t bytes = kPages * static_cast<uint64_t>(getpagesize());
+    const MetalBuffer buffer = backend.allocateBuffer(bytes, BufferStorage::Shared, "wired sample");
+    require(waitFor([&] { return sample(buffer).wiredBytes == bytes; }, std::chrono::seconds(1)),
+            "a buffer the backend holds did not read as wired");
+    require(waitFor([&] { return sample(buffer).wiredBytes == 0; }, std::chrono::seconds(5)) &&
+                sample(buffer).bytes == bytes,
+            "a buffer whose keep-alive lapsed still read as wired");
+    const WiredSample locked = wiredWhileLocked(buffer);
+    require(locked.bytes == bytes && locked.wiredBytes == bytes, "a locked buffer did not read as wired");
+
+    backend.releaseMemory(buffer);
+    const WiredSample released = sample(buffer);
+    require(released.bytes == 0 && released.wiredBytes == 0, "released memory was sampled");
+    backend.restoreMemory(buffer);
+    const WiredSample restored = wiredWhileLocked(buffer);
+    require(restored.bytes == bytes && restored.wiredBytes == bytes,
+            "the restored memory was not the memory sampled");
+    std::cout << "PASS a wired sample follows the buffer's memory\n";
 }
 
 // A lapsed keep-alive ends residency with one dispatch of a kernel built with
@@ -3518,6 +3566,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"synchronousWaitObeysTheWatchdog", [] { synchronousWaitObeysTheWatchdog(metallib); }},
         {"abandonedTicketReturnsAfterTheWatchdog", [] { abandonedTicketReturnsAfterTheWatchdog(metallib); }},
         {"stopRefusesSubmission", [] { stopRefusesSubmission(metallib); }},
+        {"wiredSampleFollowsTheMemory", [] { wiredSampleFollowsTheMemory(metallib); }},
         {"shutdownInterruptsACommandWait", [] { shutdownInterruptsACommandWait(metallib); }},
         {"shutdownLeavesTicketTeardownToTheCommand", [] { shutdownLeavesTicketTeardownToTheCommand(metallib); }},
         {"shutdownSparesACommandThatCompletes", [] { shutdownSparesACommandThatCompletes(metallib); }},

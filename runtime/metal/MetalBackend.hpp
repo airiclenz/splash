@@ -367,6 +367,27 @@ struct MetalMemoryStats {
 // enough to refuse an unsupported Mac before a model is downloaded.
 [[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
 
+// Some memory's bytes and the part of them macOS holds wired.
+struct WiredSample {
+  uint64_t bytes = 0;
+  uint64_t wiredBytes = 0;
+};
+
+// The page queries one wired sample spends; a range too small for a share of
+// them still gets one.
+inline constexpr uint64_t kWiredSamplePages = 256;
+
+// How much of `ranges` macOS holds wired, estimated from the disposition
+// (mach_vm_page_query) of evenly spaced pages, each standing for an equal
+// share of its range: the ranges get about kWiredSamplePages queries in
+// proportion to their bytes, at least one each and at most one per page. It
+// allocates nothing; an empty range counts nothing. Every range must be
+// mapped for the call, since the kernel reports an unmapped address as an
+// unwired page. A failed query counts its share unwired: wiredBytes is what
+// the kernel confirmed wired.
+[[nodiscard]] WiredSample
+sampleWiredBytes(std::span<const std::span<const uint8_t>> ranges) noexcept;
+
 // How long a command may go without progress before the backend gives up on
 // it by default, in time the Mac is awake (AwakeClock): from its commit, and
 // then from each of its host steps as the GPU work before it ends and as it

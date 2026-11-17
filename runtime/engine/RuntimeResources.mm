@@ -10,6 +10,7 @@
 #include "model/ExpertStore.hpp"
 #include "model/ModelSizing.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/WeightImages.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/AneFfnMeasurement.hpp"
 #include "ops/KvSlotFormat.hpp"
@@ -25,6 +26,7 @@
 #include <span>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 namespace splash::engine {
 namespace {
@@ -1420,6 +1422,19 @@ EngineSpillConfig RuntimeResources::spillConfig() const noexcept {
           .always = spillAlways_,
           .denseTokens = spill.densePages * kv::kPageTokens,
           .geometry = memoryPlan_.spillGeometry()};
+}
+
+metal::WiredSample RuntimeResources::weightWiring() const {
+  if (!model_.images)
+    return {};
+  // Taken afresh at each read: a release frees the images' memory and a
+  // restore gives it other addresses, so none is kept across reads.
+  const std::vector<model::WeightImages::Contents> images = model_.images->contents();
+  std::vector<std::span<const uint8_t>> ranges;
+  ranges.reserve(images.size());
+  for (const model::WeightImages::Contents &image : images)
+    ranges.push_back(image.bytes);
+  return metal::sampleWiredBytes(ranges);
 }
 
 std::optional<KvSpillSnapshot> RuntimeResources::kvSpillSnapshot() const {

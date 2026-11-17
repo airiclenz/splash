@@ -339,6 +339,12 @@ public:
   [[nodiscard]] std::optional<model::ExpertStoreStats> streamedExpertStats() const;
   // Which requests keep their KV on the SSD cache (EngineConfig::spill).
   [[nodiscard]] EngineSpillConfig spillConfig() const noexcept;
+  // The weight images held now and the part of them macOS keeps wired, for
+  // /status: about metal::kWiredSamplePages page queries over the images'
+  // addresses as they stand at the call, so a restore after an idle release
+  // is sampled where it now lives; 0 for both while no image is held.
+  // Engine thread, which alone releases and restores the images.
+  [[nodiscard]] metal::WiredSample weightWiring() const;
   // What the SSD cache holds and did of spilled KV (Cache::spillSnapshot), for
   // /status, none for a target that keeps its KV in memory; engine thread.
   [[nodiscard]] std::optional<KvSpillSnapshot> kvSpillSnapshot() const;
