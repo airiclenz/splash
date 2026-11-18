@@ -954,6 +954,15 @@ bool waitFor(Predicate done, std::chrono::milliseconds limit) {
     return done();
 }
 
+// The sanitizer runtimes intercept mlock and munlock as no-ops ("ThreadSanitizer
+// ignores mlock/mlockall/munlock/munlockall"), so under them a locked page is
+// not wired and only the plain suite can check that it reads as wired.
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+constexpr bool kMlockWires = false;
+#else
+constexpr bool kMlockWires = true;
+#endif
+
 // A wired sample reads a buffer the backend holds as wired, the same buffer
 // once its keep-alive lapsed as not wired (the idle unwiring /status watches
 // for) and its mlocked pages as wired, and follows the buffer's memory as the
@@ -988,14 +997,15 @@ void wiredSampleFollowsTheMemory(const std::string &metallibPath) {
                 sample(buffer).bytes == bytes,
             "a buffer whose keep-alive lapsed still read as wired");
     const WiredSample locked = wiredWhileLocked(buffer);
-    require(locked.bytes == bytes && locked.wiredBytes == bytes, "a locked buffer did not read as wired");
+    require(locked.bytes == bytes && (!kMlockWires || locked.wiredBytes == bytes),
+            "a locked buffer did not read as wired");
 
     backend.releaseMemory(buffer);
     const WiredSample released = sample(buffer);
     require(released.bytes == 0 && released.wiredBytes == 0, "released memory was sampled");
     backend.restoreMemory(buffer);
     const WiredSample restored = wiredWhileLocked(buffer);
-    require(restored.bytes == bytes && restored.wiredBytes == bytes,
+    require(restored.bytes == bytes && (!kMlockWires || restored.wiredBytes == bytes),
             "the restored memory was not the memory sampled");
     std::cout << "PASS a wired sample follows the buffer's memory\n";
 }
