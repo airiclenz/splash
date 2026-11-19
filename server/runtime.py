@@ -549,6 +549,10 @@ class MultiplexedRuntime:
         # relaunch is expected to take again from its own.
         self._last_start_seconds: float | None = None
         self._terminal_error: EngineRuntimeError | None = None
+        # Set once the current generation has its terminal error, replaced
+        # with each generation: what a write that found the engine gone waits
+        # for (_write_bytes).
+        self._generation_failed = threading.Event()
         self._pending: dict[int, RuntimeCall] = {}
         self._status_waiters: dict[int, _StatusWaiter] = {}
         self._liveness_timer: threading.Timer | None = None
@@ -1028,6 +1032,7 @@ class MultiplexedRuntime:
                 self._process = process
                 self._stderr_relay = relay
                 self._terminal_error = None
+                self._generation_failed = threading.Event()
                 self._ready_message = None
                 self._last_status = None
                 attempt.generation = generation
@@ -1076,6 +1081,7 @@ class MultiplexedRuntime:
             raise TimeoutError("native write lock timed out")
         failure: BaseException | None = None
         finish_failure = None
+        reader_fails: threading.Event | None = None
         offset = 0
         try:
             try:
@@ -1121,22 +1127,44 @@ class MultiplexedRuntime:
                 )
             except BaseException as error:
                 with self._state_lock:
-                    terminal = (
-                        self._terminal_error if generation == self._generation else None
-                    )
+                    current = generation == self._generation
+                    terminal = self._terminal_error if current else None
+                    if (
+                        current
+                        and terminal is None
+                        and isinstance(error, BrokenPipeError)
+                        and threading.current_thread() is not self._reader_thread
+                    ):
+                        reader_fails = self._generation_failed
                 if terminal is not None:
                     failure = terminal.restate()
                 elif isinstance(error, EngineRuntimeError):
                     failure = error
                 else:
                     failure = EngineUnhealthy(f"native protocol write failed: {error}")
-            if failure:
+            if failure and reader_fails is None:
                 # Fence/detach the generation before another writer can enter.
                 # Completion callbacks may submit again, so deliver them only
                 # after releasing the write lock.
                 finish_failure = self._begin_generation_failure(generation, failure)
         finally:
             self._write_lock.release()
+        if reader_fails is not None:
+            # The engine is gone, and its reader may not have read yet what it
+            # wrote before: the requests it started. That reader fails the
+            # generation at the end of the output with all of them
+            # (supervision.Quarantine), so this write waits for it, unfenced:
+            # a broken pipe takes no other writer's frame. Its event callbacks
+            # may write, so never under the write lock.
+            reader_fails.wait(self._thresholds.stop_grace)
+            with self._state_lock:
+                terminal = (
+                    self._terminal_error if generation == self._generation else None
+                )
+            if terminal is not None:
+                failure = terminal.restate()
+            else:
+                finish_failure = self._begin_generation_failure(generation, failure)
         if finish_failure:
             finish_failure()
         if failure:
@@ -1507,6 +1535,7 @@ class MultiplexedRuntime:
             # kept, so its frames do not outlive the requests they ran for.
             failure = error.restate()
             self._terminal_error = failure
+            self._generation_failed.set()
             served_seconds = (
                 None if self._ready_at is None else time.monotonic() - self._ready_at
             )

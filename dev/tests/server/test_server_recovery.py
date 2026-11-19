@@ -1,5 +1,7 @@
 import concurrent.futures
+import contextlib
 import dataclasses
+import errno
 import http.client
 import io
 import json
@@ -768,6 +770,58 @@ class ServerRecoveryTests(HarnessTestCase):
             lambda process, frame: (
                 segfault if frame.prompt_tokens == poison else self.serve
             )(process, frame)
+        )
+        # The run and its re-run die.
+        kind, error = self.outcome_of(backend, runtime, poison)
+        self.assertEqual((kind, error.code), ("error", "runtime_unavailable"))
+        kind, error = self.outcome_of(backend, runtime, poison)
+        self.assertEqual(
+            (kind, error.status, error.code), ("error", 400, "request_quarantined")
+        )
+        self.assertEqual(self.outcome_of(backend, runtime, (4, 5))[0], "done")
+
+    def test_a_fault_death_a_write_finds_first_keeps_its_suspects(self):
+        """A write that finds the dead engine's pipe broken before its output
+        is read, as a status refresh may, does not clear the requests that
+        engine started from the quarantine's suspects."""
+        poison = (1, 2, 3)
+        # Each dying engine's generation and when a write has found it gone.
+        write_failed = {}
+
+        def refresh_status():
+            with contextlib.suppress(engine_runtime.EngineRuntimeError):
+                runtime.status(timeout=1.0)
+
+        def segfault_then_write(process, frame):
+            failed = write_failed[runtime._generation] = threading.Event()
+
+            def broken_pipe(_data):
+                failed.set()
+                raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+            process.stdin.write = broken_pipe
+            process.send(wire.StartEvent(frame.request_id, 0, 0))
+            process.crash(signal.SIGSEGV)
+            threading.Thread(target=refresh_status, daemon=True).start()
+
+        factory, runtime, backend = self.quarantine_server(
+            lambda process, frame: (
+                segfault_then_write if frame.prompt_tokens == poison else self.serve
+            )(process, frame)
+        )
+        dispatch = runtime._dispatch_message
+
+        def read_late(generation, message):
+            # The reader takes a dying engine's StartEvent only once the write
+            # has failed and its writer has let go of the write lock.
+            if isinstance(message, wire.StartEvent) and generation in write_failed:
+                write_failed[generation].wait(2)
+                with runtime._write_lock:
+                    pass
+            dispatch(generation, message)
+
+        self.enterContext(
+            mock.patch.object(runtime, "_dispatch_message", side_effect=read_late)
         )
         # The run and its re-run die.
         kind, error = self.outcome_of(backend, runtime, poison)

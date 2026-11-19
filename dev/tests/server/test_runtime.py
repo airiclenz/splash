@@ -1,4 +1,5 @@
 import dataclasses
+import errno
 import math
 import os
 import select
@@ -2589,6 +2590,76 @@ class RuntimeTests(unittest.TestCase):
         recovered.result(0.5)
         self.assertEqual(runtime.pending_count, 0)
         self.assertEqual(runtime.restart_count, 1)
+
+    def test_a_broken_pipe_leaves_the_failure_to_the_reader(self):
+        """A write that finds the engine dead before the reader has read the
+        engine's last output leaves the failure to the reader, which reports
+        every request that engine started (supervision.Quarantine)."""
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
+        self.addCleanup(runtime.close)
+        heard = []
+        runtime.on_engine_failure = lambda _error, _served, started, _exit: (
+            heard.append(started)
+        )
+        call = runtime.submit(request(1))
+        process = factory.processes[0]
+        write_failed = threading.Event()
+        dispatch = runtime._dispatch_message
+
+        def broken_pipe(_data):
+            write_failed.set()
+            raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+        def read_late(generation, message):
+            # The reader takes the StartEvent only once the write has failed
+            # and its writer has let go of the write lock.
+            if isinstance(message, wire.StartEvent):
+                write_failed.wait(2)
+                with runtime._write_lock:
+                    pass
+            dispatch(generation, message)
+
+        with (
+            mock.patch.object(runtime, "_dispatch_message", side_effect=read_late),
+            mock.patch.object(process.stdin, "write", side_effect=broken_pipe),
+        ):
+            process.send(wire.StartEvent(call.request_id, 0, 0))
+            process.close_stdout()
+            with self.assertRaises(engine_runtime.EngineUnhealthy) as writer:
+                runtime.status(timeout=1.0)
+            with self.assertRaises(engine_runtime.EngineUnhealthy):
+                call.result(1.0)
+        self.assertEqual(heard, [frozenset({call.fingerprint})])
+        # The writer raises the reader's failure.
+        self.assertEqual(str(writer.exception), "native protocol reached EOF")
+
+    def test_a_broken_pipe_met_on_the_reader_fails_the_engine_at_once(self):
+        """A write from an event callback runs on the reader, which cannot
+        wait for itself to fail the engine."""
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
+        self.addCleanup(runtime.close)
+        # A reader that waited for itself would outlast the result's wait.
+        runtime._thresholds = dataclasses.replace(runtime._thresholds, stop_grace=30.0)
+        heard = []
+        runtime.on_engine_failure = lambda _error, _served, started, _exit: (
+            heard.append(started)
+        )
+        call = runtime.submit(request(1), on_event=lambda call, _event: call.stop())
+        process = factory.processes[0]
+        broken_pipe = BrokenPipeError(errno.EPIPE, "Broken pipe")
+        with mock.patch.object(process.stdin, "write", side_effect=broken_pipe):
+            process.send(wire.StartEvent(call.request_id, 0, 0))
+            with self.assertRaisesRegex(
+                engine_runtime.EngineUnhealthy, "native protocol write failed"
+            ):
+                call.result(1.0)
+        self.assertEqual(heard, [frozenset({call.fingerprint})])
 
     def test_request_deadline_does_not_abandon_a_started_frame(self):
         process = FakeProcess(1000)
