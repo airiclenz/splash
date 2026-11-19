@@ -2709,7 +2709,7 @@ it replaces no proposals before it has started, as only the verify reads the
 masks. A selection where no budget runs out dispatches nothing more.
 
 Requests carry the score-token IDs and Done events the selected f32 logits; the
-server and the engine must speak the same native wire version (13). Done carries the engine's per-request timing record
+server and the engine must speak the same native wire version (14). Done carries the engine's per-request timing record
 (`EngineRequestTiming`: prefill start depth, prefilled rows, prefill and decode
 batch walls, decode steps, suspensions, decode suspensions, replayed rows)
 after the speculative counts and before the option logit count; Python exposes

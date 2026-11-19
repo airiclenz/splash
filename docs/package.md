@@ -167,7 +167,7 @@ release, `https://github.com/incoai/splash/releases/latest/download/appcast.xml`
 and opens a disk image it downloads only once it has checked who signed it:
 the release key, an EdDSA key whose public half is `SPARKLE_PUBLIC_KEY` there,
 or, to replace a lost release key, the app's Developer ID. An app built while
-`SPARKLE_PUBLIC_KEY` is empty checks for nothing. Sparkle asks on the second
+`SPARKLE_PUBLIC_KEY` is empty checks for nothing. This M1/M2 fork builds its app that way, under its own bundle ID `io.github.paperniuk.splash-m1` rather than `ai.inco.splash`, so it never checks for or installs updates; upgrade it by packaging and installing a new build. Sparkle asks on the second
 launch whether to check by itself, once a day, and installs an update by
 quitting the app, which stops what runs first, without asking.
 `package_app.py` puts `Sparkle.framework` in `Contents/Frameworks` without its
