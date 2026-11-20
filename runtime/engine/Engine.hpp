@@ -73,8 +73,10 @@ struct EngineConfig final {
   // (Scheduler). Finite and positive.
   double decodeGapMilliseconds = 500.0;
   // Keep isolated prefill commands short enough that macOS does not abort
-  // them for starving the display (SchedulerConfig::isolatedBoundMilliseconds);
-  // kUnboundedPrefillCommand runs whole chunks.
+  // them for starving the display (SchedulerConfig::isolatedBoundMilliseconds),
+  // though never below the model's least rows (CommandLimits::minimumUnitRows)
+  // rounded up to the tail alignment; kUnboundedPrefillCommand runs whole
+  // chunks.
   double prefillCommandMilliseconds = kDefaultPrefillCommandMilliseconds;
   // Whether that bound holds each command buffer of a prefill command
   // (model::Model::prefillCommandBuffers()) or the whole command. Some Macs

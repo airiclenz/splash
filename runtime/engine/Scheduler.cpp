@@ -504,15 +504,21 @@ uint32_t Scheduler::isolatedRows(const Lane &leader) const {
                          measured_->milliseconds * deeper;
   if (fitting >= kChunk)
     return kChunk;
+  // The bound yields to the model's least rows, rounded up to the tail
+  // alignment, up to a chunk: on an M2 Pro with Qwen3.8-27B a whole-command
+  // bound of 2 s took 64-128 rows below the Neural Engine split's 155, and
+  // the split ran 2 of 1476 commands.
+  const uint32_t align = config_.tailAlignment, least = config_.limits.minimumUnitRows;
+  const uint32_t floor = least > 1 ? std::min(align ? (least + align - 1) / align * align : least, kChunk) : 0;
   // With tail alignment the bound keeps the most whole multiples of it that
   // fit, rather than halving: on an M1 Max a whole-command bound of 2 s at
   // 10K of context halved to 256-row commands where 384 rows fit.
-  if (const uint32_t align = config_.tailAlignment; align && fitting >= align)
-    return static_cast<uint32_t>(fitting) / align * align;
+  if (align && fitting >= align)
+    return std::max(static_cast<uint32_t>(fitting) / align * align, floor);
   uint32_t rows = kChunk;
   while (rows > kMinimumPrefillRows && rows > fitting)
     rows /= 2;
-  return rows;
+  return std::max(rows, floor);
 }
 
 uint32_t Scheduler::trimmedTail(const Lane &leader, uint32_t rows) const {
@@ -552,7 +558,8 @@ std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready
   while (lanes.front().rows > kMinimumPrefillRows && !withinPairs(lanes))
     lanes.front().rows /= 2;
   // Joiners never take a unit past its rows: a cut's, a group's or a chunk.
-  // An isolated command stays within the isolated bound; a group, whose
+  // An isolated command stays within the isolated bound, but never below the
+  // model's least rows rounded up to the tail alignment; a group, whose
   // passes already end its command buffers, keeps its rows.
   const uint32_t unitRows = cut ? cutRows(leader) : group ? groupRows(leader) : isolatedRows(leader);
   if (unitRows < lanes.front().rows) {

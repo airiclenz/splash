@@ -1739,6 +1739,37 @@ void testIsolatedPrefillStaysWithinItsBound() {
           "the snapshot did not report the isolated bound");
 }
 
+// The isolated bound yields to the model's least rows (the Neural Engine
+// split's), rounded up to the tail alignment, up to a chunk, in either bound
+// scope: at 20 ms and 12 ms a row two seconds fit 100 and 166 rows, 64 and
+// 128 without the split but 256 with its 155; 155 unaligned; a chunk where a
+// chunk fits or the least rows pass one; four buffers fitting 100 rows, 256.
+void testIsolatedPrefillHoldsTheSplitFloor() {
+  struct Case final {
+    uint32_t buffers, alignment, leastRows;
+    double rowMilliseconds;
+    uint32_t rows;
+  };
+  for (const auto [buffers, alignment, leastRows, rowMilliseconds, rows] :
+       {Case{1, 128, 155, 20.0, 256}, Case{1, 128, 155, 12.0, 256}, Case{1, 128, 1, 20.0, 64},
+        Case{1, 128, 1, 12.0, 128}, Case{1, 128, 155, 0.5, kChunk}, Case{1, 0, 155, 20.0, 155},
+        Case{1, 128, 3000, 20.0, kChunk}, Case{4, 128, 155, 80.0, 256}}) {
+    model::CommandLimits commandLimits = limits();
+    commandLimits.minimumUnitRows = leastRows;
+    Sim sim(test::kDense27B, {.limits = commandLimits,
+                              .isolatedBoundMilliseconds = kDefaultPrefillCommandMilliseconds,
+                              .isolatedBuffers = buffers,
+                              .tailAlignment = alignment});
+    measureACommand(sim, 1, kChunk, rowMilliseconds * kChunk);
+    sim.lane(2, 0, 20'000);
+    const BatchPlan plan = sim.plan();
+    require(plan.width() == 1 && rowsOf(plan) == rows && sim.scheduler.snapshot().boundCuts == 0,
+            "an isolated command of " + std::to_string(buffers) + " buffers, alignment " + std::to_string(alignment) +
+                ", least rows " + std::to_string(leastRows) + " at " + std::to_string(rowMilliseconds) +
+                " ms a row took " + std::to_string(rowsOf(plan)) + " rows");
+  }
+}
+
 // With tail alignment a prompt's last command a few rows past a multiple of
 // it ends on the multiple: 288 rows run as 256, leaving 32. More than 32
 // past (300), at most two multiples (256 + 16 is 272, past two: 256), and no
@@ -1899,6 +1930,7 @@ constexpr test::TestCase kTests[] = {
     {"testAnAbandonedCommandsRowsCountOnce", testAnAbandonedCommandsRowsCountOnce},
     {"testPassesYieldToAHigherPriority", testPassesYieldToAHigherPriority},
     {"testIsolatedPrefillStaysWithinItsBound", testIsolatedPrefillStaysWithinItsBound},
+    {"testIsolatedPrefillHoldsTheSplitFloor", testIsolatedPrefillHoldsTheSplitFloor},
     {"testAlignedPrefillLeavesItsTail", testAlignedPrefillLeavesItsTail},
     {"testTheContendedFloorIsConfigured", testTheContendedFloorIsConfigured},
 };

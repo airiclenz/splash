@@ -32,7 +32,8 @@ enum class Phase : uint8_t {
 // the display needs it (ImpactingInteractivity); under desktop load an M2 Max
 // aborted 3-5 s buffers but not 3 s ones. A prefill command ends a buffer at
 // every layer, and an isolated prefill command keeps each buffer within this
-// bound; short contexts still get a whole chunk.
+// bound, though never below the model's least rows (Scheduler::isolatedRows);
+// short contexts still get a whole chunk.
 inline constexpr double kDefaultPrefillCommandMilliseconds = 2000.0;
 inline constexpr double kUnboundedPrefillCommand = std::numeric_limits<double>::infinity();
 
@@ -46,8 +47,10 @@ struct SchedulerConfig final {
   // An isolated command (one run whole while nothing of its priority
   // decodes) holds no more rows than the last measured command's time a row
   // fits in this many milliseconds per Metal command buffer times `buffers`
-  // of them (model::Model::prefillCommandBuffers); kUnboundedPrefillCommand,
-  // the scheduler's default (the engine's is
+  // of them (model::Model::prefillCommandBuffers), unless that falls below
+  // the model's least rows (CommandLimits::minimumUnitRows) rounded up to the
+  // tail alignment, which it then holds, up to a chunk;
+  // kUnboundedPrefillCommand, the scheduler's default (the engine's is
   // kDefaultPrefillCommandMilliseconds), keeps whole chunks.
   double isolatedBoundMilliseconds = kUnboundedPrefillCommand;
   uint32_t isolatedBuffers = 1;
@@ -363,8 +366,10 @@ private:
   // bound (SchedulerConfig::isolatedBoundMilliseconds) at the last measured
   // command's time a row, fewer where the leader's layers reach more
   // attention pairs: whole multiples of the tail alignment where one is set,
-  // else halving from a chunk; a chunk before any command was measured or
-  // without a bound.
+  // else halving from a chunk; never below the model's least rows
+  // (CommandLimits::minimumUnitRows, where above one) rounded up to the tail
+  // alignment, up to a chunk, to which the bound yields; a chunk before any
+  // command was measured or without a bound.
   [[nodiscard]] uint32_t isolatedRows(const Lane &leader) const;
   // The leader's rows less a tail of up to kPrefillTailRows past a multiple
   // of the tail alignment, where they finish its prompt.
