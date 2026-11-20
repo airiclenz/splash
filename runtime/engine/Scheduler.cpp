@@ -558,9 +558,8 @@ std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready
   while (lanes.front().rows > kMinimumPrefillRows && !withinPairs(lanes))
     lanes.front().rows /= 2;
   // Joiners never take a unit past its rows: a cut's, a group's or a chunk.
-  // An isolated command stays within the isolated bound, but never below the
-  // model's least rows rounded up to the tail alignment; a group, whose
-  // passes already end its command buffers, keeps its rows.
+  // An isolated command stays within the isolated bound (isolatedRows); a
+  // group, whose passes already end its command buffers, keeps its rows.
   const uint32_t unitRows = cut ? cutRows(leader) : group ? groupRows(leader) : isolatedRows(leader);
   if (unitRows < lanes.front().rows) {
     lanes.front().rows = unitRows;
