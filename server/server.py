@@ -1439,7 +1439,8 @@ def _native_command(
     context, and serves what its plan holds of the first engine's context,
     where its own automatic one would follow a Neural Engine split calibrated
     anew. A relaunch after a display-stall abort runs `prefill_bound_ms` per
-    `prefill_bound_scope` (_shorter_prefill_after_display_stall)."""
+    `prefill_bound_scope` (_shorter_prefill_after_display_stall), which the
+    engine applies down to the Neural Engine FFN split's least rows."""
     if prefill_bound_ms is None:
         prefill_bound_ms = _prefill_bound(args)
     if prefill_bound_scope is None:
@@ -1476,7 +1477,10 @@ def _shorter_prefill_after_display_stall(args, model_root, learned=None, save=No
     GPU while the display needs it, and how long it tolerates depends on
     the Mac and display load. Some Macs abort a long command however it is
     split into command buffers, so the first such abort bounds whole
-    commands instead; each later one halves the bound for the next engine.
+    commands instead; each later one halves the bound for the next engine,
+    though the engine never shrinks a command below the Neural Engine FFN
+    split's calibrated least rows rounded up to the tail alignment, so past
+    that floor a halving no longer shortens its commands.
 
     `learned` is the (scope, bound) a previous server learned, the policy's
     start in place of the options'. `save`, given only when the learned bound
@@ -1500,7 +1504,8 @@ def _shorter_prefill_after_display_stall(args, model_root, learned=None, save=No
         else:
             bound = max(PREFILL_BOUND_FLOOR_MS, bound // 2)
         print_status(
-            f"Prefill bound · {bound} ms per {scope} after a macOS display-stall abort",
+            f"Prefill bound · {bound} ms per {scope} after a macOS display-stall "
+            "abort, down to the Neural Engine split's least rows",
             error=True,
         )
         if save is not None:

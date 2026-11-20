@@ -904,7 +904,10 @@ SERVE_OPTIONS = (
             "SPLASH_PREFILL_BOUND_MS, the bound an earlier macOS display-stall "
             f"abort taught this Mac, or {PREFILL_BOUND_DEFAULT_MS}); halved after "
             "each such abort once the bound holds whole commands, and kept for "
-            "later starts that give neither prefill bound option",
+            "later starts that give neither prefill bound option; a command "
+            "never drops below the Neural Engine FFN split's calibrated least "
+            "rows, rounded up to the tail alignment, whatever the bound "
+            "(--disable-ane removes that floor)",
         ),
         environment="SPLASH_PREFILL_BOUND_MS",
     ),

@@ -2228,7 +2228,13 @@ buffer, a buffer per attention layer, or in 2 s for the whole command, so that
 macOS does not abort an M1 or M2 prefill buffer for holding the GPU while the
 display needs it (`ImpactingInteractivity`); after such an abort the server
 restarts the engine with whole-command scope, then halves the bound down to
-500 ms. On Apple7/8 the bound keeps whole multiples of 128 rows, and a
+500 ms. The bound yields to the Neural Engine FFN split under either scope:
+an isolated command never holds fewer rows than the split's calibrated least
+rows (`CommandLimits::minimumUnitRows`) rounded up to the
+tail alignment, up to a chunk (256 on an M2 Pro with Qwen3.8-27B), so the
+split keeps running and such a command may run past the bound;
+`--disable-ane` removes that floor. On Apple7/8 the bound keeps whole
+multiples of 128 rows, and a
 leader's last command ends on a multiple of 128 where at most 32 rows would
 run past it, the rest in a command of their own, since their projections run
 128-row tiles and the Neural Engine split 128-row functions. A
