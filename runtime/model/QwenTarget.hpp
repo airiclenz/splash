@@ -728,6 +728,10 @@ protected:
   const ops::ExecutionPlans &operators_;
 
 private:
+  // Row-history pairs a prefill attention piece reads at most, for this
+  // device's family (ops::prefillAttentionPieceWork).
+  const uint64_t prefillAttentionPieceWork_;
+
   void requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, const kv::PageStorage &kv,
                       QwenPrefillLayers layers, const ops::AneFfn *aneFfn) const;
   // `paired`: the chunk is one of its command's two.

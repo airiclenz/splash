@@ -63,7 +63,8 @@ void includeDenseFfn(QwenTargetGeometry &geometry, ops::SwiGluProjections ffn) {
 
 QwenTarget::QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeometry &geometry,
                        metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
-    : weightsBase_(weights), geometry_(geometry), backend_(backend), operators_(operators) {
+    : weightsBase_(weights), geometry_(geometry), backend_(backend), operators_(operators),
+      prefillAttentionPieceWork_(ops::prefillAttentionPieceWork(backend.capabilities().appleGpuFamily)) {
   if (!geometry_.valid()) throw std::invalid_argument("Qwen target weights do not match execution geometry");
   if (!ops::PagedAttention::compiles(geometry_.attentionQueryHeads, geometry_.kvLayout, geometry_.attentionGate,
                                      geometry_.rotaryPairs))
@@ -311,7 +312,8 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
       // start its first row into every KV head's block of the stride. Sparse
       // attention, whose block lists follow the chunk's tiles, attends whole.
       const uint32_t pieceRows = blocks.empty()
-                                     ? ops::prefillAttentionPieceRows(sequence.chunk.committed_tokens, sequence.rows)
+                                     ? ops::prefillAttentionPieceRows(sequence.chunk.committed_tokens, sequence.rows,
+                                                                    prefillAttentionPieceWork_)
                                      : sequence.rows;
       const uint64_t pieceRowBytes = uint64_t{geometry_.attentionQueryHeads / geometry_.attentionKvHeads} *
                                      geometry_.attentionHeadDimension * sizeof(uint16_t);

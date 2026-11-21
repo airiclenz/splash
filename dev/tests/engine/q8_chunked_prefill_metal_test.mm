@@ -611,21 +611,38 @@ void testAttentionGeometries(id<MTLDevice> device, id<MTLCommandQueue> queue,
 // A chunk attended in pieces of rows matches the oracle like a whole chunk,
 // over a long history, ragged last piece and a stride past the chunk, with
 // the tensor tile and the Apple7/8 register tile (one simdgroup per eight
-// fused rows); and the piece size keeps whole chunks at short history and
-// shrinks with history.
+// fused rows), down to a full chunk in 64-row pieces as Apple7/8 attend at
+// deep history; and the piece size keeps whole chunks at short history and
+// shrinks with history, faster on Apple7/8.
 void testAttentionPieces(id<MTLDevice> device, id<MTLCommandQueue> queue,
                          id<MTLComputePipelineState> store,
                          const AttentionPipelines &attention,
                          const AttentionPipelines &registerTile) {
+  using splash::ops::kApple7PrefillAttentionPieceWork;
+  using splash::ops::kPrefillAttentionPieceWork;
   using splash::ops::prefillAttentionPieceRows;
-  require(prefillAttentionPieceRows(0, 2048) == 2048 &&
-              prefillAttentionPieceRows(14336, 2048) == 2048 &&
-              prefillAttentionPieceRows(30000, 2048) == 1024 &&
-              prefillAttentionPieceRows(124000, 2048) == 256 &&
-              prefillAttentionPieceRows(124000, 100) == 100 &&
-              prefillAttentionPieceRows(splash::kv::kMaximumLogicalTokens - 2048, 2048) >=
+  using splash::ops::prefillAttentionPieceWork;
+  constexpr uint64_t wide = kPrefillAttentionPieceWork, narrow = kApple7PrefillAttentionPieceWork;
+  static_assert(wide == uint64_t{1} << 25 && narrow == uint64_t{1} << 23);
+  static_assert(prefillAttentionPieceWork(7) == narrow && prefillAttentionPieceWork(8) == narrow &&
+                prefillAttentionPieceWork(9) == wide && prefillAttentionPieceWork(10) == wide);
+  require(prefillAttentionPieceRows(0, 2048, wide) == 2048 &&
+              prefillAttentionPieceRows(14336, 2048, wide) == 2048 &&
+              prefillAttentionPieceRows(30000, 2048, wide) == 1024 &&
+              prefillAttentionPieceRows(124000, 2048, wide) == 256 &&
+              prefillAttentionPieceRows(124000, 100, wide) == 100 &&
+              prefillAttentionPieceRows(splash::kv::kMaximumLogicalTokens - 2048, 2048, wide) >=
                   splash::kv::kPrefillAttentionTileRows,
           "prefill attention piece rows");
+  require(prefillAttentionPieceRows(0, 2048, narrow) == 2048 &&
+              prefillAttentionPieceRows(14336, 2048, narrow) == 512 &&
+              prefillAttentionPieceRows(30000, 2048, narrow) == 256 &&
+              prefillAttentionPieceRows(82000, 2048, narrow) == 64 &&
+              prefillAttentionPieceRows(124000, 2048, narrow) == 64 &&
+              prefillAttentionPieceRows(124000, 100, narrow) == 64 &&
+              prefillAttentionPieceRows(splash::kv::kMaximumLogicalTokens - 2048, 2048, narrow) >=
+                  splash::kv::kPrefillAttentionTileRows,
+          "Apple7/8 prefill attention piece rows");
   struct Geometry {
     uint32_t committed;
     uint32_t chunk;
@@ -635,8 +652,9 @@ void testAttentionPieces(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const std::pair<const AttentionPipelines *, uint32_t> tiles[] = {
       {&attention, 256}, {&registerTile, 32 * kQueryHeadsPerKvHead}};
   for (const auto &[pipelines, threads] : tiles) {
-    for (const Geometry &geometry : {Geometry{2500, 96, 96, 32}, Geometry{70, 77, 96, 32},
-                                     Geometry{1000, 256, 256, 64}, Geometry{1000, 256, 256, 256}}) {
+    for (const Geometry &geometry :
+         {Geometry{2500, 96, 96, 32}, Geometry{70, 77, 96, 32}, Geometry{1000, 256, 256, 64},
+          Geometry{1000, 256, 256, 256}, Geometry{4093, 2048, 2048, 64}}) {
       Case data = makeCase(device, geometry.committed, geometry.chunk, geometry.stride);
       fillHistory(data);
       fillCurrent(data);
@@ -647,7 +665,18 @@ void testAttentionPieces(id<MTLDevice> device, id<MTLCommandQueue> queue,
       encodeAttentionPieces(encoder, *pipelines, data, geometry.piece, threads);
       [encoder endEncoding];
       finish(command);
-      validateAttention(data);
+      if (geometry.chunk <= 256) {
+        validateAttention(data);
+        continue;
+      }
+      // A full chunk is checked over a bounded sample of rows: the chunk
+      // reference rows and both sides of its first and last piece boundaries.
+      std::vector<uint32_t> rows = chunkReferenceRows(data);
+      for (uint32_t boundary : {geometry.piece, geometry.chunk - geometry.piece})
+        rows.insert(rows.end(), {boundary - 1, boundary});
+      std::sort(rows.begin(), rows.end());
+      rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+      validateAttention(data, rows);
     }
   }
 }

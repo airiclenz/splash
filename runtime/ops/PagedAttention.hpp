@@ -113,17 +113,26 @@ namespace splash::ops {
 // The GPU finishes a dispatch before it serves the display, and macOS aborts
 // a command that keeps the display waiting too long (Apple7/8 Macs at long
 // context). A chunk's prefill attention therefore goes in pieces of rows of
-// at most about this many row-history pairs, each its own dispatch.
+// at most about this many row-history pairs, each its own dispatch. Apple7/8
+// take the smaller bound: a 2^25-pair piece ran ~170 ms on an M2 Pro at 82k
+// of history, a 2^23-pair one ~65 ms; later families keep the larger one.
 inline constexpr uint64_t kPrefillAttentionPieceWork = uint64_t{1} << 25;
+inline constexpr uint64_t kApple7PrefillAttentionPieceWork = uint64_t{1} << 23;
+
+// The piece bound for a device of `appleGpuFamily`.
+[[nodiscard]] constexpr uint64_t prefillAttentionPieceWork(uint32_t appleGpuFamily) noexcept {
+  return appleGpuFamily == 7 || appleGpuFamily == 8 ? kApple7PrefillAttentionPieceWork
+                                                    : kPrefillAttentionPieceWork;
+}
 
 // Rows of each prefill attention piece of a chunk of `rows` rows after
-// `committedTokens` of history: the chunk itself while short, else halved
-// down to one tile.
-[[nodiscard]] constexpr uint32_t prefillAttentionPieceRows(uint32_t committedTokens,
-                                                           uint32_t rows) noexcept {
+// `committedTokens` of history, at most about `work` row-history pairs: the
+// chunk itself while short, else halved down to one tile.
+[[nodiscard]] constexpr uint32_t prefillAttentionPieceRows(uint32_t committedTokens, uint32_t rows,
+                                                           uint64_t work) noexcept {
   uint32_t piece = kv::kChunkedPrefillMaximumRows;
   while (piece > kv::kPrefillAttentionTileRows &&
-         uint64_t{piece} * (uint64_t{committedTokens} + piece) > kPrefillAttentionPieceWork)
+         uint64_t{piece} * (uint64_t{committedTokens} + piece) > work)
     piece /= 2;
   return piece < rows ? piece : rows;
 }
