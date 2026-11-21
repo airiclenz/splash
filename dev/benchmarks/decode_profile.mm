@@ -2,7 +2,7 @@
 //
 //   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]
 //                  [--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE]
-//                  [--dispatch-list FILE] [--verify-rows auto|all]
+//                  [--dispatch-list FILE] [--verify-rows auto|all] [--prefill-only]
 //   decode-profile METALLIB MODEL_ROOT --images HxW[,HxW...] [--cycles K]
 //
 // Drives the real model runtime with Metal dispatch profiling enabled, so
@@ -12,7 +12,12 @@
 // the gap between the sum of parts and the fused command shows how much a
 // cycle pays in dispatch boundaries rather than kernel work. --dispatch-list
 // writes the attributed B1 cycles' dispatches in order, one line each: index,
-// pipeline and GPU microseconds.
+// pipeline and GPU microseconds. Each table gives, per pipeline, the
+// longest single dispatch's GPU milliseconds (max_ms) beside its count and
+// total, so the prefill table shows a prompt's longest GEMM, GDN and
+// attention dispatch. --prefill-only sizes KV pages for one lane and stops
+// after the prefill table, skipping the B1 through B4 cycles and their three
+// more prefills, so a long prompt needs a quarter of the KV pool.
 // With --images it profiles the vision encoder instead, loading only the
 // model's vision role: K encodes of a synthetic image per patch grid (height
 // x width in patches), fused and then attributed.
@@ -58,6 +63,7 @@ namespace {
 struct Attribution final {
   uint64_t dispatches = 0;
   double gpuSeconds = 0.0;
+  double maxGpuSeconds = 0.0;
 };
 
 using Table = std::map<std::string, Attribution>;
@@ -67,11 +73,13 @@ void accumulate(Table &table, std::span<const metal::DispatchTiming> timings) {
     Attribution &entry = table[timing.pipelineName];
     ++entry.dispatches;
     entry.gpuSeconds += timing.gpuSeconds;
+    entry.maxGpuSeconds = std::max(entry.maxGpuSeconds, timing.gpuSeconds);
   }
 }
 
 // `fusedGpuSeconds` is already per unit of work; the table accumulated
-// `divisor` units.
+// `divisor` units. A pipeline's longest dispatch is one dispatch's time, so
+// it is never divided.
 void print(const std::string &title, const Table &table, double divisor,
            double fusedGpuSeconds) {
   std::vector<std::pair<std::string, Attribution>> rows(table.begin(),
@@ -88,11 +96,12 @@ void print(const std::string &title, const Table &table, double divisor,
   std::printf("\n== %s: %.2f ms fused, %.2f ms as %llu separate dispatches ==\n",
               title.c_str(), fusedGpuSeconds * 1e3, total * 1e3 / divisor,
               static_cast<unsigned long long>(dispatches / divisor));
-  std::printf("%-44s %9s %10s %6s\n", "pipeline", "count", "gpu_ms", "share");
+  std::printf("%-44s %9s %10s %9s %6s\n", "pipeline", "count", "gpu_ms", "max_ms",
+              "share");
   for (const auto &[name, entry] : rows) {
-    std::printf("%-44s %9.1f %10.3f %5.1f%%\n", name.c_str(),
+    std::printf("%-44s %9.1f %10.3f %9.3f %5.1f%%\n", name.c_str(),
                 entry.dispatches / divisor, entry.gpuSeconds * 1e3 / divisor,
-                entry.gpuSeconds / total * 100.0);
+                entry.maxGpuSeconds * 1e3, entry.gpuSeconds / total * 100.0);
   }
 }
 
@@ -322,7 +331,7 @@ int main(int argc, char **argv) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
                      "[--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE] "
-                     "[--dispatch-list FILE] [--verify-rows auto|all]\n"
+                     "[--dispatch-list FILE] [--verify-rows auto|all] [--prefill-only]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
         return 2;
@@ -337,8 +346,17 @@ int main(int argc, char **argv) {
       bool textOptions = false;
       std::string dispatchList;
       model::VerifyRows verifyRows = model::VerifyRows::Auto;
+      bool prefillOnly = false;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
+        // The one option without a value: step back so the loop's += 2
+        // lands on the next option.
+        if (option == "--prefill-only") {
+          prefillOnly = true;
+          textOptions = true;
+          --index;
+          continue;
+        }
         if (index + 1 >= argc)
           throw std::invalid_argument(std::string(option) + " requires a value");
         if (option == "--prompt-tokens") {
@@ -391,7 +409,9 @@ int main(int argc, char **argv) {
           model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
       ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
 
-      // Enough Page32 pages for four lanes of prompt plus generated rows.
+      // Enough Page32 pages for four lanes (one with --prefill-only) of
+      // prompt plus generated rows.
+      const uint32_t laneCount = prefillOnly ? 1 : 4;
       const uint32_t pagesPerLane =
           (promptTokens + 256 + model::ExecutionLimits::targetVerifyRows) /
               kv::kPageTokens +
@@ -401,7 +421,7 @@ int main(int argc, char **argv) {
       const kv::Layout kvLayout = model.targetKvLayout(format);
       const uint32_t extentPages = kvLayout.maximumExtentPages();
       const uint32_t pageCount =
-          (pagesPerLane * 4 + extentPages - 1) / extentPages * extentPages;
+          (pagesPerLane * laneCount + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(
           backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
           queryHostMemory, 0);
@@ -426,7 +446,7 @@ int main(int argc, char **argv) {
                   cycles, std::string(ops::formatName(stateFormat)).c_str());
 
       std::array<Lane, 4> lanes;
-      for (uint32_t index = 0; index < lanes.size(); ++index) {
+      for (uint32_t index = 0; index < laneCount; ++index) {
         lanes[index] = {index + 1, index, 0,
                         pageRange(index * pagesPerLane, pagesPerLane)};
       }
@@ -452,6 +472,10 @@ int main(int argc, char **argv) {
                  BackendInstrumentation::takeDispatchProfile(backend));
       print("prefill " + std::to_string(promptTokens) + " rows", prefillTable,
             1.0, prefillFused);
+      if (prefillOnly) {
+        executor.end(lanes[0].id);
+        return 0;
+      }
 
       auto profileWidth = [&](const char *title, std::span<Lane> active) {
         std::vector<CycleTiming> fused;
