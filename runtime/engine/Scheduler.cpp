@@ -491,11 +491,18 @@ uint32_t Scheduler::cutRows(const Lane &leader) const {
 }
 
 uint32_t Scheduler::isolatedRows(const Lane &leader) const {
-  if (!measured_ || !std::isfinite(config_.isolatedBoundMilliseconds) || measured_->milliseconds <= 0.0)
+  if (!std::isfinite(config_.isolatedBoundMilliseconds))
     return kChunk;
-  // As cutRows: the last command's time a row, more where this lane's layers
-  // reach more pairs than its heaviest did. Its fixed part counts as rows,
-  // which only lowers the bound's rows.
+  // The bound yields to the model's least rows, rounded up to the tail alignment, up to a chunk: on an M2 Pro
+  // with Qwen3.8-27B a whole-command bound of 2 s took 64-128 rows below the Neural Engine split's 155, and the
+  // split ran 2 of 1476 commands.
+  const uint32_t align = config_.tailAlignment, least = config_.limits.minimumUnitRows;
+  const uint32_t floor = least > 1 ? std::min(align ? (least + align - 1) / align * align : least, kChunk) : 0;
+  // Unmeasured, a chunk deep in a context could run 30-40 s: take the floor.
+  if (!measured_ || measured_->milliseconds <= 0.0)
+    return floor ? floor : align ? align : kMinimumPrefillRows;
+  // As cutRows: the last command's time a row, more where this lane's layers reach more pairs than its heaviest
+  // did. Its fixed part counts as rows, which only lowers the bound's rows.
   const model::PrefillLane probe{leader.processed, measured_->rows, leader.shape.indexPages};
   const double pairs = double(layerPairs({&probe, 1}));
   const double deeper =
@@ -504,15 +511,8 @@ uint32_t Scheduler::isolatedRows(const Lane &leader) const {
                          measured_->milliseconds * deeper;
   if (fitting >= kChunk)
     return kChunk;
-  // The bound yields to the model's least rows, rounded up to the tail
-  // alignment, up to a chunk: on an M2 Pro with Qwen3.8-27B a whole-command
-  // bound of 2 s took 64-128 rows below the Neural Engine split's 155, and
-  // the split ran 2 of 1476 commands.
-  const uint32_t align = config_.tailAlignment, least = config_.limits.minimumUnitRows;
-  const uint32_t floor = least > 1 ? std::min(align ? (least + align - 1) / align * align : least, kChunk) : 0;
-  // With tail alignment the bound keeps the most whole multiples of it that
-  // fit, rather than halving: on an M1 Max a whole-command bound of 2 s at
-  // 10K of context halved to 256-row commands where 384 rows fit.
+  // With tail alignment the bound keeps the most whole multiples of it that fit, rather than halving: on an M1
+  // Max a whole-command bound of 2 s at 10K of context halved to 256-row commands where 384 rows fit.
   if (align && fitting >= align)
     return std::max(static_cast<uint32_t>(fitting) / align * align, floor);
   uint32_t rows = kChunk;

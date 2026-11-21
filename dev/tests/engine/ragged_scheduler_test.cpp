@@ -1693,14 +1693,14 @@ void testAnAbandonedCommandsRowsCountOnce() {
 // it, and runs once it is abandoned, the lanes rerunning from a first pass.
 // ---- This fork's M1 prefill rules -----------------------------------------
 
-// Runs lane `id`'s first command, `rows` rows from position 0 that finish its
-// prompt, in `milliseconds`, and drops the lane: the command the next ones
-// are sized from.
-void measureACommand(Sim &sim, uint64_t id, uint32_t rows, double milliseconds) {
-  sim.lane(id, 0, rows);
+// Runs lane `id`'s first command, from position 0 of a chunk-long prompt,
+// whatever rows it was planned with, at `rowMilliseconds` a row, and drops the
+// lane: the command the next ones are sized from.
+void measureACommand(Sim &sim, uint64_t id, double rowMilliseconds) {
+  sim.lane(id, 0, kChunk);
   const BatchPlan plan = sim.plan();
-  require(rowsOf(plan) == rows, "the measured command did not run its rows");
-  completePrefill(sim, plan, {.wallMilliseconds = milliseconds});
+  require(plan.width() == 1 && rowsOf(plan) > 0, "the measured command ran no rows");
+  completePrefill(sim, plan, {.wallMilliseconds = rowMilliseconds * rowsOf(plan)});
   sim.scheduler.cancel(id);
   sim.scheduler.remove(id);
 }
@@ -1709,7 +1709,7 @@ void measureACommand(Sim &sim, uint64_t id, uint32_t rows, double milliseconds) 
 // the bound per buffer times the buffers: at 5 ms a row two seconds fit 400
 // rows, halved from a chunk to 256, and with 128-row tail alignment the most
 // whole multiples, 384; four buffers fit 1600 rows, 1024 halved and 1536
-// aligned. Unbounded, or before any command was measured, a chunk.
+// aligned. Unbounded, a chunk.
 void testIsolatedPrefillStaysWithinItsBound() {
   struct Case final {
     uint32_t buffers, alignment, rows;
@@ -1720,7 +1720,7 @@ void testIsolatedPrefillStaysWithinItsBound() {
                               .isolatedBoundMilliseconds = kDefaultPrefillCommandMilliseconds,
                               .isolatedBuffers = buffers,
                               .tailAlignment = alignment});
-    measureACommand(sim, 1, kChunk, 5.0 * kChunk);
+    measureACommand(sim, 1, 5.0);
     sim.lane(2, 0, 20'000);
     const BatchPlan plan = sim.plan();
     require(plan.width() == 1 && rowsOf(plan) == rows && sim.scheduler.snapshot().boundCuts == 0,
@@ -1728,12 +1728,12 @@ void testIsolatedPrefillStaysWithinItsBound() {
                 std::to_string(alignment) + " took " + std::to_string(rowsOf(plan)) + " rows");
   }
   Sim unbounded(test::kDense27B, SchedulerConfig{.limits = limits()});
-  measureACommand(unbounded, 1, kChunk, 5.0 * kChunk);
+  measureACommand(unbounded, 1, 5.0);
   unbounded.lane(2, 0, 20'000);
   require(rowsOf(unbounded.plan()) == kChunk, "an unbounded isolated command took less than a chunk");
   Sim first(test::kDense27B, {.limits = limits(), .isolatedBoundMilliseconds = kDefaultPrefillCommandMilliseconds});
   first.lane(2, 0, 20'000);
-  require(rowsOf(first.plan()) == kChunk, "the first isolated command took less than a chunk");
+  require(rowsOf(first.plan()) == 64, "the first isolated command did not hold the least matrix rows");
   require(first.scheduler.snapshot().prefillBoundMilliseconds == kDefaultPrefillCommandMilliseconds &&
               std::isinf(unbounded.scheduler.snapshot().prefillBoundMilliseconds),
           "the snapshot did not report the isolated bound");
@@ -1760,13 +1760,42 @@ void testIsolatedPrefillHoldsTheSplitFloor() {
                               .isolatedBoundMilliseconds = kDefaultPrefillCommandMilliseconds,
                               .isolatedBuffers = buffers,
                               .tailAlignment = alignment});
-    measureACommand(sim, 1, kChunk, rowMilliseconds * kChunk);
+    measureACommand(sim, 1, rowMilliseconds);
     sim.lane(2, 0, 20'000);
     const BatchPlan plan = sim.plan();
     require(plan.width() == 1 && rowsOf(plan) == rows && sim.scheduler.snapshot().boundCuts == 0,
             "an isolated command of " + std::to_string(buffers) + " buffers, alignment " + std::to_string(alignment) +
                 ", least rows " + std::to_string(leastRows) + " at " + std::to_string(rowMilliseconds) +
                 " ms a row took " + std::to_string(rowsOf(plan)) + " rows");
+  }
+}
+
+// Before any command was measured, a bounded isolated command holds the floor
+// however deep its lane: at 80K of history and four seconds, 256 rows for the
+// Neural Engine split's 155 aligned to 128, in either bound scope (16
+// buffers); without the split one alignment, 128, or the least matrix rows,
+// 64; unbounded, a chunk.
+void testTheFirstIsolatedCommandHoldsTheFloor() {
+  struct Case final {
+    uint32_t buffers, alignment, leastRows;
+    double bound;
+    uint32_t rows;
+  };
+  for (const auto [buffers, alignment, leastRows, bound, rows] :
+       {Case{1, 128, 155, 4000.0, 256}, Case{1, 128, 1, 4000.0, 128}, Case{1, 0, 1, 4000.0, 64},
+        Case{1, 128, 155, kUnboundedPrefillCommand, kChunk}, Case{16, 128, 155, 4000.0, 256}}) {
+    model::CommandLimits commandLimits = limits();
+    commandLimits.minimumUnitRows = leastRows;
+    Sim sim(test::kDense27B, {.limits = commandLimits,
+                              .isolatedBoundMilliseconds = bound,
+                              .isolatedBuffers = buffers,
+                              .tailAlignment = alignment});
+    sim.lane(1, 80'000, 20'000);
+    const BatchPlan plan = sim.plan();
+    require(plan.width() == 1 && rowsOf(plan) == rows && sim.scheduler.snapshot().boundCuts == 0,
+            "an unmeasured isolated command of " + std::to_string(buffers) + " buffers, alignment " +
+                std::to_string(alignment) + ", least rows " + std::to_string(leastRows) + " under a bound of " +
+                std::to_string(bound) + " ms took " + std::to_string(rowsOf(plan)) + " rows");
   }
 }
 
@@ -1931,6 +1960,7 @@ constexpr test::TestCase kTests[] = {
     {"testPassesYieldToAHigherPriority", testPassesYieldToAHigherPriority},
     {"testIsolatedPrefillStaysWithinItsBound", testIsolatedPrefillStaysWithinItsBound},
     {"testIsolatedPrefillHoldsTheSplitFloor", testIsolatedPrefillHoldsTheSplitFloor},
+    {"testTheFirstIsolatedCommandHoldsTheFloor", testTheFirstIsolatedCommandHoldsTheFloor},
     {"testAlignedPrefillLeavesItsTail", testAlignedPrefillLeavesItsTail},
     {"testTheContendedFloorIsConfigured", testTheContendedFloorIsConfigured},
 };

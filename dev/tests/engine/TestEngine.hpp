@@ -24,8 +24,12 @@ inline engine::MemoryGovernor *(*ampleGovernor)() = nullptr;
 
 // An engine config completed as the bootstrap completes one, for tests: what
 // the test set, and otherwise the whole logical context, every 32-bit token
-// in the vocabulary and an ample governor.
+// in the vocabulary and an ample governor. A default isolated prefill bound
+// becomes unbounded: an untimed command is never measured, so under a bound
+// every isolated command would hold the model's least rows.
 [[nodiscard]] inline engine::EngineConfig engineConfig(engine::EngineConfig config = {}) {
+  if (config.prefillCommandMilliseconds == engine::kDefaultPrefillCommandMilliseconds)
+    config.prefillCommandMilliseconds = engine::kUnboundedPrefillCommand;
   if (!config.maxContext)
     config.maxContext = kv::kMaximumLogicalTokens;
   if (!config.vocabularySize)
