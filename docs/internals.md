@@ -746,7 +746,11 @@ Decode runs one of three kernel paths, chosen by the device's calibration row
 (`KernelSelection.cpp`). On Apple7/8 (M1, M2) the staged tile's dispatches run
 on simdgroup MMA kernels (`kernels/shared/gguf_linear_mma.metal`) with their own
 split tier, and wherever every format of a projection takes it the register
-tile runs with an fp32 table, with a one-pass gate/up. Their staged MMA tile
+tile runs with an fp32 table, with a one-pass gate/up. There MLX affine units
+split by `kApple7AffineRegisterLaw` at one table tile's rows in two passes,
+a gate/up pair of one format also up to two table tiles, where it runs one,
+so every width takes the same split and a row's sums do not change with the
+rows batched beside it. Their staged MMA tile
 holds at most 32 rows (`kMaximumMmaStagedRows`), so a plan of 33 to 64 rows,
 a three- or four-lane decode step's among them, runs the 64-row MMA prefill
 tile; a gate/up pair keeps its one plan there, a gate pass into the gate
