@@ -150,7 +150,9 @@ uint64_t LinearPlan::gateScratchBytes() const noexcept {
 LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destination)
     : workload_(w), config_(config), destination_(destination) {
   validate(w);
-  // Only the decode tiles have fp32 instances, of their plain projection.
+  // Only the decode tiles have fp32 instances, of their plain projection, and
+  // on Apple7/8 the MMA prefill tile, which runs their plans past the staged
+  // tile's 32 rows (requireConfiguration).
   if (destination == FloatOutput::Float32 &&
       (w.rows > kMaximumDecodeTileRows || w.epilogue != LinearEpilogue::None))
     throw std::invalid_argument("an fp32 destination takes a plain projection on the decode tiles");

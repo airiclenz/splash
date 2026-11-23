@@ -148,6 +148,11 @@ void LinearPlan::requireConfiguration() const {
                                 "gate and up in one pass");
   if (c.mmaPrefill && c.tile != LinearTile::GgufPrefill)
     throw std::invalid_argument("only the prefill block tile runs Apple7/8's 64-row MMA tiles");
+  // Of the prefill tiles only Apple7/8's MMA tile has fp32 instances (_a_f32),
+  // for their decode steps of 33 to 64 rows.
+  if (destination_ == FloatOutput::Float32 &&
+      (c.tile == LinearTile::GgufPrefillInt8 || (c.tile == LinearTile::GgufPrefill && !c.mmaPrefill)))
+    throw std::invalid_argument("of the prefill block tiles only Apple7/8's MMA tile writes fp32");
   if (c.fp32Table && c.tile != LinearTile::GgufRegister)
     throw std::invalid_argument("only the register block tile reads an fp32 table");
   if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || workload_.rows > 8))
@@ -408,7 +413,9 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
 // chunk's stay inside the budget-sized prefill buffers, and the simdgroups of
 // a tile that only hold them skip their matmuls. Apple7/8 also run plans of
 // 33 to 64 rows here, past their staged MMA tile's 32, a gate/up pair among
-// them as a gate pass into the gate scratch and an up pass (addTensorPasses).
+// them as a gate pass into the gate scratch and an up pass (addTensorPasses),
+// and a plain projection into fp32 (a decode step's logits) on the MMA
+// tile's fp32 instances.
 void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
                             const Projection &p, const LinearPlan &plan,
                             const Projection *gate) const {
@@ -465,13 +472,14 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
     const uint32_t colTiles = s.outputSize / GGUF_TILE_COLUMNS;
     if (splits > 1) {
       bindings.insert(bindings.end(), {partials, counters, aux});
-      graph.add("gguf_prefill_mma_split_" + std::string(s.name()) + "_" + epilogue, std::move(bindings),
-                GgufPrefillSplitParams{params, splits}, {rowTiles, colTiles, splits}, {kMmaPrefillThreads, 1, 1});
+      graph.add(kernelInstance("gguf_prefill_mma_split_" + std::string(s.name()) + "_" + epilogue, plan.destination()),
+                std::move(bindings), GgufPrefillSplitParams{params, splits}, {rowTiles, colTiles, splits},
+                {kMmaPrefillThreads, 1, 1});
       return;
     }
     if (epilogue != epilogueSuffix(LinearEpilogue::None)) bindings.push_back(aux);
     const metal::DispatchSize groups{rowTiles, colTiles, 1};
-    const std::string kernel = prefillKernel(s.name(), epilogue, useMma);
+    const std::string kernel = kernelInstance(prefillKernel(s.name(), epilogue, useMma), plan.destination());
     const uint32_t threads = useMma ? kMmaPrefillThreads : GGUF_PREFILL_THREADS;
     if (p.planeInputs()) {
       graph.add(leadingInputsInstance(kernel), std::move(bindings),

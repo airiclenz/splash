@@ -18,9 +18,11 @@
 namespace splash::ops {
 
 // The instance of kernel `name` that writes `destination`: a plain decode
-// kernel's fp32 instance is "<name>_f32".
-[[nodiscard]] inline std::string kernelInstance(std::string_view name, FloatOutput destination) {
-  return std::string(name) + (destination == FloatOutput::Float32 ? "_f32" : "");
+// kernel's fp32 instance is "<name>_f32". It takes the name by value, so a
+// name built for the call is extended in place, not copied.
+[[nodiscard]] inline std::string kernelInstance(std::string name, FloatOutput destination) {
+  if (destination == FloatOutput::Float32) name += "_f32";
+  return name;
 }
 // The instance of prefill residual kernel `name` that reads a view of the
 // leading inputs of wider weight rows (Projection::leadingInputs):

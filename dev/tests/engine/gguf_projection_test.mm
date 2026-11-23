@@ -14,7 +14,8 @@
 //   count, whose tiles' walks wrap past the partition's end;
 // - gate/up: each format's gate with the next format the tile takes as up, and in one pass
 //   (LinearConfig::oneGateUpPass) bitwise the two passes at the same K split, one lane on the 16-row tile too; pairs of
-//   33-64 rows on the plan the device selects (Apple7/8's MMA prefill tile, split and unsplit) over a NaN gate scratch;
+//   33-64 rows on the plan the device selects (Apple7/8's MMA prefill tile, split and unsplit) over a NaN gate scratch,
+//   and the plain projection of those rows into fp32 (a decode step's logits) rounding to its bf16 output;
 // - prefill: 128-row tiles with each epilogue, whose simdgroups past the chunk write nothing, and chunks of up to 64
 //   rows on the decode tiles equal to them bitwise; fused segments at their column offsets;
 // - int8 decode: rotated PQ2_0 projections on the int8 decode tiles (LinearConfig::decodeInt8) within the fp32
@@ -755,9 +756,11 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
 
 // Gate/up pairs of 33, 48 and 64 rows (a decode step of three or four lanes, or a prefill chunk) on the plan `linear`
 // selects, run through Linear::add over a gate scratch of NaN: Q4_K and MLX 4-bit pairs [1024, 1024], the gate within
-// fp64 and the output within it times silu of that gate. Apple7/8's staged MMA tile stops at 32 rows, so they run the
-// MMA prefill tile (`prefillTile`), as a gate pass into the gate scratch and an up pass: at the split selected for this
-// narrow grid and in the other form, unsplit or in two splits.
+// fp64 and the output within it times silu of that gate; and the up tensor's plain projection of those rows within
+// fp64, into fp32 too (a decode step's logits, FloatOutput::Float32) each value rounding to the bf16 one. Apple7/8's
+// staged MMA tile stops at 32 rows, so they run the MMA prefill tile (`prefillTile`), the pair as a gate pass into the
+// gate scratch and an up pass: at the split selected for this narrow grid and in the other form, unsplit or in two
+// splits.
 void selectedGateUp(MetalBackend &backend, const Linear &linear, bool prefillTile) {
   constexpr uint32_t N = 1024, K = 1024, columns = N + kPadding, kRows[] = {33, 48, 64};
   for (const Fmt f : {Q4K, Fmt(GGUF_FMT_AF4G64)}) {
@@ -782,10 +785,33 @@ void selectedGateUp(MetalBackend &backend, const Linear &linear, bool prefillTil
                                 kPoisonNaN, N, name);
         checkValues(out, within(upDots, true), within(gateDots, true), {}, plan.workload(), rows, N, name);
       }
+      // The plain projection, into bf16 and into fp32, on the plan selected for each and in the other split.
+      Projection logits = up;
+      logits.destination = FloatOutput::Float32;
+      const LinearWorkload plain{{columns, K}, rows, LinearEpilogue::None};
+      const LinearConfig selectedPlain = linear.plan(plain, up).configuration();
+      std::vector<LinearConfig> configs{selectedPlain};
+      if (prefillTile) {
+        if (selectedPlain.tile != LinearTile::GgufPrefill ||
+            linear.plan(plain, logits).configuration() != selectedPlain)
+          fail(label + ": the selected plain plans do not run the prefill tile alike");
+        LinearConfig other = selectedPlain;
+        other.splits = other.splits > 1 ? 1 : 2;
+        configs.push_back(other);
+      }
+      for (const LinearConfig &config : configs) {
+        const std::string name = label + " plain S=" + std::to_string(config.splits);
+        const LinearPlan plan = Linear::plan(plain, config, FloatOutput::BFloat16);
+        const std::vector<uint16_t> input = storageRows(x, K, rows, plan.storageRows());
+        const Outcome out = run(backend, linear, plan, up, nullptr, input, {}, kPoisonNaN, N, name);
+        checkValues(out, within(upDots, true), within(upDots, true), {}, plain, rows, N, name);
+        floatOutput(backend, linear, Linear::plan(plain, config, FloatOutput::Float32), logits, input, out,
+                    within(upDots, true), N, name);
+      }
     }
   }
-  section(std::string("selected gate/up: Q4_K and MLX 4-bit pairs at 1024x1024, 33/48/64 rows over a NaN gate "
-                      "scratch, within fp64") +
+  section(std::string("selected gate/up and fp32 plain: Q4_K and MLX 4-bit at 1024x1024, 33/48/64 rows, the pairs "
+                      "over a NaN gate scratch, within fp64, fp32 rounding to bf16's") +
           (prefillTile ? " on the MMA prefill tile, split and unsplit" : ""));
 }
 

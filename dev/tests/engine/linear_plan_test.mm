@@ -83,8 +83,11 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
 
 // fp32 destinations (the logits): the plan of a projection with an fp32
 // destination keeps the configuration, input table and scratch of its bf16
-// plan on every family and core count, and only plain plans on the decode
-// tiles take one. ggufProjectionMatrix checks the fp32 kernel it encodes.
+// plan on every family and core count, at up to the decode tiles' 64 rows
+// (Apple7/8's MMA prefill tile past 32), and only plain plans on the decode
+// tiles take one, of the prefill tiles only Apple7/8's MMA tile.
+// ggufProjectionMatrix and apple7PrefillSplitDispatch check the fp32 kernels
+// they encode.
 void floatOutputPlans() {
   const auto fp32 = [](Projection p) {
     p.destination = FloatOutput::Float32;
@@ -96,8 +99,8 @@ void floatOutputPlans() {
       for (const uint32_t n : {256U, 5120U, 16640U, 248320U})
         for (const uint32_t k : {2048U, 5120U}) {
           const Projection p = blockProjection(n, k, 1);
-          for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-            const LinearWorkload w{{n, k}, lanes * 8, LinearEpilogue::None};
+          for (const uint32_t rows : {8U, 16U, 24U, 32U, 33U, 48U, 64U}) {
+            const LinearWorkload w{{n, k}, rows, LinearEpilogue::None};
             const LinearPlan bf16 = linear.plan(w, p), head = linear.plan(w, fp32(p));
             if (head.configuration() != bf16.configuration() || head.destination() != FloatOutput::Float32 ||
                 head.input() != bf16.input() || head.storageRows() != bf16.storageRows() ||
@@ -118,6 +121,13 @@ void floatOutputPlans() {
     rejects([&] { (void)linear.plan(w, fp32(p)); }, "an fp32 destination takes a plain projection on the decode tiles",
             "an fp32 plan of other than a plain projection on the decode tiles was accepted");
   }
+  const LinearWorkload step{{5120, 2048}, 48, LinearEpilogue::None};
+  (void)Linear::plan(step, {.tile = LinearTile::GgufPrefill, .mmaPrefill = true}, FloatOutput::Float32);
+  for (const LinearConfig config :
+       {LinearConfig{.tile = LinearTile::GgufPrefill}, LinearConfig{.tile = LinearTile::GgufPrefillInt8}})
+    rejects([&] { (void)Linear::plan(step, config, FloatOutput::Float32); },
+            "of the prefill block tiles only Apple7/8's MMA tile writes fp32",
+            "an fp32 plan on a prefill tile without fp32 instances was accepted");
 }
 
 // Every Apple9 GPU runs plans of up to 32 rows on the register tile (which
@@ -1858,7 +1868,8 @@ void apple7PrefillSplits() {
 }
 
 // Leading-input views and non-Apple7/8 devices refuse split GgufPrefill dispatches; Apple7/8 encodes
-// gguf_prefill_mma_split_* with its 3D grid, and a gate/up pair as a gate pass into the gate scratch and an up pass.
+// gguf_prefill_mma_split_* with its 3D grid, a gate/up pair as a gate pass into the gate scratch and an up pass, and
+// a plain projection into fp32 (a decode step's logits) on the fp32 instances.
 void apple7PrefillSplitDispatch(metal::MetalBackend &backend) {
   constexpr uint32_t n = 320, k = 10240, rows = 384, splits = 8;
   const QuantizedSegment seg = segmentPlanes(backend, GGUF_FMT_Q80, n, k);
@@ -1916,6 +1927,25 @@ void apple7PrefillSplitDispatch(metal::MetalBackend &backend) {
                 dispatches[1].buffers[4].buffer.sameView(pairBuffers.output) &&
                 dispatches[1].buffers.back().buffer.sameView(pairBuffers.gateScratch),
             "Apple7/8 prefill gate/up dispatches at S=" + std::to_string(pairSplits));
+    // The up tensor's plain projection of those rows into fp32 runs the
+    // fp32 instance of the same tile, into fp32 rows.
+    Projection head = up;
+    head.destination = FloatOutput::Float32;
+    const LinearWorkload plain{{pairColumns, pairInputs}, pairRows, LinearEpilogue::None};
+    LinearConfig headConfig = m1.plan(plain, head).configuration();
+    headConfig.splits = pairSplits;
+    const LinearPlan logits = Linear::plan(plain, headConfig, FloatOutput::Float32);
+    const LinearScratchSize headScratch = logits.scratchSize();
+    const LinearBuffers headBuffers{
+        .input = pairBuffers.input,
+        .output = allocate(backend, uint64_t{pairRows} * pairColumns * sizeof(float)),
+        .scratch = {{}, {}, allocate(backend, headScratch.partials), allocate(backend, headScratch.counters)}};
+    metal::CommandGraph headGraph;
+    (void)m1.add(headGraph, headBuffers, head, logits);
+    require(headConfig.tile == LinearTile::GgufPrefill && headGraph.dispatches().size() == 1 &&
+                headGraph.dispatches()[0].pipelineName == kernel + "a_f32" &&
+                headGraph.dispatches()[0].buffers[4].buffer.sameView(headBuffers.output),
+            "Apple7/8 prefill fp32 head dispatch at S=" + std::to_string(pairSplits));
   }
   {
     metal::CommandGraph graph;
