@@ -13,7 +13,8 @@
 // - both on the staged tile's spread walk too (LinearConfig::spread), over partitions from 72 steps down to 9, an odd
 //   count, whose tiles' walks wrap past the partition's end;
 // - gate/up: each format's gate with the next format the tile takes as up, and in one pass
-//   (LinearConfig::oneGateUpPass) bitwise the two passes at the same K split, one lane on the 16-row tile too;
+//   (LinearConfig::oneGateUpPass) bitwise the two passes at the same K split, one lane on the 16-row tile too; pairs of
+//   33-64 rows on the plan the device selects (Apple7/8's MMA prefill tile, split and unsplit) over a NaN gate scratch;
 // - prefill: 128-row tiles with each epilogue, whose simdgroups past the chunk write nothing, and chunks of up to 64
 //   rows on the decode tiles equal to them bitwise; fused segments at their column offsets;
 // - int8 decode: rotated PQ2_0 projections on the int8 decode tiles (LinearConfig::decodeInt8) within the fp32
@@ -750,6 +751,42 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) pair(wide[lanes - 1][0], wide[lanes - 1][1], 1024, lanes);
   section(std::string(tileName(tile)) + " gate/up: " + std::to_string(formats.size()) +
           " gate and up format pairs at N 256 and 4 at N 1024, 1-4 lanes, within fp64");
+}
+
+// Gate/up pairs of 33, 48 and 64 rows (a decode step of three or four lanes, or a prefill chunk) on the plan `linear`
+// selects, run through Linear::add over a gate scratch of NaN: Q4_K and MLX 4-bit pairs [1024, 1024], the gate within
+// fp64 and the output within it times silu of that gate. Apple7/8's staged MMA tile stops at 32 rows, so they run the
+// MMA prefill tile (`prefillTile`), as a gate pass into the gate scratch and an up pass: at the split selected for this
+// narrow grid and in the other form, unsplit or in two splits.
+void selectedGateUp(MetalBackend &backend, const Linear &linear, bool prefillTile) {
+  constexpr uint32_t N = 1024, K = 1024, columns = N + kPadding, kRows[] = {33, 48, 64};
+  for (const Fmt f : {Q4K, Fmt(GGUF_FMT_AF4G64)}) {
+    const Tensor g = tensor(backend, f, N, K), u = tensor(backend, f, N, K);
+    const Projection gate = projection({&g}, columns), up = projection({&u}, columns);
+    const std::vector<float> x = activations(Inputs::Dense, kMaximumDecodeTileRows, K);
+    const std::vector<Dot> upDots = products({&u}, columns, x, kMaximumDecodeTileRows),
+                           gateDots = products({&g}, columns, x, kMaximumDecodeTileRows);
+    for (const uint32_t rows : kRows) {
+      const LinearPlan selected = linear.plan(up, rows, LinearEpilogue::GateUp, &gate);
+      const std::string label = std::string(fmtName(f)) + " " + std::to_string(rows) + " rows";
+      std::vector<LinearPlan> plans{selected};
+      if (prefillTile) {
+        LinearConfig other = selected.configuration();
+        if (other.tile != LinearTile::GgufPrefill) fail(label + ": the selected plan does not run the prefill tile");
+        other.splits = other.splits > 1 ? 1 : 2;
+        plans.push_back(Linear::plan(selected.workload(), other, FloatOutput::BFloat16));
+      }
+      for (const LinearPlan &plan : plans) {
+        const std::string name = label + " S=" + std::to_string(plan.configuration().splits);
+        const Outcome out = run(backend, linear, plan, up, &gate, storageRows(x, K, rows, plan.storageRows()), {},
+                                kPoisonNaN, N, name);
+        checkValues(out, within(upDots, true), within(gateDots, true), {}, plan.workload(), rows, N, name);
+      }
+    }
+  }
+  section(std::string("selected gate/up: Q4_K and MLX 4-bit pairs at 1024x1024, 33/48/64 rows over a NaN gate "
+                      "scratch, within fp64") +
+          (prefillTile ? " on the MMA prefill tile, split and unsplit" : ""));
 }
 
 // Gate/up in one pass (LinearConfig::oneGateUpPass) on the staged tile, gate and up in each format ([768, K]), and in
@@ -2003,6 +2040,7 @@ int main(int argc, char **argv) {
         if (tile == LinearTile::GgufRegister) fusedDecode(backend, linear, tile, false, true);
         gateUpPairs(backend, linear, tile);
       }
+      selectedGateUp(backend, linear, backend.capabilities().appleGpuFamily < 9);
       decodeTile(backend, linear, LinearTile::GgufStaged, true, decodeInputs(true), tileFormats(LinearTile::GgufStaged));
       columnTile(backend, linear);
       fusedDecode(backend, linear, LinearTile::GgufStaged, true);

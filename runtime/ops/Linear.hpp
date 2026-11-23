@@ -392,7 +392,8 @@ private:
                      const Projection &projection, const LinearPlan &plan,
                      const Projection *gate) const;
   void addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &buffers,
-                      const Projection &projection, const LinearPlan &plan) const;
+                      const Projection &projection, const LinearPlan &plan,
+                      const Projection *gate) const;
   void addGgufPrefillInt8(metal::CommandGraph &graph, const LinearBuffers &buffers,
                           const Projection &projection, const LinearPlan &plan) const;
   void addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &buffers,

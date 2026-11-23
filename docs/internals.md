@@ -746,7 +746,12 @@ Decode runs one of three kernel paths, chosen by the device's calibration row
 (`KernelSelection.cpp`). On Apple7/8 (M1, M2) the staged tile's dispatches run
 on simdgroup MMA kernels (`kernels/shared/gguf_linear_mma.metal`) with their own
 split tier, and wherever every format of a projection takes it the register
-tile runs with an fp32 table, with a one-pass gate/up. On
+tile runs with an fp32 table, with a one-pass gate/up. Their staged MMA tile
+holds at most 32 rows (`kMaximumMmaStagedRows`), so a plan of 33 to 64 rows,
+a three- or four-lane decode step's among them, runs the 64-row MMA prefill
+tile; a gate/up pair keeps its one plan there, a gate pass into the gate
+scratch and an up pass that applies silu(gate), the two sharing the split
+scratch. On
 Apple9 (M3, M4) the register tile (`LinearTile::GgufRegister`) runs the kernels of
 `runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal`, which feed the codes themselves to
 bf16 matrix operations, each chain of 32 inputs (16 for 16-input scales) closed by its fp32 scale,
@@ -1069,7 +1074,8 @@ decode tiles run on every GPU, each in every format it takes (the register tile 
 one to four lanes, every K split and epilogue, fused segments, every format's gate with the next
 format's up and the prefill tiles, each output inside the fp64 bound of
 `GgufFormatReference.hpp`, the one-pass gate/up bitwise against the two passes at the same K
-split, one lane on the staged 16-row tile bitwise against the 8-row tile, and, where the device
+split, one lane on the staged 16-row tile bitwise against the 8-row tile, gate/up pairs of 33 to
+64 rows on the plan the device selects over a NaN gate scratch, and, where the device
 row takes int8 activations, rotated PQ2_0 on the int8 tiles within the fp32 rounding of the exact
 products of their codes, lanes and pass modes bitwise, a non-finite input's row alone not
 finite, and a plan of one or two rows on the column tile in every format and in fused

@@ -106,12 +106,12 @@ GgufDecodeFusedParams fusedSegments(const LinearPlan &plan, std::span<const Quan
   return params;
 }
 
-// A single tensor's decode dispatches through `tensor(segment, epilogue
-// suffix, output, epilogue input)`: gate/up as a gate pass into the gate
-// scratch and an up pass whose epilogue applies silu(gate) to the bf16 up
-// value, any other epilogue in one dispatch.
+// A single tensor's dispatches through `tensor(segment, epilogue suffix,
+// output, epilogue input)`: gate/up as a gate pass into the gate scratch and
+// an up pass whose epilogue applies silu(gate) to the bf16 up value, any
+// other epilogue in one dispatch.
 template <class Tensor>
-void addDecodeTensor(const LinearBuffers &b, LinearEpilogue epilogue, const QuantizedSegment &segment,
+void addTensorPasses(const LinearBuffers &b, LinearEpilogue epilogue, const QuantizedSegment &segment,
                      const Projection *gate, const Tensor &tensor) {
   if (epilogue != LinearEpilogue::GateUp) {
     tensor(segment, epilogueSuffix(epilogue), b.output, epilogueInput(b, epilogue));
@@ -298,7 +298,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   switch (plan.configuration().tile) {
   case LinearTile::GgufRegister: addGgufRegister(graph, b, p, plan, gate); break;
   case LinearTile::GgufStaged: addGgufStaged(graph, b, p, plan, gate); break;
-  case LinearTile::GgufPrefill: addGgufPrefill(graph, b, p, plan); break;
+  case LinearTile::GgufPrefill: addGgufPrefill(graph, b, p, plan, gate); break;
   case LinearTile::GgufPrefillInt8: addGgufPrefillInt8(graph, b, p, plan); break;
   case LinearTile::GgufColumn: addGgufColumn(graph, b, p, plan, gate); break;
   }
@@ -397,7 +397,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   }
   if (w.epilogue == LinearEpilogue::GateUp && segments.size() != 1)
     throw std::invalid_argument("block gate/up takes single tensors");
-  for (const QuantizedSegment &s : segments) addDecodeTensor(b, w.epilogue, s, gate, tensor);
+  for (const QuantizedSegment &s : segments) addTensorPasses(b, w.epilogue, s, gate, tensor);
 }
 
 // The prefill tile, which runs plans of more than kMaximumDecodeTileRows rows
@@ -406,12 +406,14 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
 // (a fused projection's segments otherwise run as small grids of their own),
 // a projection with an epilogue in one dispatch per segment. Rows past the
 // chunk's stay inside the budget-sized prefill buffers, and the simdgroups of
-// a tile that only hold them skip their matmuls.
+// a tile that only hold them skip their matmuls. Apple7/8 also run plans of
+// 33 to 64 rows here, past their staged MMA tile's 32, a gate/up pair among
+// them as a gate pass into the gate scratch and an up pass (addTensorPasses).
 void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
-                            const Projection &p, const LinearPlan &plan) const {
+                            const Projection &p, const LinearPlan &plan,
+                            const Projection *gate) const {
   const LinearWorkload w = plan.workload();
   const auto [n, k] = w.matrix;
-  const char epilogue = epilogueSuffix(w.epilogue);
   const bool useMma = mma();
   if (plan.configuration().mmaPrefill && !useMma)
     throw std::invalid_argument("Apple7/8's 64-row MMA prefill tiles run on Apple7/8 alone");
@@ -448,23 +450,26 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
         bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
       }
       bindings.push_back(b.output);
-      graph.add(prefillKernel(group.front()->name(), epilogue, false), std::move(bindings), params,
+      graph.add(prefillKernel(group.front()->name(), epilogueSuffix(w.epilogue), false), std::move(bindings), params,
                 {rowTiles, columns / GGUF_TILE_COLUMNS, 1}, {GGUF_PREFILL_THREADS, 1, 1});
     }
     return;
   }
+  // A gate/up pair's gate and up passes share the split scratch: the last
+  // split of each tile returns its counter to zero (split_reduce.h).
   const auto [partials, counters] = splitScratch(b, splits);
-  for (const QuantizedSegment &s : p.blocks().segments) {
-    std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
+  const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
+                          const metal::MetalBuffer &aux) {
+    std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, output};
     const GgufPrefillParams params{k, w.rows, n, s.columnOffset};
     const uint32_t colTiles = s.outputSize / GGUF_TILE_COLUMNS;
     if (splits > 1) {
-      bindings.insert(bindings.end(), {partials, counters, epilogueInput(b, w.epilogue)});
+      bindings.insert(bindings.end(), {partials, counters, aux});
       graph.add("gguf_prefill_mma_split_" + std::string(s.name()) + "_" + epilogue, std::move(bindings),
                 GgufPrefillSplitParams{params, splits}, {rowTiles, colTiles, splits}, {kMmaPrefillThreads, 1, 1});
-      continue;
+      return;
     }
-    if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
+    if (epilogue != epilogueSuffix(LinearEpilogue::None)) bindings.push_back(aux);
     const metal::DispatchSize groups{rowTiles, colTiles, 1};
     const std::string kernel = prefillKernel(s.name(), epilogue, useMma);
     const uint32_t threads = useMma ? kMmaPrefillThreads : GGUF_PREFILL_THREADS;
@@ -473,7 +478,10 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
                 GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {threads, 1, 1});
     } else
       graph.add(kernel, std::move(bindings), params, groups, {threads, 1, 1});
-  }
+  };
+  if (w.epilogue == LinearEpilogue::GateUp && p.blocks().segments.size() != 1)
+    throw std::invalid_argument("block gate/up takes single tensors");
+  for (const QuantizedSegment &s : p.blocks().segments) addTensorPasses(b, w.epilogue, s, gate, tensor);
 }
 
 // The int8 prefill tile: the chunk's rows quantized into the scratch's codes
@@ -486,6 +494,9 @@ void Linear::addGgufPrefillInt8(metal::CommandGraph &graph, const LinearBuffers 
                                 const LinearPlan &plan) const {
   const LinearWorkload w = plan.workload();
   const auto [n, k] = w.matrix;
+  // No device selects it for a gate/up pair (a pair reaches the prefill tiles
+  // on Apple7/8 alone), whose up pass would read a gate scratch nothing wrote.
+  if (w.epilogue == LinearEpilogue::GateUp) throw std::invalid_argument("the int8 prefill tile takes no gate/up pair");
   const uint32_t storage = plan.storageRows(), groups = k / GGUF_PREFILL_INT8_GROUP,
                  rowTiles = (w.rows + GGUF_PREFILL_INT8_ROWS - 1) / GGUF_PREFILL_INT8_ROWS;
   for (const QuantizedSegment &s : p.blocks().segments)
@@ -510,7 +521,7 @@ void Linear::addGgufPrefillInt8(metal::CommandGraph &graph, const LinearBuffers 
 }
 
 // Every table tile of the plan's rows in each threadgroup: single tensors and
-// gate/up through addDecodeTensor, fused projections through fusedSegments,
+// gate/up through addTensorPasses, fused projections through fusedSegments,
 // but into fp32 a dispatch per segment.
 void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
                              const Projection &p, const LinearPlan &plan,
@@ -595,7 +606,7 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
     return;
   }
   if (segments.size() == 1) {
-    addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
+    addTensorPasses(b, w.epilogue, segments.front(), gate, tensor);
     return;
   }
   for (const QuantizedSegment &s : segments) tensor(s, epilogueSuffix(w.epilogue), b.output, b.output);

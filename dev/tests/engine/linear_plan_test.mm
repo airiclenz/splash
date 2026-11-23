@@ -1817,6 +1817,19 @@ void apple7PrefillSplits() {
                     plan.scratchSize().partials == 0 && plan.scratchSize().counters == 0,
                 "Apple7/8 wide projection stayed unsplit at " + std::to_string(rows) + " rows");
       }
+      // A gate/up pair of 33 to 64 rows runs the MMA prefill tile as a gate
+      // pass into the gate scratch, which the plan sizes for its rows, and an
+      // up pass, both within the decode tiles' split scratch bound.
+      const Projection up = blockProjection(1024, 1024, 1), gate = blockProjection(1024, 1024, 1);
+      const LinearScratchSize decodeBound = linear.scratchSize({1024, 1024}, kMaximumDecodeTileRows);
+      for (const uint32_t rows : {33U, 48U, 64U}) {
+        const LinearPlan plan = linear.plan(up, rows, LinearEpilogue::GateUp, &gate);
+        const LinearScratchSize need = plan.scratchSize();
+        require(plan.configuration().tile == LinearTile::GgufPrefill && plan.configuration().splits > 1 &&
+                    plan.gateScratchBytes() == uint64_t{rows} * 1024 * sizeof(uint16_t) &&
+                    decodeBound.partials >= need.partials && decodeBound.counters >= need.counters,
+                "Apple7/8 gate/up prefill plan at " + std::to_string(rows) + " rows");
+      }
       // The ANE FFN split's down, a view of leading inputs, has no split
       // kernel: it stays unsplit where a projection of its shape splits.
       const Projection downView = wide.leadingInputs(8192);
@@ -1845,7 +1858,7 @@ void apple7PrefillSplits() {
 }
 
 // Leading-input views and non-Apple7/8 devices refuse split GgufPrefill dispatches; Apple7/8 encodes
-// gguf_prefill_mma_split_* with its 3D grid.
+// gguf_prefill_mma_split_* with its 3D grid, and a gate/up pair as a gate pass into the gate scratch and an up pass.
 void apple7PrefillSplitDispatch(metal::MetalBackend &backend) {
   constexpr uint32_t n = 320, k = 10240, rows = 384, splits = 8;
   const QuantizedSegment seg = segmentPlanes(backend, GGUF_FMT_Q80, n, k);
@@ -1875,6 +1888,34 @@ void apple7PrefillSplitDispatch(metal::MetalBackend &backend) {
     rejects([&] { (void)m3.add(graph, buffers, hcDown, splitNone); }, "split block prefill requires the MMA tile",
             "Apple9 accepted a split GgufPrefill plan");
     require(graph.empty(), "refused Apple9 split prefill encoded a dispatch");
+  }
+  // A gate/up pair on the prefill tile runs its gate pass into the gate
+  // scratch, which its up pass then reads, unsplit and split alike.
+  for (const uint32_t pairSplits : {1U, 2U}) {
+    constexpr uint32_t pairRows = 48, pairColumns = 1024, pairInputs = 1024;
+    const Projection up(pairColumns, pairInputs,
+                        BlockWeights{{segmentPlanes(backend, GGUF_FMT_Q4K, pairColumns, pairInputs)}}),
+        gate(pairColumns, pairInputs, BlockWeights{{segmentPlanes(backend, GGUF_FMT_Q4K, pairColumns, pairInputs)}});
+    LinearConfig config = m1.plan(up, pairRows, LinearEpilogue::GateUp, &gate).configuration();
+    config.splits = pairSplits;
+    const LinearPlan pair =
+        Linear::plan({{pairColumns, pairInputs}, pairRows, LinearEpilogue::GateUp}, config, FloatOutput::BFloat16);
+    const LinearScratchSize pairScratch = pair.scratchSize();
+    const LinearBuffers pairBuffers{
+        .input = allocate(backend, uint64_t{pairRows} * pairInputs * 2),
+        .output = allocate(backend, uint64_t{pairRows} * pairColumns * 2),
+        .gateScratch = allocate(backend, pair.gateScratchBytes()),
+        .scratch = {{}, {}, allocate(backend, pairScratch.partials), allocate(backend, pairScratch.counters)}};
+    metal::CommandGraph graph;
+    (void)m1.add(graph, pairBuffers, up, pair, &gate);
+    const std::string kernel = pairSplits > 1 ? "gguf_prefill_mma_split_q4k_" : "gguf_prefill_mma_q4k_";
+    const auto &dispatches = graph.dispatches();
+    require(config.tile == LinearTile::GgufPrefill && dispatches.size() == 2 &&
+                dispatches[0].pipelineName == kernel + "a" && dispatches[1].pipelineName == kernel + "g" &&
+                dispatches[0].buffers[4].buffer.sameView(pairBuffers.gateScratch) &&
+                dispatches[1].buffers[4].buffer.sameView(pairBuffers.output) &&
+                dispatches[1].buffers.back().buffer.sameView(pairBuffers.gateScratch),
+            "Apple7/8 prefill gate/up dispatches at S=" + std::to_string(pairSplits));
   }
   {
     metal::CommandGraph graph;
