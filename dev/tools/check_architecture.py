@@ -20,9 +20,10 @@ INCLUDE = re.compile(r'^\s*#\s*(?:include|import)\s*(["<])([^">]+)[">]', re.MULT
 # Tile, split and kernel-configuration names runtime/ops owns: model/ and
 # engine/ size workspaces through the operators, never through these.
 OPERATOR_WORKSPACE_POLICY_NAMES: tuple[str, ...] = (
-    "prefillAttentionTiles",
-    "kVerifySplits",
-    "kPrefillAttentionTileRows",
+    "attentionTiles",
+    "kAttentionTileRows",
+    "kAttentionMaximumSplits",
+    "kAttentionSequenceSplits",
     "moeMaximumTiles",
     "LinearTile",
     "LinearConfig",
@@ -225,9 +226,11 @@ NOTE_ALLOWANCE: dict[str, int] = {
     "dev/tests/engine/timing_profile_test.cpp": 1,
 }
 # runtime/engine's production lines: the budget only goes down, unless the
-# owner raises it. The fork raised upstream's 30,105 for its engine timing,
-# eviction and denial causes and status keys, and the M1/M2 port's own lines.
-ENGINE_LINE_BUDGET = 31_170
+# owner raises it. The M1/M2 port's prefill bound and Neural Engine options
+# hold 241 lines over upstream's 30_594, and its calibrated pair (#66) 232.
+# The fork raised the port's 31_067 for its engine timing, eviction and
+# denial causes, status keys and tail checkpoint (1.7 merge).
+ENGINE_LINE_BUDGET = 31_869
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

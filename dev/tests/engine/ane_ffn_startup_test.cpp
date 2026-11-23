@@ -33,6 +33,7 @@ using Kind = AneFfnOutcome::Kind;
 using Mode = splash::ops::AneFfn::Mode;
 using splash::ops::ane_ffn::Calibration;
 using splash::ops::ane_ffn::ChunkTimings;
+using splash::ops::ane_ffn::Timing;
 using splash::ops::ane_ffn::Timings;
 using splash::test::rejects;
 using splash::test::require;
@@ -97,9 +98,10 @@ struct Fake {
   std::optional<std::string> unavailable;
   uint64_t unitBytes = 256 * kMiB;
   std::function<Timings()> time = measured;
-  // The split layer of full chunks by its units, the same at every count unless a test sets it.
-  std::function<double(uint32_t)> split = [](uint32_t) { return 13.0; };
-  std::function<AneFfnPrepared(uint32_t, bool, Mode)> prepare = [](uint32_t, bool timed, Mode) {
+  // The split's full chunk at the units calibration first chooses, timed on the layers time() timed: by default as
+  // the first layers' chunks below time it.
+  std::function<double(uint32_t)> timeAt = [](uint32_t) { return 15.5; };
+  std::function<AneFfnPrepared(uint32_t, bool)> prepare = [](uint32_t, bool timed) {
     AneFfnPrepared prepared;
     if (timed) prepared.chunks = timedChunks(15.5);
     prepared.error = 0.025;
@@ -109,14 +111,24 @@ struct Fake {
   // for, and the calibration it remembered and under which most units.
   std::optional<Calibration> stored, remembered;
   std::optional<uint32_t> recalled, rememberedMost;
+  // Whether remember() keeps what it is given, as a cache directory that takes writes does.
+  bool keeps = true;
   bool healthy = true;
-  // The calls the start made: of unavailable() and time(), and of prepare() with its arguments.
+  // The calls the start made: of unavailable() and time(), the units of timeAt()'s, and of prepare() with its
+  // arguments, the last and the units of each.
   uint32_t asked = 0, timings = 0;
+  std::vector<uint32_t> timedUnits;
   std::optional<std::pair<uint32_t, bool>> prepared;
-  // The mode each prepare() asked for, and whether each plannedBytes() asked for a split of pairs.
+  std::vector<uint32_t> preparedUnits;
+  // The mode each prepare() asked for, and whether each plannedBytes() asked for a split of pairs; a test's
+  // check of the mode, which may refuse it.
   std::vector<Mode> modesAsked;
   std::vector<bool> plannedFor;
-  std::vector<uint32_t> splitsTimed;
+  std::function<void(Mode)> checkMode = [](Mode) {};
+  // The units a start asked a split to time a pair's command on at, in order; `timingPair` throws for those no
+  // split runs at.
+  std::vector<uint32_t> pairsTimed;
+  std::function<void(uint32_t)> timingPair = [](uint32_t) {};
 
   [[nodiscard]] uint64_t bytes(uint32_t aneUnits) const { return aneUnits * unitBytes; }
   // What the plan holds with the largest split the model could take, the most units whose plan holds any: the
@@ -144,23 +156,32 @@ struct Fake {
       ++timings;
       return time();
     };
-    result.timeSplit = [this](uint32_t aneUnits, double gpuAlone) {
-      require(gpuAlone == time().gpuAlone, "the split was timed against another GPU alone");
-      splitsTimed.push_back(aneUnits);
-      return split(aneUnits);
+    result.timeAt = [this](uint32_t aneUnits, double gpuAlone) {
+      if (gpuAlone != time().gpuAlone) throw std::logic_error("a split was timed against another GPU alone");
+      timedUnits.push_back(aneUnits);
+      return Timing{aneUnits / 34.0, 0.0, timeAt(aneUnits)};
     };
     result.prepare = [this](uint32_t aneUnits, bool timeChunks, Mode mode) {
       prepared = {aneUnits, timeChunks};
+      preparedUnits.push_back(aneUnits);
       modesAsked.push_back(mode);
-      return prepare(aneUnits, timeChunks, mode);
+      checkMode(mode);
+      return prepare(aneUnits, timeChunks);
+    };
+    result.timingPair = [this](uint32_t aneUnits) -> std::unique_ptr<ops::AneFfn> {
+      pairsTimed.push_back(aneUnits);
+      timingPair(aneUnits);
+      return nullptr;
     };
     result.recall = [this](uint32_t maxAneUnits) {
       recalled = maxAneUnits;
       return stored;
     };
     result.remember = [this](uint32_t maxAneUnits, const Calibration &calibration) {
+      if (!keeps) return false;
       rememberedMost = maxAneUnits;
       stored = remembered = calibration;
+      return true;
     };
     result.forget = [this](uint32_t) { stored.reset(); };
     result.healthy = [this] { return healthy; };
@@ -350,12 +371,12 @@ void testDeterministicContext() {
     timings.gpuAlone = 14.0;
     return timings;
   };
-  const auto slowChunks = [](uint32_t, bool, Mode) {
+  const auto slowChunks = [](uint32_t, bool) {
     AneFfnPrepared prepared;
     prepared.chunks = timedChunks(21.0);
     return prepared;
   };
-  const auto fails = [](uint32_t, bool, Mode) -> AneFfnPrepared { throw std::runtime_error("an evaluation failed"); };
+  const auto fails = [](uint32_t, bool) -> AneFfnPrepared { throw std::runtime_error("an evaluation failed"); };
   const Calibration nine{9, 700, {{{512, 5.0}, {2048, 20.0}}}};
   const uint32_t most = Fake{}.largestSplitContext();
   require(most && most < contextWith(Fake{}.bytes(1)), "the largest split holds no less context");
@@ -497,7 +518,7 @@ void testFailures() {
               has(started.log, " with --disable-ane). --disable-ane silences this line."),
           "a timing that failed did not warn: " + started.log);
   fake = {};
-  fake.prepare = [](uint32_t, bool, Mode) -> AneFfnPrepared {
+  fake.prepare = [](uint32_t, bool) -> AneFfnPrepared {
     throw std::runtime_error("ANE FFN split of 640 rows failed (the Neural Engine's output or its scales were not "
                              "finite)");
   };
@@ -506,22 +527,22 @@ void testFailures() {
               has(started.log, "unavailable (ANE FFN split of 640 rows failed"),
           "a split that failed verify() was not unavailable");
   // Chunks that were not timed are not read.
-  fake.prepare = [](uint32_t, bool, Mode) { return AneFfnPrepared{}; };
+  fake.prepare = [](uint32_t, bool) { return AneFfnPrepared{}; };
   started = start(fake);
   require(started.start.outcome.kind == Kind::Unavailable && !started.start.plan && !fake.remembered &&
               has(started.log, "unavailable (the split's chunks were not timed)"),
           "a split of no chunks timed was not unavailable: " + started.log);
 
   bool cancelled = false;
-  fake.prepare = [&](uint32_t, bool, Mode) -> AneFfnPrepared {
+  fake.prepare = [&](uint32_t, bool) -> AneFfnPrepared {
     cancelled = true;
     throw std::runtime_error("the Metal command was not submitted");
   };
   rejects([&] { static_cast<void>(start(fake, {}, {}, [&] { return cancelled; })); }, "not submitted",
           "a cancelled start went on");
-  fake.prepare = [](uint32_t, bool, Mode) -> AneFfnPrepared { throw ane::Interrupted("the wait was interrupted"); };
+  fake.prepare = [](uint32_t, bool) -> AneFfnPrepared { throw ane::Interrupted("the wait was interrupted"); };
   rejects([&] { static_cast<void>(start(fake)); }, "interrupted", "an interrupted wait went on");
-  fake.prepare = [&](uint32_t, bool, Mode) -> AneFfnPrepared {
+  fake.prepare = [&](uint32_t, bool) -> AneFfnPrepared {
     fake.healthy = false;
     throw std::runtime_error("the backend stopped serving");
   };
@@ -545,7 +566,7 @@ void testACommandOutOfMemoryIsCommandMemory() {
         return metal::MetalBackendError("Metal command 2 failed: Insufficient Memory", outOfMemory);
       };
       if (setup)
-        fake.prepare = [&](uint32_t, bool, Mode) -> AneFfnPrepared { throw failed(); };
+        fake.prepare = [&](uint32_t, bool) -> AneFfnPrepared { throw failed(); };
       else
         fake.time = [&]() -> Timings { throw failed(); };
       const std::string what = std::string(setup ? "setup" : "calibration") + "'s command that failed " +
@@ -603,17 +624,298 @@ void testNoGain() {
                                "2048-row FFN layer by enough (calibrated in "),
           "a share predicted to gain too little split: " + started.log);
   fake = {};
-  fake.prepare = [](uint32_t, bool, Mode) {
+  fake.prepare = [](uint32_t, bool) {
     AneFfnPrepared prepared;
     prepared.chunks = timedChunks(21.0);
     return prepared;
   };
   started = start(fake);
-  require(started.start.outcome.kind == Kind::NoGain && fake.remembered && !fake.remembered->aneUnits &&
-              !started.start.plan &&
+  require(started.start.outcome.kind == Kind::NoGain && fake.preparedUnits == std::vector{8u} && fake.remembered &&
+              !fake.remembered->aneUnits && !started.start.plan &&
               has(started.log, "no chunk of the Neural Engine split beats it by enough, 21.0 ms per 2048-row FFN "
                                "layer against 20.0 (calibrated in "),
           "a split of no chunk that gains split: " + started.log);
+}
+
+// The chosen units' full chunk, timed nearest T's least as the fit's timings were and on their layers, fits the
+// bandwidth's term where the low share could not: the M5 Max's timings choose 6 units, whose split layer of 13.84 ms
+// chooses 7 (ane_ffn_calibration_test), whose split is prepared, timed, served and remembered instead where it takes
+// no chunk longer, and otherwise the split of 6 serves, prepared again. One whose refitted model keeps its units is
+// prepared once. The first layers' chunks do not refit: a model whose first layers' formats are slower, as mixed
+// quantizations' can be, would bias it.
+void testRefitMovesTheChoice() {
+  Fake fake;
+  fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+  fake.timeAt = [](uint32_t) { return 13.84; };
+  fake.prepare = [](uint32_t aneUnits, bool timed) {
+    AneFfnPrepared prepared;
+    if (timed) prepared.chunks = timedChunks(aneUnits == 6 ? 13.84 : 13.55);
+    prepared.error = 0.025;
+    return prepared;
+  };
+  Started started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.timings == 1 && fake.timedUnits == std::vector{6u} &&
+              fake.preparedUnits == std::vector{6u, 7u} && fake.prepared == std::pair(7u, true) &&
+              fake.remembered && fake.remembered->aneUnits == 7 && fake.remembered->minimumRows == 553 &&
+              started.start.plan && started.start.plan->breakdown().aneFfnBytes == fake.bytes(7) &&
+              has(started.log, "Neural Engine FFN split at share 0.21 for chunks of 553 rows or more: 13.6 ms per "
+                               "2048-row FFN layer against 20.0 on the GPU alone"),
+          "the refitted choice of 7 units did not serve: " + started.log);
+  // Seven units whose 640-row function takes 6.0 ms, against six's 5.5, split chunks from 603 rows, not 553, and the
+  // split of six serves, prepared again.
+  fake = {};
+  fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+  fake.timeAt = [](uint32_t) { return 13.84; };
+  fake.prepare = [](uint32_t aneUnits, bool timed) {
+    AneFfnPrepared prepared;
+    if (timed) {
+      prepared.chunks = timedChunks(aneUnits == 6 ? 13.84 : 13.55);
+      if (aneUnits == 7) prepared.chunks.functions[11].split = 6.0;
+    }
+    prepared.error = 0.025;
+    return prepared;
+  };
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.preparedUnits == std::vector{6u, 7u, 6u} &&
+              fake.prepared == std::pair(6u, false) && fake.remembered && fake.remembered->aneUnits == 6 &&
+              fake.remembered->minimumRows == 553 &&
+              has(started.log, "Neural Engine FFN split at share 0.18 for chunks of 553 rows or more: 13.8 ms per "
+                               "2048-row FFN layer against 20.0 on the GPU alone"),
+          "a refitted choice that took chunks longer served: " + started.log);
+  fake.preparedUnits.clear();
+  fake.stored.reset();
+  fake.time = measured;
+  fake.timeAt = [](uint32_t) { return 15.5; };
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.preparedUnits == std::vector{8u} &&
+              fake.remembered && fake.remembered->aneUnits == 8,
+          "a choice its refitted model keeps was prepared again");
+  // Six units' full chunk takes 13.84 ms over the first layers, which would choose 7, but 13.19 over the fit's, which
+  // keeps 6; and the other way about, 7, whose full chunk takes 13.0 ms.
+  for (const bool fitLayersMove : {false, true}) {
+    fake = {};
+    fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+    fake.timeAt = [=](uint32_t) { return fitLayersMove ? 13.84 : 13.19; };
+    fake.prepare = [=](uint32_t aneUnits, bool timed) {
+      AneFfnPrepared prepared;
+      if (timed) prepared.chunks = timedChunks(aneUnits == 6 ? (fitLayersMove ? 13.19 : 13.84) : 13.0);
+      prepared.error = 0.025;
+      return prepared;
+    };
+    started = start(fake);
+    require(started.start.outcome.kind == Kind::Split &&
+                fake.preparedUnits == (fitLayersMove ? std::vector{6u, 7u} : std::vector{6u}) && fake.remembered &&
+                fake.remembered->aneUnits == (fitLayersMove ? 7u : 6u),
+            "the first layers' chunks, not the split timed on the fit's layers, refitted the choice: " + started.log);
+  }
+  // A refit whose split cannot be timed leaves the first units, whose split is prepared, served and remembered.
+  fake = {};
+  fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+  fake.timeAt = [](uint32_t) -> double { throw std::runtime_error("the Neural Engine refused the program"); };
+  fake.prepare = [](uint32_t, bool timed) {
+    AneFfnPrepared prepared;
+    if (timed) prepared.chunks = timedChunks(13.84);
+    prepared.error = 0.025;
+    return prepared;
+  };
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.preparedUnits == std::vector{6u} && fake.remembered &&
+              fake.remembered->aneUnits == 6 &&
+              has(started.log, "refitted share was not found (the Neural Engine refused the program); its first "
+                               "share serves"),
+          "a refit whose split could not be timed did not leave the first units to serve: " + started.log);
+}
+
+// A refitted split that cannot be prepared leaves the first, which was: the M5 Max's timings choose 6 units and then
+// 7 (testRefitMovesTheChoice), whose program the Neural Engine refuses, and the split of 6 serves, prepared again, and
+// is remembered, the log saying why. It ended the start with the GPU alone and nothing remembered, so that every
+// later start calibrated again. On a backend that stopped serving, or in a start that was cancelled, the failure
+// ends the start as any other does.
+void testARefittedSplitThatFailsKeepsTheFirst() {
+  const auto timings = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+  Fake fake;
+  fake.time = timings;
+  fake.timeAt = [](uint32_t) { return 13.84; };
+  fake.prepare = [](uint32_t aneUnits, bool timed) {
+    if (aneUnits == 7) throw std::runtime_error("the Neural Engine refused the program of 7 units");
+    AneFfnPrepared prepared;
+    if (timed) prepared.chunks = timedChunks(13.84);
+    prepared.error = 0.025;
+    return prepared;
+  };
+  const Started started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.preparedUnits == std::vector{6u, 7u, 6u} &&
+              fake.prepared == std::pair(6u, false) && fake.remembered && fake.remembered->aneUnits == 6 &&
+              fake.remembered->minimumRows == 553 && started.start.plan &&
+              started.start.plan->breakdown().aneFfnBytes == fake.bytes(6) &&
+              has(started.log, "refitted share was not prepared (the Neural Engine refused the program of 7 units); "
+                               "its first share serves") &&
+              has(started.log, "Neural Engine FFN split at share 0.18 for chunks of 553 rows or more: 13.8 ms per "
+                               "2048-row FFN layer against 20.0 on the GPU alone"),
+          "a refitted split that failed to prepare did not leave the first to serve: " + started.log);
+  fake = {};
+  fake.time = timings;
+  fake.timeAt = [](uint32_t) { return 13.84; };
+  fake.prepare = [&](uint32_t aneUnits, bool timed) {
+    if (aneUnits == 7) {
+      fake.healthy = false;
+      throw std::runtime_error("the backend stopped serving");
+    }
+    AneFfnPrepared prepared;
+    if (timed) prepared.chunks = timedChunks(13.84);
+    return prepared;
+  };
+  rejects([&] { static_cast<void>(start(fake)); }, "stopped serving",
+          "a start went on past a refitted split's failure on a backend that stopped");
+  fake = {};
+  fake.time = timings;
+  fake.timeAt = [](uint32_t) { return 13.84; };
+  bool cancelled = false;
+  fake.prepare = [&](uint32_t aneUnits, bool timed) {
+    if (aneUnits == 7) {
+      cancelled = true;
+      throw std::runtime_error("ANE program was not submitted");
+    }
+    AneFfnPrepared prepared;
+    if (timed) prepared.chunks = timedChunks(13.84);
+    return prepared;
+  };
+  rejects([&] { static_cast<void>(start(fake, {}, {}, [&] { return cancelled; })); }, "not submitted",
+          "a cancelled start went on past a refitted split's failure");
+}
+
+// A first split that does not prepare again after the refitted one lost leaves the GPU alone to this start, its
+// context the calibration's, and the calibration of the first units remembered, which the next start sets up: the
+// M5 Max's timings choose 6 units and then 7, whose 640-row function takes 6.0 ms (testRefitMovesTheChoice), and the
+// Neural Engine refuses the program of 6 the second time. It ended the start with the GPU alone and nothing
+// remembered, so that every later start calibrated again.
+void testAFirstSplitThatDoesNotPrepareAgainIsRemembered() {
+  Fake fake;
+  fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+  fake.timeAt = [](uint32_t) { return 13.84; };
+  uint32_t preparedSix = 0;
+  fake.prepare = [&](uint32_t aneUnits, bool timed) {
+    if (aneUnits == 6 && ++preparedSix == 2) throw std::runtime_error("the Neural Engine refused the program of 6 units");
+    AneFfnPrepared prepared;
+    if (timed) {
+      prepared.chunks = timedChunks(aneUnits == 6 ? 13.84 : 13.55);
+      if (aneUnits == 7) prepared.chunks.functions[11].split = 6.0;
+    }
+    prepared.error = 0.025;
+    return prepared;
+  };
+  Started started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && !started.start.split && !started.start.plan &&
+              fake.preparedUnits == std::vector{6u, 7u, 6u} && fake.remembered && fake.remembered->aneUnits == 6 &&
+              fake.remembered->minimumRows == 553 && started.start.outcome.context == contextWith(fake.bytes(6)) &&
+              has(started.log, "its calibrated share's split was not prepared again: the Neural Engine refused the "
+                               "program of 6 units; the next start sets it up as calibrated"),
+          "a first split that did not prepare again left nothing remembered: " + started.log);
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.timings == 1 && fake.prepared == std::pair(6u, false) &&
+              has(started.log, "set up as calibrated before"),
+          "the next start did not set up the remembered first units: " + started.log);
+}
+
+// A split the Neural Engine refuses (ane::Refused) counts beside the calibration, and the second refusal leaves the
+// GPU alone, uncalibrated, until the calibration's key changes: it was forgotten at each refusal, so that a split the
+// Neural Engine refused each time was calibrated every other start. A calibration whose first split does not prepare
+// again is kept with the refusal and refused again by the next start (testAFirstSplitThatDoesNotPrepareAgainIsRemembered's
+// timings); a remembered split refused once is calibrated again, and that split refused; a split refused while it is
+// calibrated is calibrated once more. The log says what the next start does, as what stayed remembered says.
+void testARefusedSplitIsNotCalibratedInALoop() {
+  const auto refusedUntimed = [](uint32_t aneUnits, bool timed) {
+    if (!timed) throw ane::Refused("ANE load failed: the Neural Engine refused the program of " +
+                                   std::to_string(aneUnits) + " units");
+    AneFfnPrepared prepared;
+    prepared.chunks = timedChunks(aneUnits == 6 ? 13.84 : 13.55);
+    if (aneUnits == 7) prepared.chunks.functions[11].split = 6.0;
+    return prepared;
+  };
+  constexpr std::string_view kLeft = "starts leave the GPU alone until Splash, macOS or the model changes";
+  Fake fake;
+  fake.time = [] { return Timings{{14.0 / 34, 9.9673, 23.929}, {27.0 / 34, 4.7526, 46.034}, 15.834}; };
+  fake.timeAt = [](uint32_t) { return 13.84; };
+  fake.prepare = refusedUntimed;
+  Started started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && fake.stored && fake.stored->aneUnits == 6 &&
+              fake.stored->refusals == 1 &&
+              has(started.log, "refused the program of 6 units; the next start sets it up as calibrated"),
+          "a calibration whose first split was refused again was not kept with the refusal: " + started.log);
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && fake.stored && !fake.stored->aneUnits &&
+              fake.stored->refusals == 2 && has(started.log, std::string("refused the program of 6 units; ") + kLeft.data()),
+          "a split refused twice did not leave the GPU alone: " + started.log);
+  for (int later = 0; later < 2; ++later) {
+    fake.preparedUnits.clear();
+    started = start(fake);
+    require(started.start.outcome.kind == Kind::Unavailable && fake.timings == 1 && fake.preparedUnits.empty() &&
+                started.start.outcome.context == contextWith(0) &&
+                has(started.log, std::string("the Neural Engine refused its split twice; ") + kLeft.data()),
+            "a start after a split refused twice calibrated or set a split up: " + started.log);
+  }
+
+  const std::array<ChunkTimings::Gpu, 2> gpu{{{512, 5.0}, {2048, 20.0}}};
+  fake = {};
+  fake.stored = Calibration{9, 700, gpu};
+  fake.prepare = [](uint32_t aneUnits, bool timed) -> AneFfnPrepared {
+    if (aneUnits == 9) throw ane::Refused("ANE compilation failed");
+    return Fake{}.prepare(aneUnits, timed);
+  };
+  fake.keeps = false;
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && fake.stored && fake.stored->aneUnits == 9 &&
+              has(started.log, "ANE compilation failed; the next start sets it up as calibrated"),
+          "a refusal that could not be remembered said the next start would not set the split up: " + started.log);
+  fake.keeps = true;
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && fake.stored && !fake.stored->aneUnits &&
+              fake.stored->refusals == 1 &&
+              has(started.log, "ANE compilation failed; the next start calibrates again"),
+          "a remembered split refused once was not left to calibrate again: " + started.log);
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && fake.timings == 1 && fake.stored &&
+              fake.stored->aneUnits == 8 && fake.stored->refusals == 1,
+          "the start after a refusal did not calibrate again, keeping the refusal: " + started.log);
+  fake.prepare = [](uint32_t, bool) -> AneFfnPrepared { throw ane::Refused("ANE load failed"); };
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && fake.stored && fake.stored->refusals == 2 &&
+              has(started.log, std::string("ANE load failed; ") + kLeft.data()),
+          "a split calibrated again after a refusal and refused did not leave the GPU alone: " + started.log);
+
+  fake = {};
+  fake.prepare = [](uint32_t, bool) -> AneFfnPrepared { throw ane::Refused("ANE load failed"); };
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && fake.stored && fake.stored->refusals == 1 &&
+              has(started.log, "ANE load failed; the next start calibrates again"),
+          "a split refused while it was calibrated was not counted: " + started.log);
+  started = start(fake);
+  started = start(fake);
+  require(fake.timings == 2 && fake.stored && fake.stored->refusals == 2 &&
+              has(started.log, std::string("the Neural Engine refused its split twice; ") + kLeft.data()),
+          "a split refused each time it was calibrated was calibrated more than twice: " + started.log);
+}
+
+// A remembered split that fails to prepare for another reason than the Neural Engine's refusal, as Metal refusing an
+// arena under memory pressure, keeps its calibration: that start runs the GPU alone and the next sets the split up.
+// It was forgotten, and the next start calibrated again.
+void testAFailureThatIsNotARefusalKeepsTheCalibration() {
+  const std::array<ChunkTimings::Gpu, 2> gpu{{{512, 5.0}, {2048, 20.0}}};
+  Fake fake;
+  fake.stored = Calibration{9, 700, gpu};
+  fake.prepare = [](uint32_t, bool) -> AneFfnPrepared {
+    throw metal::MetalAllocationError("the prefill arena was not allocated", metal::AllocationFailure::DriverRejected);
+  };
+  Started started = start(fake);
+  require(started.start.outcome.kind == Kind::Unavailable && !started.start.split && fake.stored &&
+              fake.stored->aneUnits == 9 && fake.stored->minimumRows == 700 && !fake.stored->refusals &&
+              has(started.log, "its remembered share's split was not prepared: the prefill arena was not allocated; "
+                               "the next start sets it up as calibrated"),
+          "a remembered split that failed for another reason than a refusal lost its calibration: " + started.log);
+  fake.prepare = Fake{}.prepare;
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && !fake.timings && fake.prepared == std::pair(9u, false),
+          "the start after a failure that was not a refusal did not set the calibration up: " + started.log);
 }
 
 // A start takes this Mac's calibration once remembered: it neither times nor remembers, prepares the remembered units
@@ -649,25 +951,6 @@ void testRemembered() {
   }
 }
 
-// A calibration takes the units its timings refine the fit's to, logs the fit's share beside them and remembers
-// them; with timings that show no faster neighbour it takes the fit's 8 units, timed a unit either way.
-void testRefined() {
-  Fake fake;
-  fake.split = [](uint32_t aneUnits) { return 10.0 + 0.4 * std::abs(static_cast<double>(aneUnits) - 10.0); };
-  Started started = start(fake);
-  require(started.start.outcome.kind == Kind::Split && fake.splitsTimed == std::vector<uint32_t>{8, 7, 9, 10, 11} &&
-              fake.prepared == std::pair(10u, true) && fake.remembered && fake.remembered->aneUnits == 10 &&
-              started.start.plan && started.start.plan->breakdown().aneFfnBytes == fake.bytes(10) &&
-              has(started.log, "Neural Engine FFN split at share 0.29 for chunks of ") &&
-              has(started.log, " on the GPU alone, refined from the fit's share 0.24, "),
-          "the refined units were not taken: " + started.log);
-  fake = {};
-  started = start(fake);
-  require(started.start.outcome.kind == Kind::Split && fake.splitsTimed == std::vector<uint32_t>{8, 7, 9} &&
-              fake.prepared == std::pair(8u, true) && !has(started.log, "refined"),
-          "timings of no faster neighbour moved the fit's units: " + started.log);
-}
-
 // A given share runs the units nearest it, untimed, over the chunks given, and is not remembered; a given split
 // of no units or of rows no function holds is refused.
 void testGivenShare() {
@@ -683,23 +966,21 @@ void testGivenShare() {
   started = start(fake, {.given = AneFfnSetting::Given{0.2, 832}});
   require(started.start.outcome.kind == Kind::Split && has(started.log, "for chunks of 832 rows or more"),
           "the given least chunk did not run as given: " + started.log);
-  // A given split has slots for pairs; a calibrated one, whose share was timed on single chunks, has one.
+  // A given split has slots for pairs; a calibrated one, whose share was timed on single chunks, has one, and its
+  // plan sets no pair's memory aside until a start has timed pairs.
   require(fake.modesAsked == std::vector<Mode>{Mode::Pair, Mode::Pair}, "a given split was not prepared for pairs");
   require(std::ranges::all_of(fake.plannedFor, [](bool pairs) { return pairs; }),
           "a given split was planned without its pairs' memory");
   Fake calibrating;
-  static_cast<void>(start(calibrating));
-  require(!calibrating.plannedFor.empty() &&
-              std::ranges::none_of(calibrating.plannedFor, [](bool pairs) { return pairs; }),
+  started = start(calibrating);
+  require(started.start.plan && started.start.plan->breakdown().aneFfnBytes == calibrating.bytes(8) &&
+              !started.start.pair,
           "a calibrated split was planned with a pair's memory");
   require(calibrating.modesAsked == std::vector<Mode>{Mode::Single}, "a calibrated split was not prepared as a single");
   // A split that cannot give a pair its slots serves single chunks at the given share, and says so.
   Fake single;
-  single.prepare = [](uint32_t, bool, Mode mode) -> AneFfnPrepared {
+  single.checkMode = [](Mode mode) {
     if (mode == Mode::Pair) throw std::runtime_error("ANE FFN second slot failed");
-    AneFfnPrepared prepared;
-    prepared.error = 0.025;
-    return prepared;
   };
   started = start(single, {.given = AneFfnSetting::Given{0.2}});
   require(started.start.outcome.kind == Kind::Split && single.modesAsked == std::vector<Mode>{Mode::Pair, Mode::Fallback} &&
@@ -708,7 +989,7 @@ void testGivenShare() {
           "a split without pairs did not serve single chunks: " + started.log);
   // A split that fails either way is unavailable, as before.
   Fake neither;
-  neither.prepare = [](uint32_t, bool, Mode) -> AneFfnPrepared { throw std::runtime_error("ANE FFN failed"); };
+  neither.prepare = [](uint32_t, bool) -> AneFfnPrepared { throw std::runtime_error("ANE FFN failed"); };
   started = start(neither, {.given = AneFfnSetting::Given{0.2}});
   require(started.start.outcome.kind == Kind::Unavailable && neither.modesAsked == std::vector<Mode>{Mode::Pair, Mode::Fallback},
           "a split that failed with and without pairs was not unavailable: " + started.log);
@@ -729,6 +1010,186 @@ void testGivenShare() {
           "least rows without a share were taken");
 }
 
+// A full command's seconds as the test plays them: 9 as a single chunk, and as a pair of chunks 7.5 at 25 units and
+// 0.2 more a unit either way.
+double prefillSeconds(uint32_t pairUnits, ops::AneFfn *) {
+  return pairUnits ? 7.5 + 0.2 * std::abs(static_cast<double>(pairUnits) - 25.0) : 9.0;
+}
+
+// What timePairs() of `started` logs on `fake`, its commands taking `prefill` seconds.
+std::string timePairs(Fake &fake, const Started &started, const AneFfnPairPrefill &prefill = prefillSeconds) {
+  return test::capturedStderr([&] { started.start.timePairs(fake.model(), prefill); });
+}
+
+// A split of 32 MiB a unit, so that the plan holds a pair's split of any units beside it.
+Fake pairing() {
+  Fake fake;
+  fake.unitBytes = 32 * kMiB;
+  return fake;
+}
+
+// A start that calibrates serves single chunks and offers to time pairs. Timing them climbs from the split's 8
+// units to the fastest command's, checks that the split that serves builds there, and remembers the units beside
+// the calibration; the next start sets the pair's memory aside, prepares its split and serves the context its plan
+// holds with both.
+void testPairsTimed() {
+  Fake fake = pairing();
+  Started started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && started.start.timePairs && !started.start.pair &&
+              started.start.plan->breakdown().aneFfnBytes == fake.bytes(8) && !has(started.log, "pairs of chunks"),
+          "a start that calibrated did not serve single chunks and offer to time pairs: " + started.log);
+  const std::string log = timePairs(fake, started);
+  require(fake.pairsTimed == std::vector<uint32_t>{11, 14, 17, 20, 23, 26, 29, 25, 24} &&
+              fake.prepared == std::pair(25u, false) && fake.modesAsked.back() == Mode::Pair && fake.remembered &&
+              fake.remembered->pairUnits == 25u && fake.remembered->aneUnits == 8 &&
+              fake.remembered->minimumRows == 553 && fake.rememberedMost == fake.recalled,
+          "the fastest pair's units were not found and remembered beside the calibration: " + log);
+  require(has(log, "Timing the Neural Engine FFN split's pairs of chunks on whole prefills.") &&
+              has(log, "Neural Engine FFN split runs commands of 769 rows or more as pairs of chunks at share 0.74 "
+                       "from the next start: a 2048-row prefill takes 7.50 s against 9.00 as a single chunk (timed "
+                       "in "),
+          "the pair's units were not logged: " + log);
+  fake.modesAsked.clear();
+  started = start(fake);
+  const uint64_t both = fake.bytes(8) + fake.bytes(25);
+  require(started.start.outcome.kind == Kind::Split && fake.timings == 1 && !started.start.timePairs &&
+              fake.modesAsked == std::vector<Mode>{Mode::Single, Mode::Pair} &&
+              started.start.plan->breakdown().aneFfnBytes == both &&
+              started.start.outcome.context == contextWith(both) && contextWith(both) < contextWith(fake.bytes(8)),
+          "the next start did not set the pair's memory aside and prepare its split: " + started.log);
+  require(has(started.log, "Neural Engine FFN split at share 0.24 for chunks of 553 rows or more, and at 0.74 for "
+                           "commands of 769 rows or more as pairs of chunks, 2.5% from the GPU alone on the Neural "
+                           "Engine's part (set up as calibrated before in ") &&
+              has(started.log, "; context " + grouped(contextWith(both)) + " tokens ("),
+          "the pair's split was not logged with its context: " + started.log);
+}
+
+// A pair that gains under 5% on the single chunk's command is remembered as none: the next start plans the split
+// alone and times nothing.
+void testPairsWithoutGain() {
+  Fake fake = pairing();
+  Started started = start(fake);
+  const std::string log =
+      timePairs(fake, started, [](uint32_t pairUnits, ops::AneFfn *) { return pairUnits ? 8.8 : 9.0; });
+  require(fake.remembered && fake.remembered->pairUnits == 0u && fake.remembered->aneUnits == 8 &&
+              fake.modesAsked == std::vector<Mode>{Mode::Single} &&
+              has(log, "Neural Engine FFN split runs no pairs of chunks: at share 0.32 a 2048-row prefill takes "
+                       "8.80 s against 9.00 as a single chunk (timed in "),
+          "a pair that gains too little was not remembered as none: " + log);
+  fake.modesAsked.clear();
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && !started.start.timePairs &&
+              fake.modesAsked == std::vector<Mode>{Mode::Single} &&
+              started.start.plan->breakdown().aneFfnBytes == fake.bytes(8),
+          "a start whose calibration holds no pair planned or timed one: " + started.log);
+}
+
+// Units the Neural Engine does not run a pair at give way to fewer: a split that does not build to time a command
+// ends the climb below it, and where the split that serves, of every function, builds at fewer units than the
+// timed one, the most that build are remembered. Where none runs, none is remembered.
+void testPairsUnitsThatDoNotBuild() {
+  const auto refused = [](uint32_t most) {
+    return [most](uint32_t pairUnits) {
+      if (pairUnits > most) throw std::runtime_error("ANECCompile() FAILED");
+    };
+  };
+  Fake fake = pairing();
+  fake.timingPair = refused(23);
+  Started started = start(fake);
+  std::string log = timePairs(fake, started);
+  require(fake.pairsTimed == std::vector<uint32_t>{11, 14, 17, 20, 23, 26, 22, 24} &&
+              fake.remembered->pairUnits == 23u &&
+              has(log, "Neural Engine FFN split runs no pair of chunks at share 0.76 (ANECCompile() FAILED)."),
+          "units no split was timed at did not end the climb below them: " + log);
+  fake = pairing();
+  fake.prepare = [&](uint32_t aneUnits, bool timed) {
+    if (fake.modesAsked.back() == Mode::Pair) refused(22)(aneUnits);
+    AneFfnPrepared prepared;
+    if (timed) prepared.chunks = timedChunks(15.5);
+    return prepared;
+  };
+  started = start(fake);
+  log = timePairs(fake, started);
+  require(fake.remembered->pairUnits == 22u && fake.prepared == std::pair(22u, false) &&
+              has(log, "runs no pair of chunks at share 0.74 (ANECCompile() FAILED).") &&
+              has(log, "as pairs of chunks at share 0.65 from the next start: a 2048-row prefill takes 7.50 s"),
+          "the split that serves did not give way to the units it builds at: " + log);
+  fake = pairing();
+  fake.timingPair = refused(0);
+  started = start(fake);
+  log = timePairs(fake, started);
+  require(fake.remembered->pairUnits == 0u && has(log, "Neural Engine FFN split runs no pairs of chunks (timed in "),
+          "a pair was remembered where no split runs one: " + log);
+}
+
+// The pair's split takes its memory beside the split's: with --max-context its units are timed within those whose
+// plan still holds the context, a start whose plan holds no pair beside the split offers to time none, and one
+// whose plan does not hold the remembered pair serves single chunks, at the context asked for.
+void testPairsWithinContext() {
+  Fake fake = pairing();
+  const uint32_t context = contextWith(fake.bytes(8) + fake.bytes(20));
+  Started started = start(fake, {}, {context});
+  const std::string log = timePairs(fake, started);
+  require(fake.pairsTimed == std::vector<uint32_t>{11, 14, 17, 20, 19} && fake.remembered->pairUnits == 20u,
+          "the pair's units were not timed within those the plan holds the context with: " + log);
+  fake.modesAsked.clear();
+  started = start(fake, {}, {context});
+  require(fake.modesAsked == std::vector<Mode>{Mode::Single, Mode::Pair} &&
+              started.start.plan->maximumContextTokens() >= context,
+          "the remembered pair was not served within the context asked for: " + started.log);
+  fake = pairing();
+  started = start(fake, {}, {contextWith(fake.bytes(8))});
+  require(started.start.outcome.kind == Kind::Split && !started.start.timePairs,
+          "a start whose plan holds no pair's split offered to time one");
+  const std::array<ChunkTimings::Gpu, 2> gpu{{{512, 5.0}, {2048, 20.0}}};
+  fake = pairing();
+  fake.stored = Calibration{.aneUnits = 9, .minimumRows = 700, .gpu = gpu, .pairUnits = 25};
+  started = start(fake, {}, {contextWith(fake.bytes(9))});
+  require(started.start.outcome.kind == Kind::Split && fake.modesAsked == std::vector<Mode>{Mode::Single} &&
+              !started.start.timePairs && started.start.plan->breakdown().aneFfnBytes == fake.bytes(9),
+          "a pair the plan does not hold the context with was served: " + started.log);
+}
+
+// A command that fails while pairs are timed leaves the calibration without them and warns, so that the next start
+// times them again; cancellation and a backend that stopped serving end the start. A remembered pair whose split
+// cannot be built leaves its commands single chunks, in the plan that set its memory aside.
+void testPairsFailures() {
+  Fake fake = pairing();
+  Started started = start(fake);
+  const AneFfnPairPrefill fails = [](uint32_t, ops::AneFfn *) -> double {
+    throw std::runtime_error("prefill warmup result mismatch");
+  };
+  const std::string log = timePairs(fake, started, fails);
+  require(!fake.remembered->pairUnits && has(log, "Warning · Neural Engine FFN split's pairs of chunks were not "
+                                                  "timed (prefill warmup result mismatch)."),
+          "a command that failed while pairs were timed did not warn: " + log);
+  bool cancelled = false;
+  fake = pairing();
+  started = start(fake, {}, {}, [&] { return cancelled; });
+  cancelled = true;
+  rejects([&] { static_cast<void>(timePairs(fake, started, fails)); }, "result mismatch",
+          "a cancelled start went on timing pairs");
+  fake = pairing();
+  started = start(fake);
+  fake.healthy = false;
+  rejects([&] { static_cast<void>(timePairs(fake, started, fails)); }, "result mismatch",
+          "pairs were timed on a backend that stopped serving");
+  const std::array<ChunkTimings::Gpu, 2> gpu{{{512, 5.0}, {2048, 20.0}}};
+  fake = pairing();
+  fake.stored = Calibration{.aneUnits = 9, .minimumRows = 700, .gpu = gpu, .pairUnits = 25};
+  fake.prepare = [&](uint32_t, bool) -> AneFfnPrepared {
+    if (fake.modesAsked.back() == Mode::Pair) throw std::runtime_error("ANE FFN second slot failed");
+    return {};
+  };
+  started = start(fake);
+  require(started.start.outcome.kind == Kind::Split && !started.start.pair &&
+              started.start.plan->breakdown().aneFfnBytes == fake.bytes(9) + fake.bytes(25) &&
+              has(started.log, "Warning · Neural Engine FFN split cannot run commands as pairs of chunks (ANE FFN "
+                               "second slot failed); they run as single chunks.") &&
+              !has(started.log, "as pairs of chunks,"),
+          "a pair's split that failed did not leave its commands single chunks: " + started.log);
+}
+
 } // namespace
 
 int main() {
@@ -745,9 +1206,18 @@ int main() {
     testFailures();
     testACommandOutOfMemoryIsCommandMemory();
     testNoGain();
+    testRefitMovesTheChoice();
+    testARefittedSplitThatFailsKeepsTheFirst();
+    testAFirstSplitThatDoesNotPrepareAgainIsRemembered();
+    testARefusedSplitIsNotCalibratedInALoop();
+    testAFailureThatIsNotARefusalKeepsTheCalibration();
     testRemembered();
-    testRefined();
     testGivenShare();
+    testPairsTimed();
+    testPairsWithoutGain();
+    testPairsUnitsThatDoNotBuild();
+    testPairsWithinContext();
+    testPairsFailures();
     std::cout << "ane ffn startup tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

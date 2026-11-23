@@ -176,6 +176,9 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
       Executor &executor = h.model;
       Events &events = h.events;
       engine::Engine &engine = h.engine;
+      // The test counts every state's buffers taken; a decode that captures
+      // states takes those of the page the 4127-token prompt's output reaches.
+      executor.decodeStateCaptures = false;
       if (disk) {
         executor.deniedReservations = 1000;
         executor.stateTier = std::make_shared<OffloadControl>();
@@ -828,6 +831,9 @@ void testSharedCheckpointSurvivesPeerReplayPoint() {
     Events &events = h.events;
     engine::Engine &engine = h.engine;
     executor.decodeFinishes = false;
+    // No reply checkpoints: the second lane's decode would publish its own,
+    // as memory allows, beside the prefill checkpoints counted here.
+    executor.decodeStateCaptures = false;
     // Checkpoints at 4096 and 8192, the replay state at 10400, too near 8192
     // for a tail checkpoint.
     std::vector<uint32_t> first(10401);
@@ -971,6 +977,9 @@ void suspendWithoutTheReplayPoint(test::EngineHarness &h, double &now, const std
   Executor &executor = h.model;
   Events &events = h.events;
   engine::Engine &engine = h.engine;
+  // Its decode captures no state (Model::capturesInDecode), so the deepest
+  // state it holds is its replay point.
+  executor.decodeStateCaptures = false;
   executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
   executor.beginGrowthBlocked = [&executor] {
     return executor.lastBeginId == 2 && executor.requests.at(1).resident;

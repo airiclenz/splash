@@ -42,6 +42,7 @@
 #include "metal/abi/AneFfn.h"
 #include "metal/abi/QuantFormat.h"
 #include "ops/AneFfn.hpp"
+#include "ops/AneFfnMeasurement.hpp"
 #include "ops/Linear.hpp"
 
 #include <algorithm>
@@ -92,6 +93,9 @@ constexpr uint32_t kHidden = 5120, kSegment = 2560, kIntermediate = 6144, kLayer
 // The most the split's output may differ from the GPU's alone, as the RMS of their difference relative to the GPU's:
 // int8 leaves about 1%.
 constexpr double kMaximumError = 0.05;
+// The most a chunk's rows on the GPU alone may differ from a full chunk's where Apple7/8 split K at short chunks, as
+// the RMS of their difference relative to the full chunk's: bf16's unit roundoff (the order leaves about 0.06%).
+constexpr double kBf16Roundoff = 0x1p-8;
 // What a kernel must leave as it was.
 constexpr uint8_t kUntouched = 0x5A;
 constexpr uint16_t kUntouchedHalf = 0x5A5A;
@@ -478,14 +482,19 @@ struct Chunk {
 };
 Chunk chunk(MetalBackend &backend, uint32_t rows) {
   const auto bf16Rows = [&](uint32_t width) { return test::sharedBuffer(backend, uint64_t{rows} * width * 2); };
-  // Chunks of at least kMinimumRows rows take no split scratch, but where the family runs the int8 prefill tile its
-  // codes and scales (Linear::prefillScratchSize).
+  // Where the family runs the int8 prefill tile, its codes and scales, and where it splits K in chunks of at least
+  // kMinimumRows rows (Apple7/8), the partials and counters of the projections and of the split's GPU part at any
+  // share, as the runtime's prefill arena sizes them (RuntimeArenas.cpp).
   const Linear linear(backend.capabilities(), Int8Activations::On);
-  LinearScratchSize size = linear.prefillScratchSize({kIntermediate, kHidden});
-  size.include(linear.prefillScratchSize({kHidden, kIntermediate}));
+  LinearScratchSize size = linear.scratchSize({kIntermediate, kHidden}, SPLASH_PREFILL_TOKEN_BUDGET);
+  size.include(linear.scratchSize({kHidden, kIntermediate}, SPLASH_PREFILL_TOKEN_BUDGET));
+  size.include(AneFfn::prefillScratchSize(linear, {kIntermediate, kHidden}));
   const auto bytes = [&](uint64_t count) { return count ? test::sharedBuffer(backend, count) : MetalBuffer{}; };
   return {{bf16Rows(kHidden), bf16Rows(kIntermediate), bf16Rows(kIntermediate),
-           {.input = bytes(size.input), .sums = bytes(size.sums)}},
+           {.input = bytes(size.input),
+            .sums = bytes(size.sums),
+            .partials = bytes(size.partials),
+            .counters = bytes(size.counters)}},
           {bf16Rows(kHidden), bf16Rows(kHidden)}};
 }
 // Normal values scaled by row(r) into the leading rows of the chunk's normalized rows.
@@ -517,7 +526,7 @@ Forward forward(MetalBackend &backend, const Linear &linear, const Model &model,
     if (splits)
       split->add(graph, layer, ffn, residual, output, rows);
     else
-      linear.addPrefillSwiGlu(graph, model.layers[layer], ffn, residual, output, rows);
+      linear.addSwiGlu(graph, model.layers[layer], ffn, residual, output, rows);
   }
   Forward result;
   const auto start = AwakeClock::now();
@@ -600,13 +609,40 @@ void split(MetalBackend &backend, const Linear &linear, const Model &model, cons
     test::rejects([&] { split->setMinimumRows(rows); }, "no function of",
                   model.name + ": a least chunk of " + std::to_string(rows) + " rows was taken");
   // verify() checks every function, in each slot, against the leading rows of a full chunk on the GPU
-  // alone, which computes every row alike whatever the chunk's rows.
+  // alone, which computes every row alike whatever the chunk's rows: bit for bit where no projection splits K, and
+  // where Apple7/8 split K at short chunks within fp32 summation order, which moves the rows by bf16's unit roundoff
+  // in RMS at most (values near zero differ by far more relatively, so no element bound holds).
+  const auto splitsK = [&](uint32_t rows) {
+    return std::any_of(model.layers.begin(), model.layers.end(), [&](const SwiGluProjections &layer) {
+      return linear.plan(*layer.gate, rows, LinearEpilogue::None).configuration().splits > 1 ||
+             linear.plan(*layer.up, rows, LinearEpilogue::UpWithGate).configuration().splits > 1 ||
+             linear.plan(*layer.down, rows, LinearEpilogue::Residual).configuration().splits > 1;
+    });
+  };
   const Forward full = forward(backend, linear, model, nullptr, chunk, AneFfn::kMaximumRows);
-  for (const uint32_t rows : {AneFfn::kMinimumRows, 700u})
-    if (const Forward fewer = forward(backend, linear, model, nullptr, chunk, rows);
-        !std::equal(fewer.bits.begin(), fewer.bits.end(), full.bits.begin()))
-      fail(model.name + ": the GPU computed the rows of a chunk of " + std::to_string(rows) +
-           " rows other than a full chunk's");
+  for (const uint32_t rows : {AneFfn::kMinimumRows, 700u}) {
+    const Forward fewer = forward(backend, linear, model, nullptr, chunk, rows);
+    const bool bitwise = std::equal(fewer.bits.begin(), fewer.bits.end(), full.bits.begin());
+    if (!splitsK(rows) && !splitsK(AneFfn::kMaximumRows)) {
+      if (!bitwise)
+        fail(model.name + ": the GPU computed the rows of a chunk of " + std::to_string(rows) +
+             " rows other than a full chunk's, and no projection splits K");
+      continue;
+    }
+    double largest = 0.0;
+    uint64_t unequal = 0;
+    for (uint64_t i = 0; i < fewer.bits.size(); ++i) {
+      unequal += fewer.bits[i] != full.bits[i];
+      largest = std::max(largest, std::fabs(double(fewer[i]) - full[i]));
+    }
+    const double error = difference(full, fewer).first;
+    std::cout << "  " << model.name << ", " << rows << " rows, split K: " << unequal << " of " << fewer.bits.size()
+              << " values differ from a full chunk's, by at most " << largest << ", " << 100.0 * error
+              << "% RMS\n";
+    if (!(error <= kBf16Roundoff))
+      fail(model.name + ": the GPU computed the rows of a chunk of " + std::to_string(rows) + " rows " +
+           std::to_string(100.0 * error) + "% RMS from a full chunk's, past fp32 summation order");
+  }
   const auto started = AwakeClock::now();
   const double error = split->verify(model.layers, chunk.ffn, chunk.hidden);
   std::cout << "  " << model.name << ": verified in " << millisecondsSince(started) << " ms, " << 100.0 * error
@@ -676,6 +712,31 @@ void pair(MetalBackend &backend, const Linear &linear, const Model &model) {
       split->pairRows(1100) != 512u || split->pairRows(577) != 256u || split->pairRows(477) != 256u)
     fail("pair: 2048, 256, 1100, 577 or 477 rows do not split as 1024, 128, 512, 256 and 256 first");
   section("pair: the rows of a command's two chunks");
+
+  // The split a start times a pair's command on holds the one function a full command's two chunks run, and runs
+  // them.
+  const std::unique_ptr<AneFfn> timing = ane_ffn::Measurement::pair(backend, linear, model.layers, kAneUnits, nullptr);
+  if (timing->pairRows(kMost) != kMost / 2) fail("pair: the split that times a pair does not halve a full command");
+  CommandGraph full;
+  if (!timing->begin()) fail("pair: the split that times a pair does not begin a command");
+  for (uint32_t layer = 0; layer < kLayers; ++layer)
+    for (const Chunk &part : chunks) {
+      timing->settle(full, &part);
+      timing->add(full, layer, part.ffn, part.hidden[layer & 1], part.hidden[(layer & 1) ^ 1], kRows[0], &part);
+    }
+  timing->settle(full);
+  static_cast<void>(timing->commit(full, {}).wait());
+  if (!timing->finish()) fail("pair: the split that times a pair: " + timing->reason());
+  section("pair: the split a start times a pair's command on runs a full command's two chunks");
+
+  // From the least rows a split is given, it takes no smaller command as two chunks, and the others as before.
+  split->setPairMinimumRows(768);
+  if (split->pairRows(767) || split->pairRows(768) != 384u || split->pairRows(kMost) != kMost / 2)
+    fail("pair: a split of pairs from 768 rows does not take 767 rows as none, 768 as 384 first and 2048 as 1024");
+  for (const uint32_t rows : {2 * kLeast - 1, kMost + 1})
+    test::rejects([&] { split->setPairMinimumRows(rows); }, "no pair of " + std::to_string(rows) + " rows",
+                  "a split took " + std::to_string(rows) + " rows for its least pair");
+  section("pair: the least rows of a command it takes as two chunks");
 
   // A split built without pairs takes no command as two chunks and refuses a second chunk of a layer.
   AneFfn single(backend, Linear(backend.capabilities(), Int8Activations::On), model.layers, kAneUnits, nullptr,

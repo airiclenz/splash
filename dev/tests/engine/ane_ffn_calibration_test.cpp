@@ -68,6 +68,26 @@ void testBandwidth() {
           "the ANE's fraction was not clamped to none or all of the bandwidth");
 }
 
+// A split layer timed at another share fits u again where the GPU's part takes the longer there, and T passes through
+// it: here 17 at 0.25 against G 15 and A 10, u = 0.2. Where the ANE's part takes the longer there, it says nothing of u.
+// On the M5 Max, whose ANE's part takes the longer at the low share by default (int8 activations), the low share
+// leaves u at none, and the fit chooses 6 of Qwen3.8-27B's 34 units; the split layer of 6 units, 13.84 ms against G's
+// 13.18, gives u = 0.065, which chooses the 7 a sweep of given shares found fastest (6 prefills 1.4-1.5% slower).
+void testRefit() {
+  const Model lines = fit({0.25, 15, 15}, {0.75, 5, 30});
+  const Model refitted = refit(lines, 0.25, 17);
+  require(near(refitted.u, 0.2) && near(refitted(0.25), 17) && near(refitted(0.5), 20),
+          "the bandwidth's term was not fitted at the share timed");
+  require(refit(refitted, 0.5, 30).u == refitted.u && refit(lines, 0.5, 30).u == 0.0,
+          "a split layer where the ANE's part takes the longer fitted the bandwidth's term");
+  const Timing low{14.0 / 34, 9.9673, 23.929}, high{27.0 / 34, 4.7526, 46.034};
+  const Model m5Max = fit(low, high);
+  require(m5Max.u == 0.0 && choose(m5Max, 15.834, 34, 33) == 6u, "the M5 Max's low share fitted u or chose not 6");
+  const Model atSix = refit(m5Max, 6.0 / 34, 13.84);
+  require(atSix.u > 0.06 && atSix.u < 0.07 && choose(atSix, 15.834, 34, 33) == 7u,
+          "the M5 Max's split layer at 6 units did not choose 7");
+}
+
 // T is least at the units where the GPU's part, slowed by the bandwidth, meets the ANE's, and the units chosen are
 // those whose T, or T a unit either way, is least at its longest: G(s) = 20 - 20 s and A(s) = 40 s meet at s = 1/3,
 // where of 10 units 3 (G 14, A 12; 16 a unit either way) beat 2 (G 16; 18 below) and 4 (A 16; 20 above), and of 100
@@ -187,24 +207,60 @@ void testMinimumRows() {
     rejects([&] { static_cast<void>(minimumRows(timings)); }, "not those of its functions", what + " were taken");
 }
 
-// A calibration as a line of text comes back as it was, and one of no split as none; a line of another tag or
-// version, with more or fewer fields, units without least rows or the GPU alone out of order or unusable is not one.
+// A split takes no chunk longer than another where it splits every chunk the other splits, each in at most 2% longer:
+// one faster at the most rows and alike elsewhere, one 1.25% slower at every function, and one whose 640-row function
+// takes 5.3 ms against 5.5, splitting from 533 rows against 553, do; one 3% slower at 1024 rows does not, nor one whose
+// 640-row function takes 6.0 ms, which splits from 603 rows and leaves chunks of 553 to 602 rows to the GPU alone, nor
+// one that splits none.
+void testSlowerNowhere() {
+  const ChunkTimings incumbent = functions(0.8, {{640, 5.5}});
+  require(slowerNowhere(incumbent, incumbent) && slowerNowhere(functions(0.8, {{640, 5.5}, {2048, 15.0}}), incumbent) &&
+              slowerNowhere(functions(0.81, {{640, 5.5}}), incumbent) &&
+              slowerNowhere(functions(0.8, {{640, 5.3}}), incumbent),
+          "a split no chunk of which took longer was refused");
+  require(!slowerNowhere(functions(0.8, {{640, 5.5}, {1024, 0.824 * gpuAt(1024)}}), incumbent) &&
+              !slowerNowhere(functions(0.8, {{640, 6.0}, {2048, 15.0}}), incumbent) &&
+              !slowerNowhere(functions(0.8, {{2048, 21.0}}), incumbent),
+          "a split that took chunks longer was taken");
+}
+
+// A calibration as a line of text comes back as it was, its refusals too, with its pair's units: none until a start
+// timed them, 0 where no pair gained. One of no split comes back as none with its refusals. A line of another tag or
+// version, with more or fewer fields, units without least rows, a pair's units that are no number or come without a
+// split, the GPU alone out of order or unusable, more refusals than kRefusals or a split beside kRefusals is not one.
 void testCalibrationText() {
-  const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}};
+  const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}, 1};
   const std::optional<Calibration> back = Calibration::parse(made.text());
   require(back && back->aneUnits == 8 && back->minimumRows == 655 && back->gpu[0].rows == 512 &&
-              back->gpu[0].milliseconds == 5.25 && back->gpu[1].rows == 2048 && back->gpu[1].milliseconds == 19.375,
+              back->gpu[0].milliseconds == 5.25 && back->gpu[1].rows == 2048 &&
+              back->gpu[1].milliseconds == 19.375 && back->refusals == 1 && !back->pairUnits,
           "a calibration did not come back as it was: " + made.text());
-  const std::optional<Calibration> none = Calibration::parse(Calibration{}.text());
-  require(none && !none->aneUnits && !none->minimumRows, "a calibration of no split did not come back");
-  for (const std::string_view line : {"", "ane-ffn-calibration-0 8 655 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-1 8 655 512 5.25 2048",
-                                      "ane-ffn-calibration-1 8 655 512 5.25 2048 19.375 1",
-                                      "ane-ffn-calibration-1 8 0 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-1 0 655 0 0 0 0",
-                                      "ane-ffn-calibration-1 8 655 2048 19.375 512 5.25",
-                                      "ane-ffn-calibration-1 8 655 512 0 2048 19.375",
-                                      "ane-ffn-calibration-1 8 655 512 nan 2048 19.375"})
+  for (const uint32_t pairUnits : {0u, 25u}) {
+    Calibration paired = made;
+    paired.pairUnits = pairUnits;
+    const std::optional<Calibration> again = Calibration::parse(paired.text());
+    require(again && again->aneUnits == 8 && again->minimumRows == 655 && again->refusals == 1 &&
+                again->pairUnits == pairUnits,
+            "a calibration did not come back with its pair's units: " + paired.text());
+  }
+  const std::optional<Calibration> none = Calibration::parse(Calibration{}.text()),
+                                   refused = Calibration::parse(Calibration{.refusals = 2}.text());
+  require(none && !none->aneUnits && !none->minimumRows && !none->refusals && !none->pairUnits && refused &&
+              !refused->aneUnits && refused->refusals == 2,
+          "a calibration of no split did not come back");
+  for (const std::string_view line : {"", "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375 0",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0 - 1",
+                                      "ane-ffn-calibration-3 8 0 512 5.25 2048 19.375 0 -",
+                                      "ane-ffn-calibration-3 0 655 0 0 0 0 0 -",
+                                      "ane-ffn-calibration-3 0 0 0 0 0 0 0 25",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0 25x",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0 -1",
+                                      "ane-ffn-calibration-3 8 655 2048 19.375 512 5.25 0 -",
+                                      "ane-ffn-calibration-3 8 655 512 0 2048 19.375 0 -",
+                                      "ane-ffn-calibration-3 8 655 512 nan 2048 19.375 0 -",
+                                      "ane-ffn-calibration-3 0 0 0 0 0 0 3 -",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 2 -"})
     require(!Calibration::parse(line), "\"" + std::string(line) + "\" was taken for a calibration");
 }
 
@@ -256,49 +312,63 @@ void testBreaker() {
 
 } // namespace
 
-// Refinement weighs the fit's units against their neighbours: a split layer of 10 ms at 12 units and 0.3 ms more a
-// unit either way (2.7-2.9% a unit near its least) moves the fit's 15 down and its 9 up to 12, timing a unit below
-// first; at the least it stays, after timing a unit either way; it moves at most 3 units, and not for gains under 2%
-// a unit, nor past one unit or the most units.
-void testRefine() {
+// The pair's units climb from the single chunks' 17 three at a time while each command takes 2% less, then move to a
+// neighbour's as a refinement does: a command of 8 s at 25 units and 0.2 s more a unit either way climbs to 26 and
+// moves down to 25. Units no split runs at end the climb, as where the compiler refuses more than 30: from 23 the
+// units climb to 29 and move up to 30. A pair that only loses comes back to the single chunks' units, for the caller
+// to weigh; none comes back where no units run.
+void testChoosePair() {
   std::vector<uint32_t> timedUnits;
-  const auto vee = [&](double slope) {
-    return [&timedUnits, slope](uint32_t aneUnits) {
-      timedUnits.push_back(aneUnits);
-      return 10.0 + slope * std::abs(static_cast<double>(aneUnits) - 12.0);
+  // A command's seconds at its units, 8 at `least` and 0.2 more a unit either way, none above `most`.
+  const auto vee = [&](uint32_t least, uint32_t most) {
+    return [&timedUnits, least, most](uint32_t pairUnits) -> std::optional<double> {
+      timedUnits.push_back(pairUnits);
+      if (pairUnits > most) return std::nullopt;
+      return 8.0 + 0.2 * std::abs(static_cast<double>(pairUnits) - least);
     };
   };
-  require(refine(15, 33, vee(0.3)) == 12u && timedUnits == std::vector<uint32_t>{15, 14, 13, 12},
-          "the fit's units above the least did not move down to it");
+  std::optional<PairTiming> pair = choosePair(17, 33, vee(25, 33));
+  require(pair && pair->units == 25 && near(pair->time, 8.0) &&
+              timedUnits == std::vector<uint32_t>{20, 23, 26, 29, 25, 24},
+          "the pair's units did not climb to the fastest command's");
   timedUnits.clear();
-  require(refine(9, 33, vee(0.3)) == 12u && timedUnits == std::vector<uint32_t>{9, 8, 10, 11, 12},
-          "the fit's units below the least did not move up to it");
+  pair = choosePair(23, 33, vee(33, 30));
+  require(pair && pair->units == 30 && timedUnits == std::vector<uint32_t>{26, 29, 32, 28, 30, 31},
+          "units no split runs at did not end the climb below them");
   timedUnits.clear();
-  require(refine(12, 33, vee(0.3)) == 12u && timedUnits == std::vector<uint32_t>{12, 11, 13},
-          "the least moved or was not timed a unit either way");
-  require(refine(20, 33, vee(0.3)) == 17u, "the refinement moved more than 3 units");
-  require(refine(14, 33, vee(0.15)) == 14u, "a gain under 2% a unit moved the fit's units");
-  require(refine(1, 33, vee(-0.3)) == 1u && refine(8, 8, vee(0.3)) == 8u,
-          "the refinement moved past one unit or the most units");
-  for (const auto &[chosen, most] : {std::pair{0u, 33u}, std::pair{9u, 8u}})
-    rejects([&] { static_cast<void>(refine(chosen, most, vee(0.3))); }, "no feasible units",
-            "a refinement of " + std::to_string(chosen) + " units of at most " + std::to_string(most));
-  rejects([] { static_cast<void>(refine(12, 33, [](uint32_t) { return std::numeric_limits<double>::quiet_NaN(); })); },
-          "not usable", "a timing of NaN refined units");
+  pair = choosePair(17, 33, vee(17, 33));
+  require(pair && pair->units == 17 && near(pair->time, 8.0),
+          "a pair that loses above the single chunks' units did not come back to them");
+  timedUnits.clear();
+  require(!choosePair(17, 33, vee(25, 0)) && timedUnits == std::vector<uint32_t>{20, 17, 16, 18},
+          "units were chosen where no split runs");
+  pair = choosePair(30, 33, vee(40, 33));
+  require(pair && pair->units == 33, "the climb did not end at the most units");
+  for (const auto &[single, most] : {std::pair{0u, 33u}, std::pair{9u, 8u}})
+    rejects([&] { static_cast<void>(choosePair(single, most, vee(25, 33))); }, "no feasible units",
+            "a pair beside " + std::to_string(single) + " units of at most " + std::to_string(most));
+  rejects([] { static_cast<void>(choosePair(17, 33, [](uint32_t) { return std::optional(0.0); })); }, "not usable",
+          "a command of 0 s chose units");
+  // The pair's split serves where its command takes 5% less than the single chunk's.
+  require(pairGains(10.0, 9.5) && !pairGains(10.0, 9.6), "the pair's gain is not 5%");
+  rejects([] { static_cast<void>(pairGains(10.0, std::numeric_limits<double>::infinity())); }, "not usable",
+          "a command of no usable time gained");
 }
 
 int main() {
   try {
     testFit();
     testBandwidth();
+    testRefit();
     testChoice();
     testUnusable();
     testMostUnits();
-    testRefine();
+    testChoosePair();
     testNoGain();
     testUsable();
     testNearestUnits();
     testMinimumRows();
+    testSlowerNowhere();
     testCalibrationText();
     testBreaker();
     std::cout << "ane ffn calibration tests passed\n";

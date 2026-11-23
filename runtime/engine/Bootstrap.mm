@@ -114,9 +114,10 @@ protocol::ProtocolLimits protocolLimitsFor(
   limits.maxPromptTokens = maxContext;
   limits.maxLogicalOutputTokens = maxContext;
   limits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
-  limits.maxSimulationTokens = model::ExecutionLimits::draftQueryRows;
+  // A mask row at a lane's anchor and after each of its verify rows' tokens.
+  limits.maxSimulationTokens = model::ExecutionLimits::targetVerifyRows;
   limits.maxMaskWords = model::maskWordsPerToken(capabilities.vocabularySize) *
-                        (model::ExecutionLimits::draftQueryRows + 1);
+                        (model::ExecutionLimits::targetVerifyRows + 1);
   return limits;
 }
 
@@ -250,7 +251,7 @@ void ServingRuntime::sampleThermalState() {
 RuntimeBootstrapReport ServingRuntime::requireWarmup(
     const EngineMemoryPlan &memoryPlan, std::span<const uint32_t> prefillRowClasses,
     model::RuntimeModel &modelRuntime, KvPool &kvPool, WarmupProgress progress,
-    ActualMemoryReporter memoryReporter) {
+    ActualMemoryReporter memoryReporter, const PairTimer &timePairs) {
   RuntimeBootstrapReport report = reportForPlan(memoryPlan);
   // Its steps: the prefill of the most rows, one of each row class, each
   // decode width and the state restore, each counted done as it ends.
@@ -305,11 +306,15 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
 
   {
     const KvPool::RunwayHold runway(kvPool);
+    // The split's pairs of chunks are timed on the prefill of the most rows,
+    // once one has created its pipelines.
     model::WarmupStepResult maximumPrefill =
-        run(RuntimeBootstrapStage::MaximumPrefill, report.warmup.maximumPrefill,
-            [&] {
-              return modelRuntime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
-            });
+        run(RuntimeBootstrapStage::MaximumPrefill, report.warmup.maximumPrefill, [&] {
+          const auto prefill = [&] { return modelRuntime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget); };
+          model::WarmupStepResult result = prefill();
+          if (timePairs) timePairs([&] { return prefill().wallSeconds; });
+          return result;
+        });
     report.warmup.maximumPrefillDetail = maximumPrefill.detail;
     // A pipeline is created the first time a dispatch names it, so a class of
     // prefill chunk no warmup ran would create its kernels while its request
@@ -541,7 +546,8 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
         resourcesPointer->memoryGovernor().growToTargets(loopPointer->monotonicMilliseconds(),
                                                          pressure ? pressure() : MemoryPressure::Normal);
         return report;
-      });
+      },
+      [resourcesPointer](const std::function<double()> &prefill) { resourcesPointer->timeAneFfnPairs(prefill); });
 
   return std::unique_ptr<ServingRuntime>(
       new ServingRuntime(std::move(resources), std::move(modelRuntime), std::move(nativeLoop), ready,

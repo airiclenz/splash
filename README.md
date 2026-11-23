@@ -167,9 +167,10 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--state-format bf16` | Use BF16 recurrent states, half the size. Default: FP32. |
 | `--prefill-bound-ms 1000` | Longest prefill GPU command buffer. Prefill ends a buffer at every layer, so 2048-token chunks still fit at most context lengths. Default: 2000 (`SPLASH_PREFILL_BOUND_MS`), so macOS does not abort long-context prefill for stalling the display (`ImpactingInteractivity`); after the first such abort the restarted engine bounds each whole command instead of each buffer (`--prefill-bound-scope command`), and each later abort halves the bound, down to 500. The bound yields to the Neural Engine FFN split: it never shrinks a prefill command below the split's calibrated least rows, rounded up to the tail alignment (256 on an M2 Pro with Qwen3.8-27B), so such a command may run past the bound; `--disable-ane` removes that floor. Unless a start gives `--prefill-bound-ms` or `--prefill-bound-scope` (or their variables), the bound an abort chose is kept in `~/Library/Application Support/Splash/prefill-bound.json` for this Mac model and macOS version and later starts begin from it; delete that file to reset. `--prefill-mode full` always sends whole 2048-token chunks. `/status` reports it as `scheduler.prefill_bound_ms`. |
+| `--cached-states exact` | Cache recurrent states unquantized. Default: 8-bit (INT8). |
 | `--activations bf16` | Use BF16 activations. Default: auto. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
-| `--ane-ffn-share 0.35 --ane-ffn-minimum-rows 520` | Fix the Neural Engine's share of the prefill FFN, and the least chunk rows it splits, instead of calibrating them at start; a fixed share also runs a command of 256 rows or more as two chunks, one's FFN on the Neural Engine beside the other's mixer, which gains only at a share above the calibrated one. Default: calibrated; `0` keeps the FFN on the GPU. |
+| `--ane-ffn-share 0.35 --ane-ffn-minimum-rows 520` | Fix the Neural Engine's share of the prefill FFN, and the least chunk rows it splits, instead of calibrating them at start; a fixed share also runs a command of 256 rows or more as two chunks, one's FFN on the Neural Engine beside the other's mixer, which gains only at a share above the calibrated one. Default: calibrated, with a higher share of its own for commands of 769 rows or more as two chunks, which the first start times and later starts serve; `0` keeps the FFN on the GPU. |
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
 
@@ -236,8 +237,8 @@ Each supported model pairs a trained DFlash2 draft with Metal kernels for its
 shapes. The runtime, scheduler, cache, and API are shared. Weights are
 converted to the kernels' layouts as they load, with no copy on disk; kernels
 ship precompiled, with no Xcode or local tuning required. Speculative decoding
-is the default decode path; `--no-speculation` decodes one token per step
-instead, with the draft loaded but idle.
+is the decode path; the fork's `--no-speculation` is refused at start until it
+is ported to 1.7's decode.
 [How Splash works](https://inco.ai/blog/splash/)
 
 ## More

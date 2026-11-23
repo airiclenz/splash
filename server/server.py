@@ -37,6 +37,7 @@ from . import (
     release_identity,
     serve_options,
     serve_record,
+    unix_socket,
 )
 from . import runtime as engine_runtime
 from .backend import (
@@ -45,7 +46,7 @@ from .backend import (
     ThinkingEndError,
     thinking_end_tokens,
 )
-from .chat_templates import ChatTemplateError, ChatTemplates
+from .chat_templates import ChatTemplateError, ChatTemplates, read_template_file
 from .connections import ConnectionSlots, HttpAdmission, RequestBodyReservation
 from .constraints import (
     ConstraintFactory,
@@ -69,6 +70,7 @@ from .http_security import (
     OriginRefused,
     RefusedOriginLog,
     authenticate,
+    socket_hosts,
     validate_headers,
 )
 from .images import MAX_IMAGE_BYTES
@@ -266,8 +268,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # The native job submitted last, which a failure cancels.
         self._submitted = None
         self._last_sse_write = time.monotonic()
+        # A UNIX socket's peer is a process on this Mac, whose end closes the
+        # connection, and macOS refuses the TCP options on one.
+        keepalive = (
+            () if self.request.family == socket.AF_UNIX else TCP_KEEPALIVE_OPTIONS
+        )
         try:
-            for level, option, value in TCP_KEEPALIVE_OPTIONS:
+            for level, option, value in keepalive:
                 self.request.setsockopt(level, option, value)
         except OSError as error:
             # macOS refuses options on a connection its client reset before
@@ -329,9 +336,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             min(self._unread_body, self.server.max_request_bytes)
         )
         try:
-            allowed_hosts = self.server.allowed_hosts | {
-                self.connection.getsockname()[0].lower()
-            }
+            allowed_hosts = self.server.allowed_hosts | socket_hosts(
+                self.connection.getsockname()
+            )
             self._allow_origin = validate_headers(
                 self.headers, allowed_hosts, self.server.allowed_origins
             )
@@ -1276,9 +1283,21 @@ class FrontendServer(HTTPServer):
         )
         self.api_key = api_key
         self.webui = webui
+        path = unix_socket.path(address[0])
+        if path is not None:
+            self.address_family = socket.AF_UNIX
+            address = path
+        # A UNIX socket's hold on its path, from its bind until it closes.
+        self._claim = None
         self.allowed_hosts = {
             host.lower().rstrip(".")
-            for host in (*allowed_hosts, address[0], "localhost", "127.0.0.1", "::1")
+            for host in (
+                *allowed_hosts,
+                *socket_hosts(address),
+                "localhost",
+                "127.0.0.1",
+                "::1",
+            )
             if host not in ("0.0.0.0", "::")
         }
         # As serve_options.parse_allowed_origin returns them.
@@ -1303,8 +1322,8 @@ class FrontendServer(HTTPServer):
             "id": self.instance_id,
             "pid": os.getpid(),
             "model": self.app.model,
-            "host": self.server_address[0],
-            "port": self.server_address[1],
+            "host": self.host,
+            "port": self.server_port,
             "started_at": self.started_at,
         }
         status["build"] = self.build_identity.as_dict()
@@ -1317,6 +1336,22 @@ class FrontendServer(HTTPServer):
         }
         status["console"] = console_stats()
         return status
+
+    @property
+    def host(self):
+        """Where it listens, as --host names it: the address it bound, or a
+        UNIX socket's unix:PATH."""
+        if self.address_family == socket.AF_UNIX:
+            return unix_socket.PREFIX + self.server_address
+        return self.server_address[0]
+
+    def server_bind(self):
+        if self.address_family != socket.AF_UNIX:
+            return super().server_bind()
+        self._claim = unix_socket.Claim(self.server_address)
+        self._claim.bind(self.socket)
+        # A UNIX socket has no port, which /status reports as none.
+        self.server_port = None
 
     def server_activate(self):
         super().server_activate()
@@ -1369,6 +1404,8 @@ class FrontendServer(HTTPServer):
 
     def server_close(self):
         super().server_close()
+        if self._claim is not None:
+            self._claim.close()
         self.connections.stop()
         self.connections.idle.wait(min(2.0, HTTP_IO_TIMEOUT))
 
@@ -1621,6 +1658,10 @@ class ListenError(Exception):
     """The HTTP server cannot listen at its address."""
 
 
+class OptionError(Exception):
+    """An option the served model's family cannot follow."""
+
+
 def _start_failed(args, error, failure):
     """End a start that failed, saying why in the log and, for the app, in
     the launcher's serve record (serve_record)."""
@@ -1694,6 +1735,23 @@ def main():
                 f"{args.model} is not prepared as a model of a family this "
                 "release serves: prepare it again"
             )
+        if args.reasoning_effort is not None and not (
+            family.chat_format.reasoning_switch
+        ):
+            # No effort reaches a model that opens its reasoning itself, so
+            # the server cannot set every request's.
+            raise OptionError(
+                f"--reasoning-effort cannot set how {args.model} reasons: a "
+                f"{family.name} model decides each turn whether to reason, "
+                "whatever effort its prompt names"
+            )
+        # A file that cannot be read stops the start before the tokenizer
+        # loads; whether its template serves requests is found with the
+        # tokenizer (ChatTemplates).
+        custom = None
+        if args.chat_template_file is not None:
+            custom = read_template_file(args.chat_template_file)
+            print_status(f"Chat template file · {args.chat_template_file}")
         # A tokenizer the loader cannot read fails with whatever its parsers
         # raise, such as a KeyError for a tokenizer.json without added_tokens:
         # each is the model's.
@@ -1710,7 +1768,7 @@ def main():
         thinking_end = thinking_end_tokens(
             tokenizer, args.thinking_end_text, family.chat_format
         )
-        chat_templates = ChatTemplates(tokenizer)
+        chat_templates = ChatTemplates(tokenizer, override=custom)
         print_status(f"Chat template · {chat_templates.describe()}")
         learned, save_learned = _recall_learned_bound(args)
         learned_options = (
@@ -1748,6 +1806,17 @@ def main():
         runtime.command_after_failure = _shorter_prefill_after_display_stall(
             args, model_root, learned, save_learned
         )
+
+        def engine_recovering(recovering):
+            # The record follows the engine once the server is ready, for
+            # what supervises it by the file (serve_record). It runs on the
+            # thread the change came on, which must not block (follow): a
+            # record that cannot be written is a queued warning line.
+            if recovering:
+                serve_record.recovering(args.serve_record)
+            else:
+                serve_record.recovered(args.serve_record)
+
         backend = NativeBackend(
             runtime,
             tokenizer,
@@ -1788,6 +1857,7 @@ def main():
             response_store=dialects.responses.ResponseStore(),
             served_model_names=args.served_model_name,
             announce_served_name=args.announce_served_name,
+            reasoning_effort=args.reasoning_effort,
             default_reasoning_effort=args.default_reasoning_effort,
             max_reasoning_effort=args.max_reasoning_effort,
             default_thinking_token_budget=args.thinking_token_budget,
@@ -1806,7 +1876,13 @@ def main():
         # The app takes the server for ready from its record alone: one that
         # cannot say so has not started (serve_record).
         serve_record.ready(args.serve_record)
-        address = f"http://{args.host}:{server.server_port}"
+        # Told at once of an engine that failed since its Ready.
+        backend.follow(engine_recovering)
+        address = (
+            server.host
+            if server.address_family == socket.AF_UNIX
+            else f"http://{args.host}:{server.server_port}"
+        )
         tokens = served.max_context_tokens
         context = f"{tokens // 1024}K" if tokens % 1024 == 0 else f"{tokens:,}"
         mode = "" if served.vision else " · text only"
@@ -1816,6 +1892,10 @@ def main():
         _start_failed(args, error, serve_record.engine_failure(error.event, str(error)))
     except ListenError as error:
         _start_failed(args, error, serve_record.failure(serve_record.PORT, str(error)))
+    except OptionError as error:
+        _start_failed(
+            args, error, serve_record.failure(serve_record.CONFIGURATION, str(error))
+        )
     except (
         ModelError,
         ChatTemplateError,

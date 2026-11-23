@@ -29,6 +29,41 @@ template <uint Count> struct moe_mma_formats {
   }
 };
 
+// Writes the elements of `acc` through write(row, column, v), the tile's `live` rows alone: a tile's grouped rows
+// start at its first_row and the next tile's follow its live rows (moe_expert_slab.h), so a partial tile's padding
+// rows are the next tile's. A full tile writes every row without the guard.
+template <uint FM, class Write>
+inline void moe_mma_store(thread float2 (&acc)[FN][FM], sgmatrix::Lane l, uint live, Write write) {
+  if (live == FM * 8) {
+    elements(acc, l, write);
+    return;
+  }
+  elements(acc, l, [&](uint row, uint column, float v) {
+    if (row < live) write(row, column, v);
+  });
+}
+
+// The grid formats on the column tile in a pass of Rows-row tiles (moe_mma_column_format but Q2_0, which the passes
+// run on their own paths). Their path is in the 8-row passes alone: in the 32-row pass it gained 6-12% on Flash-Next's
+// 64- and 128-row prefill chunks but cost its 2048-row chunk 0.6% with IQ2_XXS experts (M2 Max).
+template <ushort Rows> constexpr bool moe_mma_grid_column_format(uint format) {
+  return format != FmtQ20::Id && moe_mma_column_format(format, Rows);
+}
+// Whether one of a pass's formats (function constants 0 to Count - 1) is such a grid format: a constant of the
+// pipeline, so a pass of none holds none of their column path, and Q2_0's pipelines stay as they were.
+template <ushort Rows, uint Count> inline bool moe_mma_grid_column_pass() {
+  bool any = moe_mma_grid_column_format<Rows>(kMmaMoeFormat0) || moe_mma_grid_column_format<Rows>(kMmaMoeFormat1);
+  if constexpr (Count > 2)
+    any = any || moe_mma_grid_column_format<Rows>(kMmaMoeFormat2) || moe_mma_grid_column_format<Rows>(kMmaMoeFormat3);
+  return any;
+}
+// Runs body(f) for `format` when it is such a grid format.
+template <ushort Rows, uint Count, class Body> inline void moe_mma_grid_column(uint format, Body body) {
+  moe_mma_formats<Count>()(format, [&](auto f) {
+    if constexpr (moe_mma_grid_column_format<Rows>(decltype(f)::Id)) body(f);
+  });
+}
+
 // Runs body(integral_constant<uint, FM>) with the fewest 8-row fragments that hold a tile's live rows.
 template <ushort Rows, class Body> inline void moe_mma_live_rows(uint rows, Body body) {
   if constexpr (Rows == 8) body(integral_constant<uint, 1>{});
@@ -56,20 +91,32 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
   const MoeGgufSegment s =
       moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size, p.routed_format, p.shared_format,
                                slots, chunks, p.floor_slots, p.chunk_slots, 2, sw0, sw1, smeta);
-  device bfloat *x = input + ulong(t) * Rows * p.input_size;
-  const ulong out = ulong(t) * Rows * p.output_size;
+  device bfloat *x = input + ulong(tile.first_row) * p.input_size;
+  const ulong out = ulong(tile.first_row) * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * kColumns, thread_index = simd_group * 32 + simd_lane;
-  // A tile of at most MOE_GGUF_COLUMN_ROWS live rows runs the column tile (kernels/common/gguf_column_tile.h), as
+  // A tile of at most GGUF_COLUMN_ROWS live rows runs the column tile (kernels/common/gguf_column_tile.h), as
   // moe_expert_gguf's does: a GEMV in registers without a stage or barrier, where the staged MMA tile's padded 8-row
   // steps and their per-step stage barrier bound a one- or two-row tile, not DRAM. A decode tile of a sparse route
-  // (Qwen3.8-Flash-Next: ten of 512 experts a layer) is almost always such a tile. Q2_0 only, which has no pair
-  // table: measured on M1 Max, the column tile halves these tiles' time on Q2_0 but runs ~11% slower than the staged
-  // MMA on IQ3_XXS, whose heavier weights and dequant outweigh the stage it skips; formats not measured stay on the
-  // staged MMA.
+  // (Qwen3.8-Flash-Next: ten of 512 experts a layer) is almost always such a tile. Only the formats of
+  // moe_mma_column_format, which have no pair table: measured on M1 Max, the column tile halves these tiles' time on
+  // Q2_0 but runs ~11% slower than the staged MMA on IQ3_XXS, whose heavier weights and dequant outweigh the stage it
+  // skips; formats not measured stay on the staged MMA.
   if (moe_column_tile(tiles, t) && s.format == FmtQ20::Id) {
-    float sums[MOE_GGUF_COLUMN_ROWS];
-    column_dot<FmtQ20, MOE_GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane, 0,
+    float sums[GGUF_COLUMN_ROWS];
+    column_dot<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane, 0,
                                              p.input_size / 32, tl, sums);
+    for (uint row = 0; row < tile.rows; ++row)
+      output[out + ulong(row) * p.output_size + origin + simd_lane] = bfloat(sums[row]);
+    return;
+  }
+  if (moe_mma_grid_column_pass<Rows, 2>() && moe_column_tile(tiles, t) &&
+      moe_mma_grid_column_format<Rows>(s.format)) {
+    // The grid formats (moe_mma_grid_column_pass), whose grids are constant tables.
+    float sums[GGUF_COLUMN_ROWS];
+    moe_mma_grid_column<Rows, 2>(s.format, [&](auto f) {
+      column_dot<decltype(f), GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta,
+                                                    origin + simd_lane, 0, p.input_size / 32, tl, sums);
+    });
     for (uint row = 0; row < tile.rows; ++row)
       output[out + ulong(row) * p.output_size + origin + simd_lane] = bfloat(sums[row]);
     return;
@@ -84,7 +131,7 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
       accumulate<F, FM>(x, s.w0, s.w1, s.meta, p.input_size, origin, stage + simd_group * kSimdgroupStage, tl,
                         simd_lane, 0, p.input_size / kStep, acc);
     });
-    elements(acc, sgmatrix::lane_map(simd_lane), [&](uint row, uint column, float v) {
+    moe_mma_store(acc, sgmatrix::lane_map(simd_lane), tile.rows, [&](uint row, uint column, float v) {
       output[out + ulong(row) * p.output_size + origin + column] = bfloat(v);
     });
   });
@@ -104,14 +151,16 @@ template [[host_name("moe_expert_gguf_mma_m32_down_s2")]] kernel MoeExpertGgufMm
 // simdgroup parks bf16(gate) in its stage, which it no longer reads, and the up simdgroup writes bf16(up) * silu(gate)
 // as gguf_epilogue<EpUpWithGate> does, so the intermediate is bitwise that of the gate and up passes apart.
 //
-// A column tile (moe_column_tile: an expert's only tile, of at most MOE_GGUF_COLUMN_ROWS live rows) runs each
-// projection on the tile its own pass would take: the column tile for Q2_0, the 8-row MMA otherwise. Where gate and up
-// both take the column tile, a lane runs its column's two chains interleaved (column_dot_pair), whose FMAs overlap and
-// whose activation loads serve both; the even threadgroup's two simdgroups take its columns and the odd one's, which
-// has none. On an M2 Max (38 cores), against the two passes, a layer of Qwen3.8-Flash-Next's shape
-// (gguf-moe-benchmark flash-next) decodes 8 to 32 rows 3-16% faster in Q2_0 and 0.4-6% faster with IQ2_S or IQ3_XXS
-// gate and up, and Flash-Next Q2_0's decode cycle is 3.2-4.4% shorter at one to four lanes. Other tiles run the MMAs
-// that hold their live rows.
+// A column tile (moe_column_tile: an expert's only tile, of at most GGUF_COLUMN_ROWS live rows) runs each
+// projection on the tile its own pass would take: the column tile for the formats of moe_mma_column_format, the 8-row
+// MMA otherwise. Where Q2_0 gate and up both take the column tile, a lane runs its column's two chains interleaved
+// (column_dot_pair), whose FMAs overlap and whose activation loads serve both; the even threadgroup's two simdgroups
+// take its columns and the odd one's, which has none. On an M2 Max (38 cores), against the two passes, a layer of
+// Qwen3.8-Flash-Next's shape (gguf-moe-benchmark flash-next) decodes 8 to 32 rows 3-16% faster in Q2_0 and 0.4-6%
+// faster with IQ2_S or IQ3_XXS gate and up, and Flash-Next Q2_0's decode cycle is 3.2-4.4% shorter at one to four
+// lanes. IQ2_XXS and IQ2_S gate and up run column_dot on their own simdgroups, which beat their pair at pooled routing
+// (a verify's rows sharing their experts) on an M2 Max; their decode layer runs 8 to 32 rows 16-19% faster at random
+// routing and 1-4% at pooled than on the 8-row MMA. Other tiles run the MMAs that hold their live rows.
 template <ushort Rows, ushort Tables, uint Shared>
 kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
                                         device const MoeTileDescriptor *tiles [[buffer(1)]],
@@ -137,13 +186,16 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
                                                      p.up_routed_format, p.up_shared_format, slots, chunks,
                                                      p.floor_slots, p.chunk_slots, 1, usw0, usw1, usmeta);
   const uint K = p.input_size, N = p.output_size;
-  device bfloat *x = input + ulong(t) * Rows * K;
-  const ulong out = ulong(t) * Rows * N;
+  device bfloat *x = input + ulong(tile.first_row) * K;
+  const ulong out = ulong(tile.first_row) * N;
   const uint origin = group.x * kColumns, thread_index = simd_group * 32 + simd_lane;
   const bool up = simd_group == 1;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
   const bool column = moe_column_tile(tiles, t);
   const bool gate_column = column && gs.format == FmtQ20::Id, up_column = column && us.format == FmtQ20::Id;
+  const bool grid = moe_mma_grid_column_pass<Rows, 4>() && column;
+  const bool gate_grid = grid && moe_mma_grid_column_format<Rows>(gs.format);
+  const bool up_grid = grid && moe_mma_grid_column_format<Rows>(us.format);
   const auto product = [](float v, bfloat g) { return bfloat(float(bfloat(v)) * splash_silu(float(g))); };
   if (gate_column && up_column) {
     // As many simdgroups as the two passes' column tiles run: the even threadgroup's two take the odd one's columns
@@ -151,8 +203,8 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
     if (group.x % 2) return;
     // Q2_0 has no pair table, so tl is left unfilled here on purpose.
     const uint pair_column = origin + simd_group * kColumns + simd_lane;
-    float g[MOE_GGUF_COLUMN_ROWS], u[MOE_GGUF_COLUMN_ROWS];
-    column_dot_pair<FmtQ20, MOE_GGUF_COLUMN_ROWS>(x, tile.rows, K, gs.w0, gs.w1, gs.meta, us.w0, us.w1, us.meta,
+    float g[GGUF_COLUMN_ROWS], u[GGUF_COLUMN_ROWS];
+    column_dot_pair<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, K, gs.w0, gs.w1, gs.meta, us.w0, us.w1, us.meta,
                                                   pair_column, tl, g, u);
     for (uint row = 0; row < tile.rows; ++row)
       output[out + ulong(row) * N + pair_column] = product(u[row], bfloat(g[row]));
@@ -174,16 +226,22 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
   const sgmatrix::Lane l = sgmatrix::lane_map(simd_lane);
   static_assert(Rows * kColumns * sizeof(bfloat) <= kSimdgroupStage * sizeof(half), "the gate fits a stage");
   if (column) {
-    // At most MOE_GGUF_COLUMN_ROWS live rows, one fragment. Each simdgroup sums its projection on its own tile, the
+    // At most GGUF_COLUMN_ROWS live rows, one fragment. Each simdgroup sums its projection on its own tile, the
     // gate parks bf16(gate) in its stage, and both meet at the one barrier before the up writes the products: the
     // simdgroups may take different tiles (a shared expert of Q2_0 gate and another up format), so neither tile's
     // branch holds a barrier of its own.
     const bool on_column = up ? up_column : gate_column;
-    float sums[MOE_GGUF_COLUMN_ROWS];
+    float sums[GGUF_COLUMN_ROWS];
     float2 acc[FN][1];
+    const bool on_grid = up ? up_grid : gate_grid, on_dot = on_column || on_grid;
     if (on_column) {
-      column_dot<FmtQ20, MOE_GGUF_COLUMN_ROWS>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32,
+      column_dot<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32,
                                                table, sums);
+    } else if (on_grid) {
+      moe_mma_grid_column<Rows, 4>(s.format, [&](auto f) {
+        column_dot<decltype(f), GGUF_COLUMN_ROWS>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0,
+                                                      K / 32, table, sums);
+      });
     } else {
       zero(acc);
       moe_mma_formats<4>()(s.format, [&](auto f) {
@@ -191,18 +249,18 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
       });
     }
     if (!up) {
-      if (on_column)
+      if (on_dot)
         for (uint row = 0; row < tile.rows; ++row) gate[row * kColumns + simd_lane] = bfloat(sums[row]);
       else
         elements(acc, l, [&](uint row, uint column, float v) { gate[row * kColumns + column] = bfloat(v); });
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!up) return;
-    if (on_column)
+    if (on_dot)
       for (uint row = 0; row < tile.rows; ++row)
         output[out + ulong(row) * N + origin + simd_lane] = product(sums[row], gate[row * kColumns + simd_lane]);
     else
-      elements(acc, l, [&](uint row, uint column, float v) {
+      moe_mma_store(acc, l, tile.rows, [&](uint row, uint column, float v) {
         output[out + ulong(row) * N + origin + column] = product(v, gate[row * kColumns + column]);
       });
     return;
@@ -218,7 +276,7 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
     if (!up) elements(acc, l, [&](uint row, uint column, float v) { gate[row * kColumns + column] = bfloat(v); });
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (up)
-      elements(acc, l, [&](uint row, uint column, float v) {
+      moe_mma_store(acc, l, tile.rows, [&](uint row, uint column, float v) {
         output[out + ulong(row) * N + origin + column] = product(v, gate[row * kColumns + column]);
       });
   });

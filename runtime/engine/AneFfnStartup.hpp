@@ -30,6 +30,14 @@ struct AneFfnSetting final {
   // gives it.
   static constexpr uint32_t kGivenMinimumRows = 256;
   static_assert(kGivenMinimumRows >= ops::AneFfn::kMinimumRows && kGivenMinimumRows <= ops::AneFfn::kMaximumRows);
+  // A calibrated split runs single chunks, at the share timed on them. A
+  // command of this many rows or more runs as a pair of chunks on a second
+  // split of more units (AneFfnStart::pair): past the 768 rows that fill a
+  // function, where a single chunk pads to the next one's rows. On an M1 Max
+  // the 27B's 768-row prefill ran 206 tok/s as a pair at 0.71 against 211 as
+  // one chunk at the calibrated 0.50, and one of 816 rows 209 against 196.
+  static constexpr uint32_t kPairMinimumRows = 6 * ops::AneFfn::kProgramStep + 1;
+  static_assert(kPairMinimumRows >= 2 * ops::AneFfn::kMinimumRows && kPairMinimumRows <= ops::AneFfn::kMaximumRows);
   struct Given final {
     double share = 0.0;
     uint32_t minimumRows = kGivenMinimumRows;
@@ -69,19 +77,22 @@ struct AneFfnModel final {
   // that may run pairs of chunks or of one that does not
   // (ops::AneFfn::plannedBytes).
   std::function<uint64_t(uint32_t aneUnits, bool pairs)> plannedBytes;
-  // Calibration's timings (ops::ane_ffn::Measurement::time).
+  // Calibration's timings (ops::ane_ffn::Measurement::time), and the same of
+  // the split with the ANE taking `aneUnits`, on the layers they timed, less
+  // their GPU alone's `gpuAlone`.
   std::function<ops::ane_ffn::Timings()> time;
-  // The split layer of full chunks with the ANE taking `aneUnits` units, less
-  // the GPU alone's `gpuAlone` of time() (ops::ane_ffn::Measurement::split).
-  std::function<double(uint32_t aneUnits, double gpuAlone)> timeSplit;
+  std::function<ops::ane_ffn::Timing(uint32_t aneUnits, double gpuAlone)> timeAt;
   // The split that serves with the ANE taking `aneUnits`, verified, with its
   // chunks timed (ops::ane_ffn::Measurement::chunks) when `timeChunks`, run
   // as `mode` says. A model a test plays prepares no split.
   std::function<AneFfnPrepared(uint32_t aneUnits, bool timeChunks, ops::AneFfn::Mode mode)> prepare;
+  // The split a start times a pair's command at `aneUnits` on
+  // (ops::ane_ffn::Measurement::pair).
+  std::function<std::unique_ptr<ops::AneFfn>(uint32_t aneUnits)> timingPair;
   // This Mac's calibration of the split within `maxAneUnits` units, if one
-  // is remembered; remembering one; and forgetting it.
+  // is remembered; remembering one, true once kept; and forgetting it.
   std::function<std::optional<ops::ane_ffn::Calibration>(uint32_t maxAneUnits)> recall;
-  std::function<void(uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration)> remember;
+  std::function<bool(uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration)> remember;
   std::function<void(uint32_t maxAneUnits)> forget;
   // Whether the Metal backend still serves.
   std::function<bool()> healthy;
@@ -132,12 +143,25 @@ struct AneFfnSnapshot {
   double aneMilliseconds = 0.0;
 };
 
+// The seconds of a cold prefill of a full command on the engine once it
+// prefills: with `pair` taking it as a pair of chunks at `pairUnits`, or as a
+// single chunk on the start's split for none (AneFfnStart::timePairs).
+using AneFfnPairPrefill = std::function<double(uint32_t pairUnits, ops::AneFfn *pair)>;
+
 // The split a start runs and the memory plan that sets its memory aside,
-// both none without one, and the outcome.
+// both none without one, and the outcome. Beside a calibrated split, `pair`
+// takes the commands that run as pairs of chunks
+// (AneFfnSetting::kPairMinimumRows), at the units this Mac's calibration
+// holds for it, with its memory set aside too. Where the calibration holds
+// none yet, `timePairs` times them on `model`, the start's as the engine
+// holds it, and remembers the units, or that no pair gains enough: the next
+// start serves them, as its plan sets their memory aside.
 struct AneFfnStart final {
   std::unique_ptr<ops::AneFfn> split;
   std::optional<EngineMemoryPlan> plan;
   AneFfnOutcome outcome;
+  std::unique_ptr<ops::AneFfn> pair{};
+  std::function<void(const AneFfnModel &model, const AneFfnPairPrefill &prefill)> timePairs{};
 };
 
 // The prefill FFN's Neural Engine split of `model` as `setting` allows,
@@ -147,12 +171,18 @@ struct AneFfnStart final {
 // until the plan holds a split; then it logs that it sets the split up. The
 // split takes this Mac's calibration of the model within the units the plan
 // holds, once remembered; else it is calibrated: timed, its share chosen
-// (ops::ane_ffn::choose), the split that serves prepared, its chunks timed
-// and the least it takes found (ops::ane_ffn::minimumRows), and the outcome
-// remembered, a split or none. The split then judges itself against the GPU
+// (ops::ane_ffn::choose) and again once its split is timed there as the
+// fit's were (ops::ane_ffn::refit), taken where its split is prepared and takes no chunk
+// longer (ops::ane_ffn::slowerNowhere), the least chunk found (minimumRows), and the
+// outcome remembered, a split or none. The split then judges itself against the GPU
 // alone as calibrated (ops::ane_ffn::Breaker), which forgets the calibration
-// when it trips, so that the next start calibrates again; a given split
-// takes the given least chunk, no breaker, and nothing remembered. Logs the
+// when it trips; the Neural Engine's refusals count (ops::ane_ffn::Calibration). A
+// given split takes the given least chunk, no breaker, and nothing remembered. A
+// calibrated split serves single chunks; the commands that run as pairs of
+// chunks take a second split (AneFfnStart::pair), whose units a start times
+// on whole prefills once the engine runs them (AneFfnStart::timePairs): a
+// pair's Neural Engine works beside the other chunk's mixer, which no FFN
+// layer timed here shows. Logs the
 // outcome, a split a relaunch's context refuses in a plain line: the server,
 // not the user, asked for that context. A failure leaves the GPU alone,
 // unless `cancelled` returns true, the wait for the ANE was interrupted or

@@ -64,8 +64,10 @@ struct WaveLaw final {
 };
 using SplitLaw = std::variant<TierLaw, WaveLaw>;
 
-// Register tile against the staged tile for a decode step of `lanes` lanes,
-// by the unit's FormatClass: register where 4 * columnTiles * lanes <
+// Register tile against the staged tile for a plan of `tiles` table tiles
+// (8 rows each, a decode lane's verify rows where it was measured), one to
+// four, the most the register tile holds (Linear.hpp, kMaximumRegisterRows),
+// by the unit's FormatClass: register where 4 * columnTiles * tiles <
 // belowQuarters * cores (in quarter threadgroups per core); kAlways where it
 // takes the formats whatever the grid, 0 never.
 struct RegisterBoundary final {
@@ -80,23 +82,23 @@ struct ProjectionCalibration final {
   uint32_t spreadFromCores;
   // From this many cores a gate/up pair of one format may run in one pass.
   uint32_t onePassFromCores;
-  // One unsplit decode lane of fewer bits per weight than this, in
-  // sixteenths, runs the staged 16-row tile; 0 never.
+  // One unsplit table tile of rows (at most 8) of fewer bits per weight than
+  // this, in sixteenths, runs the staged 16-row tile; 0 never.
   uint32_t sixteenRowBelowBits16;
-  // The most waves of the 16-row tile one such lane runs in from there, under
+  // The most waves of the 16-row tile one such plan runs in from there, under
   // a wave law (sixteenRowLane); 0 never.
   uint32_t sixteenRowWaves;
-  // Prefill chunks of up to this many rows run the staged tile
-  // (<= kMaximumStagedPrefillRows); longer ones the prefill tile.
-  uint32_t stagedPrefillRows;
-  // The staged decode of a unit the int8 decode tiles take
-  // (UnitFormats::decodeInt8Takes) runs them on plans of at least this many
-  // rows (one lane's 16-row plan counts 16).
+  // A staged plan on the decode tiles of a unit the int8 decode tiles take
+  // (UnitFormats::decodeInt8Takes) runs them where it stores at least this
+  // many rows (a 16-row plan counts 16).
   uint32_t decodeInt8FromRows;
   // Longer prefill chunks of a unit the int8 prefill tile takes
   // (UnitFormats::prefillInt8Takes) run that tile, where the family's int8
   // matmul is faster than its bf16 one.
   bool prefillInt8;
+  // K-split tiers for long prefill chunks (GgufPrefill) over the chunk's
+  // 2D grid of 64-row by 64-column tiles; empty leaves prefill unsplit.
+  std::span<const SplitTier> prefillSplits{};
 };
 
 struct FloatTileCalibration final {
@@ -109,9 +111,9 @@ struct FloatTileCalibration final {
 };
 
 struct AttentionCalibration final {
-  // A dense prefill tile takes one history split per this many pages its
-  // rows read (PagedAttention.cpp).
-  uint32_t prefillPagesPerSplit;
+  // A dense tile of a sequence of tiles, a prompt chunk's or a 9- to 16-row
+  // lane's, takes one history split per this many pages its rows read.
+  uint32_t pagesPerSplit;
   // From this many pages each split of the longest tile or lane reads, a
   // dense split over INT8 pages scores INT8 queries (PagedAttention.cpp).
   uint32_t int8QueriesFromPages;
@@ -221,16 +223,14 @@ inline constexpr uint32_t kApple10SixteenRowBelowBits16 = 72;
 // most waves measured end to end (the 27B's gate/up passes, 17 per core).
 inline constexpr uint32_t kApple10SixteenRowWaves = 2;
 
-// Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile of its
-// rows with the decode split law (the prefill tile's outputs up to fp32
-// reassociation, gguf-projection checks it): 1.8-2.9x faster on a 17408 x
-// 5120 Q4_K (16-core M5 Pro). The prefill tile takes as long for 33 rows as
-// for 64, so up to 64 rows run the staged 64-row tile: 6-43% less time on
-// Apple10, 12-22% on a 10-core M4.
-// Larger Apple9 GPUs, unmeasured, keep the prefill tile past 32 rows.
-inline constexpr uint32_t kApple9StagedPrefillRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
-inline constexpr uint32_t kApple9SmallStagedPrefillRows = 64;
-inline constexpr uint32_t kApple10StagedPrefillRows = 64;
+// Prefill: 128-row tiles, past the decode tiles' 64 rows (KernelSelection.cpp:
+// the staged tile of a chunk's rows with the decode split law ran a 17408 x
+// 5120 Q4_K chunk of up to 32 rows 1.8-2.9x faster than the prefill tile on a
+// 16-core M5 Pro, within fp32 reassociation of its outputs, gguf-projection
+// checks it). The prefill tile takes as long for 33 rows as for 64, the staged
+// 64-row tile 6-43% less on Apple10 and 12-22% less on a 10-core M4; larger
+// Apple9 GPUs, unmeasured, take it too, which computes half the prefill
+// tile's rows.
 
 // Rotated PQ2_0 units decode in int8 activations on Apple10 and Apple11,
 // whose neural accelerators multiply int8 operands, from 16 rows: the 8-row
@@ -250,18 +250,12 @@ inline constexpr ProjectionCalibration kApple9Projection{
     .onePassFromCores = kNever,
     .sixteenRowBelowBits16 = 0,
     .sixteenRowWaves = 0,
-    .stagedPrefillRows = kApple9StagedPrefillRows,
     // Apple9's matrix operations share the FP32 pipe and multiply int8 at
     // 0.9x their bf16 rate (40-core M3 Max, measured): it keeps bf16
     // activations in decode and prefill, end to end unmeasured.
     .decodeInt8FromRows = kNever,
     .prefillInt8 = false,
 };
-inline constexpr ProjectionCalibration kApple9SmallProjection = [] {
-  ProjectionCalibration row = kApple9Projection;
-  row.stagedPrefillRows = kApple9SmallStagedPrefillRows;
-  return row;
-}();
 inline constexpr ProjectionCalibration kApple10Projection{
     .registerSplits = TierLaw{kRegisterTiers},
     .stagedSplits = kApple10StagedLaw,
@@ -270,10 +264,9 @@ inline constexpr ProjectionCalibration kApple10Projection{
     .onePassFromCores = kApple10OnePassFromCores,
     .sixteenRowBelowBits16 = kApple10SixteenRowBelowBits16,
     .sixteenRowWaves = kApple10SixteenRowWaves,
-    .stagedPrefillRows = kApple10StagedPrefillRows,
     .decodeInt8FromRows = kApple10DecodeInt8FromRows,
     // Apple10 and Apple11 multiply int8 faster than bf16, so every chunk past
-    // the staged tile runs the int8 prefill tile where it takes the formats:
+    // the decode tiles runs the int8 prefill tile where it takes the formats:
     // at least 1.13x less time than the bf16 tile over the 27B's projection
     // shapes in af4g64 and af5g64 at 65-2048 rows (M5 Max, M5 Pro and M6,
     // measured).
@@ -297,11 +290,25 @@ inline constexpr ProjectionCalibration kApple11Projection = [] {
 // 12288 x 5120 S4 0.264 against S1 0.302, Q4_K 5120 x 6144 S8 0.151 against
 // S4 0.164; at four lanes within 5% of either.
 inline constexpr SplitTier kMmaTiers[] = {{24, 512}};
+// Narrow prefill grids on Apple7/8's 64x64 MMA tile starve cores at S1:
+// Q8_0 320x10240 (Flash-Next hyper-connection down) gains 3.5-4.1x at
+// 128 rows (0.670-0.791 -> 0.193 ms at S8) and -38% at 384 rows (0.677 ->
+// 0.422 ms at S8) on a 38-core M2 Max, cutting 128/384-row appends on 64K
+// history by 13.7%/3.7% in decode-profile while leaving wide projections
+// (e.g. 2560x6144 at >= 1024 rows, 5120x17408 from 384 rows) unsplit.
+inline constexpr SplitTier kMmaPrefillTiers[] = {{8, 512, 8}};
+
+// Apple7/8's register tile over MLX affine units: a wave law, its constants a grid search's fit to the 27B MLX
+// 4-bit projections' fastest splits at one to four lanes on a 32-core M1 Max, weighted by their calls a decode step.
+// Summed over one to four lanes it leaves 1.2 ms a step from the fastest splits, where kRegisterTiers leave 7.6.
+inline constexpr WaveLaw kApple7AffineRegisterLaw{
+    .tile = {12, 10, 6}, .gateUpPair = {1, 0, 1}, .sixteenRowResident = 0, .partitionInputs = 1024, .maximumSplits = 16};
 
 // Apple7/8 decode on the register tile's F32 instances wherever every format
 // takes it: the MMA tile's per-element dequantization through threadgroup
-// memory bounds MLX 4-bit decode there. Prefill chunks of up to 32 rows run
-// the staged MMA tile of their rows, longer ones the 64-row MMA prefill tile.
+// memory bounds MLX 4-bit decode there. Other plans of up to 32 rows run
+// the staged MMA tile of their rows (kMaximumMmaStagedRows), longer ones the
+// 64-row MMA prefill tile.
 inline constexpr ProjectionCalibration kApple7Projection{
     .registerSplits = TierLaw{kRegisterTiers},
     .stagedSplits = TierLaw{kMmaTiers},
@@ -315,10 +322,10 @@ inline constexpr ProjectionCalibration kApple7Projection{
     .onePassFromCores = kNever,
     .sixteenRowBelowBits16 = 0,
     .sixteenRowWaves = 0,
-    .stagedPrefillRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS,
     // fp32-only matrix operations: bf16 activations in decode and prefill.
     .decodeInt8FromRows = kNever,
     .prefillInt8 = false,
+    .prefillSplits = kMmaPrefillTiers,
 };
 
 // ---- Float projections ----------------------------------------------------
@@ -342,7 +349,7 @@ inline constexpr FloatTileCalibration kApple10FloatTile{true, 16, 3, 4, 6};
 // of 8 pages or more scores INT8 queries, repaying their quantization once
 // per threadgroup: splits of 1-5 pages took up to 31% more, of 9 less (M6,
 // 20-core M5 Pro).
-inline constexpr AttentionCalibration kApple10Attention{.prefillPagesPerSplit = 32, .int8QueriesFromPages = 8};
+inline constexpr AttentionCalibration kApple10Attention{.pagesPerSplit = 32, .int8QueriesFromPages = 8};
 
 // No Apple9 GPU scores INT8 queries: on a 10-core M4 they took 8-12% longer,
 // its matrix operations sharing the FP32 pipe. Larger Apple9 GPUs, unmeasured,
@@ -358,7 +365,7 @@ inline constexpr AttentionCalibration kApple9Attention = [] {
 // after 4K tokens. Larger Apple9 GPUs, unmeasured, keep 32.
 inline constexpr AttentionCalibration kApple9SmallAttention = [] {
   AttentionCalibration row = kApple9Attention;
-  row.prefillPagesPerSplit = 64;
+  row.pagesPerSplit = 64;
   return row;
 }();
 
@@ -376,9 +383,8 @@ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device)
   if (gpu != GpuClass::Apple9)
     return {cores, gpu == GpuClass::Apple11 ? kApple11Projection : kApple10Projection, kApple10FloatTile,
             kApple10Attention};
-  const bool small = cores <= kApple9SmallGpuCores;
-  return {cores, small ? kApple9SmallProjection : kApple9Projection, kApple9FloatTile,
-          small ? kApple9SmallAttention : kApple9Attention};
+  return {cores, kApple9Projection, kApple9FloatTile,
+          cores <= kApple9SmallGpuCores ? kApple9SmallAttention : kApple9Attention};
 }
 
 } // namespace splash::ops

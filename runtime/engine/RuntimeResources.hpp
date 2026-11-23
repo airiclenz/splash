@@ -103,6 +103,8 @@ struct CacheDiskQuota final {
 struct RuntimeResourcesConfig {
   kv::Format kvFormat = kv::Format::Int8;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
+  // Cached states keep stateFormat rather than codes (--cached-states exact).
+  bool exactCachedStates = false;
   std::filesystem::path metallibPath;
   std::filesystem::path modelRoot;
   model::ModelDescriptor model;
@@ -160,9 +162,9 @@ struct RuntimeResourcesConfig {
   // --kv-window-trim off: a windowed target's pages keep every layer's K/V,
   // for validation that trimming changes no output (CacheWindowPolicy::trim).
   bool kvWindowTrim = true;
-  // --verify-rows: the rows of the draft's block a decode cycle verifies
-  // (model::budgetsVerifyRows); a benchmark round verifies every row so that
-  // rounds repeat one another.
+  // --verify-rows: the rows a decode cycle verifies (reportVerifyRows); a
+  // benchmark round verifies every row of a draft's block a lane (all) so
+  // that rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
   // --no-speculation: copied into the model's RuntimeContext; off skips the
   // draft proposal.
@@ -305,9 +307,9 @@ public:
   // finds a persistent tier emptied (CacheDirectory::engineFailed).
   void engineFailed() noexcept;
   // At a clean stop, after the engine's flush (Engine::flushRestorePoints):
-  // each state copy's label takes its state's current recency, both files
-  // reach the drive and the directory records a clean end. False when they
-  // did not; true at once without a persistent tier.
+  // the cache closes its tier (Cache::closePersistentTier), both files reach
+  // the drive and the directory records a clean end. False when they did
+  // not; true at once without a persistent tier.
   [[nodiscard]] bool closePersistentCache();
 
   [[nodiscard]] metal::MetalBackend &backend() noexcept { return *backend_; }
@@ -333,6 +335,11 @@ public:
   [[nodiscard]] const AneFfnOutcome &aneFfnOutcome() const noexcept { return aneFfnOutcome_; }
   // The split as it stands now, for /status.
   [[nodiscard]] AneFfnSnapshot aneFfnSnapshot() const;
+  // Times the units of the split's pairs of chunks where the start has yet
+  // to (AneFfnStart::timePairs): `prefill` returns the seconds of a cold
+  // prefill of a full command on the model's runtime, which takes the split
+  // being timed from modelContext(). Nothing otherwise.
+  void timeAneFfnPairs(const std::function<double()> &prefill);
   // The streamed PLE table's store (--ple-memory), if the model has one.
   [[nodiscard]] std::optional<model::SparseRowStats> streamedTableStats() const;
   // The streamed routed experts' store (--expert-memory), if the model has one.
@@ -351,7 +358,7 @@ public:
   [[nodiscard]] std::optional<model::KvBlockCacheStats> kvBlockCacheStats() const;
   [[nodiscard]] std::optional<model::KvHistoryStreamStats> kvHistoryStreamStats() const;
 
-  [[nodiscard]] model::RuntimeContext modelContext() noexcept;
+  [[nodiscard]] model::RuntimeContext modelContext();
   // What the engine gives back while idle (NativeLoopConfig::weights): the
   // weight images, and the Neural Engine split's program if it runs one.
   [[nodiscard]] ReleasableMemory &releasableMemory() noexcept { return releasableMemory_; }
@@ -374,7 +381,8 @@ private:
                    std::unique_ptr<DiskSpace> diskSpace,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+                   std::unique_ptr<ops::AneFfn> aneFfn, std::unique_ptr<ops::AneFfn> aneFfnPair,
+                   AneFfnOutcome aneFfnOutcome,
                    std::unique_ptr<model::KvBlockCache> blockCache,
                    std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
                    model::VerifyRows verifyRows, bool isSpeculationEnabled);
@@ -405,10 +413,18 @@ private:
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   std::unique_ptr<ops::AneFfn> aneFfn_;
+  // The split that takes the commands aneFfn_ runs as pairs of chunks
+  // (AneFfnStart::pair); what times its units until a start has; and the one
+  // the model's commands run on, which modelContext() hands over by address:
+  // aneFfnPair_, or the one being timed.
+  std::unique_ptr<ops::AneFfn> aneFfnPair_;
+  std::function<void(const AneFfnPairPrefill &)> timeAneFfnPairs_;
+  ops::AneFfn *servingPair_ = nullptr;
   // A spill-capable target's readers of its spilled KV; none for another.
   std::unique_ptr<model::KvBlockCache> blockCache_;
   std::unique_ptr<model::KvHistoryStream> historyStream_;
-  // Over model_'s images, its expert store if it has one, and aneFfn_.
+  // Over model_'s images, its expert store if it has one, aneFfn_ and
+  // aneFfnPair_.
   ReleasableMemory releasableMemory_;
   AneFfnOutcome aneFfnOutcome_;
   // --kv-spill always.

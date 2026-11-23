@@ -60,7 +60,7 @@ public:
   // The GPU part's down projection is a view of leading inputs, which only
   // the prefill residual tiles (GgufPrefill, GgufPrefillInt8) run: no chunk
   // the split takes stages.
-  static_assert(kMinimumRows > kMaximumStagedPrefillRows, "the split's chunks run the prefill residual tiles");
+  static_assert(kMinimumRows > kMaximumDecodeTileRows, "the split's chunks run the prefill residual tiles");
 
   // The ANE takes `aneUnits` of the units() of intermediate channels, and
   // the GPU the rest through `linear`'s prefill plans. The program is
@@ -88,6 +88,12 @@ public:
   // The units the split moves intermediate channels in, of `layers`, which
   // it takes: the ANE takes from one to all but one of them.
   [[nodiscard]] static uint32_t units(std::span<const SwiGluProjections> layers);
+  // The scratch `linear`'s prefill plans of the GPU's part of gate and up
+  // take, of a split of layers whose gate is of `gate`'s shape, at every
+  // share the ANE can take: their narrower grids split K where the full
+  // projections' do not (Apple7/8). None for a gate the split does not take.
+  // Down's part, a view of leading inputs, runs unsplit (Linear::plan).
+  [[nodiscard]] static LinearScratchSize prefillScratchSize(const Linear &linear, ProjectionShape gate);
   // The Metal memory of the split of `layers` with the ANE taking `aneUnits`,
   // of a Pair or Fallback when `pairs`, a Single otherwise.
   [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits,
@@ -132,10 +138,12 @@ public:
   // leaves unwritten show; each through begin(), the layers encoded as add()
   // encodes them, commit() and its completion check; each against the
   // leading rows of a full chunk on the GPU, which computes every row alike
-  // whatever the chunk's rows. Returns the largest error of what the ANE
-  // adds to the GPU's part (AneFfn.cpp). Throws if an output is not finite,
-  // that error exceeds its bound or the ANE's work fails, which stops the
-  // split.
+  // whatever the chunk's rows: bit for bit where no projection splits K, and
+  // within fp32 summation order where Apple7/8 split K at short chunks (the
+  // comparison holds within its error bound either way). Returns the largest
+  // error of what the ANE adds to the GPU's part (AneFfn.cpp). Throws
+  // ane::Refused if an output is not finite, that error exceeds its bound or
+  // the ANE's work fails, which stops the split.
   [[nodiscard]] double verify(std::span<const SwiGluProjections> layers, const PrefillFfnBuffers &ffn,
                               const std::array<metal::MetalBuffer, 2> &hidden);
 
@@ -158,6 +166,9 @@ public:
   // against 4.9 s as 640 and 418. The caller decides whether the command
   // splits at all (splits()).
   [[nodiscard]] std::optional<uint32_t> pairRows(uint32_t rows) const;
+  // The least rows of a command pairRows() takes: two chunks of kMinimumRows
+  // until set, and from there to kMaximumRows.
+  void setPairMinimumRows(uint32_t rows);
   // Whether the split stopped, and why.
   [[nodiscard]] bool retired() const { return handoff_.retired(); }
   [[nodiscard]] std::string reason() const { return handoff_.reason(); }
@@ -324,7 +335,7 @@ private:
   metal::MetalBackend &backend_;
   const Linear linear_;
   Shape shape_;
-  uint32_t minimumRows_ = kMinimumRows;
+  uint32_t minimumRows_ = kMinimumRows, pairMinimumRows_ = kSlots * kMinimumRows;
   // The slots and weight sets the split was built with (Mode).
   uint32_t slots_ = 1, sets_ = 2;
   std::vector<Layer> layers_;

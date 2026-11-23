@@ -54,6 +54,12 @@ struct Model final {
 // The model through the timings of a low and a high share
 // (AneFfnCalibration.cpp). Throws unless the low share is the lower.
 [[nodiscard]] Model fit(const Timing &low, const Timing &high);
+// `model` with its bandwidth's term u fit to `split`, a full chunk's split
+// layer timed at `share`, where the GPU's part takes the longer there; the
+// same model where the ANE's part does (AneFfnCalibration.cpp). Calibration
+// fits u so at the low share, then at the units the model first chooses,
+// nearest T's least.
+[[nodiscard]] Model refit(Model model, double share, double split);
 
 // The ANE's channel units, of the `units` the intermediate channels hold, at
 // which chunks split, at most `maxAneUnits` of them: those at which T, or T a
@@ -62,14 +68,6 @@ struct Model final {
 // of the GPU alone.
 [[nodiscard]] std::optional<uint32_t> choose(const Model &model, double gpuAlone, uint32_t units,
                                              uint32_t maxAneUnits);
-// The units, from `chosen` within one to `maxAneUnits`, whose split layer of
-// a full chunk `timed` measures least, moving a unit at a time while each
-// gains enough (AneFfnCalibration.cpp): the fit through two shares can put
-// choose()'s units off the fastest on a Mac whose parts are not the lines it
-// assumes. Throws for `chosen` outside those units or a timing that is not
-// usable().
-[[nodiscard]] uint32_t refine(uint32_t chosen, uint32_t maxAneUnits,
-                              const std::function<double(uint32_t aneUnits)> &timed);
 
 // A chunk's FFN layer in milliseconds: the GPU's alone at the least and the
 // most rows of the split's functions, and the split's of each function, from
@@ -90,20 +88,62 @@ struct ChunkTimings final {
 // chunk of the functions splits (AneFfnCalibration.cpp); none when not even
 // a chunk of the most rows does.
 [[nodiscard]] std::optional<uint32_t> minimumRows(const ChunkTimings &timings);
+// Whether the split `candidate` times splits every chunk the split
+// `incumbent` times splits, none of them more than the timings' noise longer
+// (AneFfnCalibration.cpp).
+[[nodiscard]] bool slowerNowhere(const ChunkTimings &candidate, const ChunkTimings &incumbent);
+
+// A split's units and a full command's time as a pair of chunks on it
+// (ops::AneFfn::pairRows).
+struct PairTiming final {
+  uint32_t units = 0;
+  double time = 0.0;
+};
+// The units, within `mostUnits`, whose command runs fastest as a pair of
+// chunks beside single chunks at `singleUnits`, as `timed` measures a
+// command at the units it is given, none where no split of them runs
+// (AneFfnCalibration.cpp); none where no units run one. Throws for no
+// feasible units or a time that is not usable().
+[[nodiscard]] std::optional<PairTiming>
+choosePair(uint32_t singleUnits, uint32_t mostUnits,
+           const std::function<std::optional<double>(uint32_t pairUnits)> &timed);
+// Whether a full command that takes `pair` as a pair of chunks gains enough on
+// one that takes `single` as one chunk for the pair's split to serve.
+[[nodiscard]] bool pairGains(double single, double pair);
 
 // What one calibration of the split on this Mac decided, which later starts
 // take again (engine::startAneFfn): the ANE's units and the least rows of a
-// chunk the split takes, none of either when no split gained enough; and the
+// chunk the split takes, none of either when no split gained enough; the
 // GPU alone's layer at the least and the most rows of the split's functions,
-// which the breaker judges the split against.
+// which the breaker judges the split against. Beside it, how often the
+// Neural Engine refused a split of the model (ane::Refused) since the start
+// that first calibrated it: a record of no split and one refusal calibrates
+// again, and the next refusal leaves no split and kRefusals, the GPU alone,
+// so that a split the Neural Engine refuses each time costs two calibrations
+// at most, not one every other start.
+// And the units of the split that runs commands as pairs of chunks, 0 where
+// none gained enough, none until a start has timed them.
 struct Calibration final {
+  static constexpr uint32_t kRefusals = 2;
   uint32_t aneUnits = 0, minimumRows = 0;
   std::array<ChunkTimings::Gpu, 2> gpu{};
+  uint32_t refusals = 0;
+  std::optional<uint32_t> pairUnits{};
 
+  // What the next start does with `record`, as remembered, in a log's words:
+  // sets its split up, calibrates again or leaves the GPU alone.
+  [[nodiscard]] static std::string nextStart(const std::optional<Calibration> &record);
+  // Why a start that takes this record, of no split, leaves the GPU alone, in
+  // a log's words: no split gained enough, or the Neural Engine refused one.
+  [[nodiscard]] std::string withoutSplit() const;
   // As one line of text, and back: none for text that is not such a line.
   [[nodiscard]] std::string text() const;
   [[nodiscard]] static std::optional<Calibration> parse(std::string_view text);
 };
+// The record `recalled` once the Neural Engine refused the split a start
+// prepared: `kept`, the calibration the next start sets up, or none, with the
+// refusal counted, and none at Calibration::kRefusals.
+[[nodiscard]] Calibration refused(const std::optional<Calibration> &recalled, Calibration kept = {});
 
 // When a split that serves loses to the GPU alone (AneFfnCalibration.cpp):
 // over each kWindow commands it finishes, the Neural Engine's milliseconds

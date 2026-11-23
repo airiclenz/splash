@@ -1208,7 +1208,7 @@ void testConstrainedMaskExchange() {
                 asked->wordsPerMask == 3 && asked->simulationTokens.empty(),
             "constrained request did not ask for one initial mask row");
 
-    protocol::MaskResponseFrame response{7, asked->maskRequestId, {1, 0, 0}};
+    protocol::MaskResponseFrame response{7, asked->maskRequestId, {1, 0, 0}, {}};
     if (reply == Reply::WrongMaskId)
       ++response.maskRequestId;
     if (reply == Reply::WrongWordCount)
@@ -1247,7 +1247,7 @@ void testConstrainedMaskExchange() {
       require(verify && verify->requestId == 7 && verify->wordsPerMask == 3 &&
                   verify->simulationTokens.size() == 8,
               "the first constrained cycle did not ask for its verify mask");
-      protocol::MaskResponseFrame rows{7, verify->maskRequestId, {}};
+      protocol::MaskResponseFrame rows{7, verify->maskRequestId, {}, {}};
       for (size_t row = 0; row <= verify->simulationTokens.size(); ++row)
         rows.maskWords.insert(rows.maskWords.end(), {1, 0, 0});
       send(rows);
