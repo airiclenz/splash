@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import quote
 
+import transformers
+
 from dev.tests.server_fixtures import (
     PATHS,
     CharTokenizer,
@@ -350,7 +352,7 @@ class ServedModelNamesTests(unittest.TestCase):
                 / "prefill-bound.json",
             ),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=object()
+                transformers.AutoTokenizer, "from_pretrained", return_value=object()
             ),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "check_capabilities"),

@@ -97,8 +97,7 @@ GGUF_DECODE_MMA_FUSED(8) GGUF_DECODE_MMA_FUSED(16) GGUF_DECODE_MMA_FUSED(24) GGU
 #undef GGUF_SEGMENT
 
 // The prefill kernels: grid (64-row tiles of the chunk, column tiles of the segment), four simdgroups; the residual
-// and gate kernels read aux at buffer 5, the plain one binds none (as gguf_prefill_*). The plain kernel also writes
-// fp32 (_a_f32): a decode step of 33 to 64 rows runs here, and its logits are fp32 (FloatOutput::Float32).
+// and gate kernels read aux at buffer 5, the plain one binds none (as gguf_prefill_*).
 template <class F, GgufEpilogue Ep, class Out = bfloat>
 inline void gguf_prefill_mma(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta,
                              device Out *output, device bfloat *aux, constant GgufPrefillParams &p, uint2 group,
@@ -113,31 +112,32 @@ inline void gguf_prefill_mma(device bfloat *input, device uchar *w0, device ucha
                     output[o] = gguf_epilogue<Ep, Out>(v, aux, o);
                   });
 }
-#define GGUF_PREFILL_MMA_BUFFERS_OF(Out)                                                                           \
+#define GGUF_PREFILL_MMA_BUFFERS(Out)                                                                              \
   device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]],             \
       device uchar *meta [[buffer(3)]], device Out *output [[buffer(4)]]
-#define GGUF_PREFILL_MMA_BUFFERS GGUF_PREFILL_MMA_BUFFERS_OF(bfloat)
 #define GGUF_PREFILL_MMA_THREAD                                                                                    \
   uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],                      \
       uint simd_group [[simdgroup_index_in_threadgroup]]
 #define GGUF_PREFILL_MMA_TABLES(F)                                                                                 \
   threadgroup half2 tl[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];                                     \
   threadgroup half stage[2 * kPrefillStage]
-#define GGUF_PREFILL_MMA_PLAIN(F, f, ep, Out)                                                                      \
-  kernel void gguf_prefill_mma_##f##_##ep(GGUF_PREFILL_MMA_BUFFERS_OF(Out),                                        \
-                                          constant GgufPrefillParams &p [[buffer(5)]], GGUF_PREFILL_MMA_THREAD) {  \
+#define GGUF_PREFILL_MMA(F, f, suffix, Out)                                                                        \
+  kernel void gguf_prefill_mma_##f##_##suffix(GGUF_PREFILL_MMA_BUFFERS(Out),                                       \
+                                              constant GgufPrefillParams &p [[buffer(5)]],                         \
+                                              GGUF_PREFILL_MMA_THREAD) {                                           \
     GGUF_PREFILL_MMA_TABLES(F);                                                                                    \
-    gguf_prefill_mma<F, EpNone>(input, w0, w1, meta, output, nullptr, p, group, simd_lane, simd_group, stage, tl); \
+    gguf_prefill_mma<F, EpNone, Out>(input, w0, w1, meta, output, nullptr, p, group, simd_lane, simd_group, stage, \
+                                     tl);                                                                          \
   }
-#define GGUF_PREFILL_MMA(F, f) GGUF_PREFILL_MMA_PLAIN(F, f, a, bfloat) GGUF_PREFILL_MMA_PLAIN(F, f, a_f32, float)
 #define GGUF_PREFILL_MMA_EPILOGUE(F, f, ep, Ep)                                                                    \
-  kernel void gguf_prefill_mma_##f##_##ep(GGUF_PREFILL_MMA_BUFFERS, device bfloat *aux [[buffer(5)]],            \
+  kernel void gguf_prefill_mma_##f##_##ep(GGUF_PREFILL_MMA_BUFFERS(bfloat), device bfloat *aux [[buffer(5)]],      \
                                           constant GgufPrefillParams &p [[buffer(6)]], GGUF_PREFILL_MMA_THREAD) {  \
     GGUF_PREFILL_MMA_TABLES(F);                                                                                    \
     gguf_prefill_mma<F, Ep>(input, w0, w1, meta, output, aux, p, group, simd_lane, simd_group, stage, tl);         \
   }
-#define GGUF_PREFILL_MMA_FORMAT(F, f) \
-  GGUF_PREFILL_MMA(F, f) GGUF_PREFILL_MMA_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_MMA_EPILOGUE(F, f, g, EpUpWithGate)
+#define GGUF_PREFILL_MMA_FORMAT(F, f)                                                                              \
+  GGUF_PREFILL_MMA(F, f, a, bfloat) GGUF_PREFILL_MMA(F, f, a_f32, float)                                           \
+      GGUF_PREFILL_MMA_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_MMA_EPILOGUE(F, f, g, EpUpWithGate)
 QUANT_FORMATS(GGUF_PREFILL_MMA_FORMAT)
 #undef GGUF_PREFILL_MMA_FORMAT
 
@@ -145,7 +145,8 @@ QUANT_FORMATS(GGUF_PREFILL_MMA_FORMAT)
 // projection, one per format: the planes advance past the groups and meta units the view leaves unread in the rows of
 // the plane tiles before the column tile, as gguf_prefill_*_r_leading_inputs does for the MPP tile.
 #define GGUF_PREFILL_MMA_LEADING_INPUTS(F, f)                                                                      \
-  kernel void gguf_prefill_mma_##f##_r_leading_inputs(GGUF_PREFILL_MMA_BUFFERS, device bfloat *aux [[buffer(5)]],  \
+  kernel void gguf_prefill_mma_##f##_r_leading_inputs(GGUF_PREFILL_MMA_BUFFERS(bfloat),                            \
+                                                      device bfloat *aux [[buffer(5)]],                            \
                                                       constant GgufPrefillLeadingParams &leading [[buffer(6)]],    \
                                                       GGUF_PREFILL_MMA_THREAD) {                                   \
     GGUF_PREFILL_MMA_TABLES(F);                                                                                    \
@@ -162,8 +163,8 @@ QUANT_FORMATS(GGUF_PREFILL_MMA_LEADING_INPUTS)
 #undef GGUF_PREFILL_MMA_LEADING_INPUTS
 
 // Split-K prefill kernels: grid (64-row tiles, column tiles of the segment, K partitions), uniform 8-buffer binding
-// with `aux` unused for plain projections, the plain one into fp32 too (_a_f32).
-template <class F, GgufEpilogue Ep, class Out>
+// with `aux` unused for plain projections.
+template <class F, GgufEpilogue Ep, class Out = bfloat>
 inline void gguf_prefill_mma_split(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta,
                                    device Out *output, device coherent(device) float *partials,
                                    device atomic_uint *counters, device bfloat *aux,
@@ -187,7 +188,7 @@ inline void gguf_prefill_mma_split(device bfloat *input, device uchar *w0, devic
 }
 #define GGUF_PREFILL_MMA_SPLIT(F, f, ep, Ep, Out)                                                                  \
   kernel void gguf_prefill_mma_split_##f##_##ep(                                                                   \
-      GGUF_PREFILL_MMA_BUFFERS_OF(Out), device coherent(device) float *partials [[buffer(5)]],                     \
+      GGUF_PREFILL_MMA_BUFFERS(Out), device coherent(device) float *partials [[buffer(5)]],                        \
       device atomic_uint *counters [[buffer(6)]], device bfloat *aux [[buffer(7)]],                                \
       constant GgufPrefillSplitParams &sp [[buffer(8)]], uint3 group [[threadgroup_position_in_grid]],             \
       uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {          \
@@ -197,15 +198,13 @@ inline void gguf_prefill_mma_split(device bfloat *input, device uchar *w0, devic
                                        simd_group, stage, tl, &arrival);                                           \
   }
 #define GGUF_PREFILL_MMA_SPLIT_FORMAT(F, f)                                                                        \
-  GGUF_PREFILL_MMA_SPLIT(F, f, a, EpNone, bfloat) GGUF_PREFILL_MMA_SPLIT(F, f, a_f32, EpNone, float)              \
+  GGUF_PREFILL_MMA_SPLIT(F, f, a, EpNone, bfloat) GGUF_PREFILL_MMA_SPLIT(F, f, a_f32, EpNone, float)               \
       GGUF_PREFILL_MMA_SPLIT(F, f, r, EpResidual, bfloat) GGUF_PREFILL_MMA_SPLIT(F, f, g, EpUpWithGate, bfloat)
 QUANT_FORMATS(GGUF_PREFILL_MMA_SPLIT_FORMAT)
 #undef GGUF_PREFILL_MMA_SPLIT_FORMAT
 #undef GGUF_PREFILL_MMA_SPLIT
 #undef GGUF_PREFILL_MMA_EPILOGUE
 #undef GGUF_PREFILL_MMA
-#undef GGUF_PREFILL_MMA_PLAIN
 #undef GGUF_PREFILL_MMA_TABLES
 #undef GGUF_PREFILL_MMA_THREAD
 #undef GGUF_PREFILL_MMA_BUFFERS
-#undef GGUF_PREFILL_MMA_BUFFERS_OF

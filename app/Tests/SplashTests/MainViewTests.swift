@@ -36,7 +36,7 @@ struct MainViewTests {
         }.environment(state)))
         window.setContentSize(CGSize(width: 800, height: 600))
         window.setFrameOrigin(NSPoint(x: -30000, y: -30000))
-        window.orderFrontRegardless()
+        window.orderFrontUnanimated()
         defer { window.orderOut(nil) }
         func field(in view: NSView) -> NSTextField? {
             (view as? NSTextField).flatMap { $0.isEditable ? $0 : nil } ?? view.subviews.lazy.compactMap(field).first
@@ -130,7 +130,7 @@ private final class FakeServer {
         let runtime = try FakeRuntime("splash-fake-server", launcher: "stepped_server")
         root = runtime.root
         port = runtime.port
-        state = runtime.state(keychain: Keychain(service: "Splash Tests"))
+        state = runtime.state()
     }
 
     /// Lets the launcher go on past the step that waits for `name`.

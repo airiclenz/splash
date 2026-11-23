@@ -7,6 +7,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+import transformers
+
 from dev.tests import server_fixtures as fixtures
 from server import protocol as wire
 from server import server
@@ -428,7 +430,9 @@ class ThinkingEndTextTests(unittest.TestCase):
                 / "prefill-bound.json",
             ),
             mock.patch.object(
-                server.AutoTokenizer, "from_pretrained", return_value=self.tokenizer()
+                transformers.AutoTokenizer,
+                "from_pretrained",
+                return_value=self.tokenizer(),
             ),
             mock.patch.object(server, "validate_tokenizer"),
             # Qwen's templates close a reasoning with a line break.
@@ -444,6 +448,7 @@ class ThinkingEndTextTests(unittest.TestCase):
                 **{"return_value.wait_ready.return_value": False},
             ) as native,
             mock.patch.object(server, "NativeBackend") as backend,
+            mock.patch.object(server, "ConstraintFactory"),
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
             mock.patch("sys.stdout", new_callable=io.StringIO),
             self.assertRaises(SystemExit) as raised,
@@ -454,14 +459,18 @@ class ThinkingEndTextTests(unittest.TestCase):
         fixtures.console_written()
         return stderr.getvalue(), native, backend
 
-    def test_startup_refuses_a_text_before_starting_the_native_worker(self):
+    def test_startup_refuses_a_text_and_stops_the_engine_it_started(self):
         stderr, native, _ = self.start("--thinking-end-text=Time is up.")
         self.assertIn(
             "the thinking end 'Time is up.' must end with </think> and hold no other "
             "special token",
             stderr,
         )
-        native.assert_not_called()
+        # The engine starts before the tokenizer loads; the refusal stops it
+        # before it is waited for.
+        native.return_value.start.assert_called_once_with()
+        native.return_value.close.assert_called_once_with()
+        native.return_value.wait_ready.assert_not_called()
 
     def test_unset_a_budget_ends_thinking_as_the_template_closes_it(self):
         # A text outranks the template's close.

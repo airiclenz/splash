@@ -180,7 +180,7 @@ struct TranscriptTests {
         let window = NSWindow(contentViewController: NSHostingController(rootView: ChatScreen().environment(state)))
         window.setContentSize(CGSize(width: 900, height: 600))
         window.setFrameOrigin(NSPoint(x: -30000, y: -30000))
-        window.orderFrontRegardless()
+        window.orderFrontUnanimated()
         defer { window.orderOut(nil) }
         try await waitFor(state.transcript.page.loaded)
         let webView = try #require(state.transcript.page.webView)
@@ -210,7 +210,7 @@ struct TranscriptTests {
         webView.frame = window.contentView?.bounds ?? .zero
         // Drawn as on screen, as WebKit holds back the animation frames of a page it can't see.
         Snapshot.drawsOffScreen(webView)
-        window.orderFrontRegardless()
+        window.orderFrontUnanimated()
         defer { window.orderOut(nil) }
         try await waitFor(transcript.page.loaded)
         let paragraph = String(repeating: "A sentence that goes on for a while. ", count: 12)
@@ -743,7 +743,7 @@ struct TranscriptTests {
         let window = NSWindow(contentViewController: NSHostingController(rootView: Sections().environment(state)))
         window.setContentSize(CGSize(width: 900, height: 600))
         window.setFrameOrigin(NSPoint(x: -30000, y: -30000))
-        window.orderFrontRegardless()
+        window.orderFrontUnanimated()
         defer { window.orderOut(nil) }
         try await waitFor(state.transcript.page.loaded)
         let webView = try #require(state.transcript.page.webView)
@@ -769,7 +769,7 @@ struct TranscriptTests {
 
     /// The transcript's page, loaded in a window off the screen, drawn as on screen, as WebKit
     /// holds back the animation frames of a page it can't see.
-    private func shownPage() async throws -> (Transcript, WKWebView, NSWindow) {
+    func shownPage() async throws -> (Transcript, WKWebView, NSWindow) {
         try Showcase.requireScripts()
         let transcript = Transcript(runtime: Showcase.runtime, attachments: Showcase.attachments)
         transcript.page.load()
@@ -780,7 +780,7 @@ struct TranscriptTests {
         window.contentView?.addSubview(webView)
         webView.frame = window.contentView?.bounds ?? .zero
         Snapshot.drawsOffScreen(webView)
-        window.orderFrontRegardless()
+        window.orderFrontUnanimated()
         try await waitFor(transcript.page.loaded)
         return (transcript, webView, window)
     }

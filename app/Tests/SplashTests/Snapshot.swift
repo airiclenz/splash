@@ -38,7 +38,7 @@ enum Snapshot {
         window.appearance = NSAppearance(named: appearance)
         window.setContentSize(size)
         window.setFrameOrigin(NSPoint(x: -30000, y: -30000))
-        window.orderFrontRegardless()
+        window.orderFrontUnanimated()
         // Web views come in as SwiftUI lays the window out; WebKit reads the switch as their
         // window comes on screen.
         var seen = Set<ObjectIdentifier>()
