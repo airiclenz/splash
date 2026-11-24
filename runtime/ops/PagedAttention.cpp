@@ -10,7 +10,6 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <vector>
 
 namespace splash::ops {
 
@@ -282,13 +281,13 @@ uint64_t gateBytes(uint64_t rows, const CompiledAttention &compiled) {
 // The q/k projection's bindings: the packed rows and norms, a rotated
 // variant's RoPE tables of `rows` rows, then the staging of the queries and
 // the sequences' page tables, which take the keys and values.
-std::vector<metal::MetalBuffer> projectionBindings(const CompiledAttention &compiled, AttentionVariant variant,
-                                                   uint64_t rows, metal::MetalBuffer packed,
-                                                   const NormWeights &queryNorm, const NormWeights &keyNorm,
-                                                   metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
-                                                   metal::MetalBuffer queries,
-                                                   std::span<const metal::MetalBuffer> pageTables) {
-  std::vector<metal::MetalBuffer> bindings{std::move(packed), queryNorm.buffer, keyNorm.buffer};
+metal::BufferList projectionBindings(const CompiledAttention &compiled, AttentionVariant variant,
+                                     uint64_t rows, metal::MetalBuffer packed,
+                                     const NormWeights &queryNorm, const NormWeights &keyNorm,
+                                     metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
+                                     metal::MetalBuffer queries,
+                                     std::span<const metal::MetalBuffer> pageTables) {
+  metal::BufferList bindings{std::move(packed), queryNorm.buffer, keyNorm.buffer};
   if (variant.rotated) {
     const uint64_t bytes = rows * compiled.rotaryPairs * sizeof(float);
     requireBytes(ropeCos, bytes, "attention RoPE cosine");
@@ -492,7 +491,7 @@ void PagedAttention::addProjection(metal::CommandGraph &graph, metal::MetalBuffe
   requireBytes(packed, uint64_t{rows.rows} * packedWidth(kernel) * 2, "attention q/k/v");
   requireQueries(queries, command, queryHeads / layout.kvHeads, layout, command.last.chunk_tokens);
   for (size_t s = 0; s < sequences.size(); ++s) requirePageTable(pageTables[s], sequences[s]);
-  std::vector<metal::MetalBuffer> bindings = projectionBindings(
+  metal::BufferList bindings = projectionBindings(
       kernel, variant, rows.rows, std::move(packed), queryNorm, keyNorm, std::move(ropeCos), std::move(ropeSin),
       std::move(queries), pageTables);
   bindings.push_back(rows.layout);
@@ -606,13 +605,12 @@ PreparedInput PagedAttention::addAttention(metal::CommandGraph &graph, const Att
       tables[d] = history.pageTable;
     }
     const auto bound = laneBindings(std::span(tables).first(dispatch.sequences));
-    std::vector<metal::MetalBuffer> split{queries, partials, statistics};
+    metal::BufferList split{queries, partials, statistics};
     split.insert(split.end(), bound.begin(), bound.end());
     // Without tree rows a split binds another buffer of the dispatch for
     // them, of which it reads nothing.
     split.insert(split.end(), {rows.tree ? rows.tree : partials, rows.layout});
-    std::vector<metal::MetalBuffer> reduce{partials, statistics, gates, output.hidden, tableInput, tableSums,
-                                           rows.layout};
+    metal::BufferList reduce{partials, statistics, gates, output.hidden, tableInput, tableSums, rows.layout};
     if (plan.sparse) {
       // Without lists, or without tree rows for the row masks, a sparse
       // kernel binds another buffer of the dispatch for them, of which it
@@ -717,7 +715,8 @@ void PagedAttention::addPathCommit(metal::CommandGraph &graph, kv::Layout layout
   }
   requireBytes(paths, uint64_t{lanes} * sizeof(uint32_t), "KV path commit paths");
   const auto tables = laneBindings(pageTables);
-  std::vector<metal::MetalBuffer> bindings(tables.begin(), tables.end());
+  metal::BufferList bindings;
+  bindings.insert(bindings.end(), tables.begin(), tables.end());
   bindings.push_back(paths);
   graph.add(kernelName(kernelFormat(layout) + "_commit", commitSuffix(layout)), std::move(bindings), params,
             {uint64_t{layout.attentionLayers} * layout.kvHeads, lanes, 1}, {layout.headDimension, 1, 1});
