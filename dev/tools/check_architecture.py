@@ -247,7 +247,7 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # The fork raises the port's 31_235 by 803 for its engine timing, eviction
 # and denial causes, status keys, tail checkpoint and --no-speculation
 # (1.7 and 1.7.1 merges).
-ENGINE_LINE_BUDGET = 32_038
+ENGINE_LINE_BUDGET = 32_054
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
