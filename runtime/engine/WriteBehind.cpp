@@ -4,22 +4,25 @@ namespace splash::engine {
 
 WriteBehind::WriteBehind(Cache &cache) : cache_(cache), copying_(cache.persistent()) {}
 
-void WriteBehind::published(uint64_t block, uint32_t tokens, double now, bool secondary) {
-  if (!cache_.kvTierWritable() || tokens < kMinimumTokens || queued_.contains(block))
+void WriteBehind::published(uint64_t block, uint32_t tokens, double now, PersistPoint kind) {
+  if (kind == PersistPoint::Head && !cache_.persistent())
+    kind = PersistPoint::Newest;
+  if (!cache_.kvTierWritable() || (tokens < kMinimumTokens && kind != PersistPoint::Head) || queued_.contains(block))
     return;
   // While copies wait for demand, the queue keeps only the points their
   // conversations still resume from.
   copying_ = copying();
   if (!copying_)
     std::erase_if(waiting_, [&](const Point &point) {
-      if (cache_.newestPoint(point.block) || (point.secondary && cache_.secondaryCheckpoint(point.block)))
+      if (cache_.newestPoint(point.block) ||
+          (point.kind == PersistPoint::Secondary && cache_.secondaryCheckpoint(point.block)))
         return false;
       queued_.erase(point.block);
       ++counters_.unneeded;
       return true;
     });
   queued_.insert(block);
-  waiting_.push_back({block, now + kDelayMilliseconds, secondary});
+  waiting_.push_back({block, now + kDelayMilliseconds, kind});
 }
 
 bool WriteBehind::settle(PersistStatus status) {
@@ -91,7 +94,7 @@ bool WriteBehind::step(double now, bool claimWaiting, const std::function<bool()
       stopped_ = Stop::Covered;
       break;
     }
-    if (!settle(cache_.persist(point->block, point->secondary))) {
+    if (!settle(cache_.persist(point->block, point->kind))) {
       stopped_ = Stop::Stalled;
       break;
     }
@@ -107,10 +110,10 @@ bool WriteBehind::flush() {
     return true;
   cache_.liftDiskWriteBudget();
   while (!waiting_.empty()) {
-    const uint64_t block = waiting_.back().block;
-    if (!settle(cache_.persist(block, waiting_.back().secondary)))
+    const Point &point = waiting_.back();
+    if (!settle(cache_.persist(point.block, point.kind)))
       return false;
-    queued_.erase(block);
+    queued_.erase(point.block);
     waiting_.pop_back();
   }
   return true;

@@ -80,8 +80,8 @@ def thinking_end_tokens(tokenizer, text, chat_format):
         or not tokenizer.added_tokens_decoder.keys().isdisjoint(tokens[:-1])
     ):
         raise ThinkingEndError(
-            f"the thinking end {text!r} must end with {THINK_END} and hold no "
-            "other special token"
+            f"the thinking end {text!r} must end with {chat_format.think_close} "
+            "and hold no other special token"
         )
     if len(tokens) > wire.MAX_THINKING_END_TOKENS:
         raise ThinkingEndError(
@@ -249,14 +249,15 @@ class CallbackStreamer:
     repeats one sentence that many times (`reasoning_loop_tripped`).
 
     With `thinking` set, stop sequences match only the content after the
-    think-end text: the reasoning before it, and the think-end text itself,
-    are sent unmatched.
+    think-end text (`think_close`): the reasoning before it, and the think-end
+    text itself, are sent unmatched.
 
     When the incremental decoder rejects a token, a fresh one is rebuilt from
     a bounded window of recent ids so streaming, stops and the guard continue
     (`decode_fallbacks` counts these); if that fails too, `end()` reconciles
     the rest of the reply from a whole-sequence decode. While the decoder is
     alive, `end()` decodes only the ids it still holds, behind a bounded window.
+    Neither window reaches back past the last of the `visible_tags`.
     """
 
     def __init__(
@@ -268,12 +269,27 @@ class CallbackStreamer:
         reasoning_loop_limit=0,
         thinking=False,
         think_end_id=None,
+        visible_tags=(),
+        think_close=THINK_END,
     ):
         self.tokenizer = tokenizer
         self.callback = callback
         self.stops = StopSearch(stop_sequences) if stop_sequences else None
         self.on_stop = on_stop
         self.backend = tokenizer.backend_tokenizer
+        # Special tokens the text holds (ChatFormat.visible_tags), by ID; every
+        # other special token decodes to nothing. The text is each run of
+        # other tokens decoded on its own, then each tag's text (_decode): at
+        # a tag, the run before it is finished as that decode finishes it,
+        # an unfinished character's bytes as its replacement, and the next
+        # run starts a new stream.
+        self.visible = {
+            tokenizer.convert_tokens_to_ids(tag): tag for tag in visible_tags
+        }
+        # The tokens of the run since the last visible tag, and the text the
+        # stream decoded of them.
+        self.run = []
+        self.run_text = ""
         self.decode_stream = DecodeStream(skip_special_tokens=True)
         self.token_ids = []
         # Length of the `token_ids` prefix up to the last token whose decoder
@@ -287,6 +303,7 @@ class CallbackStreamer:
         # True while stop matching waits for the think-end text; without stop
         # sequences there is nothing to gate, so text flows straight through.
         self.is_reasoning = bool(thinking) and self.stops is not None
+        self.think_close = think_close
         # The family's close-of-reasoning token, which retires the guard.
         self.think_end_id = think_end_id
         self.reasoning_loop_guard = (
@@ -310,13 +327,13 @@ class CallbackStreamer:
         bounded by the chunk, never by the reasoning's length.
         """
         self.pending_text += text
-        end = self.pending_text.find(THINK_END)
+        end = self.pending_text.find(self.think_close)
         if end >= 0:
-            boundary = end + len(THINK_END)
+            boundary = end + len(self.think_close)
         elif ends_reasoning:
             boundary = len(self.pending_text)
         else:
-            ready, self.pending_text = hold_partial(self.pending_text, THINK_END)
+            ready, self.pending_text = hold_partial(self.pending_text, self.think_close)
             self._send(ready)
             return ""
         self._send(self.pending_text[:boundary])
@@ -366,6 +383,16 @@ class CallbackStreamer:
             guard = self.reasoning_loop_guard
             if guard is not None and is_think_end:
                 self.reasoning_loop_guard = guard = None
+            if token_id in self.visible:
+                self._end_run()
+                self.decoded_through = len(self.token_ids)
+                # A visible think-end closes the reasoning as its step would.
+                self._emit(self.visible[token_id], is_think_end)
+                if self.stop_sequence is not None:
+                    break
+                continue
+            if self.visible:
+                self.run.append(token_id)
             if self.decode_stream is None:
                 continue
             try:
@@ -382,6 +409,8 @@ class CallbackStreamer:
                     self.decoded_through = len(self.token_ids)
             if not text and not is_think_end:
                 continue
+            if text and self.visible:
+                self.run_text += text
             # The think-end token's step closes the reasoning even when its
             # text never spells the think-end text.
             self._emit(text or "", is_think_end)
@@ -408,7 +437,9 @@ class CallbackStreamer:
         if len(held) > DECODE_RECOVERY_WINDOW:
             return ""
         stream = DecodeStream(
-            ids=self.token_ids[max(0, start - DECODE_RECOVERY_WINDOW) : start],
+            ids=self.token_ids[
+                max(self._run_start(), start - DECODE_RECOVERY_WINDOW) : start
+            ],
             skip_special_tokens=True,
         )
         parts = []
@@ -427,6 +458,12 @@ class CallbackStreamer:
         self.decoded_through = through
         return "".join(parts)
 
+    def _run_start(self):
+        """Where the run since the last visible tag starts in `token_ids`: a
+        decoder's context never reaches back past a tag, as `_decode` decodes
+        each run on its own."""
+        return len(self.token_ids) - len(self.run) if self.visible else 0
+
     def _decode_held_tail(self):
         """Return the text of the ids the live decoder still holds, or None.
 
@@ -439,7 +476,7 @@ class CallbackStreamer:
         start = self.decoded_through
         if start == len(self.token_ids):
             return ""
-        window = max(0, start - DECODE_RECOVERY_WINDOW)
+        window = max(self._run_start(), start - DECODE_RECOVERY_WINDOW)
         tail = self.tokenizer.decode(
             self.token_ids[window:],
             skip_special_tokens=True,
@@ -454,6 +491,16 @@ class CallbackStreamer:
             return None
         return tail[len(context) :]
 
+    def _end_run(self):
+        """Finish the run before a visible tag as _decode decodes it, and
+        start a new stream for the run after it."""
+        decoded = self._decode_run(self.run)
+        if not decoded.startswith(self.run_text):
+            raise RuntimeError("incremental tokenizer output diverged")
+        self._emit(decoded[len(self.run_text) :])
+        self.run, self.run_text = [], ""
+        self.decode_stream = DecodeStream(skip_special_tokens=True)
+
     def end(self):
         if self.stop_sequence is not None:
             return
@@ -466,11 +513,7 @@ class CallbackStreamer:
                 self._send(self.pending_text)
                 self.pending_text = ""
             return
-        decoded = self.tokenizer.decode(
-            self.token_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
+        decoded = self._decode(self.token_ids)
         handled = "".join(self.emitted) + self.pending_text
         if not decoded.startswith(handled):
             raise RuntimeError("incremental tokenizer output diverged")
@@ -482,21 +525,56 @@ class CallbackStreamer:
             self._send(self.pending_text)
             self.pending_text = ""
 
+    def _decode(self, token_ids):
+        """The text of token_ids, each visible tag as its text between the
+        runs of other tokens, decoded without the other special tokens."""
+        if not self.visible:
+            return self._decode_run(token_ids)
+        text, run = [], []
+        for token_id in token_ids:
+            if token_id in self.visible:
+                text += [self._decode_run(run), self.visible[token_id]]
+                run = []
+            else:
+                run.append(token_id)
+        return "".join([*text, self._decode_run(run)])
+
+    def _decode_run(self, token_ids):
+        return self.tokenizer.decode(
+            token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+
     def count_reasoning_tokens(self, chat_format, thinking, tool_calls=False):
         """The reasoning's tokens, as ReasoningSplitter reads the text: from
         the start of the output where the generation prompt opened the
         reasoning (thinking), or after the model's own opening of it
-        (chat_format.think_start_id), to its close or, where a call may follow
-        and a call's opening ends the reasoning, a call's opening; none for
-        a request without a chat format."""
+        (chat_format.think_start_ids), to its close or, where a call may
+        follow and a call's opening ends the reasoning, a call's opening;
+        where the format's reasoning returns after text, those inside each
+        of its reasoning blocks; none for a request without a chat format."""
         if chat_format is None:
             return 0
+        opening = chat_format.think_start_ids
+        if chat_format.reasoning_returns:
+            count, index, inside = 0, 0, thinking
+            while index < len(self.token_ids):
+                if inside:
+                    inside = self.token_ids[index] != chat_format.think_end_id
+                    count += inside
+                    index += 1
+                elif (
+                    opening
+                    and tuple(self.token_ids[index : index + len(opening)]) == opening
+                ):
+                    inside = True
+                    index += len(opening)
+                else:
+                    index += 1
+            return count
         if thinking:
             start = 0
-        elif chat_format.think_start_id is not None and self.token_ids[:1] == [
-            chat_format.think_start_id
-        ]:
-            start = 1
+        elif opening and tuple(self.token_ids[: len(opening)]) == opening:
+            start = len(opening)
         else:
             return 0
         calls_end = tool_calls and chat_format.calls_end_reasoning
@@ -1310,6 +1388,8 @@ class NativeBackend:
             self.reasoning_loop_limit if job.thinking else 0,
             job.thinking,
             job.chat_format.think_end_id if job.chat_format is not None else None,
+            () if job.chat_format is None else job.chat_format.visible_tags,
+            THINK_END if job.chat_format is None else job.chat_format.think_close,
         )
         state = _JobState(job, streamer, carried_pixels=bool(job.image_pixels))
         request = self._generation_request(job)
@@ -1478,7 +1558,14 @@ class NativeBackend:
                     "effort": job.reasoning.effort,
                     "enable_thinking": job.reasoning.enable_thinking,
                     "template_effort": job.reasoning.template,
-                    "thinking": job.thinking,
+                    # Whether the generation prompt opened the reasoning, where
+                    # the prompt decides it; None where the model opens its own
+                    # (ChatFormat.prompt_switches_reasoning: Inkling 2's, Flint's).
+                    "thinking": (
+                        job.thinking
+                        if job.chat_format.prompt_switches_reasoning
+                        else None
+                    ),
                 }
             self._log(record)
             if first_start:

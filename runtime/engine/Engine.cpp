@@ -32,6 +32,11 @@ uint64_t wholeMicroseconds(double milliseconds) noexcept {
              ? static_cast<uint64_t>(std::llround(milliseconds * kMicrosecondsPerMillisecond))
              : 0;
 }
+// A Background request still in the engine this long after its first tick
+// runs as Normal (Engine::age): work that outlasts a title or a summary is a
+// run the user asked for, and strict priority starved one behind attended
+// work for minutes (14.5 min for 9 tool calls on a busy 64 GB Mac).
+constexpr double kBackgroundAgeMilliseconds = 10'000.0;
 
 constexpr std::string_view kKvUnreadableMessage =
     "KV of an earlier part of the conversation could not be read from the SSD cache";
@@ -210,6 +215,7 @@ bool Engine::tick(double now) {
   // however the tick ends, what holds each from now on is as it leaves the
   // engine.
   holds(now);
+  age(now);
   // The wait the last tick left the next prefill unit in, for a decoder whose
   // memory lands, is this tick's to decide again: one that plans it again
   // goes on with it, and any other ends it, however it ends, the time it
@@ -509,9 +515,8 @@ std::optional<RequestPriority> Engine::suspendedTier() const {
   std::optional<RequestPriority> tier;
   for (const auto &[id, active] : requests_) {
     // A finalized request keeps the scheduler's flag until it is swept.
-    if (!active.finalized && scheduler_.suspended(id) &&
-        (!tier || active.request.priority < *tier))
-      tier = active.request.priority;
+    if (!active.finalized && scheduler_.suspended(id) && (!tier || yieldsAs(active) < *tier))
+      tier = yieldsAs(active);
   }
   return tier;
 }
@@ -520,13 +525,25 @@ bool Engine::admissionTries(const Request &active, std::optional<RequestPriority
                             bool draining) const {
   if (!tier)
     return !draining;
-  return active.request.priority < *tier ||
-         (scheduler_.suspended(active.request.id) && !draining);
+  return yieldsAs(active) < *tier || (scheduler_.suspended(active.request.id) && !draining);
 }
 
 bool Engine::belowRunnable(const Request &active) const {
   const std::optional<RequestPriority> runnable = scheduler_.highestRunnablePriority();
   return runnable && active.request.priority > *runnable;
+}
+
+void Engine::age(double now) {
+  for (auto &[id, active] : requests_) {
+    if (active.finalized || active.request.priority != RequestPriority::Background)
+      continue;
+    const double since = active.backgroundSince.value_or(now);
+    active.backgroundSince = since;
+    if (now - since < kBackgroundAgeMilliseconds)
+      continue;
+    active.request.priority = RequestPriority::Normal;
+    scheduler_.setPriority(id, RequestPriority::Normal);
+  }
 }
 
 void Engine::holds(double now) noexcept {
@@ -820,7 +837,7 @@ bool Engine::admitQueued(double now) {
       if (lanesFull) {
         if (!laneSought) {
           laneSought = true;
-          if (preemptBelow(active.request.priority, now)) {
+          if (preemptBelow(yieldsAs(active), now)) {
             // The suspension is this pass's progress, whatever the next admits.
             static_cast<void>(admitQueued(now));
             return true;
@@ -890,6 +907,15 @@ uint32_t Engine::tailBoundary(const Request &active) noexcept {
 
 bool Engine::holdsTailCheckpoint(const Request &active) noexcept {
   return active.latestCheckpoint && active.latestCheckpointTail;
+}
+
+uint32_t Engine::headBoundary(const Request &active) noexcept {
+  return active.request.headTokens / KvCache::pageTokens * KvCache::pageTokens;
+}
+
+bool Engine::keepsCheckpoint(const Request &active, Request::StateBoundary boundary) noexcept {
+  return !boundary.disposable &&
+         (boundary.tokens == promptReplayBoundary(active) || boundary.tokens == headBoundary(active));
 }
 
 uint32_t Engine::sharedPrefillBoundary(const Request &left,
@@ -1332,9 +1358,9 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
   // The head's end, so that the next conversation sharing the head resumes there on first use. An ordinary state,
-  // which a reclaim writes to the SSD as any other.
-  if (const uint32_t head = active.request.headTokens / KvCache::pageTokens * KvCache::pageTokens;
-      head >= stateBoundary + kMinimumJunctionGain)
+  // which a reclaim writes to the SSD as any other; it keeps the lane's last checkpoint before it cached
+  // (keepsCheckpoint) for a conversation whose head differs inside its last page.
+  if (const uint32_t head = headBoundary(active); head >= stateBoundary + kMinimumJunctionGain)
     addStateBoundary(active, stateBoundary, head, false, true);
   addStateBoundary(active, stateBoundary, latestReplayBoundary,
                    latestReplayBoundary != promptReplayBoundary(active), true);
@@ -1510,8 +1536,8 @@ void Engine::publishReachedStateBoundaries(
         ++counters_.stateCaptures;
     } else if (objective.tokens != promptProcessed) {
       // A checkpoint the command did not capture: a later state of it
-      // retires the checkpoint once published, or the prompt's replay point
-      // took its buffers.
+      // retires the checkpoint once published, or a state that keeps it
+      // (keepsCheckpoint) took its buffers.
       if (!objective.disposable)
         throw std::logic_error("prefill passed a state boundary it did not capture");
       continue;
@@ -1543,10 +1569,10 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
   // rebuilt replay point counts as a replay-state publication, not a
   // junction.
   const bool replay = !checkpoint && objective.tokens == promptReplayBoundary(active);
-  // The tail checkpoint retires none before it: the lane's last rolling
-  // checkpoint stays cached beside it, as beside the replay point.
+  // It, the head's state and the tail checkpoint keep the lane's checkpoint cached (keepsCheckpoint).
   const bool tail = checkpoint && objective.tail;
-  const bool keepsCheckpoint = replay || tail;
+  const bool keepsOwn = keepsCheckpoint(active, objective);
+  const bool keeps = keepsOwn || tail;
   uint64_t &failures = checkpoint ? counters_.checkpointPublicationFailures
                        : replay   ? counters_.replayStatePublicationFailures
                                   : counters_.junctionMaterializationFailures;
@@ -1575,25 +1601,26 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
     // the recovery point until this state is published, and retires after
     // the publication, as does the one a reused state leaves. No checkpoint
     // is published while a restore lease pins the one before it, but the
-    // tail. The prompt's replay point and the tail keep the lane's
-    // checkpoint (below).
+    // tail. The prompt's replay point, the head's state and the tail keep
+    // the lane's checkpoint (below).
     if (checkpoint && !tail && checkpointPinned(active)) {
       countCheckpointFailure(PublicationFailure::RetireBlocked);
       return false;
     }
     const bool resident = cache_.stateResident(active.latestCheckpoint.kvBlock);
-    if (!keepsCheckpoint && resident)
+    if (!keeps && resident)
       static_cast<void>(retireCheckpoint(active));
     // The command has completed, so the state it ended at for its lane's
-    // checkpoint is taken from the lane now. The replay point keeps that
-    // checkpoint only beside buffers of its own; refused them, it takes
-    // the checkpoint's unless a peer still holds it. Then what the ledger
-    // frees for the state's claim (stateClaim). The tail checkpoint goes
-    // last: the ledger frees first, and only then does the replay point
-    // take its buffers. That costs one ledger pass, at the prompt's end,
-    // claimed as the tail's own: optional, not past the host's reserve.
+    // checkpoint is taken from the lane now. The replay point and the
+    // head's state keep that checkpoint only beside buffers of their own;
+    // refused them, each takes the checkpoint's unless a peer still holds
+    // it. Then what the ledger frees for the state's claim (stateClaim).
+    // The tail checkpoint goes last: the ledger frees first, and only then
+    // does the replay point take its buffers. That costs one ledger pass,
+    // at the prompt's end, claimed as the tail's own: optional, not past
+    // the host's reserve.
     if (fromLane) {
-      const bool takesCheckpoint = replay && resident && !checkpointShared(active);
+      const bool takesCheckpoint = keepsOwn && resident && !checkpointShared(active);
       const bool tailLast = takesCheckpoint && holdsTailCheckpoint(active);
       bool first = true;
       recycled = allocate(
@@ -1650,13 +1677,14 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
     }
   }
   // The previous recovery point, if the lane still holds one, retires now,
-  // except at the prompt's replay point or its tail: there it stays cached,
-  // as disposable as any checkpoint, for a later request that shares the
-  // prompt up to it but not up to the replay point. The lane holds it
-  // until this state is published; a refused publication leaves it the
-  // lane's recovery point, unless it retired above to give this state its
-  // buffers.
-  if (!keepsCheckpoint)
+  // except at the prompt's replay point, the head's state or the tail:
+  // there it stays cached, as disposable as any checkpoint, for a later
+  // request that shares the prompt up to it but not up to that state, as a
+  // conversation whose head ends in text of its own does not share the
+  // head's last page. The lane holds it until this state is published; a
+  // refused publication leaves it the lane's recovery point, unless it
+  // retired above to give this state its buffers.
+  if (!keeps)
     static_cast<void>(retireCheckpoint(active));
   // The rolling checkpoint the tail keeps is secondary: a reclaim lets it
   // go without a write, and once the replay point is published the
@@ -1678,12 +1706,15 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
   // The state records the conversation's branch point below it.
   if (active.branchPoint)
     cache_.recordBranchPoint(block, active.branchPoint);
+  // The head's state goes to write-behind as a head, which new conversations
+  // start from whether or not this one goes on from it.
   if (!checkpoint)
-    writeBehind_.published(block, objective.tokens, now);
+    writeBehind_.published(block, objective.tokens, now,
+                           objective.tokens == headBoundary(active) ? PersistPoint::Head : PersistPoint::Newest);
   if (replay && active.keptCheckpoint) {
     if (cache_.checkpointState(active.keptCheckpoint.kvBlock).publication ==
         active.keptCheckpoint.publication)
-      writeBehind_.published(active.keptCheckpoint.kvBlock, active.keptCheckpointTokens, now, true);
+      writeBehind_.published(active.keptCheckpoint.kvBlock, active.keptCheckpointTokens, now, PersistPoint::Secondary);
     active.keptCheckpoint = {};
   }
   return true;
@@ -2439,8 +2470,11 @@ void Engine::vacateLane(Request &active, bool keepContinuation) {
   // write over its prompt's replay point (WriteBehind::kMinimumTokens) is
   // kept: a shorter one recomputes faster than its state writes. Kept, the
   // 384-token replies of 12 agent conversations at a 27 GB limit wrote 24%
-  // more to the SSD to save 2.4% of their prefill.
-  if (!keepContinuation && active.rendersReplies &&
+  // more to the SSD to save 2.4% of their prefill. A suspended lane keeps its
+  // reply's newest state by the same measure, whatever its client: the point
+  // it resumes from, which a reclaim meanwhile writes, once, rather than drop
+  // it and leave the resume to replay the whole reply.
+  if ((keepContinuation || active.rendersReplies) &&
       active.exactTokens.size() >= promptReplayBoundary(active) + WriteBehind::kMinimumTokens)
     cache_.keepReply(active.latestCheckpoint);
   if (passCommand_.holds(id))

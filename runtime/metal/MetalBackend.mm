@@ -2360,6 +2360,10 @@ uint64_t MetalBuffer::sizeBytes() const noexcept {
     return impl_ ? impl_->lengthBytes : 0;
 }
 
+uint64_t MetalBuffer::offsetBytes() const noexcept {
+    return impl_ ? impl_->offsetBytes : 0;
+}
+
 uint64_t MetalBuffer::allocatedBytes() const noexcept {
     return impl_ ? impl_->allocation->bytes : 0;
 }

@@ -63,10 +63,13 @@ public:
   // A point published or reused at this block, `tokens` deep. Nothing while
   // the disk tier takes no writes. Whether copies wait for demand is asked
   // now (copying), of the demand the last step was asked with, which a
-  // claim since changes at the next step. A `secondary` point is a request's
-  // kept rolling checkpoint, queued after its replay point: copied while it
-  // stays secondary (Cache::persist), at most one state write a request.
-  void published(uint64_t block, uint32_t tokens, double now, bool secondary = false);
+  // claim since changes at the next step. A Head point, the state at a
+  // prompt's head (Engine::headBoundary), is copied by a persistent tier
+  // while it stays an ordinary state, as new conversations start from it
+  // whether or not its own went on; a Secondary one, a request's kept rolling
+  // checkpoint queued after its replay point, while it stays secondary
+  // (Cache::persist), at most one state write a request.
+  void published(uint64_t block, uint32_t tokens, double now, PersistPoint kind = PersistPoint::Newest);
   // Steps the points that are due and not in use, unless a claim waits for
   // memory on its way back (claimWaiting), which needs the tier's writes and
   // the state write first. A temporary tier copies only while `demandBytes`
@@ -97,7 +100,7 @@ private:
   struct Point final {
     uint64_t block = 0;
     double due = 0.0;
-    bool secondary = false;
+    PersistPoint kind = PersistPoint::Newest;
   };
   // Counts a step that settled its point; false while it is in progress.
   bool settle(PersistStatus status);
