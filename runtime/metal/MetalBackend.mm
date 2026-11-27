@@ -40,6 +40,13 @@
 #include <pthread.h>
 #include <unistd.h>
 
+// The macOS 27 SDK names mach_vm_page_query's wired bit; the macOS 26 SDK
+// (GitHub's macos-26 runners) does not. Same value, so a build on either SDK
+// reads the bit as the running kernel reports it.
+#ifndef VM_PAGE_QUERY_PAGE_WIRED
+#define VM_PAGE_QUERY_PAGE_WIRED 0x1000
+#endif
+
 namespace splash::metal {
 namespace {
 
