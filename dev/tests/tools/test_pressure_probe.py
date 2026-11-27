@@ -963,7 +963,10 @@ class FakeHost:
     server takes a new sample every `sample_every` `/status` reads and reports
     it until the next, as the live server's sample lags by a few to tens of
     seconds. Each sample's host_inactive_bytes is its sequence number: live
-    page counts never repeat byte for byte between two samples.
+    page counts never repeat byte for byte between two samples. `release`, when
+    set, is an event the host sets on its `release_after_reads`th `/status`
+    read: a stub reply waiting on it then lasts that many reads, not a span of
+    wall time a slow machine fills with fewer samples.
     """
 
     def __init__(self, headroom_bytes, is_resident, reserve_bytes=GIB, sample_every=1):
@@ -976,6 +979,8 @@ class FakeHost:
         self.status_reads = 0
         self.samples = 0
         self.sampled_headroom_bytes = 0
+        self.release = None
+        self.release_after_reads = 0
         self.lock = threading.Lock()
 
     def status(self, chat_count):
@@ -986,6 +991,11 @@ class FakeHost:
                 self.sampled_headroom_bytes = max(0, headroom_bytes)
                 self.samples += 1
             self.status_reads += 1
+            if (
+                self.release is not None
+                and self.status_reads >= self.release_after_reads
+            ):
+                self.release.set()
             headroom_bytes = self.sampled_headroom_bytes
             sample_number = self.samples
         return snapshot(
@@ -1045,6 +1055,10 @@ TARGET_HEADROOM = 960 * MIB
 SHED_HEADROOM = 512 * MIB
 # The host headroom at which `auto` holds 1856 MiB.
 FILLED_HEADROOM = TARGET_HEADROOM + 1856 * MIB
+# The `/status` reads an `auto` run's chat reply lasts (about one second of
+# polling on an M2 Pro), and the wall-time ceiling on it.
+AUTO_REPLY_READS = 70
+AUTO_REPLY_CEILING_SECONDS = 30.0
 
 
 def resident_after_first_request(chat_count):
@@ -1063,8 +1077,14 @@ class BallastMainTests(unittest.TestCase):
         return code, output, events
 
     def run_auto(self, host, *extra, swapouts=(0,)):
-        """Run one lane with `--ballast-mb auto`; return (code, ballast, events)."""
-        with StubServer(host.status, reply_delay=1.0) as stub:
+        """Run one lane with `--ballast-mb auto`; return (code, ballast, events).
+
+        The chat reply lasts AUTO_REPLY_READS `/status` reads, so every host
+        sample sequence plays out alike on a fast or a slow machine.
+        """
+        with StubServer(host.status, reply_delay=AUTO_REPLY_CEILING_SECONDS) as stub:
+            host.release = stub.released
+            host.release_after_reads = AUTO_REPLY_READS
             code, output, events = self.run_with_fake_child(
                 stub,
                 [
