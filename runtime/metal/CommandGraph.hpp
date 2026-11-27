@@ -48,7 +48,9 @@ public:
   static constexpr uint32_t kDefaultThreads = 256;
 
   CommandGraph() = default;
-  // Reserves room for expectedDispatches so encoding never regrows the list.
+  // Reserves room for expectedDispatches, so a graph of a shape seen before
+  // never regrows its dispatch list: a regrowth moves every dispatch's inline
+  // bindings one by one.
   explicit CommandGraph(size_t expectedDispatches) { dispatches_.reserve(expectedDispatches); }
   // Dispatches point into payloadChunks_; a copy would keep pointing at the
   // source. A move keeps every chunk, and so every payload address.
@@ -65,16 +67,7 @@ public:
   template <class Params>
   void add(PipelineName pipeline, BufferList buffers, const Params &params,
            DispatchSize groups, DispatchSize threads = {kDefaultThreads, 1, 1}) {
-    static_assert(std::is_trivially_copyable_v<Params>,
-                  "dispatch parameters must be plain data");
-    static_assert(alignof(Params) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__,
-                  "dispatch parameters exceed the payload chunk alignment");
-    void *payload = storePayload(sizeof(Params), alignof(Params));
-    std::memcpy(payload, &params, sizeof(Params));
-    ComputeDispatch &dispatch =
-        push(std::move(pipeline), std::move(buffers), groups, threads);
-    dispatch.bytes.push_back({static_cast<uint32_t>(dispatch.buffers.size()),
-                              payload, sizeof(Params)});
+    push(std::move(pipeline), std::move(buffers), params, groups, threads);
   }
 
   // A dispatch of the grid in `grid`, which an earlier dispatch writes
@@ -82,8 +75,8 @@ public:
   template <class Params>
   void add(PipelineName pipeline, BufferList buffers, const Params &params,
            DispatchSize groups, IndirectGrid grid, DispatchSize threads) {
-    add(std::move(pipeline), std::move(buffers), params, groups, threads);
-    dispatches_.back().indirectThreadgroups = std::move(grid);
+    push(std::move(pipeline), std::move(buffers), params, groups, threads)
+        .indirectThreadgroups = std::move(grid);
   }
 
   // The same dispatches with their bindings in a std::vector, moved or copied
@@ -183,7 +176,9 @@ private:
     return list;
   }
 
-  ComputeDispatch &push(PipelineName pipeline, BufferList buffers,
+  // Takes the list by reference: passing an inline list by value moves each
+  // binding.
+  ComputeDispatch &push(PipelineName &&pipeline, BufferList &&buffers,
                         DispatchSize groups, DispatchSize threads) {
     ComputeDispatch &dispatch = dispatches_.emplace_back();
     dispatch.pipelineName = std::move(pipeline.value);
@@ -193,6 +188,20 @@ private:
     for (uint32_t index = 0; index < buffers.size(); ++index) {
       dispatch.buffers.push_back({index, std::move(buffers[index])});
     }
+    return dispatch;
+  }
+
+  template <class Params>
+  ComputeDispatch &push(PipelineName &&pipeline, BufferList &&buffers, const Params &params,
+                        DispatchSize groups, DispatchSize threads) {
+    static_assert(std::is_trivially_copyable_v<Params>,
+                  "dispatch parameters must be plain data");
+    static_assert(alignof(Params) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__,
+                  "dispatch parameters exceed the payload chunk alignment");
+    void *payload = storePayload(sizeof(Params), alignof(Params));
+    std::memcpy(payload, &params, sizeof(Params));
+    ComputeDispatch &dispatch = push(std::move(pipeline), std::move(buffers), groups, threads);
+    dispatch.bytes.push_back({static_cast<uint32_t>(dispatch.buffers.size()), payload, sizeof(Params)});
     return dispatch;
   }
 

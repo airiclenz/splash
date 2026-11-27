@@ -253,7 +253,6 @@ void DraftAttention::addContextCommit(
   metal::BufferList bindings{
       std::move(contextKv), std::move(keyNorm), std::move(ropeCos),
       std::move(ropeSin)};
-  bindings.reserve(2 * kMaximumLanes + 6);
   appendLaneBindings(bindings, persistentKeys, persistentValues);
   bindings.push_back(std::move(retainedRows));
   bindings.push_back(std::move(laneRows));

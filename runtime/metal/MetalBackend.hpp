@@ -140,10 +140,11 @@ struct IndirectGrid {
 };
 
 // Dispatches up to these binding counts keep their bindings inline, so
-// encoding one allocates nothing; a dispatch past them moves to the heap. 22
-// buffers covers the batched GDN decode: two inputs, a current and a next
-// state per lane, its tensors and scratch.
-inline constexpr size_t kInlineBufferBindings = 22;
+// encoding one allocates nothing; a dispatch past them moves to the heap. 28
+// buffers covers the widest production dispatches of eight lanes: the batched
+// GDN decode (two inputs, a current and a next state per lane, its tensors and
+// scratch), the short convolution and the block indexer commit.
+inline constexpr size_t kInlineBufferBindings = 28;
 // Production dispatches bind at most one parameter struct.
 inline constexpr size_t kInlineBytesBindings = 1;
 // Buffers a dispatch reaches through their GPU addresses: the backend writes
